@@ -1,0 +1,14 @@
+# Render Blueprint - Versa Inventory API
+# This file tells Render how to deploy your app
+
+services:
+  - type: web
+    name: versa-inventory-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+    healthCheckPath: /health
+    plan: free
