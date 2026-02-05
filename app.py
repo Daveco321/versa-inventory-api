@@ -1,5 +1,6 @@
 """
 VERSA INVENTORY EXPORT API - Production Ready for Render
+Now supports multi-brand export with separate tabs per brand.
 """
 
 import os
@@ -144,18 +145,100 @@ def process_single_image(url, target_width, target_height):
     # All extensions failed
     return None
 
-def create_excel_with_images(data, s3_base_url, title="Inventory"):
-    output = BytesIO()
-    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
-    
-    workbook.set_properties({
-        'title': 'Versa Inventory Export',
-        'author': 'Versa Inventory System',
-        'created': datetime.now(),
+
+def _add_size_scale_charts(workbook, worksheet, start_row):
+    """Add the slim fit and regular fit size scale charts below inventory data."""
+    fmt_title = workbook.add_format({
+        'bold': True,
+        'font_name': STYLE_CONFIG['font_name'],
+        'font_size': 11,
+        'bg_color': '#FFFFFF',
+        'font_color': '#000000',
+        'border': 0,
+        'align': 'left',
+        'valign': 'vcenter'
     })
     
-    worksheet = workbook.add_worksheet(title[:31])
+    fmt_subtitle = workbook.add_format({
+        'bold': True,
+        'font_name': STYLE_CONFIG['font_name'],
+        'font_size': 10,
+        'bg_color': '#FFFFFF',
+        'font_color': '#FF0000',
+        'border': 0,
+        'align': 'center',
+        'valign': 'vcenter'
+    })
     
+    fmt_grid_header = workbook.add_format({
+        'bold': True,
+        'font_name': STYLE_CONFIG['font_name'],
+        'font_size': 10,
+        'border': 1,
+        'border_color': '#000000',
+        'align': 'center',
+        'valign': 'vcenter',
+        'bg_color': '#FFFFFF'
+    })
+    
+    fmt_grid_data = workbook.add_format({
+        'font_name': STYLE_CONFIG['font_name'],
+        'font_size': 10,
+        'border': 1,
+        'border_color': '#000000',
+        'align': 'center',
+        'valign': 'vcenter',
+        'bg_color': '#FFFFFF'
+    })
+    
+    r = start_row
+    worksheet.set_row(r, 20)
+    worksheet.set_row(r + 1, 18)
+    worksheet.set_row(r + 2, 25)
+    worksheet.set_row(r + 3, 25)
+    worksheet.set_row(r + 4, 25)
+    
+    # SLIM FIT chart
+    worksheet.write(r, 0, 'Slim Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
+    worksheet.merge_range(r + 1, 0, r + 1, 4, '9 PC. Slim Fit SIZE SCALE TO USE', fmt_subtitle)
+    worksheet.write(r + 2, 0, '', fmt_grid_header)
+    worksheet.write(r + 2, 1, '14-14.5', fmt_grid_header)
+    worksheet.write(r + 2, 2, '15-15.5', fmt_grid_header)
+    worksheet.write(r + 2, 3, '16-16.5', fmt_grid_header)
+    worksheet.write(r + 2, 4, '17-17.5', fmt_grid_header)
+    worksheet.write(r + 3, 0, '32/33', fmt_grid_header)
+    worksheet.write(r + 3, 1, 1, fmt_grid_data)
+    worksheet.write(r + 3, 2, 2, fmt_grid_data)
+    worksheet.write(r + 3, 3, 1, fmt_grid_data)
+    worksheet.write(r + 3, 4, '', fmt_grid_data)
+    worksheet.write(r + 4, 0, '34/35', fmt_grid_header)
+    worksheet.write(r + 4, 1, '', fmt_grid_data)
+    worksheet.write(r + 4, 2, 1, fmt_grid_data)
+    worksheet.write(r + 4, 3, 2, fmt_grid_data)
+    worksheet.write(r + 4, 4, 2, fmt_grid_data)
+    
+    # REGULAR FIT chart
+    worksheet.write(r, 7, 'Regular Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
+    worksheet.merge_range(r + 1, 7, r + 1, 11, '9 PC. CLASSIC FIT & REGULAR FIT SIZE SCALE TO USE', fmt_subtitle)
+    worksheet.write(r + 2, 7, '', fmt_grid_header)
+    worksheet.write(r + 2, 8, '15-15.5', fmt_grid_header)
+    worksheet.write(r + 2, 9, '16-16.5', fmt_grid_header)
+    worksheet.write(r + 2, 10, '17-17.5', fmt_grid_header)
+    worksheet.write(r + 2, 11, '18-18.5', fmt_grid_header)
+    worksheet.write(r + 3, 7, '32/33', fmt_grid_header)
+    worksheet.write(r + 3, 8, 1, fmt_grid_data)
+    worksheet.write(r + 3, 9, 2, fmt_grid_data)
+    worksheet.write(r + 3, 10, 1, fmt_grid_data)
+    worksheet.write(r + 3, 11, '', fmt_grid_data)
+    worksheet.write(r + 4, 7, '34/35', fmt_grid_header)
+    worksheet.write(r + 4, 8, '', fmt_grid_data)
+    worksheet.write(r + 4, 9, 1, fmt_grid_data)
+    worksheet.write(r + 4, 10, 2, fmt_grid_data)
+    worksheet.write(r + 4, 11, 2, fmt_grid_data)
+
+
+def _setup_worksheet(workbook, worksheet):
+    """Set up common worksheet formatting: headers, column widths, etc."""
     # Formats
     fmt_header = workbook.add_format({
         'bold': True,
@@ -182,7 +265,6 @@ def create_excel_with_images(data, s3_base_url, title="Inventory"):
     fmt_cell_odd = workbook.add_format({**base_props, 'bg_color': STYLE_CONFIG['row_bg_odd']})
     fmt_cell_even = workbook.add_format({**base_props, 'bg_color': STYLE_CONFIG['row_bg_even']})
     
-    # Number format with commas
     fmt_number_odd = workbook.add_format({
         **base_props, 
         'bg_color': STYLE_CONFIG['row_bg_odd'],
@@ -217,31 +299,21 @@ def create_excel_with_images(data, s3_base_url, title="Inventory"):
     # Row height
     worksheet.set_default_row(112.5)
     
-    print(f"Downloading images for {len(data)} items...")
+    return {
+        'fmt_cell_odd': fmt_cell_odd,
+        'fmt_cell_even': fmt_cell_even,
+        'fmt_number_odd': fmt_number_odd,
+        'fmt_number_even': fmt_number_even,
+    }
+
+
+def _write_brand_data(workbook, worksheet, data, processed_images, formats):
+    """Write item rows and images to a worksheet. Returns number of rows written."""
+    fmt_cell_odd = formats['fmt_cell_odd']
+    fmt_cell_even = formats['fmt_cell_even']
+    fmt_number_odd = formats['fmt_number_odd']
+    fmt_number_even = formats['fmt_number_even']
     
-    # Download images concurrently
-    tasks = [(idx, get_image_url(item, s3_base_url)) for idx, item in enumerate(data)]
-    processed_images = {}
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_idx = {
-            executor.submit(process_single_image, url, TARGET_W, TARGET_H): idx 
-            for idx, url in tasks
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                result = future.result()
-                if result:
-                    processed_images[idx] = result
-                    print(f"✓ Image {idx+1}/{len(data)}")
-            except Exception:
-                pass
-    
-    print(f"Downloaded {len(processed_images)}/{len(data)} images")
-    
-    # Write data rows
     for row_num, item in enumerate(data):
         excel_row = row_num + 1
         is_even = (row_num % 2 == 1)
@@ -288,100 +360,131 @@ def create_excel_with_images(data, s3_base_url, title="Inventory"):
         else:
             worksheet.write(excel_row, 0, "No Image", current_fmt)
     
+    return len(data)
+
+
+def _download_images_for_items(data, s3_base_url):
+    """Download all images for a list of items concurrently. Returns dict of idx -> image_data."""
+    tasks = [(idx, get_image_url(item, s3_base_url)) for idx, item in enumerate(data)]
+    processed_images = {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        future_to_idx = {
+            executor.submit(process_single_image, url, TARGET_W, TARGET_H): idx 
+            for idx, url in tasks
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                if result:
+                    processed_images[idx] = result
+            except Exception:
+                pass
+    
+    return processed_images
+
+
+def create_excel_with_images(data, s3_base_url, title="Inventory"):
+    """Single-brand export (original endpoint)."""
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    
+    workbook.set_properties({
+        'title': 'Versa Inventory Export',
+        'author': 'Versa Inventory System',
+        'created': datetime.now(),
+    })
+    
+    worksheet = workbook.add_worksheet(title[:31])
+    formats = _setup_worksheet(workbook, worksheet)
+    
+    print(f"Downloading images for {len(data)} items...")
+    processed_images = _download_images_for_items(data, s3_base_url)
+    print(f"Downloaded {len(processed_images)}/{len(data)} images")
+    
+    rows_written = _write_brand_data(workbook, worksheet, data, processed_images, formats)
+    
     # Add size scale charts at bottom
-    chart_start_row = len(data) + 2
-    
-    fmt_title = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 11,
-        'bg_color': '#FFFFFF',
-        'font_color': '#000000',
-        'border': 0,
-        'align': 'left',
-        'valign': 'vcenter'
-    })
-    
-    fmt_subtitle = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'bg_color': '#FFFFFF',
-        'font_color': '#FF0000',
-        'border': 0,
-        'align': 'center',
-        'valign': 'vcenter'
-    })
-    
-    fmt_grid_header = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'border': 1,
-        'border_color': '#000000',
-        'align': 'center',
-        'valign': 'vcenter',
-        'bg_color': '#FFFFFF'
-    })
-    
-    fmt_grid_data = workbook.add_format({
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'border': 1,
-        'border_color': '#000000',
-        'align': 'center',
-        'valign': 'vcenter',
-        'bg_color': '#FFFFFF'
-    })
-    
-    worksheet.set_row(chart_start_row, 20)
-    worksheet.set_row(chart_start_row + 1, 18)
-    worksheet.set_row(chart_start_row + 2, 25)
-    worksheet.set_row(chart_start_row + 3, 25)
-    worksheet.set_row(chart_start_row + 4, 25)
-    
-    # SLIM FIT chart
-    worksheet.write(chart_start_row, 0, 'Slim Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
-    worksheet.merge_range(chart_start_row + 1, 0, chart_start_row + 1, 4, '9 PC. Slim Fit SIZE SCALE TO USE', fmt_subtitle)
-    worksheet.write(chart_start_row + 2, 0, '', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 1, '14-14.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 2, '15-15.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 3, '16-16.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 4, '17-17.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 3, 0, '32/33', fmt_grid_header)
-    worksheet.write(chart_start_row + 3, 1, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 2, 2, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 3, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 4, '', fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 0, '34/35', fmt_grid_header)
-    worksheet.write(chart_start_row + 4, 1, '', fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 2, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 3, 2, fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 4, 2, fmt_grid_data)
-    
-    # REGULAR FIT chart
-    worksheet.write(chart_start_row, 7, 'Regular Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
-    worksheet.merge_range(chart_start_row + 1, 7, chart_start_row + 1, 11, '9 PC. CLASSIC FIT & REGULAR FIT SIZE SCALE TO USE', fmt_subtitle)
-    worksheet.write(chart_start_row + 2, 7, '', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 8, '15-15.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 9, '16-16.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 10, '17-17.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 2, 11, '18-18.5', fmt_grid_header)
-    worksheet.write(chart_start_row + 3, 7, '32/33', fmt_grid_header)
-    worksheet.write(chart_start_row + 3, 8, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 9, 2, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 10, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 3, 11, '', fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 7, '34/35', fmt_grid_header)
-    worksheet.write(chart_start_row + 4, 8, '', fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 9, 1, fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 10, 2, fmt_grid_data)
-    worksheet.write(chart_start_row + 4, 11, 2, fmt_grid_data)
+    _add_size_scale_charts(workbook, worksheet, rows_written + 2)
     
     workbook.close()
     output.seek(0)
-    
     return output
+
+
+def create_multi_brand_excel(brands_data, s3_base_url):
+    """
+    Multi-brand export: one workbook, one tab per brand.
+    
+    brands_data: list of dicts, each with:
+        - 'brand_name': str (used as tab name)
+        - 'items': list of item dicts
+    """
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    
+    workbook.set_properties({
+        'title': 'Versa Inventory Export - Multi Brand',
+        'author': 'Versa Inventory System',
+        'created': datetime.now(),
+    })
+    
+    total_items = sum(len(b['items']) for b in brands_data)
+    print(f"\n{'='*60}")
+    print(f"Multi-Brand Export: {len(brands_data)} brands, {total_items} total items")
+    print(f"{'='*60}\n")
+    
+    # Download ALL images across all brands concurrently for speed
+    all_items_flat = []
+    brand_offsets = []  # (start_idx, count) per brand
+    offset = 0
+    for brand in brands_data:
+        items = brand['items']
+        brand_offsets.append((offset, len(items)))
+        all_items_flat.extend(items)
+        offset += len(items)
+    
+    print(f"Downloading images for {len(all_items_flat)} items across all brands...")
+    all_images = _download_images_for_items(all_items_flat, s3_base_url)
+    print(f"Downloaded {len(all_images)}/{len(all_items_flat)} images total")
+    
+    # Create one worksheet per brand
+    for brand_idx, brand in enumerate(brands_data):
+        brand_name = brand['brand_name']
+        items = brand['items']
+        
+        # Excel tab names: max 31 chars, no special chars
+        safe_name = re.sub(r'[\\/*?\[\]:]', '', brand_name)[:31]
+        # Ensure unique tab name
+        if not safe_name:
+            safe_name = f"Brand_{brand_idx + 1}"
+        
+        worksheet = workbook.add_worksheet(safe_name)
+        formats = _setup_worksheet(workbook, worksheet)
+        
+        # Remap the global image indices to local (0-based) for this brand
+        start_idx, count = brand_offsets[brand_idx]
+        local_images = {}
+        for local_idx in range(count):
+            global_idx = start_idx + local_idx
+            if global_idx in all_images:
+                local_images[local_idx] = all_images[global_idx]
+        
+        print(f"  ✓ {safe_name}: {len(items)} items, {len(local_images)} images")
+        
+        rows_written = _write_brand_data(workbook, worksheet, items, local_images, formats)
+        _add_size_scale_charts(workbook, worksheet, rows_written + 2)
+    
+    workbook.close()
+    output.seek(0)
+    return output
+
+
+# ============================================
+# ROUTES
+# ============================================
 
 @app.route('/', methods=['GET'])
 def home():
@@ -390,7 +493,8 @@ def home():
         "status": "running",
         "endpoints": {
             "health": "GET /health",
-            "export": "POST /export"
+            "export": "POST /export",
+            "export_multi": "POST /export-multi"
         }
     })
 
@@ -400,6 +504,7 @@ def health_check():
 
 @app.route('/export', methods=['POST', 'OPTIONS'])
 def export_excel():
+    """Single-brand export (original endpoint)."""
     # Handle preflight request
     if request.method == 'OPTIONS':
         return '', 204
@@ -445,6 +550,73 @@ def export_excel():
         print(f"\n❌ ERROR:\n{error_trace}\n")
         return jsonify({"error": str(e), "trace": error_trace}), 500
 
+
+@app.route('/export-multi', methods=['POST', 'OPTIONS'])
+def export_multi_brand():
+    """
+    Multi-brand export: one workbook with a separate tab per brand.
+    
+    Expected JSON body:
+    {
+        "brands": [
+            {
+                "brand_name": "Nautica",
+                "items": [ { sku, brand_abbr, brand_full, fit, ... }, ... ]
+            },
+            ...
+        ],
+        "s3_base_url": "https://...",
+        "filename": "Multi_Brand_Export"
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        req_data = request.get_json()
+        
+        if not req_data or 'brands' not in req_data:
+            return jsonify({"error": "Missing 'brands' in request body"}), 400
+        
+        brands_data = req_data['brands']
+        s3_base_url = req_data.get('s3_base_url', '')
+        filename = req_data.get('filename', 'Multi_Brand_Export')
+        
+        if not s3_base_url:
+            return jsonify({"error": "Missing 's3_base_url' in request body"}), 400
+        
+        if not brands_data or not isinstance(brands_data, list):
+            return jsonify({"error": "Brands array is empty or invalid"}), 400
+        
+        # Validate each brand has items
+        for i, brand in enumerate(brands_data):
+            if 'items' not in brand or not brand['items']:
+                return jsonify({"error": f"Brand at index {i} has no items"}), 400
+            if 'brand_name' not in brand:
+                brand['brand_name'] = f"Brand_{i+1}"
+        
+        timestamp = datetime.now().strftime('%Y-%m-%d')
+        excel_filename = f"{filename}_{timestamp}.xlsx"
+        
+        excel_file = create_multi_brand_excel(brands_data, s3_base_url)
+        
+        total_items = sum(len(b['items']) for b in brands_data)
+        print(f"\n✅ Multi-brand Excel created! {len(brands_data)} tabs, {total_items} items\n")
+        
+        return send_file(
+            excel_file,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=excel_filename
+        )
+        
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"\n❌ ERROR:\n{error_trace}\n")
+        return jsonify({"error": str(e), "trace": error_trace}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("="*70)
@@ -452,9 +624,10 @@ if __name__ == '__main__':
     print("="*70)
     print(f"\n📍 Server: http://localhost:{port}")
     print("📊 Endpoints:")
-    print("   GET  /        - API Info")
-    print("   GET  /health  - Health check")
-    print("   POST /export  - Generate Excel with images")
+    print("   GET  /            - API Info")
+    print("   GET  /health      - Health check")
+    print("   POST /export      - Single brand Excel with images")
+    print("   POST /export-multi - Multi-brand Excel (one tab per brand)")
     print("\n" + "="*70 + "\n")
     
     app.run(host='0.0.0.0', port=port)
