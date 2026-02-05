@@ -452,7 +452,451 @@ def s3_read_inventory():
     except NoCredentialsError:
         print("  S3 read failed: no AWS credentials configured")
         return None, None
-    except Excep
+    except Exception as e:
+        print(f"  S3 read failed: {e}")
+        return None, None
+
+
+def s3_check_etag():
+    try:
+        s3 = get_s3()
+        resp = s3.head_object(Bucket=S3_BUCKET, Key=S3_INVENTORY_KEY)
+        return resp.get('ETag', '')
+    except Exception:
+        return None
+
+
+def s3_upload_export(key, file_bytes):
+    try:
+        s3 = get_s3()
+        s3.put_object(
+            Bucket=S3_BUCKET, Key=key, Body=file_bytes,
+            ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        print(f"    Uploaded s3://{S3_BUCKET}/{key}")
+        return True
+    except Exception as e:
+        print(f"    Upload failed for {key}: {e}")
+        return False
+
+
+def sync_inventory():
+    new_etag = s3_check_etag()
+    with _inv_lock:
+        if new_etag and new_etag == _inventory['etag'] and _inventory['items']:
+            print("  Inventory unchanged (same ETag)")
+            return False
+
+    data, etag = s3_read_inventory()
+    if data is None:
+        return False
+
+    try:
+        items = parse_inventory_excel(data)
+    except Exception as e:
+        print(f"  Failed to parse inventory: {e}")
+        return False
+
+    brands = _group_by_brand(items)
+
+    with _inv_lock:
+        _inventory['items'] = items
+        _inventory['brands'] = brands
+        _inventory['etag'] = etag
+        _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
+        _inventory['item_count'] = len(items)
+
+    print(f"  Parsed {len(items)} items across {len(brands)} brands")
+    return True
+
+
+def generate_all_exports():
+    with _export_lock:
+        if _exports['generating']:
+            return
+        _exports['generating'] = True
+        _exports['progress'] = 'starting...'
+
+    try:
+        with _inv_lock:
+            brands = dict(_inventory['brands'])
+
+        if not brands:
+            print("  No inventory data for export generation")
+            return
+
+        date_str = datetime.utcnow().strftime('%Y-%m-%d')
+        total = len(brands)
+
+        print(f"\n{'='*60}")
+        print(f"  Generating exports for {total} brands...")
+        print(f"{'='*60}")
+
+        all_items = []
+        for abbr, brand in brands.items():
+            all_items.extend(brand['items'])
+
+        print(f"  Pre-caching images for {len(all_items)} items...")
+        download_images_for_items(all_items, S3_PHOTOS_URL, use_cache=True)
+        with _img_lock:
+            cached_count = len(_img_cache)
+        print(f"  Image cache: {cached_count} images\n")
+
+        brands_list_for_multi = []
+        done = 0
+
+        # Sort brands by total warehouse inventory (highest first) for tab ordering
+        sorted_brands = sorted(brands.items(),
+            key=lambda x: sum(i.get('total_warehouse', 0) for i in x[1]['items']),
+            reverse=True)
+
+        for abbr, brand in sorted_brands:
+            done += 1
+            name = brand['name']
+            with _export_lock:
+                _exports['progress'] = f"{done}/{total}: {name}"
+
+            print(f"  [{done}/{total}] {name} ({len(brand['items'])} items)")
+
+            # Sort items within brand by total_warehouse descending
+            sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
+
+            try:
+                xl_bytes = build_brand_excel(name, sorted_items, S3_PHOTOS_URL)
+
+                with _export_lock:
+                    _exports['brands'][abbr] = {
+                        'bytes': xl_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'name': name,
+                        'items_count': len(sorted_items),
+                        'size_bytes': len(xl_bytes),
+                    }
+
+                s3_key = f"{S3_EXPORT_PREFIX}{name.replace(' ', '_')}_{date_str}.xlsx"
+                s3_upload_export(s3_key, xl_bytes)
+
+                brands_list_for_multi.append({
+                    'brand_name': name,
+                    'items': sorted_items
+                })
+            except Exception as e:
+                print(f"    Failed: {e}")
+
+        if brands_list_for_multi:
+            print(f"\n  [ALL] Multi-tab ({len(brands_list_for_multi)} brands)...")
+            try:
+                multi_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL)
+                with _export_lock:
+                    _exports['all_brands'] = {
+                        'bytes': multi_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'brands_count': len(brands_list_for_multi),
+                        'items_count': sum(len(b['items']) for b in brands_list_for_multi),
+                        'size_bytes': len(multi_bytes),
+                    }
+                s3_upload_export(f"{S3_EXPORT_PREFIX}All_Brands_{date_str}.xlsx", multi_bytes)
+            except Exception as e:
+                print(f"    Failed: {e}")
+
+        with _export_lock:
+            _exports['generating'] = False
+            _exports['progress'] = 'done'
+            _exports['last_generated'] = datetime.utcnow().isoformat() + 'Z'
+
+        print(f"\n{'='*60}")
+        print(f"  Export generation complete! {done} brands")
+        print(f"{'='*60}\n")
+
+    except Exception as e:
+        print(f"  Export generation error: {e}")
+        with _export_lock:
+            _exports['generating'] = False
+            _exports['progress'] = f'error: {e}'
+
+
+def trigger_background_generation():
+    t = threading.Thread(target=generate_all_exports, daemon=True)
+    t.start()
+
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "service": "Versa Inventory Export API v2",
+        "status": "running",
+    })
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    with _inv_lock:
+        inv_count = _inventory['item_count']
+        last_sync = _inventory['last_sync']
+    with _export_lock:
+        gen = _exports['generating']
+        brands_ready = len(_exports['brands'])
+        progress = _exports['progress']
+    with _img_lock:
+        img_count = len(_img_cache)
+
+    return jsonify({
+        "status": "healthy",
+        "inventory_items": inv_count,
+        "last_sync": last_sync,
+        "exports_generating": gen,
+        "exports_ready": brands_ready,
+        "generation_progress": progress,
+        "images_cached": img_count,
+    })
+
+
+@app.route('/sync', methods=['GET', 'OPTIONS'])
+def sync():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    updated = sync_inventory()
+
+    with _inv_lock:
+        items = list(_inventory['items'])
+        last_sync = _inventory['last_sync']
+        brand_count = len(_inventory['brands'])
+
+    with _export_lock:
+        has_exports = bool(_exports['brands'])
+        is_generating = _exports['generating']
+
+    if (updated or not has_exports) and not is_generating:
+        print("  Triggering background export generation...")
+        trigger_background_generation()
+
+    return jsonify({
+        "status": "ok",
+        "updated": updated,
+        "last_sync": last_sync,
+        "item_count": len(items),
+        "brand_count": brand_count,
+        "inventory": items,
+    })
+
+
+@app.route('/inventory', methods=['GET', 'OPTIONS'])
+def inventory():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _inv_lock:
+        return jsonify({
+            "status": "ok",
+            "last_sync": _inventory['last_sync'],
+            "item_count": _inventory['item_count'],
+            "inventory": list(_inventory['items']),
+        })
+
+
+@app.route('/exports', methods=['GET', 'OPTIONS'])
+def exports_manifest():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    with _export_lock:
+        brands = {}
+        for abbr, info in _exports['brands'].items():
+            brands[abbr] = {
+                'name': info['name'],
+                'items_count': info['items_count'],
+                'size_bytes': info['size_bytes'],
+                'generated_at': info['generated_at'],
+            }
+        all_b = None
+        if _exports['all_brands']:
+            a = _exports['all_brands']
+            all_b = {
+                'brands_count': a['brands_count'],
+                'items_count': a['items_count'],
+                'size_bytes': a['size_bytes'],
+                'generated_at': a['generated_at'],
+            }
+
+        return jsonify({
+            "generating": _exports['generating'],
+            "progress": _exports['progress'],
+            "last_generated": _exports['last_generated'],
+            "brands": brands,
+            "all_brands": all_b,
+        })
+
+
+@app.route('/download/brand/<abbr>', methods=['GET'])
+def download_brand(abbr):
+    abbr = abbr.upper()
+    with _export_lock:
+        info = _exports['brands'].get(abbr)
+    if not info:
+        return jsonify({"error": f"No pre-generated export for '{abbr}'"}), 404
+
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    filename = f"{info['name'].replace(' ', '_')}_{date_str}.xlsx"
+
+    return send_file(
+        BytesIO(info['bytes']),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=filename
+    )
+
+
+@app.route('/download/all', methods=['GET'])
+def download_all():
+    with _export_lock:
+        info = _exports['all_brands']
+    if not info:
+        return jsonify({"error": "No pre-generated all-brands export"}), 404
+
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    return send_file(
+        BytesIO(info['bytes']),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=f"All_Brands_{date_str}.xlsx"
+    )
+
+
+@app.route('/download/multi', methods=['GET'])
+def download_multi_selected():
+    brands_param = request.args.get('brands', '')
+    if not brands_param:
+        return jsonify({"error": "Missing 'brands' param"}), 400
+
+    abbrs = [b.strip().upper() for b in brands_param.split(',') if b.strip()]
+    if not abbrs:
+        return jsonify({"error": "No valid brands"}), 400
+
+    with _inv_lock:
+        all_brands = dict(_inventory['brands'])
+
+    brands_list = []
+    for abbr in abbrs:
+        if abbr in all_brands:
+            # Sort items within each brand by total_warehouse descending
+            sorted_items = sorted(all_brands[abbr]['items'],
+                key=lambda x: x.get('total_warehouse', 0), reverse=True)
+            brands_list.append({
+                'brand_name': all_brands[abbr]['name'],
+                'items': sorted_items
+            })
+
+    if not brands_list:
+        return jsonify({"error": "No matching brands in inventory"}), 404
+
+    # Sort brands (tabs) by total warehouse inventory, highest first
+    brands_list.sort(
+        key=lambda b: sum(i.get('total_warehouse', 0) for i in b['items']),
+        reverse=True)
+
+    xl_bytes = build_multi_brand_excel(brands_list, S3_PHOTOS_URL)
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+    return send_file(
+        BytesIO(xl_bytes),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f"Versa_{len(brands_list)}_Brands_{date_str}.xlsx"
+    )
+
+
+@app.route('/upload', methods=['POST', 'OPTIONS'])
+def upload_inventory():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file. Use multipart form with 'file' field."}), 400
+
+    file = request.files['file']
+    data = file.read()
+    if not data:
+        return jsonify({"error": "Empty file"}), 400
+
+    try:
+        s3 = get_s3()
+        s3.put_object(Bucket=S3_BUCKET, Key=S3_INVENTORY_KEY, Body=data,
+                       ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    except Exception as e:
+        return jsonify({"error": f"S3 upload failed: {e}"}), 500
+
+    sync_inventory()
+    with _inv_lock:
+        count = _inventory['item_count']
+
+    trigger_background_generation()
+
+    return jsonify({"status": "ok", "message": f"Uploaded and synced. {count} items.", "item_count": count})
+
+
+@app.route('/export', methods=['POST', 'OPTIONS'])
+def export_single():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req or 'data' not in req:
+            return jsonify({"error": "Missing 'data'"}), 400
+        data = req['data']
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Export')
+        if not data:
+            return jsonify({"error": "Empty data"}), 400
+
+        xl_bytes = build_brand_excel(fname, data, s3_url)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route('/export-multi', methods=['POST', 'OPTIONS'])
+def export_multi():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req or 'brands' not in req:
+            return jsonify({"error": "Missing 'brands'"}), 400
+        brands_data = req['brands']
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Multi_Brand')
+        if not brands_data:
+            return jsonify({"error": "Empty brands"}), 400
+
+        xl_bytes = build_multi_brand_excel(brands_data, s3_url)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+def startup_sync():
+    time.sleep(3)
+    print("\n  Running startup sync...")
+    try:
+        updated = sync_inventory()
+        with _inv_lock:
+            count = _inventory['item_count']
+        if count > 0:
+            print(f"  Startup: {count} items loaded, generating exports...")
+            trigger_background_generation()
+        else:
+            print("  Startup: no inventory data (upload Excel to S3 or use /upload)")
+    except Exception as e:
+        print(f"  Startup sync failed: {e}")
+
+threading.Thread(target=startup_sync, daemon=True).start()
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
