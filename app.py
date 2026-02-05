@@ -32,8 +32,8 @@ COL_WIDTH_UNITS = 22
 
 BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
-    'BEN': 'BS', 'USPA': 'US', 'CHAPS': 'CH', 'LUCKY': 'LB', 'JNY': 'JN',
-    'BEENE': 'GB', 'NICOLE': 'NM', 'SHAQ': 'SQ', 'TAYION': 'TY', 'STRAHAN': 'MS',
+    'BEN': 'BE', 'USPA': 'US', 'CHAPS': 'CH', 'LUCKY': 'LB', 'JNY': 'JN',
+    'BEENE': 'GB', 'NICOLE': 'NM', 'SHAQ': 'SH', 'TAYION': 'TA', 'STRAHAN': 'MS',
     'VD': 'VD', 'VERSA': 'VR', 'AMERICA': 'AC', 'BLO': 'BL', 'DN': 'D9'
 }
 
@@ -56,68 +56,93 @@ def extract_image_code(sku, brand_abbr):
 
 def get_image_url(item, s3_base_url):
     brand_abbr = item['brand_abbr']
-    folder_name = 'EDDIE+BAUER' if brand_abbr == 'EB' else brand_abbr
+    
+    # Map brand abbreviations to actual S3 folder names (must match S3 exactly)
+    folder_mapping = {
+        'EB': 'EDDIE+BAUER',
+        'USPA': 'US+POLO',
+        'VINCE': 'VINCE+CAMUTO',
+        'LUCKY': 'LUCKY+BRAND',
+        'BEN': 'BEN+SHERMAN',
+        'BEENE': 'GEOFFREY+BEENE',
+        'NICOLE': 'NICOLE+MILLER',
+        'AMERICA': 'AMERICAN+CREW',
+        'TAYION': 'TAYON',
+        'VD': 'Von+Dutch'
+    }
+    
+    folder_name = folder_mapping.get(brand_abbr, brand_abbr)
     image_code = extract_image_code(item['sku'], brand_abbr)
     return f"{s3_base_url}/{folder_name}/{image_code}.jpg"
 
 def process_single_image(url, target_width, target_height):
-    """Process and resize a single image from URL"""
+    """Process and resize a single image from URL - tries jpg, png, jpeg"""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
     
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'image' not in content_type:
-            return None
-        if response.status_code != 200:
-            return None
+    # Try different extensions
+    extensions_to_try = ['.jpg', '.png', '.jpeg']
+    base_url = url.rsplit('.', 1)[0]  # Remove extension
+    
+    for ext in extensions_to_try:
+        try_url = base_url + ext
+        try:
+            response = requests.get(try_url, headers=headers, timeout=10)
             
-        image_data = BytesIO(response.content)
-        
-        with PilImage.open(image_data) as im:
-            im = ImageOps.exif_transpose(im)
+            if response.status_code != 200:
+                continue
+                
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'image' not in content_type:
+                continue
             
-            im.thumbnail((target_width * 2, target_height * 2), PilImage.Resampling.LANCZOS)
+            image_data = BytesIO(response.content)
             
-            output_format = "PNG"
-            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            with PilImage.open(image_data) as im:
+                im = ImageOps.exif_transpose(im)
+                
+                im.thumbnail((target_width * 2, target_height * 2), PilImage.Resampling.LANCZOS)
+                
                 output_format = "PNG"
-            else:
-                if im.mode != "RGB":
-                    im = im.convert("RGB")
-                output_format = "JPEG"
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    output_format = "PNG"
+                else:
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    output_format = "JPEG"
+                
+                processed_image_data = BytesIO()
+                im.save(processed_image_data, format=output_format, quality=85, optimize=True)
+                processed_image_data.seek(0)
+                
+                orig_w, orig_h = im.size
             
-            processed_image_data = BytesIO()
-            im.save(processed_image_data, format=output_format, quality=85, optimize=True)
-            processed_image_data.seek(0)
+            width_ratio = target_width / orig_w
+            height_ratio = target_height / orig_h
+            scale_factor = min(width_ratio, height_ratio)
             
-            orig_w, orig_h = im.size
-        
-        width_ratio = target_width / orig_w
-        height_ratio = target_height / orig_h
-        scale_factor = min(width_ratio, height_ratio)
-        
-        final_w = orig_w * scale_factor
-        final_h = orig_h * scale_factor
-        
-        x_offset = (target_width - final_w) / 2
-        y_offset = (target_height - final_h) / 2
-        
-        return {
-            'image_data': processed_image_data,
-            'x_scale': scale_factor,
-            'y_scale': scale_factor,
-            'x_offset': x_offset,
-            'y_offset': y_offset,
-            'object_position': 1,
-            'url': url
-        }
-    except Exception:
-        return None
+            final_w = orig_w * scale_factor
+            final_h = orig_h * scale_factor
+            
+            x_offset = (target_width - final_w) / 2
+            y_offset = (target_height - final_h) / 2
+            
+            return {
+                'image_data': processed_image_data,
+                'x_scale': scale_factor,
+                'y_scale': scale_factor,
+                'x_offset': x_offset,
+                'y_offset': y_offset,
+                'object_position': 1,
+                'url': try_url
+            }
+        except Exception:
+            continue
+    
+    # All extensions failed
+    return None
 
 def create_excel_with_images(data, s3_base_url, title="Inventory"):
     output = BytesIO()
