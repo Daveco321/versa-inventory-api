@@ -228,7 +228,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
     return results
 
 
-def _setup_worksheet(workbook, worksheet):
+def _setup_worksheet(workbook, worksheet, has_color=False):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -250,8 +250,12 @@ def _setup_worksheet(workbook, worksheet):
     worksheet.hide_gridlines(2)
     worksheet.freeze_panes(1, 0)
 
-    headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication',
-               'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
+    if has_color:
+        headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabric Code', 'Fabrication',
+                   'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
+    else:
+        headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication',
+                   'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
     worksheet.set_row(0, 25)
     for c, h in enumerate(headers):
         worksheet.write(0, c, h, fmt_header)
@@ -259,28 +263,49 @@ def _setup_worksheet(workbook, worksheet):
     worksheet.set_column(0, 0, COL_WIDTH_UNITS)
     worksheet.set_column(1, 1, 20)
     worksheet.set_column(2, 2, 20)
-    worksheet.set_column(3, 3, 12)
-    worksheet.set_column(4, 4, 12)
-    worksheet.set_column(5, 5, 35)
-    worksheet.set_column(6, 10, 12)
+    if has_color:
+        worksheet.set_column(3, 3, 18)  # Color
+        worksheet.set_column(4, 4, 12)  # Fit
+        worksheet.set_column(5, 5, 12)  # Fabric Code
+        worksheet.set_column(6, 6, 35)  # Fabrication
+        worksheet.set_column(7, 11, 12) # Number columns
+    else:
+        worksheet.set_column(3, 3, 12)
+        worksheet.set_column(4, 4, 12)
+        worksheet.set_column(5, 5, 35)
+        worksheet.set_column(6, 10, 12)
     worksheet.set_default_row(112.5)
     return fmts
 
 
-def _write_rows(workbook, worksheet, data, images, fmts):
+def _write_rows(workbook, worksheet, data, images, fmts, has_color=False):
     for r, item in enumerate(data):
         row = r + 1
         even = r % 2 == 1
         cf = fmts['even'] if even else fmts['odd']
-        vals = [
-            '', item.get('sku',''), item.get('brand_full',''),
-            item.get('fit','N/A'), item.get('fabric_code','N/A'),
-            item.get('fabrication','Standard Fabric'),
-            item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
-            item.get('total_warehouse',0), item.get('total_ats',0)
-        ]
+        if has_color:
+            vals = [
+                '', item.get('sku',''), item.get('brand_full',''),
+                item.get('color',''),
+                item.get('fit','N/A'), item.get('fabric_code','N/A'),
+                item.get('fabrication','Standard Fabric'),
+                item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                item.get('total_warehouse',0), item.get('total_ats',0)
+            ]
+            num_start = 7
+            num_end = 11
+        else:
+            vals = [
+                '', item.get('sku',''), item.get('brand_full',''),
+                item.get('fit','N/A'), item.get('fabric_code','N/A'),
+                item.get('fabrication','Standard Fabric'),
+                item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                item.get('total_warehouse',0), item.get('total_ats',0)
+            ]
+            num_start = 6
+            num_end = 10
         for c, v in enumerate(vals):
-            f = (fmts['num_even'] if even else fmts['num_odd']) if 6 <= c <= 10 else cf
+            f = (fmts['num_even'] if even else fmts['num_odd']) if num_start <= c <= num_end else cf
             worksheet.write(row, c, v, f)
 
         img = images.get(r)
@@ -325,13 +350,16 @@ def _add_size_charts(workbook, worksheet, start):
 
 
 def build_brand_excel(brand_name, items, s3_base_url):
+    # Detect if items have color data
+    has_color = any(item.get('color') for item in items)
+
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
-    fmts = _setup_worksheet(wb, ws)
+    fmts = _setup_worksheet(wb, ws, has_color=has_color)
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
-    n = _write_rows(wb, ws, items, imgs, fmts)
+    n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color)
     _add_size_charts(wb, ws, n + 2)
     wb.close()
     return buf.getvalue()
@@ -341,6 +369,9 @@ def build_multi_brand_excel(brands_list, s3_base_url):
     # Sort items within each brand by total_warehouse descending
     for b in brands_list:
         b['items'] = sorted(b['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
+
+    # Detect if any items have color data
+    has_color = any(item.get('color') for b in brands_list for item in b['items'])
 
     all_items = []
     offsets = []
@@ -359,14 +390,14 @@ def build_multi_brand_excel(brands_list, s3_base_url):
     for bi, brand in enumerate(brands_list):
         safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
         ws = wb.add_worksheet(safe)
-        fmts = _setup_worksheet(wb, ws)
+        fmts = _setup_worksheet(wb, ws, has_color=has_color)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
             gi = start + li
             if gi in all_imgs:
                 local_imgs[li] = all_imgs[gi]
-        n = _write_rows(wb, ws, brand['items'], local_imgs, fmts)
+        n = _write_rows(wb, ws, brand['items'], local_imgs, fmts, has_color=has_color)
         _add_size_charts(wb, ws, n + 2)
 
     wb.close()
