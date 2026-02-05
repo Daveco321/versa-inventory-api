@@ -1,23 +1,27 @@
 """
-VERSA INVENTORY EXPORT API - Production Ready for Render
-Now supports multi-brand export with separate tabs per brand.
+VERSA INVENTORY EXPORT API v2
 """
 
 import os
-from flask import Flask, request, jsonify, send_file
+import re
+import json
+import time
+import threading
+import concurrent.futures
+from datetime import datetime
+from io import BytesIO
+
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import xlsxwriter
-import requests
-from io import BytesIO
-import re
-from datetime import datetime
-import concurrent.futures
+import requests as http_requests
+import openpyxl
 from PIL import Image as PilImage
 from PIL import ImageOps
 
 app = Flask(__name__)
-
-# CORS configuration - allow requests from any origin for the API
 CORS(app, resources={
     r"/*": {
         "origins": "*",
@@ -26,7 +30,15 @@ CORS(app, resources={
     }
 })
 
-# Image processing settings
+AWS_REGION       = os.environ.get('AWS_REGION', 'us-east-2')
+S3_BUCKET        = os.environ.get('S3_BUCKET', 'nauticaslimfit')
+S3_INVENTORY_KEY = os.environ.get('S3_INVENTORY_KEY', 'inventory/daily_inventory.xlsx')
+S3_EXPORT_PREFIX = os.environ.get('S3_EXPORT_PREFIX', 'exports/').rstrip('/') + '/'
+S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
+                                   'ALL+INVENTORY+Photos/PHOTOS+INVENTORY')
+
+S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
+
 TARGET_W = 150
 TARGET_H = 150
 COL_WIDTH_UNITS = 22
@@ -38,14 +50,61 @@ BRAND_IMAGE_PREFIX = {
     'VD': 'VD', 'VERSA': 'VR', 'AMERICA': 'AC', 'BLO': 'BL', 'DN': 'D9'
 }
 
-STYLE_CONFIG = {
-    'header_bg': '#ADD8E6',
-    'header_text': '#000000',
-    'row_bg_odd': '#FFFFFF',
-    'row_bg_even': '#F0F4F8',
-    'border_color': '#000000',
-    'font_name': 'Calibri'
+BRAND_FULL_NAMES = {
+    'NAUTICA': 'Nautica', 'DKNY': 'DKNY', 'EB': 'Eddie Bauer', 'REEBOK': 'Reebok',
+    'VINCE': 'Vince Camuto', 'BEN': 'Ben Sherman', 'USPA': 'U.S. Polo Assn.',
+    'CHAPS': 'Chaps', 'LUCKY': 'Lucky Brand', 'JNY': 'Jones New York',
+    'BEENE': 'Geoffrey Beene', 'NICOLE': 'Nicole Miller', 'SHAQ': "Shaquille O'Neal",
+    'TAYION': 'Tayion', 'STRAHAN': 'Michael Strahan', 'VD': 'Von Dutch',
+    'VERSA': 'Versa', 'AMERICA': 'American Crew', 'BLO': 'Bloomingdales', 'DN': 'Divine 9'
 }
+
+FOLDER_MAPPING = {
+    'EB': 'EDDIE+BAUER', 'USPA': 'US+POLO', 'VINCE': 'VINCE+CAMUTO',
+    'LUCKY': 'LUCKY+BRAND', 'BEN': 'BEN+SHERMAN', 'BEENE': 'GEOFFREY+BEENE',
+    'NICOLE': 'NICOLE+MILLER', 'AMERICA': 'AMERICAN+CREW',
+    'TAYION': 'TAYON', 'VD': 'Von+Dutch'
+}
+
+STYLE_CONFIG = {
+    'header_bg': '#ADD8E6', 'header_text': '#000000',
+    'row_bg_odd': '#FFFFFF', 'row_bg_even': '#F0F4F8',
+    'border_color': '#000000', 'font_name': 'Calibri'
+}
+
+_s3_client = None
+
+def get_s3():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client('s3',
+            aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', ''),
+            aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', ''),
+            region_name=AWS_REGION
+        )
+    return _s3_client
+
+_inv_lock = threading.Lock()
+_inventory = {
+    'items': [],
+    'brands': {},
+    'etag': None,
+    'last_sync': None,
+    'item_count': 0,
+}
+
+_img_lock = threading.Lock()
+_img_cache = {}
+
+_export_lock = threading.Lock()
+_exports = {
+    'brands': {},
+    'all_brands': None,
+    'generating': False,
+    'progress': '',
+    'last_generated': None,
+}
+
 
 def extract_image_code(sku, brand_abbr):
     prefix = BRAND_IMAGE_PREFIX.get(brand_abbr, brand_abbr[:2])
@@ -55,239 +114,148 @@ def extract_image_code(sku, brand_abbr):
         return f"{prefix}_{main_number}"
     return f"{prefix}_{sku}"
 
+
 def get_image_url(item, s3_base_url):
-    brand_abbr = item['brand_abbr']
-    
-    # Map brand abbreviations to actual S3 folder names (must match S3 exactly)
-    folder_mapping = {
-        'EB': 'EDDIE+BAUER',
-        'USPA': 'US+POLO',
-        'VINCE': 'VINCE+CAMUTO',
-        'LUCKY': 'LUCKY+BRAND',
-        'BEN': 'BEN+SHERMAN',
-        'BEENE': 'GEOFFREY+BEENE',
-        'NICOLE': 'NICOLE+MILLER',
-        'AMERICA': 'AMERICAN+CREW',
-        'TAYION': 'TAYON',
-        'VD': 'Von+Dutch'
-    }
-    
-    folder_name = folder_mapping.get(brand_abbr, brand_abbr)
+    brand_abbr = item.get('brand_abbr', item.get('brand', ''))
+    folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
     image_code = extract_image_code(item['sku'], brand_abbr)
     return f"{s3_base_url}/{folder_name}/{image_code}.jpg"
 
-def process_single_image(url, target_width, target_height):
-    """Process and resize a single image from URL - tries jpg, png, jpeg"""
+
+def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
     if not (isinstance(url, str) and url.startswith('http')):
         return None
-    
+
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # Try different extensions
-    extensions_to_try = ['.jpg', '.png', '.jpeg']
-    base_url = url.rsplit('.', 1)[0]  # Remove extension
-    
-    for ext in extensions_to_try:
+    base_url = url.rsplit('.', 1)[0]
+
+    for ext in ['.jpg', '.png', '.jpeg']:
         try_url = base_url + ext
         try:
-            response = requests.get(try_url, headers=headers, timeout=10)
-            
-            if response.status_code != 200:
+            resp = http_requests.get(try_url, headers=headers, timeout=10)
+            if resp.status_code != 200:
                 continue
-                
-            content_type = response.headers.get('Content-Type', '').lower()
-            if 'image' not in content_type:
+            ct = resp.headers.get('Content-Type', '').lower()
+            if 'image' not in ct:
                 continue
-            
-            image_data = BytesIO(response.content)
-            
-            with PilImage.open(image_data) as im:
+
+            with PilImage.open(BytesIO(resp.content)) as im:
                 im = ImageOps.exif_transpose(im)
-                
-                im.thumbnail((target_width * 2, target_height * 2), PilImage.Resampling.LANCZOS)
-                
-                output_format = "PNG"
+                im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
+
+                fmt = "PNG"
                 if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-                    output_format = "PNG"
+                    fmt = "PNG"
                 else:
                     if im.mode != "RGB":
                         im = im.convert("RGB")
-                    output_format = "JPEG"
-                
-                processed_image_data = BytesIO()
-                im.save(processed_image_data, format=output_format, quality=85, optimize=True)
-                processed_image_data.seek(0)
-                
-                orig_w, orig_h = im.size
-            
-            width_ratio = target_width / orig_w
-            height_ratio = target_height / orig_h
-            scale_factor = min(width_ratio, height_ratio)
-            
-            final_w = orig_w * scale_factor
-            final_h = orig_h * scale_factor
-            
-            x_offset = (target_width - final_w) / 2
-            y_offset = (target_height - final_h) / 2
-            
+                    fmt = "JPEG"
+
+                buf = BytesIO()
+                im.save(buf, format=fmt, quality=85, optimize=True)
+                raw = buf.getvalue()
+                ow, oh = im.size
+
+            wr = tw / ow
+            hr = th / oh
+            sf = min(wr, hr)
             return {
-                'image_data': processed_image_data,
-                'x_scale': scale_factor,
-                'y_scale': scale_factor,
-                'x_offset': x_offset,
-                'y_offset': y_offset,
-                'object_position': 1,
+                'raw_bytes': raw,
+                'x_scale': sf, 'y_scale': sf,
+                'x_offset': (tw - ow * sf) / 2,
+                'y_offset': (th - oh * sf) / 2,
                 'url': try_url
             }
         except Exception:
             continue
-    
-    # All extensions failed
     return None
 
 
-def _add_size_scale_charts(workbook, worksheet, start_row):
-    """Add the slim fit and regular fit size scale charts below inventory data."""
-    fmt_title = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 11,
-        'bg_color': '#FFFFFF',
-        'font_color': '#000000',
-        'border': 0,
-        'align': 'left',
-        'valign': 'vcenter'
-    })
-    
-    fmt_subtitle = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'bg_color': '#FFFFFF',
-        'font_color': '#FF0000',
-        'border': 0,
-        'align': 'center',
-        'valign': 'vcenter'
-    })
-    
-    fmt_grid_header = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'border': 1,
-        'border_color': '#000000',
-        'align': 'center',
-        'valign': 'vcenter',
-        'bg_color': '#FFFFFF'
-    })
-    
-    fmt_grid_data = workbook.add_format({
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'border': 1,
-        'border_color': '#000000',
-        'align': 'center',
-        'valign': 'vcenter',
-        'bg_color': '#FFFFFF'
-    })
-    
-    r = start_row
-    worksheet.set_row(r, 20)
-    worksheet.set_row(r + 1, 18)
-    worksheet.set_row(r + 2, 25)
-    worksheet.set_row(r + 3, 25)
-    worksheet.set_row(r + 4, 25)
-    
-    # SLIM FIT chart
-    worksheet.write(r, 0, 'Slim Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
-    worksheet.merge_range(r + 1, 0, r + 1, 4, '9 PC. Slim Fit SIZE SCALE TO USE', fmt_subtitle)
-    worksheet.write(r + 2, 0, '', fmt_grid_header)
-    worksheet.write(r + 2, 1, '14-14.5', fmt_grid_header)
-    worksheet.write(r + 2, 2, '15-15.5', fmt_grid_header)
-    worksheet.write(r + 2, 3, '16-16.5', fmt_grid_header)
-    worksheet.write(r + 2, 4, '17-17.5', fmt_grid_header)
-    worksheet.write(r + 3, 0, '32/33', fmt_grid_header)
-    worksheet.write(r + 3, 1, 1, fmt_grid_data)
-    worksheet.write(r + 3, 2, 2, fmt_grid_data)
-    worksheet.write(r + 3, 3, 1, fmt_grid_data)
-    worksheet.write(r + 3, 4, '', fmt_grid_data)
-    worksheet.write(r + 4, 0, '34/35', fmt_grid_header)
-    worksheet.write(r + 4, 1, '', fmt_grid_data)
-    worksheet.write(r + 4, 2, 1, fmt_grid_data)
-    worksheet.write(r + 4, 3, 2, fmt_grid_data)
-    worksheet.write(r + 4, 4, 2, fmt_grid_data)
-    
-    # REGULAR FIT chart
-    worksheet.write(r, 7, 'Regular Fit 9 pcs inner, 36 pcs / box (4 inners)', fmt_title)
-    worksheet.merge_range(r + 1, 7, r + 1, 11, '9 PC. CLASSIC FIT & REGULAR FIT SIZE SCALE TO USE', fmt_subtitle)
-    worksheet.write(r + 2, 7, '', fmt_grid_header)
-    worksheet.write(r + 2, 8, '15-15.5', fmt_grid_header)
-    worksheet.write(r + 2, 9, '16-16.5', fmt_grid_header)
-    worksheet.write(r + 2, 10, '17-17.5', fmt_grid_header)
-    worksheet.write(r + 2, 11, '18-18.5', fmt_grid_header)
-    worksheet.write(r + 3, 7, '32/33', fmt_grid_header)
-    worksheet.write(r + 3, 8, 1, fmt_grid_data)
-    worksheet.write(r + 3, 9, 2, fmt_grid_data)
-    worksheet.write(r + 3, 10, 1, fmt_grid_data)
-    worksheet.write(r + 3, 11, '', fmt_grid_data)
-    worksheet.write(r + 4, 7, '34/35', fmt_grid_header)
-    worksheet.write(r + 4, 8, '', fmt_grid_data)
-    worksheet.write(r + 4, 9, 1, fmt_grid_data)
-    worksheet.write(r + 4, 10, 2, fmt_grid_data)
-    worksheet.write(r + 4, 11, 2, fmt_grid_data)
+def get_image_cached(url):
+    base = url.rsplit('.', 1)[0]
+
+    with _img_lock:
+        if base in _img_cache:
+            c = _img_cache[base]
+            return {
+                'image_data': BytesIO(c['raw_bytes']),
+                'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
+                'x_offset': c['x_offset'], 'y_offset': c['y_offset'],
+                'object_position': 1, 'url': c['url']
+            }
+
+    result = _process_image_from_url(url)
+    if result:
+        with _img_lock:
+            _img_cache[base] = result
+        return {
+            'image_data': BytesIO(result['raw_bytes']),
+            'x_scale': result['x_scale'], 'y_scale': result['y_scale'],
+            'x_offset': result['x_offset'], 'y_offset': result['y_offset'],
+            'object_position': 1, 'url': result['url']
+        }
+    return None
+
+
+def download_images_for_items(items, s3_base_url, use_cache=True):
+    urls = [(i, get_image_url(item, s3_base_url)) for i, item in enumerate(items)]
+    results = {}
+
+    def _fetch(idx_url):
+        idx, url = idx_url
+        if use_cache:
+            return idx, get_image_cached(url)
+        else:
+            r = _process_image_from_url(url)
+            if r:
+                return idx, {
+                    'image_data': BytesIO(r['raw_bytes']),
+                    'x_scale': r['x_scale'], 'y_scale': r['y_scale'],
+                    'x_offset': r['x_offset'], 'y_offset': r['y_offset'],
+                    'object_position': 1, 'url': r['url']
+                }
+            return idx, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(_fetch, pair): pair[0] for pair in urls}
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                idx, img = f.result()
+                if img:
+                    results[idx] = img
+            except Exception:
+                pass
+    return results
 
 
 def _setup_worksheet(workbook, worksheet):
-    """Set up common worksheet formatting: headers, column widths, etc."""
-    # Formats
     fmt_header = workbook.add_format({
-        'bold': True,
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 11,
-        'bg_color': STYLE_CONFIG['header_bg'],
-        'font_color': STYLE_CONFIG['header_text'],
-        'border': 1,
-        'border_color': STYLE_CONFIG['border_color'],
-        'align': 'center',
-        'valign': 'vcenter'
+        'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
+        'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
+        'border': 1, 'border_color': STYLE_CONFIG['border_color'],
+        'align': 'center', 'valign': 'vcenter'
     })
-    
-    base_props = {
-        'font_name': STYLE_CONFIG['font_name'],
-        'font_size': 10,
-        'text_wrap': True,
-        'valign': 'vcenter',
-        'align': 'center',
-        'border': 1,
-        'border_color': STYLE_CONFIG['border_color']
+    base = {
+        'font_name': STYLE_CONFIG['font_name'], 'font_size': 10,
+        'text_wrap': True, 'valign': 'vcenter', 'align': 'center',
+        'border': 1, 'border_color': STYLE_CONFIG['border_color']
     }
-    
-    fmt_cell_odd = workbook.add_format({**base_props, 'bg_color': STYLE_CONFIG['row_bg_odd']})
-    fmt_cell_even = workbook.add_format({**base_props, 'bg_color': STYLE_CONFIG['row_bg_even']})
-    
-    fmt_number_odd = workbook.add_format({
-        **base_props, 
-        'bg_color': STYLE_CONFIG['row_bg_odd'],
-        'num_format': '#,##0'
-    })
-    fmt_number_even = workbook.add_format({
-        **base_props, 
-        'bg_color': STYLE_CONFIG['row_bg_even'],
-        'num_format': '#,##0'
-    })
-    
+    fmts = {
+        'odd':  workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd']}),
+        'even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even']}),
+        'num_odd':  workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd'],  'num_format': '#,##0'}),
+        'num_even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '#,##0'}),
+    }
+
     worksheet.hide_gridlines(2)
     worksheet.freeze_panes(1, 0)
-    
-    # Headers
-    headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication', 
+
+    headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication',
                'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
-    
     worksheet.set_row(0, 25)
-    for col_num, header in enumerate(headers):
-        worksheet.write(0, col_num, header, fmt_header)
-    
-    # Column widths
+    for c, h in enumerate(headers):
+        worksheet.write(0, c, h, fmt_header)
+
     worksheet.set_column(0, 0, COL_WIDTH_UNITS)
     worksheet.set_column(1, 1, 20)
     worksheet.set_column(2, 2, 20)
@@ -295,339 +263,621 @@ def _setup_worksheet(workbook, worksheet):
     worksheet.set_column(4, 4, 12)
     worksheet.set_column(5, 5, 35)
     worksheet.set_column(6, 10, 12)
-    
-    # Row height
     worksheet.set_default_row(112.5)
-    
-    return {
-        'fmt_cell_odd': fmt_cell_odd,
-        'fmt_cell_even': fmt_cell_even,
-        'fmt_number_odd': fmt_number_odd,
-        'fmt_number_even': fmt_number_even,
-    }
+    return fmts
 
 
-def _write_brand_data(workbook, worksheet, data, processed_images, formats):
-    """Write item rows and images to a worksheet. Returns number of rows written."""
-    fmt_cell_odd = formats['fmt_cell_odd']
-    fmt_cell_even = formats['fmt_cell_even']
-    fmt_number_odd = formats['fmt_number_odd']
-    fmt_number_even = formats['fmt_number_even']
-    
-    for row_num, item in enumerate(data):
-        excel_row = row_num + 1
-        is_even = (row_num % 2 == 1)
-        
-        current_fmt = fmt_cell_even if is_even else fmt_cell_odd
-        
-        data_values = [
-            '',
-            item.get('sku', ''),
-            item.get('brand_full', ''),
-            item.get('fit', 'N/A'),
-            item.get('fabric_code', 'N/A'),
-            item.get('fabrication', 'Standard Fabric'),
-            item.get('jtw', 0),
-            item.get('tr', 0),
-            item.get('dcw', 0),
-            item.get('total_warehouse', 0),
-            item.get('total_ats', 0)
+def _write_rows(workbook, worksheet, data, images, fmts):
+    for r, item in enumerate(data):
+        row = r + 1
+        even = r % 2 == 1
+        cf = fmts['even'] if even else fmts['odd']
+        vals = [
+            '', item.get('sku',''), item.get('brand_full',''),
+            item.get('fit','N/A'), item.get('fabric_code','N/A'),
+            item.get('fabrication','Standard Fabric'),
+            item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+            item.get('total_warehouse',0), item.get('total_ats',0)
         ]
-        
-        for col_num, value in enumerate(data_values):
-            if col_num >= 6 and col_num <= 10:
-                fmt_to_use = fmt_number_even if is_even else fmt_number_odd
-            else:
-                fmt_to_use = current_fmt
-            
-            worksheet.write(excel_row, col_num, value, fmt_to_use)
-        
-        img_data = processed_images.get(row_num)
-        
-        if img_data:
+        for c, v in enumerate(vals):
+            f = (fmts['num_even'] if even else fmts['num_odd']) if 6 <= c <= 10 else cf
+            worksheet.write(row, c, v, f)
+
+        img = images.get(r)
+        if img:
             try:
-                worksheet.insert_image(excel_row, 0, "img.png", {
-                    'image_data': img_data['image_data'],
-                    'x_scale': img_data['x_scale'],
-                    'y_scale': img_data['y_scale'],
-                    'x_offset': img_data['x_offset'],
-                    'y_offset': img_data['y_offset'],
-                    'object_position': 1,
-                    'url': img_data['url']
+                worksheet.insert_image(row, 0, "img.png", {
+                    'image_data': img['image_data'],
+                    'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
+                    'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
+                    'object_position': 1, 'url': img.get('url', '')
                 })
-            except:
-                worksheet.write(excel_row, 0, "Error", current_fmt)
+            except Exception:
+                worksheet.write(row, 0, "Error", cf)
         else:
-            worksheet.write(excel_row, 0, "No Image", current_fmt)
-    
+            worksheet.write(row, 0, "No Image", cf)
     return len(data)
 
 
-def _download_images_for_items(data, s3_base_url):
-    """Download all images for a list of items concurrently. Returns dict of idx -> image_data."""
-    tasks = [(idx, get_image_url(item, s3_base_url)) for idx, item in enumerate(data)]
-    processed_images = {}
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_idx = {
-            executor.submit(process_single_image, url, TARGET_W, TARGET_H): idx 
-            for idx, url in tasks
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
+def _add_size_charts(workbook, worksheet, start):
+    t = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':11,'bg_color':'#FFFFFF','border':0,'align':'left','valign':'vcenter'})
+    s = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':10,'bg_color':'#FFFFFF','font_color':'#FF0000','border':0,'align':'center','valign':'vcenter'})
+    gh = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':10,'border':1,'align':'center','valign':'vcenter','bg_color':'#FFFFFF'})
+    gd = workbook.add_format({'font_name':'Calibri','font_size':10,'border':1,'align':'center','valign':'vcenter','bg_color':'#FFFFFF'})
+    r = start
+    for i in range(5): worksheet.set_row(r+i, [20,18,25,25,25][i])
+
+    worksheet.write(r,0,'Slim Fit 9 pcs inner, 36 pcs / box (4 inners)',t)
+    worksheet.merge_range(r+1,0,r+1,4,'9 PC. Slim Fit SIZE SCALE TO USE',s)
+    for c,v in enumerate(['','14-14.5','15-15.5','16-16.5','17-17.5']): worksheet.write(r+2,c,v,gh)
+    worksheet.write(r+3,0,'32/33',gh)
+    for c,v in enumerate([1,2,1,''],1): worksheet.write(r+3,c,v,gd)
+    worksheet.write(r+4,0,'34/35',gh)
+    for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,c,v,gd)
+
+    worksheet.write(r,7,'Regular Fit 9 pcs inner, 36 pcs / box (4 inners)',t)
+    worksheet.merge_range(r+1,7,r+1,11,'9 PC. CLASSIC FIT & REGULAR FIT SIZE SCALE TO USE',s)
+    for c,v in enumerate(['','15-15.5','16-16.5','17-17.5','18-18.5']): worksheet.write(r+2,7+c,v,gh)
+    worksheet.write(r+3,7,'32/33',gh)
+    for c,v in enumerate([1,2,1,''],1): worksheet.write(r+3,7+c,v,gd)
+    worksheet.write(r+4,7,'34/35',gh)
+    for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,7+c,v,gd)
+
+
+def build_brand_excel(brand_name, items, s3_base_url):
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
+    ws = wb.add_worksheet(brand_name[:31])
+    fmts = _setup_worksheet(wb, ws)
+    imgs = download_images_for_items(items, s3_base_url, use_cache=True)
+    n = _write_rows(wb, ws, items, imgs, fmts)
+    _add_size_charts(wb, ws, n + 2)
+    wb.close()
+    return buf.getvalue()
+
+
+def build_multi_brand_excel(brands_list, s3_base_url):
+    all_items = []
+    offsets = []
+    off = 0
+    for b in brands_list:
+        offsets.append((off, len(b['items'])))
+        all_items.extend(b['items'])
+        off += len(b['items'])
+
+    all_imgs = download_images_for_items(all_items, s3_base_url, use_cache=True)
+
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
+
+    for bi, brand in enumerate(brands_list):
+        safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
+        ws = wb.add_worksheet(safe)
+        fmts = _setup_worksheet(wb, ws)
+        start, count = offsets[bi]
+        local_imgs = {}
+        for li in range(count):
+            gi = start + li
+            if gi in all_imgs:
+                local_imgs[li] = all_imgs[gi]
+        n = _write_rows(wb, ws, brand['items'], local_imgs, fmts)
+        _add_size_charts(wb, ws, n + 2)
+
+    wb.close()
+    return buf.getvalue()
+
+
+def _col_val(row_dict, name):
+    if name in row_dict:
+        return row_dict[name]
+    lo = name.lower()
+    for k, v in row_dict.items():
+        if k.lower() == lo:
+            return v
+    return None
+
+
+def parse_inventory_excel(file_bytes):
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    rows_iter = ws.iter_rows(values_only=False)
+    header_row = next(rows_iter)
+    headers = [str(cell.value or '').strip() for cell in header_row]
+
+    items = []
+    for row in rows_iter:
+        rd = {headers[i]: row[i].value for i in range(min(len(headers), len(row)))}
+
+        sku = str(_col_val(rd, 'SKU') or '').strip()
+        brand = str(_col_val(rd, 'Brand') or '').strip().upper()
+        if not sku or sku == 'N/A' or not brand:
+            continue
+
+        jtw = int(_col_val(rd, 'JTW') or 0)
+        tr  = int(_col_val(rd, 'TR')  or 0)
+        dcw = int(_col_val(rd, 'DCW') or 0)
+        committed = int(_col_val(rd, 'Committed') or 0)
+        allocated = int(_col_val(rd, 'Allocated') or 0)
+
+        total_ats_raw = _col_val(rd, 'Total ATS') or _col_val(rd, 'Total_ATS') or _col_val(rd, 'TotalATS') or 0
+        total_ats = int(total_ats_raw)
+
+        brand_full = BRAND_FULL_NAMES.get(brand, brand)
+
+        items.append({
+            'sku': sku,
+            'brand': brand,
+            'brand_abbr': brand,
+            'brand_full': brand_full,
+            'name': f"{brand} {sku}",
+            'jtw': jtw, 'tr': tr, 'dcw': dcw,
+            'committed': committed, 'allocated': allocated,
+            'total_ats': total_ats,
+            'total_warehouse': jtw + tr + dcw,
+            'image': ''
+        })
+
+    wb.close()
+    return items
+
+
+def _group_by_brand(items):
+    brands = {}
+    for item in items:
+        abbr = item['brand']
+        if abbr not in brands:
+            brands[abbr] = {'name': item['brand_full'], 'items': []}
+        brands[abbr]['items'].append(item)
+    return brands
+
+
+def s3_read_inventory():
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_INVENTORY_KEY)
+        data = resp['Body'].read()
+        etag = resp.get('ETag', '')
+        print(f"  Downloaded s3://{S3_BUCKET}/{S3_INVENTORY_KEY} ({len(data)} bytes)")
+        return data, etag
+    except ClientError as e:
+        print(f"  S3 read failed: {e.response['Error']['Code']}")
+        return None, None
+    except NoCredentialsError:
+        print("  S3 read failed: no AWS credentials configured")
+        return None, None
+    except Exception as e:
+        print(f"  S3 read failed: {e}")
+        return None, None
+
+
+def s3_check_etag():
+    try:
+        s3 = get_s3()
+        resp = s3.head_object(Bucket=S3_BUCKET, Key=S3_INVENTORY_KEY)
+        return resp.get('ETag', '')
+    except Exception:
+        return None
+
+
+def s3_upload_export(key, file_bytes):
+    try:
+        s3 = get_s3()
+        s3.put_object(
+            Bucket=S3_BUCKET, Key=key, Body=file_bytes,
+            ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        print(f"    Uploaded s3://{S3_BUCKET}/{key}")
+        return True
+    except Exception as e:
+        print(f"    Upload failed for {key}: {e}")
+        return False
+
+
+def sync_inventory():
+    new_etag = s3_check_etag()
+    with _inv_lock:
+        if new_etag and new_etag == _inventory['etag'] and _inventory['items']:
+            print("  Inventory unchanged (same ETag)")
+            return False
+
+    data, etag = s3_read_inventory()
+    if data is None:
+        return False
+
+    try:
+        items = parse_inventory_excel(data)
+    except Exception as e:
+        print(f"  Failed to parse inventory: {e}")
+        return False
+
+    brands = _group_by_brand(items)
+
+    with _inv_lock:
+        _inventory['items'] = items
+        _inventory['brands'] = brands
+        _inventory['etag'] = etag
+        _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
+        _inventory['item_count'] = len(items)
+
+    print(f"  Parsed {len(items)} items across {len(brands)} brands")
+    return True
+
+
+def generate_all_exports():
+    with _export_lock:
+        if _exports['generating']:
+            return
+        _exports['generating'] = True
+        _exports['progress'] = 'starting...'
+
+    try:
+        with _inv_lock:
+            brands = dict(_inventory['brands'])
+
+        if not brands:
+            print("  No inventory data for export generation")
+            return
+
+        date_str = datetime.utcnow().strftime('%Y-%m-%d')
+        total = len(brands)
+
+        print(f"\n{'='*60}")
+        print(f"  Generating exports for {total} brands...")
+        print(f"{'='*60}")
+
+        all_items = []
+        for abbr, brand in brands.items():
+            all_items.extend(brand['items'])
+
+        print(f"  Pre-caching images for {len(all_items)} items...")
+        download_images_for_items(all_items, S3_PHOTOS_URL, use_cache=True)
+        with _img_lock:
+            cached_count = len(_img_cache)
+        print(f"  Image cache: {cached_count} images\n")
+
+        brands_list_for_multi = []
+        done = 0
+
+        for abbr, brand in brands.items():
+            done += 1
+            name = brand['name']
+            with _export_lock:
+                _exports['progress'] = f"{done}/{total}: {name}"
+
+            print(f"  [{done}/{total}] {name} ({len(brand['items'])} items)")
+
             try:
-                result = future.result()
-                if result:
-                    processed_images[idx] = result
-            except Exception:
-                pass
-    
-    return processed_images
+                xl_bytes = build_brand_excel(name, brand['items'], S3_PHOTOS_URL)
+
+                with _export_lock:
+                    _exports['brands'][abbr] = {
+                        'bytes': xl_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'name': name,
+                        'items_count': len(brand['items']),
+                        'size_bytes': len(xl_bytes),
+                    }
+
+                s3_key = f"{S3_EXPORT_PREFIX}{name.replace(' ', '_')}_{date_str}.xlsx"
+                s3_upload_export(s3_key, xl_bytes)
+
+                brands_list_for_multi.append({
+                    'brand_name': name,
+                    'items': brand['items']
+                })
+            except Exception as e:
+                print(f"    Failed: {e}")
+
+        if brands_list_for_multi:
+            print(f"\n  [ALL] Multi-tab ({len(brands_list_for_multi)} brands)...")
+            try:
+                multi_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL)
+                with _export_lock:
+                    _exports['all_brands'] = {
+                        'bytes': multi_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'brands_count': len(brands_list_for_multi),
+                        'items_count': sum(len(b['items']) for b in brands_list_for_multi),
+                        'size_bytes': len(multi_bytes),
+                    }
+                s3_upload_export(f"{S3_EXPORT_PREFIX}All_Brands_{date_str}.xlsx", multi_bytes)
+            except Exception as e:
+                print(f"    Failed: {e}")
+
+        with _export_lock:
+            _exports['generating'] = False
+            _exports['progress'] = 'done'
+            _exports['last_generated'] = datetime.utcnow().isoformat() + 'Z'
+
+        print(f"\n{'='*60}")
+        print(f"  Export generation complete! {done} brands")
+        print(f"{'='*60}\n")
+
+    except Exception as e:
+        print(f"  Export generation error: {e}")
+        with _export_lock:
+            _exports['generating'] = False
+            _exports['progress'] = f'error: {e}'
 
 
-def create_excel_with_images(data, s3_base_url, title="Inventory"):
-    """Single-brand export (original endpoint)."""
-    output = BytesIO()
-    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
-    
-    workbook.set_properties({
-        'title': 'Versa Inventory Export',
-        'author': 'Versa Inventory System',
-        'created': datetime.now(),
-    })
-    
-    worksheet = workbook.add_worksheet(title[:31])
-    formats = _setup_worksheet(workbook, worksheet)
-    
-    print(f"Downloading images for {len(data)} items...")
-    processed_images = _download_images_for_items(data, s3_base_url)
-    print(f"Downloaded {len(processed_images)}/{len(data)} images")
-    
-    rows_written = _write_brand_data(workbook, worksheet, data, processed_images, formats)
-    
-    # Add size scale charts at bottom
-    _add_size_scale_charts(workbook, worksheet, rows_written + 2)
-    
-    workbook.close()
-    output.seek(0)
-    return output
+def trigger_background_generation():
+    t = threading.Thread(target=generate_all_exports, daemon=True)
+    t.start()
 
-
-def create_multi_brand_excel(brands_data, s3_base_url):
-    """
-    Multi-brand export: one workbook, one tab per brand.
-    
-    brands_data: list of dicts, each with:
-        - 'brand_name': str (used as tab name)
-        - 'items': list of item dicts
-    """
-    output = BytesIO()
-    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
-    
-    workbook.set_properties({
-        'title': 'Versa Inventory Export - Multi Brand',
-        'author': 'Versa Inventory System',
-        'created': datetime.now(),
-    })
-    
-    total_items = sum(len(b['items']) for b in brands_data)
-    print(f"\n{'='*60}")
-    print(f"Multi-Brand Export: {len(brands_data)} brands, {total_items} total items")
-    print(f"{'='*60}\n")
-    
-    # Download ALL images across all brands concurrently for speed
-    all_items_flat = []
-    brand_offsets = []  # (start_idx, count) per brand
-    offset = 0
-    for brand in brands_data:
-        items = brand['items']
-        brand_offsets.append((offset, len(items)))
-        all_items_flat.extend(items)
-        offset += len(items)
-    
-    print(f"Downloading images for {len(all_items_flat)} items across all brands...")
-    all_images = _download_images_for_items(all_items_flat, s3_base_url)
-    print(f"Downloaded {len(all_images)}/{len(all_items_flat)} images total")
-    
-    # Create one worksheet per brand
-    for brand_idx, brand in enumerate(brands_data):
-        brand_name = brand['brand_name']
-        items = brand['items']
-        
-        # Excel tab names: max 31 chars, no special chars
-        safe_name = re.sub(r'[\\/*?\[\]:]', '', brand_name)[:31]
-        # Ensure unique tab name
-        if not safe_name:
-            safe_name = f"Brand_{brand_idx + 1}"
-        
-        worksheet = workbook.add_worksheet(safe_name)
-        formats = _setup_worksheet(workbook, worksheet)
-        
-        # Remap the global image indices to local (0-based) for this brand
-        start_idx, count = brand_offsets[brand_idx]
-        local_images = {}
-        for local_idx in range(count):
-            global_idx = start_idx + local_idx
-            if global_idx in all_images:
-                local_images[local_idx] = all_images[global_idx]
-        
-        print(f"  ✓ {safe_name}: {len(items)} items, {len(local_images)} images")
-        
-        rows_written = _write_brand_data(workbook, worksheet, items, local_images, formats)
-        _add_size_scale_charts(workbook, worksheet, rows_written + 2)
-    
-    workbook.close()
-    output.seek(0)
-    return output
-
-
-# ============================================
-# ROUTES
-# ============================================
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "service": "Versa Inventory Export API",
+        "service": "Versa Inventory Export API v2",
         "status": "running",
-        "endpoints": {
-            "health": "GET /health",
-            "export": "POST /export",
-            "export_multi": "POST /export-multi"
-        }
     })
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy", "service": "Versa Inventory Export API"})
 
-@app.route('/export', methods=['POST', 'OPTIONS'])
-def export_excel():
-    """Single-brand export (original endpoint)."""
-    # Handle preflight request
+@app.route('/health', methods=['GET'])
+def health():
+    with _inv_lock:
+        inv_count = _inventory['item_count']
+        last_sync = _inventory['last_sync']
+    with _export_lock:
+        gen = _exports['generating']
+        brands_ready = len(_exports['brands'])
+        progress = _exports['progress']
+    with _img_lock:
+        img_count = len(_img_cache)
+
+    return jsonify({
+        "status": "healthy",
+        "inventory_items": inv_count,
+        "last_sync": last_sync,
+        "exports_generating": gen,
+        "exports_ready": brands_ready,
+        "generation_progress": progress,
+        "images_cached": img_count,
+    })
+
+
+@app.route('/sync', methods=['GET', 'OPTIONS'])
+def sync():
     if request.method == 'OPTIONS':
         return '', 204
-    
+
+    updated = sync_inventory()
+
+    with _inv_lock:
+        items = list(_inventory['items'])
+        last_sync = _inventory['last_sync']
+        brand_count = len(_inventory['brands'])
+
+    with _export_lock:
+        has_exports = bool(_exports['brands'])
+        is_generating = _exports['generating']
+
+    if (updated or not has_exports) and not is_generating:
+        print("  Triggering background export generation...")
+        trigger_background_generation()
+
+    return jsonify({
+        "status": "ok",
+        "updated": updated,
+        "last_sync": last_sync,
+        "item_count": len(items),
+        "brand_count": brand_count,
+        "inventory": items,
+    })
+
+
+@app.route('/inventory', methods=['GET', 'OPTIONS'])
+def inventory():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _inv_lock:
+        return jsonify({
+            "status": "ok",
+            "last_sync": _inventory['last_sync'],
+            "item_count": _inventory['item_count'],
+            "inventory": list(_inventory['items']),
+        })
+
+
+@app.route('/exports', methods=['GET', 'OPTIONS'])
+def exports_manifest():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    with _export_lock:
+        brands = {}
+        for abbr, info in _exports['brands'].items():
+            brands[abbr] = {
+                'name': info['name'],
+                'items_count': info['items_count'],
+                'size_bytes': info['size_bytes'],
+                'generated_at': info['generated_at'],
+            }
+        all_b = None
+        if _exports['all_brands']:
+            a = _exports['all_brands']
+            all_b = {
+                'brands_count': a['brands_count'],
+                'items_count': a['items_count'],
+                'size_bytes': a['size_bytes'],
+                'generated_at': a['generated_at'],
+            }
+
+        return jsonify({
+            "generating": _exports['generating'],
+            "progress": _exports['progress'],
+            "last_generated": _exports['last_generated'],
+            "brands": brands,
+            "all_brands": all_b,
+        })
+
+
+@app.route('/download/brand/<abbr>', methods=['GET'])
+def download_brand(abbr):
+    abbr = abbr.upper()
+    with _export_lock:
+        info = _exports['brands'].get(abbr)
+    if not info:
+        return jsonify({"error": f"No pre-generated export for '{abbr}'"}), 404
+
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    filename = f"{info['name'].replace(' ', '_')}_{date_str}.xlsx"
+
+    return send_file(
+        BytesIO(info['bytes']),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=filename
+    )
+
+
+@app.route('/download/all', methods=['GET'])
+def download_all():
+    with _export_lock:
+        info = _exports['all_brands']
+    if not info:
+        return jsonify({"error": "No pre-generated all-brands export"}), 404
+
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    return send_file(
+        BytesIO(info['bytes']),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=f"All_Brands_{date_str}.xlsx"
+    )
+
+
+@app.route('/download/multi', methods=['GET'])
+def download_multi_selected():
+    brands_param = request.args.get('brands', '')
+    if not brands_param:
+        return jsonify({"error": "Missing 'brands' param"}), 400
+
+    abbrs = [b.strip().upper() for b in brands_param.split(',') if b.strip()]
+    if not abbrs:
+        return jsonify({"error": "No valid brands"}), 400
+
+    with _inv_lock:
+        all_brands = dict(_inventory['brands'])
+
+    brands_list = []
+    for abbr in abbrs:
+        if abbr in all_brands:
+            brands_list.append({
+                'brand_name': all_brands[abbr]['name'],
+                'items': all_brands[abbr]['items']
+            })
+
+    if not brands_list:
+        return jsonify({"error": "No matching brands in inventory"}), 404
+
+    xl_bytes = build_multi_brand_excel(brands_list, S3_PHOTOS_URL)
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+    return send_file(
+        BytesIO(xl_bytes),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f"Versa_{len(brands_list)}_Brands_{date_str}.xlsx"
+    )
+
+
+@app.route('/upload', methods=['POST', 'OPTIONS'])
+def upload_inventory():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file. Use multipart form with 'file' field."}), 400
+
+    file = request.files['file']
+    data = file.read()
+    if not data:
+        return jsonify({"error": "Empty file"}), 400
+
     try:
-        req_data = request.get_json()
-        
-        if not req_data or 'data' not in req_data:
-            return jsonify({"error": "Missing 'data' in request body"}), 400
-        
-        data = req_data['data']
-        s3_base_url = req_data.get('s3_base_url', '')
-        filename = req_data.get('filename', 'Inventory_Export')
-        
-        if not s3_base_url:
-            return jsonify({"error": "Missing 's3_base_url' in request body"}), 400
-        
+        s3 = get_s3()
+        s3.put_object(Bucket=S3_BUCKET, Key=S3_INVENTORY_KEY, Body=data,
+                       ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    except Exception as e:
+        return jsonify({"error": f"S3 upload failed: {e}"}), 500
+
+    sync_inventory()
+    with _inv_lock:
+        count = _inventory['item_count']
+
+    trigger_background_generation()
+
+    return jsonify({"status": "ok", "message": f"Uploaded and synced. {count} items.", "item_count": count})
+
+
+@app.route('/export', methods=['POST', 'OPTIONS'])
+def export_single():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req or 'data' not in req:
+            return jsonify({"error": "Missing 'data'"}), 400
+        data = req['data']
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Export')
         if not data:
-            return jsonify({"error": "Data array is empty"}), 400
-        
-        timestamp = datetime.now().strftime('%Y-%m-%d')
-        excel_filename = f"{filename}_{timestamp}.xlsx"
-        
-        print(f"\n{'='*60}")
-        print(f"Creating Excel: {excel_filename}")
-        print(f"Items: {len(data)}")
-        print(f"{'='*60}\n")
-        
-        excel_file = create_excel_with_images(data, s3_base_url, filename)
-        
-        print(f"\n✅ Excel file created!\n")
-        
-        return send_file(
-            excel_file,
+            return jsonify({"error": "Empty data"}), 400
+
+        xl_bytes = build_brand_excel(fname, data, s3_url)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=excel_filename
-        )
-        
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"\n❌ ERROR:\n{error_trace}\n")
-        return jsonify({"error": str(e), "trace": error_trace}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.route('/export-multi', methods=['POST', 'OPTIONS'])
-def export_multi_brand():
-    """
-    Multi-brand export: one workbook with a separate tab per brand.
-    
-    Expected JSON body:
-    {
-        "brands": [
-            {
-                "brand_name": "Nautica",
-                "items": [ { sku, brand_abbr, brand_full, fit, ... }, ... ]
-            },
-            ...
-        ],
-        "s3_base_url": "https://...",
-        "filename": "Multi_Brand_Export"
-    }
-    """
+def export_multi():
     if request.method == 'OPTIONS':
         return '', 204
-    
     try:
-        req_data = request.get_json()
-        
-        if not req_data or 'brands' not in req_data:
-            return jsonify({"error": "Missing 'brands' in request body"}), 400
-        
-        brands_data = req_data['brands']
-        s3_base_url = req_data.get('s3_base_url', '')
-        filename = req_data.get('filename', 'Multi_Brand_Export')
-        
-        if not s3_base_url:
-            return jsonify({"error": "Missing 's3_base_url' in request body"}), 400
-        
-        if not brands_data or not isinstance(brands_data, list):
-            return jsonify({"error": "Brands array is empty or invalid"}), 400
-        
-        # Validate each brand has items
-        for i, brand in enumerate(brands_data):
-            if 'items' not in brand or not brand['items']:
-                return jsonify({"error": f"Brand at index {i} has no items"}), 400
-            if 'brand_name' not in brand:
-                brand['brand_name'] = f"Brand_{i+1}"
-        
-        timestamp = datetime.now().strftime('%Y-%m-%d')
-        excel_filename = f"{filename}_{timestamp}.xlsx"
-        
-        excel_file = create_multi_brand_excel(brands_data, s3_base_url)
-        
-        total_items = sum(len(b['items']) for b in brands_data)
-        print(f"\n✅ Multi-brand Excel created! {len(brands_data)} tabs, {total_items} items\n")
-        
-        return send_file(
-            excel_file,
+        req = request.get_json()
+        if not req or 'brands' not in req:
+            return jsonify({"error": "Missing 'brands'"}), 400
+        brands_data = req['brands']
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Multi_Brand')
+        if not brands_data:
+            return jsonify({"error": "Empty brands"}), 400
+
+        xl_bytes = build_multi_brand_excel(brands_data, s3_url)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=excel_filename
-        )
-        
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"\n❌ ERROR:\n{error_trace}\n")
-        return jsonify({"error": str(e), "trace": error_trace}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+def startup_sync():
+    time.sleep(3)
+    print("\n  Running startup sync...")
+    try:
+        updated = sync_inventory()
+        with _inv_lock:
+            count = _inventory['item_count']
+        if count > 0:
+            print(f"  Startup: {count} items loaded, generating exports...")
+            trigger_background_generation()
+        else:
+            print("  Startup: no inventory data (upload Excel to S3 or use /upload)")
+    except Exception as e:
+        print(f"  Startup sync failed: {e}")
+
+threading.Thread(target=startup_sync, daemon=True).start()
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print("="*70)
-    print(" 🚀 VERSA INVENTORY EXPORT API")
-    print("="*70)
-    print(f"\n📍 Server: http://localhost:{port}")
-    print("📊 Endpoints:")
-    print("   GET  /            - API Info")
-    print("   GET  /health      - Health check")
-    print("   POST /export      - Single brand Excel with images")
-    print("   POST /export-multi - Multi-brand Excel (one tab per brand)")
-    print("\n" + "="*70 + "\n")
-    
     app.run(host='0.0.0.0', port=port)
