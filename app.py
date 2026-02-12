@@ -1,5 +1,8 @@
 """
-VERSA INVENTORY EXPORT API v2
+VERSA INVENTORY EXPORT API v3
+- Dropbox as primary inventory source
+- STYLE+OVERRIDES image lookup (matches frontend)
+- Size-suffix stripping for correct image URLs
 """
 
 import os
@@ -41,6 +44,13 @@ S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
 S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides.json')
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
+
+# STYLE+OVERRIDES — primary image source (matches frontend logic)
+S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
+
+# Dropbox direct download URL for hourly inventory file
+DROPBOX_URL = os.environ.get('DROPBOX_URL',
+    'https://dl.dropboxusercontent.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&st=ydpzilob&dl=1')
 
 TARGET_W = 150
 TARGET_H = 150
@@ -96,10 +106,11 @@ _inventory = {
     'etag': None,
     'last_sync': None,
     'item_count': 0,
+    'source': None,  # 'dropbox' or 's3'
 }
 
 _img_lock = threading.Lock()
-_img_cache = {}
+_img_cache = {}  # base_style → image result (shared across all size variants)
 
 _export_lock = threading.Lock()
 _exports = {
@@ -164,12 +175,11 @@ def load_allocation_from_s3():
         if len(lines) < 2:
             return []
         headers = [h.strip() for h in lines[0].split(',')]
-        # Find column indices (flexible matching)
         po_idx = next((i for i, h in enumerate(headers) if 'po' in h.lower()), 0)
         cust_idx = next((i for i, h in enumerate(headers) if 'customer' in h.lower()), 1)
         sku_idx = next((i for i, h in enumerate(headers) if 'sku' in h.lower()), 2)
         qty_idx = next((i for i, h in enumerate(headers) if 'qty' in h.lower()), 3)
-        
+
         results = []
         for line in lines[1:]:
             cols = [c.strip() for c in line.split(',')]
@@ -247,22 +257,38 @@ def load_production_from_s3():
 
 
 def extract_image_code(sku, brand_abbr):
+    """Extract image code from SKU — strips size suffix first"""
     prefix = BRAND_IMAGE_PREFIX.get(brand_abbr, brand_abbr[:2])
-    numbers = re.findall(r'\d+', str(sku))
+    # Strip size suffix (everything after first dash)
+    base_sku = sku.split('-')[0]
+    numbers = re.findall(r'\d+', str(base_sku))
     if numbers:
         main_number = max(numbers, key=len)
         return f"{prefix}_{main_number}"
-    return f"{prefix}_{sku}"
+    return f"{prefix}_{base_sku}"
+
+
+def get_base_style(sku):
+    """Get base style from SKU by stripping size suffix — matches frontend logic"""
+    return sku.split('-')[0].upper()
 
 
 def get_image_url(item, s3_base_url):
+    """Get brand-folder fallback URL"""
     brand_abbr = item.get('brand_abbr', item.get('brand', ''))
     folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
     image_code = extract_image_code(item['sku'], brand_abbr)
     return f"{s3_base_url}/{folder_name}/{image_code}.jpg"
 
 
+def get_style_override_url(sku):
+    """Get STYLE+OVERRIDES URL — primary image source (matches frontend)"""
+    base_style = get_base_style(sku)
+    return f"{S3_OVERRIDES_IMG_URL}/{base_style}.jpg"
+
+
 def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
+    """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions"""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
 
@@ -311,12 +337,21 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
     return None
 
 
-def get_image_cached(url):
-    base = url.rsplit('.', 1)[0]
+def get_image_cached(item, s3_base_url):
+    """
+    Get image for an item, using cache keyed by base_style.
+    Priority: STYLE+OVERRIDES → brand folder fallback.
+    All size variants of the same style share one cache entry.
+    """
+    sku = item.get('sku', '')
+    base_style = get_base_style(sku)
 
+    # Check cache first — all size variants share same image
     with _img_lock:
-        if base in _img_cache:
-            c = _img_cache[base]
+        if base_style in _img_cache:
+            c = _img_cache[base_style]
+            if c is None:
+                return None  # Previously failed — skip
             return {
                 'image_data': BytesIO(c['raw_bytes']),
                 'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
@@ -324,10 +359,20 @@ def get_image_cached(url):
                 'object_position': 1, 'url': c['url']
             }
 
-    result = _process_image_from_url(url)
+    # Try STYLE+OVERRIDES first (primary — matches frontend)
+    override_url = get_style_override_url(sku)
+    result = _process_image_from_url(override_url)
+
+    # Fallback to brand folder
+    if not result:
+        brand_url = get_image_url(item, s3_base_url)
+        result = _process_image_from_url(brand_url)
+
+    # Cache result (even None to avoid re-fetching failures)
+    with _img_lock:
+        _img_cache[base_style] = result
+
     if result:
-        with _img_lock:
-            _img_cache[base] = result
         return {
             'image_data': BytesIO(result['raw_bytes']),
             'x_scale': result['x_scale'], 'y_scale': result['y_scale'],
@@ -338,33 +383,46 @@ def get_image_cached(url):
 
 
 def download_images_for_items(items, s3_base_url, use_cache=True):
-    urls = [(i, get_image_url(item, s3_base_url)) for i, item in enumerate(items)]
+    """Download images for all items using thread pool. Deduplicates by base_style."""
     results = {}
 
-    def _fetch(idx_url):
-        idx, url = idx_url
-        if use_cache:
-            return idx, get_image_cached(url)
-        else:
-            r = _process_image_from_url(url)
-            if r:
-                return idx, {
-                    'image_data': BytesIO(r['raw_bytes']),
-                    'x_scale': r['x_scale'], 'y_scale': r['y_scale'],
-                    'x_offset': r['x_offset'], 'y_offset': r['y_offset'],
-                    'object_position': 1, 'url': r['url']
-                }
-            return idx, None
+    # Deduplicate: only fetch once per unique base_style
+    style_to_indices = {}  # base_style → list of item indices
+    unique_items = {}      # base_style → first item with that style
+    for i, item in enumerate(items):
+        base_style = get_base_style(item.get('sku', ''))
+        if base_style not in style_to_indices:
+            style_to_indices[base_style] = []
+            unique_items[base_style] = item
+        style_to_indices[base_style].append(i)
+
+    def _fetch(base_style_item):
+        base_style, item = base_style_item
+        return base_style, get_image_cached(item, s3_base_url)
+
+    unique_pairs = list(unique_items.items())
+    print(f"    Fetching images: {len(unique_pairs)} unique styles for {len(items)} items")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_fetch, pair): pair[0] for pair in urls}
+        futures = {pool.submit(_fetch, pair): pair[0] for pair in unique_pairs}
         for f in concurrent.futures.as_completed(futures):
             try:
-                idx, img = f.result()
+                base_style, img = f.result()
                 if img:
-                    results[idx] = img
+                    # Apply this image to ALL items with this base_style
+                    for idx in style_to_indices.get(base_style, []):
+                        # Each index needs its own BytesIO copy
+                        cached = _img_cache.get(base_style)
+                        if cached:
+                            results[idx] = {
+                                'image_data': BytesIO(cached['raw_bytes']),
+                                'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
+                                'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
+                                'object_position': 1, 'url': cached['url']
+                            }
             except Exception:
                 pass
+
     return results
 
 
@@ -404,16 +462,16 @@ def _setup_worksheet(workbook, worksheet, has_color=False):
     worksheet.set_column(1, 1, 20)
     worksheet.set_column(2, 2, 20)
     if has_color:
-        worksheet.set_column(3, 3, 18)  # Color
-        worksheet.set_column(4, 4, 12)  # Fit
-        worksheet.set_column(5, 5, 12)  # Fabric Code
-        worksheet.set_column(6, 6, 35)  # Fabrication
-        worksheet.set_column(7, 13, 12) # Number columns (JTW through Total ATS)
+        worksheet.set_column(3, 3, 18)
+        worksheet.set_column(4, 4, 12)
+        worksheet.set_column(5, 5, 12)
+        worksheet.set_column(6, 6, 35)
+        worksheet.set_column(7, 13, 12)
     else:
         worksheet.set_column(3, 3, 12)
         worksheet.set_column(4, 4, 12)
         worksheet.set_column(5, 5, 35)
-        worksheet.set_column(6, 12, 12) # Number columns (JTW through Total ATS)
+        worksheet.set_column(6, 12, 12)
     worksheet.set_default_row(112.5)
     return fmts
 
@@ -492,9 +550,7 @@ def _add_size_charts(workbook, worksheet, start):
 
 
 def build_brand_excel(brand_name, items, s3_base_url):
-    # Detect if items have color data
     has_color = any(item.get('color') for item in items)
-
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
@@ -508,11 +564,9 @@ def build_brand_excel(brand_name, items, s3_base_url):
 
 
 def build_multi_brand_excel(brands_list, s3_base_url):
-    # Sort items within each brand by total_warehouse descending
     for b in brands_list:
         b['items'] = sorted(b['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
 
-    # Detect if any items have color data
     has_color = any(item.get('color') for b in brands_list for item in b['items'])
 
     all_items = []
@@ -587,7 +641,6 @@ def parse_inventory_excel(file_bytes):
         total_ats_raw = _col_val(rd, 'Total ATS') or _col_val(rd, 'Total_ATS') or _col_val(rd, 'TotalATS') or 0
         total_ats = int(total_ats_raw)
 
-        # Additional context fields
         container = str(_col_val(rd, 'Container') or '').strip()
         receive_date = str(_col_val(rd, 'Receive Date') or _col_val(rd, 'ReceiveDate') or '').strip()
         lot_number = str(_col_val(rd, 'Lot Number') or _col_val(rd, 'LotNumber') or '').strip()
@@ -625,6 +678,53 @@ def _group_by_brand(items):
     return brands
 
 
+# ============================================
+# DROPBOX SYNC — primary inventory source
+# ============================================
+def sync_from_dropbox():
+    """Fetch inventory directly from Dropbox shared link"""
+    if not DROPBOX_URL:
+        print("  No DROPBOX_URL configured, skipping Dropbox sync")
+        return False
+
+    print(f"  📂 Fetching inventory from Dropbox...")
+    try:
+        resp = http_requests.get(DROPBOX_URL, timeout=60, headers={
+            'User-Agent': 'Mozilla/5.0'
+        })
+        if resp.status_code != 200:
+            print(f"  ⚠ Dropbox returned HTTP {resp.status_code}")
+            return False
+
+        data = resp.content
+        print(f"  📂 Downloaded {len(data)} bytes from Dropbox")
+
+        items = parse_inventory_excel(data)
+        if not items:
+            print("  ⚠ No valid rows parsed from Dropbox file")
+            return False
+
+        brands = _group_by_brand(items)
+
+        with _inv_lock:
+            _inventory['items'] = items
+            _inventory['brands'] = brands
+            _inventory['etag'] = 'dropbox'
+            _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
+            _inventory['item_count'] = len(items)
+            _inventory['source'] = 'dropbox'
+
+        print(f"  ✓ Dropbox sync: {len(items)} items across {len(brands)} brands")
+        return True
+
+    except Exception as e:
+        print(f"  ⚠ Dropbox sync failed: {e}")
+        return False
+
+
+# ============================================
+# S3 SYNC — fallback inventory source
+# ============================================
 def s3_read_inventory():
     try:
         s3 = get_s3()
@@ -668,6 +768,14 @@ def s3_upload_export(key, file_bytes):
 
 
 def sync_inventory():
+    """Sync inventory: try Dropbox first, then S3 fallback"""
+    # Try Dropbox first
+    if DROPBOX_URL:
+        if sync_from_dropbox():
+            return True
+        print("  Dropbox failed, falling back to S3...")
+
+    # S3 fallback
     new_etag = s3_check_etag()
     with _inv_lock:
         if new_etag and new_etag == _inventory['etag'] and _inventory['items']:
@@ -692,6 +800,7 @@ def sync_inventory():
         _inventory['etag'] = etag
         _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
         _inventory['item_count'] = len(items)
+        _inventory['source'] = 's3'
 
     print(f"  Parsed {len(items)} items across {len(brands)} brands")
     return True
@@ -717,8 +826,10 @@ def generate_all_exports():
 
         print(f"\n{'='*60}")
         print(f"  Generating exports for {total} brands...")
+        print(f"  Image strategy: STYLE+OVERRIDES first → brand folder fallback")
         print(f"{'='*60}")
 
+        # Pre-cache images for ALL items (deduplicates by base_style)
         all_items = []
         for abbr, brand in brands.items():
             all_items.extend(brand['items'])
@@ -726,13 +837,13 @@ def generate_all_exports():
         print(f"  Pre-caching images for {len(all_items)} items...")
         download_images_for_items(all_items, S3_PHOTOS_URL, use_cache=True)
         with _img_lock:
-            cached_count = len(_img_cache)
-        print(f"  Image cache: {cached_count} images\n")
+            cached_count = sum(1 for v in _img_cache.values() if v is not None)
+            failed_count = sum(1 for v in _img_cache.values() if v is None)
+        print(f"  Image cache: {cached_count} found, {failed_count} not found\n")
 
         brands_list_for_multi = []
         done = 0
 
-        # Sort brands by total warehouse inventory (highest first) for tab ordering
         sorted_brands = sorted(brands.items(),
             key=lambda x: sum(i.get('total_warehouse', 0) for i in x[1]['items']),
             reverse=True)
@@ -745,7 +856,6 @@ def generate_all_exports():
 
             print(f"  [{done}/{total}] {name} ({len(brand['items'])} items)")
 
-            # Sort items within brand by total_warehouse descending
             sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
 
             try:
@@ -793,6 +903,8 @@ def generate_all_exports():
 
         print(f"\n{'='*60}")
         print(f"  Export generation complete! {done} brands")
+        with _img_lock:
+            print(f"  Image cache: {len(_img_cache)} unique styles cached")
         print(f"{'='*60}\n")
 
     except Exception as e:
@@ -807,10 +919,14 @@ def trigger_background_generation():
     t.start()
 
 
+# ============================================
+# ROUTES
+# ============================================
+
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "service": "Versa Inventory Export API v2",
+        "service": "Versa Inventory Export API v3",
         "status": "running",
     })
 
@@ -820,21 +936,25 @@ def health():
     with _inv_lock:
         inv_count = _inventory['item_count']
         last_sync = _inventory['last_sync']
+        source = _inventory['source']
     with _export_lock:
         gen = _exports['generating']
         brands_ready = len(_exports['brands'])
         progress = _exports['progress']
     with _img_lock:
         img_count = len(_img_cache)
+        img_found = sum(1 for v in _img_cache.values() if v is not None)
 
     return jsonify({
         "status": "healthy",
         "inventory_items": inv_count,
+        "inventory_source": source,
         "last_sync": last_sync,
         "exports_generating": gen,
         "exports_ready": brands_ready,
         "generation_progress": progress,
         "images_cached": img_count,
+        "images_found": img_found,
     })
 
 
@@ -963,7 +1083,6 @@ def download_multi_selected():
     brands_list = []
     for abbr in abbrs:
         if abbr in all_brands:
-            # Sort items within each brand by total_warehouse descending
             sorted_items = sorted(all_brands[abbr]['items'],
                 key=lambda x: x.get('total_warehouse', 0), reverse=True)
             brands_list.append({
@@ -974,7 +1093,6 @@ def download_multi_selected():
     if not brands_list:
         return jsonify({"error": "No matching brands in inventory"}), 404
 
-    # Sort brands (tabs) by total warehouse inventory, highest first
     brands_list.sort(
         key=lambda b: sum(i.get('total_warehouse', 0) for i in b['items']),
         reverse=True)
@@ -1067,7 +1185,6 @@ def export_multi():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
-
 # ── Style Overrides ────────────────────────────────
 @app.route('/overrides', methods=['GET', 'OPTIONS'])
 def get_overrides():
@@ -1118,19 +1235,55 @@ def get_production():
     return jsonify({"production": data})
 
 
+@app.route('/regenerate', methods=['POST', 'OPTIONS'])
+def regenerate_exports():
+    """Force re-sync inventory and regenerate all exports"""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    with _export_lock:
+        if _exports['generating']:
+            return jsonify({"status": "already_generating", "progress": _exports['progress']})
+
+    # Clear image cache to force re-download
+    with _img_lock:
+        _img_cache.clear()
+
+    updated = sync_inventory()
+    trigger_background_generation()
+
+    with _inv_lock:
+        count = _inventory['item_count']
+        source = _inventory['source']
+
+    return jsonify({
+        "status": "regenerating",
+        "inventory_source": source,
+        "item_count": count,
+        "message": f"Re-synced {count} items from {source}, regenerating exports..."
+    })
+
+
 def startup_sync():
     time.sleep(3)
-    print("\n  Running startup sync...")
+    print("\n" + "="*60)
+    print("  VERSA INVENTORY EXPORT API v3 — Startup")
+    print("="*60)
+
     load_overrides_from_s3()
+
+    # Sync inventory: Dropbox first, then S3 fallback
     try:
         updated = sync_inventory()
         with _inv_lock:
             count = _inventory['item_count']
+            source = _inventory['source']
         if count > 0:
-            print(f"  Startup: {count} items loaded, generating exports...")
+            print(f"  ✓ Startup: {count} items loaded from {source}")
+            print(f"  → Generating exports (images + Excel)...")
             trigger_background_generation()
         else:
-            print("  Startup: no inventory data (upload Excel to S3 or use /upload)")
+            print("  ⚠ Startup: no inventory data")
     except Exception as e:
         print(f"  Startup sync failed: {e}")
 
