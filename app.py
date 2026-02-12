@@ -49,8 +49,9 @@ S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_P
 S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
 
 # Dropbox direct download URL for hourly inventory file
+# Dropbox shared link — will be converted to direct download at runtime
 DROPBOX_URL = os.environ.get('DROPBOX_URL',
-    'https://dl.dropboxusercontent.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&st=ydpzilob&dl=1')
+    'https://www.dropbox.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&dl=1')
 
 TARGET_W = 150
 TARGET_H = 150
@@ -687,17 +688,43 @@ def sync_from_dropbox():
         print("  No DROPBOX_URL configured, skipping Dropbox sync")
         return False
 
+    # Convert any Dropbox URL format to direct download
+    url = DROPBOX_URL.strip()
+    # Remove st= param (session-specific, expires)
+    url = re.sub(r'[&?]st=[^&]*', '', url)
+    # Ensure dl=1 for direct download
+    url = re.sub(r'[&?]dl=\d', '', url)
+    url += ('&' if '?' in url else '?') + 'dl=1'
+
     print(f"  📂 Fetching inventory from Dropbox...")
+    print(f"     URL: {url[:80]}...")
     try:
-        resp = http_requests.get(DROPBOX_URL, timeout=60, headers={
-            'User-Agent': 'Mozilla/5.0'
-        })
+        # Use a session to follow redirects properly
+        session = http_requests.Session()
+        resp = session.get(url, timeout=60, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }, allow_redirects=True)
+
+        print(f"     HTTP {resp.status_code}, Content-Type: {resp.headers.get('Content-Type', 'unknown')}")
+        print(f"     Size: {len(resp.content)} bytes, Redirects: {len(resp.history)}")
+
         if resp.status_code != 200:
             print(f"  ⚠ Dropbox returned HTTP {resp.status_code}")
             return False
 
+        # Verify we got an Excel file, not an HTML page
+        ct = resp.headers.get('Content-Type', '').lower()
+        if 'html' in ct:
+            print(f"  ⚠ Dropbox returned HTML instead of Excel (likely auth/redirect issue)")
+            print(f"     First 200 chars: {resp.text[:200]}")
+            return False
+
         data = resp.content
-        print(f"  📂 Downloaded {len(data)} bytes from Dropbox")
+        if len(data) < 1000:
+            print(f"  ⚠ Dropbox file too small ({len(data)} bytes), likely error page")
+            return False
+
+        print(f"  📂 Downloaded {len(data):,} bytes from Dropbox")
 
         items = parse_inventory_excel(data)
         if not items:
@@ -718,7 +745,7 @@ def sync_from_dropbox():
         return True
 
     except Exception as e:
-        print(f"  ⚠ Dropbox sync failed: {e}")
+        print(f"  ⚠ Dropbox sync failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -1264,10 +1291,39 @@ def regenerate_exports():
     })
 
 
+DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
+
+
+def hourly_resync():
+    """Background loop: re-sync from Dropbox and regenerate exports every hour"""
+    while True:
+        time.sleep(DROPBOX_RESYNC_INTERVAL)
+        print(f"\n  ⏰ Hourly re-sync triggered...")
+
+        with _export_lock:
+            if _exports['generating']:
+                print("  ⏭ Skipping — export generation already in progress")
+                continue
+
+        try:
+            updated = sync_inventory()
+            if updated:
+                with _inv_lock:
+                    count = _inventory['item_count']
+                    source = _inventory['source']
+                print(f"  ✓ Re-synced {count} items from {source}, regenerating exports...")
+                trigger_background_generation()
+            else:
+                print("  No changes detected, skipping export regeneration")
+        except Exception as e:
+            print(f"  ⚠ Hourly re-sync failed: {e}")
+
+
 def startup_sync():
     time.sleep(3)
     print("\n" + "="*60)
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
+    print(f"  Dropbox URL configured: {'YES' if DROPBOX_URL else 'NO'}")
     print("="*60)
 
     load_overrides_from_s3()
@@ -1286,6 +1342,11 @@ def startup_sync():
             print("  ⚠ Startup: no inventory data")
     except Exception as e:
         print(f"  Startup sync failed: {e}")
+
+    # Start hourly re-sync loop
+    if DROPBOX_URL:
+        print(f"  ⏰ Hourly Dropbox re-sync enabled (every {DROPBOX_RESYNC_INTERVAL//3600}h)")
+        threading.Thread(target=hourly_resync, daemon=True).start()
 
 threading.Thread(target=startup_sync, daemon=True).start()
 
