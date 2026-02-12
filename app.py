@@ -29,6 +29,7 @@ CORS(app, resources={
         "allow_headers": ["Content-Type"]
     }
 })
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB for base64 images
 
 AWS_REGION       = os.environ.get('AWS_REGION', 'us-east-2')
 S3_BUCKET        = os.environ.get('S3_BUCKET', 'nauticaslimfit')
@@ -36,6 +37,8 @@ S3_INVENTORY_KEY = os.environ.get('S3_INVENTORY_KEY', 'inventory/daily_inventory
 S3_EXPORT_PREFIX = os.environ.get('S3_EXPORT_PREFIX', 'exports/').rstrip('/') + '/'
 S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
                                    'ALL+INVENTORY+Photos/PHOTOS+INVENTORY')
+
+S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides.json')
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
 
@@ -104,6 +107,45 @@ _exports = {
     'progress': '',
     'last_generated': None,
 }
+
+_overrides_lock = threading.Lock()
+_style_overrides = {}
+
+def load_overrides_from_s3():
+    """Load style overrides from S3 on startup"""
+    global _style_overrides
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _overrides_lock:
+            _style_overrides = data
+        print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No existing style overrides in S3 (will create on first save)")
+        else:
+            print(f"  ⚠ Could not load overrides from S3: {e}")
+    except Exception as e:
+        print(f"  ⚠ Override load error: {e}")
+
+def save_overrides_to_s3():
+    """Save style overrides to S3"""
+    try:
+        s3 = get_s3()
+        with _overrides_lock:
+            data = json.dumps(_style_overrides)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_OVERRIDES_KEY,
+            Body=data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Saved {len(_style_overrides)} style overrides to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save overrides to S3: {e}")
+        return False
 
 
 def extract_image_code(sku, brand_abbr):
@@ -911,9 +953,45 @@ def export_multi():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+
+# ── Style Overrides ────────────────────────────────
+@app.route('/overrides', methods=['GET', 'OPTIONS'])
+def get_overrides():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _overrides_lock:
+        return jsonify({"overrides": _style_overrides})
+
+@app.route('/overrides', methods=['POST'])
+def save_overrides():
+    try:
+        req = request.get_json()
+        if not req or 'overrides' not in req:
+            return jsonify({"error": "Missing 'overrides' in request body"}), 400
+
+        overrides = req['overrides']
+        if not isinstance(overrides, dict):
+            return jsonify({"error": "'overrides' must be an object"}), 400
+
+        with _overrides_lock:
+            global _style_overrides
+            _style_overrides = overrides
+
+        success = save_overrides_to_s3()
+
+        if success:
+            return jsonify({"success": True, "count": len(overrides)})
+        else:
+            return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
 def startup_sync():
     time.sleep(3)
     print("\n  Running startup sync...")
+    load_overrides_from_s3()
     try:
         updated = sync_inventory()
         with _inv_lock:
