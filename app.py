@@ -294,10 +294,10 @@ def _setup_worksheet(workbook, worksheet, has_color=False):
 
     if has_color:
         headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabric Code', 'Fabrication',
-                   'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
+                   'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
     else:
         headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication',
-                   'JTW', 'TR', 'DCW', 'Total Warehouse', 'Total ATS']
+                   'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
     worksheet.set_row(0, 25)
     for c, h in enumerate(headers):
         worksheet.write(0, c, h, fmt_header)
@@ -310,12 +310,12 @@ def _setup_worksheet(workbook, worksheet, has_color=False):
         worksheet.set_column(4, 4, 12)  # Fit
         worksheet.set_column(5, 5, 12)  # Fabric Code
         worksheet.set_column(6, 6, 35)  # Fabrication
-        worksheet.set_column(7, 11, 12) # Number columns
+        worksheet.set_column(7, 13, 12) # Number columns (JTW through Total ATS)
     else:
         worksheet.set_column(3, 3, 12)
         worksheet.set_column(4, 4, 12)
         worksheet.set_column(5, 5, 35)
-        worksheet.set_column(6, 10, 12)
+        worksheet.set_column(6, 12, 12) # Number columns (JTW through Total ATS)
     worksheet.set_default_row(112.5)
     return fmts
 
@@ -332,20 +332,22 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False):
                 item.get('fit','N/A'), item.get('fabric_code','N/A'),
                 item.get('fabrication','Standard Fabric'),
                 item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                item.get('qa',0), item.get('incoming',0),
                 item.get('total_warehouse',0), item.get('total_ats',0)
             ]
             num_start = 7
-            num_end = 11
+            num_end = 13
         else:
             vals = [
                 '', item.get('sku',''), item.get('brand_full',''),
                 item.get('fit','N/A'), item.get('fabric_code','N/A'),
                 item.get('fabrication','Standard Fabric'),
                 item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                item.get('qa',0), item.get('incoming',0),
                 item.get('total_warehouse',0), item.get('total_ats',0)
             ]
             num_start = 6
-            num_end = 10
+            num_end = 12
         for c, v in enumerate(vals):
             f = (fmts['num_even'] if even else fmts['num_odd']) if num_start <= c <= num_end else cf
             worksheet.write(row, c, v, f)
@@ -476,11 +478,21 @@ def parse_inventory_excel(file_bytes):
         jtw = int(_col_val(rd, 'JTW') or 0)
         tr  = int(_col_val(rd, 'TR')  or 0)
         dcw = int(_col_val(rd, 'DCW') or 0)
+        qa  = int(_col_val(rd, 'QA') or _col_val(rd, 'Q/A') or _col_val(rd, 'Quality') or 0)
         committed = int(_col_val(rd, 'Committed') or 0)
         allocated = int(_col_val(rd, 'Allocated') or 0)
+        incoming  = int(_col_val(rd, 'Incoming') or _col_val(rd, 'In Transit') or
+                        _col_val(rd, 'InTransit') or _col_val(rd, 'In-Transit') or
+                        _col_val(rd, 'On Order') or _col_val(rd, 'PO') or
+                        _col_val(rd, 'Incoming Qty') or 0)
 
         total_ats_raw = _col_val(rd, 'Total ATS') or _col_val(rd, 'Total_ATS') or _col_val(rd, 'TotalATS') or 0
         total_ats = int(total_ats_raw)
+
+        # Additional context fields
+        container = str(_col_val(rd, 'Container') or '').strip()
+        receive_date = str(_col_val(rd, 'Receive Date') or _col_val(rd, 'ReceiveDate') or '').strip()
+        lot_number = str(_col_val(rd, 'Lot Number') or _col_val(rd, 'LotNumber') or '').strip()
 
         brand_full = BRAND_FULL_NAMES.get(brand, brand)
 
@@ -490,10 +502,14 @@ def parse_inventory_excel(file_bytes):
             'brand_abbr': brand,
             'brand_full': brand_full,
             'name': f"{brand} {sku}",
-            'jtw': jtw, 'tr': tr, 'dcw': dcw,
+            'jtw': jtw, 'tr': tr, 'dcw': dcw, 'qa': qa,
+            'incoming': incoming,
             'committed': committed, 'allocated': allocated,
             'total_ats': total_ats,
-            'total_warehouse': jtw + tr + dcw,
+            'total_warehouse': jtw + tr + dcw + qa,
+            'container': container,
+            'receive_date': receive_date,
+            'lot_number': lot_number,
             'image': ''
         })
 
@@ -1010,3 +1026,4 @@ threading.Thread(target=startup_sync, daemon=True).start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
