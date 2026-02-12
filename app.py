@@ -150,7 +150,7 @@ def save_overrides_to_s3():
         return False
 
 
-S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL_WAREHOUSE_ALLOCATION.csv')
+S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL WAREHOUSE ALLOCATION.csv')
 S3_PRODUCTION_KEY = os.environ.get('S3_PRODUCTION_KEY', 'inventory/Style_Ledger.xlsx')
 
 
