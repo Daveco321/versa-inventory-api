@@ -150,6 +150,102 @@ def save_overrides_to_s3():
         return False
 
 
+S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL_WAREHOUSE_ALLOCATION.csv')
+S3_PRODUCTION_KEY = os.environ.get('S3_PRODUCTION_KEY', 'inventory/Style_Ledger.xlsx')
+
+
+def load_allocation_from_s3():
+    """Load allocation CSV from S3 and return as list of dicts"""
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_ALLOCATION_KEY)
+        text = resp['Body'].read().decode('utf-8-sig')
+        lines = text.strip().split('\n')
+        if len(lines) < 2:
+            return []
+        headers = [h.strip() for h in lines[0].split(',')]
+        # Find column indices (flexible matching)
+        po_idx = next((i for i, h in enumerate(headers) if 'po' in h.lower()), 0)
+        cust_idx = next((i for i, h in enumerate(headers) if 'customer' in h.lower()), 1)
+        sku_idx = next((i for i, h in enumerate(headers) if 'sku' in h.lower()), 2)
+        qty_idx = next((i for i, h in enumerate(headers) if 'qty' in h.lower()), 3)
+        
+        results = []
+        for line in lines[1:]:
+            cols = [c.strip() for c in line.split(',')]
+            if len(cols) <= sku_idx or not cols[sku_idx]:
+                continue
+            try:
+                qty = int(cols[qty_idx]) if len(cols) > qty_idx else 0
+            except ValueError:
+                qty = 0
+            results.append({
+                'po': cols[po_idx] if len(cols) > po_idx else '',
+                'customer': cols[cust_idx] if len(cols) > cust_idx else '',
+                'sku': cols[sku_idx].upper(),
+                'qty': qty
+            })
+        print(f"  ✓ Loaded {len(results)} allocation rows from S3")
+        return results
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No allocation file found in S3")
+        else:
+            print(f"  ⚠ Could not load allocation from S3: {e}")
+        return []
+    except Exception as e:
+        print(f"  ⚠ Allocation load error: {e}")
+        return []
+
+
+def load_production_from_s3():
+    """Load Style Ledger xlsx from S3 and return as list of dicts"""
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_PRODUCTION_KEY)
+        data = resp['Body'].read()
+        wb = openpyxl.load_workbook(BytesIO(data), read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        results = []
+        for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+            style = str(row[2] or '').strip().upper()
+            if not style:
+                continue
+            etd = None
+            if row[5]:
+                if isinstance(row[5], datetime):
+                    etd = row[5].strftime('%Y-%m-%d')
+                else:
+                    try:
+                        etd = str(row[5])
+                    except:
+                        etd = None
+            try:
+                units = int(row[3] or 0)
+            except (ValueError, TypeError):
+                units = 0
+            results.append({
+                'production': str(row[0] or '').strip(),
+                'poName': str(row[1] or '').strip(),
+                'style': style,
+                'units': units,
+                'brand': str(row[4] or '').strip(),
+                'etd': etd
+            })
+        wb.close()
+        print(f"  ✓ Loaded {len(results)} production rows from S3")
+        return results
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No Style Ledger found in S3")
+        else:
+            print(f"  ⚠ Could not load production from S3: {e}")
+        return []
+    except Exception as e:
+        print(f"  ⚠ Production load error: {e}")
+        return []
+
+
 def extract_image_code(sku, brand_abbr):
     prefix = BRAND_IMAGE_PREFIX.get(brand_abbr, brand_abbr[:2])
     numbers = re.findall(r'\d+', str(sku))
@@ -1006,6 +1102,22 @@ def save_overrides():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+@app.route('/allocations', methods=['GET', 'OPTIONS'])
+def get_allocations():
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = load_allocation_from_s3()
+    return jsonify({"allocations": data})
+
+
+@app.route('/production', methods=['GET', 'OPTIONS'])
+def get_production():
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = load_production_from_s3()
+    return jsonify({"production": data})
+
+
 def startup_sync():
     time.sleep(3)
     print("\n  Running startup sync...")
@@ -1028,3 +1140,4 @@ threading.Thread(target=startup_sync, daemon=True).start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
