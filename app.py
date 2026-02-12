@@ -50,7 +50,8 @@ BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
     'BEN': 'BE', 'USPA': 'US', 'CHAPS': 'CH', 'LUCKY': 'LB', 'JNY': 'JN',
     'BEENE': 'GB', 'NICOLE': 'NM', 'SHAQ': 'SH', 'TAYION': 'TA', 'STRAHAN': 'MS',
-    'VD': 'VD', 'VERSA': 'VR', 'AMERICA': 'AC', 'BLO': 'BL', 'DN': 'D9'
+    'VD': 'VD', 'VERSA': 'VR', 'AMERICA': 'AC', 'BLO': 'BL', 'DN': 'D9',
+    'KL': 'KL', 'NE': 'NE'
 }
 
 BRAND_FULL_NAMES = {
@@ -59,7 +60,8 @@ BRAND_FULL_NAMES = {
     'CHAPS': 'Chaps', 'LUCKY': 'Lucky Brand', 'JNY': 'Jones New York',
     'BEENE': 'Geoffrey Beene', 'NICOLE': 'Nicole Miller', 'SHAQ': "Shaquille O'Neal",
     'TAYION': 'Tayion', 'STRAHAN': 'Michael Strahan', 'VD': 'Von Dutch',
-    'VERSA': 'Versa', 'AMERICA': 'American Crew', 'BLO': 'Bloomingdales', 'DN': 'Divine 9'
+    'VERSA': 'Versa', 'AMERICA': 'American Crew', 'BLO': 'Bloomingdales', 'DN': 'Divine 9',
+    'KL': 'Karl Lagerfeld Paris', 'NE': 'Neiman Marcus'
 }
 
 FOLDER_MAPPING = {
@@ -1026,4 +1028,3 @@ threading.Thread(target=startup_sync, daemon=True).start()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
