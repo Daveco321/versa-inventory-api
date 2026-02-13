@@ -1372,7 +1372,7 @@ def parse_packing_list():
                     {'role': 'user', 'content': f'Parse this packing list data and return the structured JSON:\n\n{sheets_text}'}
                 ]
             },
-            timeout=60
+            timeout=90
         )
 
         if resp.status_code != 200:
