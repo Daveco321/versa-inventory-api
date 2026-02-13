@@ -6,4 +6,3 @@ openpyxl
 requests
 Pillow
 gunicorn
-PyMuPDF
