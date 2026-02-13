@@ -29,10 +29,11 @@ CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
+        "allow_headers": ["Content-Type"],
+        "expose_headers": ["X-Original-Size", "X-Compressed-Size", "X-Pages", "X-Images-Total", "X-Images-Compressed"]
     }
 })
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB for base64 images
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB for PDF uploads
 
 AWS_REGION       = os.environ.get('AWS_REGION', 'us-east-2')
 S3_BUCKET        = os.environ.get('S3_BUCKET', 'nauticaslimfit')
@@ -1291,6 +1292,209 @@ def regenerate_exports():
     })
 
 
+###############################################################################
+# PACKING LIST EXTRACTION — Claude API proxy
+###############################################################################
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
+PACKING_LIST_SYSTEM_PROMPT = """You are an expert at parsing packing list spreadsheets for apparel manufacturers.
+You receive raw cell data from Excel packing lists. These come in varying formats:
+
+FORMAT A (Pants/Bottoms): Columns are STYLE, COLOUR, CARTON NO., SIZE (e.g. "30 X 30" = waist x inseam), TTL CTN, quantity columns, TOTAL QUANTITY.
+- Styles appear once and subsequent rows with empty STYLE belong to the same style+color.
+- A style+color combo can span many rows (different carton groups and sizes).
+- Sometimes the same style appears again later with a different color, or even re-appears with the same color (combine them).
+
+FORMAT B (Dress Shirts): Columns are STYLE, COLOUR, CARTON NO., TTL CTN, then SIZE COLUMNS with pre-pack quantities in the header row (like 4, 8, 4, 4, 8, 8). A sub-header row shows actual size labels (S 14-14.5 32/33, M 15-15.5 32/33, etc.). QTY PER CARTON and TOTAL QUANTITY at the end.
+- The pre-pack ratio per size is the number in the header (e.g., 4 for S means 4 of size S per carton).
+- Styles repeat across rows for different carton groupings — combine them.
+
+RULES:
+- IGNORE rows about TOTAL, CTNS, MEASUREMENT, CBM, G.W, N.W, SEAL NO, CONTAINER NO.
+- For each unique STYLE + COLOR combination, sum ALL quantities across ALL rows and ALL sizes.
+- Return the size breakdown: for each size, the total quantity across all rows.
+- Identify the pre-pack ratio (units per carton per size).
+- If a workbook has multiple sheets, process ALL sheets.
+- Return ONLY valid JSON, no markdown fences, no explanation.
+
+OUTPUT FORMAT (strict JSON):
+{
+  "sheets": [
+    {
+      "sheet_name": "PO#...",
+      "po_number": "extracted PO number",
+      "pack_qty_per_carton": 36,
+      "styles": [
+        {
+          "style": "TJVCCN069SLY",
+          "color": "WHITE GRND W/ LT BLUE & BLK STRIPES",
+          "total_qty": 1449,
+          "sizes": {"S 14-14.5 32/33": 161, "M 15-15.5 32/33": 322, ...},
+          "prepack_ratio": {"S 14-14.5 32/33": 4, "M 15-15.5 32/33": 8, ...}
+        }
+      ]
+    }
+  ]
+}
+"""
+
+@app.route('/api/parse-packing-list', methods=['POST', 'OPTIONS'])
+def parse_packing_list():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "ANTHROPIC_API_KEY not configured on server"}), 500
+
+    data = request.get_json()
+    if not data or 'sheets_text' not in data:
+        return jsonify({"error": "Missing sheets_text in request body"}), 400
+
+    sheets_text = data['sheets_text']
+
+    try:
+        resp = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01'
+            },
+            json={
+                'model': 'claude-sonnet-4-20250514',
+                'max_tokens': 8000,
+                'system': PACKING_LIST_SYSTEM_PROMPT,
+                'messages': [
+                    {'role': 'user', 'content': f'Parse this packing list data and return the structured JSON:\n\n{sheets_text}'}
+                ]
+            },
+            timeout=120
+        )
+
+        if resp.status_code != 200:
+            return jsonify({"error": f"Claude API error: {resp.status_code}", "detail": resp.text}), 502
+
+        result = resp.json()
+        text = ''.join(block.get('text', '') for block in result.get('content', []) if block.get('type') == 'text')
+
+        # Strip markdown fences if present
+        text = text.strip()
+        if text.startswith('```'):
+            text = re.sub(r'^```\w*\n?', '', text)
+            text = re.sub(r'\n?```$', '', text)
+
+        parsed = json.loads(text)
+        return jsonify({"status": "success", "data": parsed})
+
+    except json.JSONDecodeError as e:
+        return jsonify({"error": "Failed to parse Claude response as JSON", "raw": text[:2000]}), 502
+    except http_requests.exceptions.Timeout:
+        return jsonify({"error": "Claude API request timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+###############################################################################
+# FILE COMPRESSION — PDF (server-side with image recompression)
+###############################################################################
+
+@app.route('/api/compress-pdf', methods=['POST', 'OPTIONS'])
+def compress_pdf():
+    """Compress a PDF by recompressing embedded images at lower quality."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files['file']
+    quality = int(request.form.get('quality', 65))  # JPEG quality 1-100
+    quality = max(20, min(95, quality))
+
+    try:
+        import fitz  # pymupdf
+
+        original_data = file.read()
+        original_size = len(original_data)
+
+        doc = fitz.open(stream=original_data, filetype="pdf")
+        page_count = len(doc)
+
+        images_processed = 0
+        images_total = 0
+
+        for page_num in range(page_count):
+            page = doc[page_num]
+            image_list = page.get_images(full=True)
+            images_total += len(image_list)
+
+            for img_index, img_info in enumerate(image_list):
+                xref = img_info[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    if not base_image:
+                        continue
+
+                    img_bytes = base_image["image"]
+                    img_ext = base_image.get("ext", "png")
+
+                    # Only recompress if image is large enough to matter
+                    if len(img_bytes) < 5000:
+                        continue
+
+                    # Open with PIL and recompress as JPEG
+                    pil_img = PilImage.open(BytesIO(img_bytes))
+
+                    # Convert CMYK/RGBA to RGB for JPEG
+                    if pil_img.mode in ('CMYK', 'RGBA', 'P', 'LA'):
+                        pil_img = pil_img.convert('RGB')
+
+                    # Recompress
+                    buf = BytesIO()
+                    pil_img.save(buf, format='JPEG', quality=quality, optimize=True)
+                    new_bytes = buf.getvalue()
+
+                    # Only replace if actually smaller
+                    if len(new_bytes) < len(img_bytes):
+                        doc.update_stream(xref, new_bytes)
+                        images_processed += 1
+
+                except Exception:
+                    continue
+
+        # Save with garbage collection and deflate compression
+        compressed_data = doc.tobytes(
+            garbage=4,        # Maximum garbage collection
+            deflate=True,     # Compress streams
+            clean=True,       # Clean up content streams
+            linear=False      # Linearization not needed
+        )
+        doc.close()
+
+        compressed_size = len(compressed_data)
+
+        # Build response
+        response = Response(
+            compressed_data,
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="compressed.pdf"',
+                'X-Original-Size': str(original_size),
+                'X-Compressed-Size': str(compressed_size),
+                'X-Pages': str(page_count),
+                'X-Images-Total': str(images_total),
+                'X-Images-Compressed': str(images_processed)
+            }
+        )
+        return response
+
+    except ImportError:
+        return jsonify({"error": "pymupdf not installed on server. Add PyMuPDF to requirements.txt"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Compression failed: {str(e)}"}), 500
+
+
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
 
 _worker_initialized = False
@@ -1363,4 +1567,5 @@ def startup_sync():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
 
