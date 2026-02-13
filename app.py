@@ -1366,13 +1366,13 @@ def parse_packing_list():
             },
             json={
                 'model': 'claude-sonnet-4-20250514',
-                'max_tokens': 8000,
+                'max_tokens': 4000,
                 'system': PACKING_LIST_SYSTEM_PROMPT,
                 'messages': [
                     {'role': 'user', 'content': f'Parse this packing list data and return the structured JSON:\n\n{sheets_text}'}
                 ]
             },
-            timeout=120
+            timeout=60
         )
 
         if resp.status_code != 200:
@@ -1410,6 +1410,219 @@ def parse_packing_list():
         return jsonify({"error": "Claude API request timed out"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+###############################################################################
+# PACKING LIST — Formatted Excel Export (matches catalog export style)
+###############################################################################
+
+@app.route('/api/packing-list-excel', methods=['POST', 'OPTIONS'])
+def packing_list_excel():
+    """Build a professionally formatted Excel from parsed packing list data."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    data = request.get_json()
+    if not data or 'sheets' not in data:
+        return jsonify({"error": "Missing sheets data"}), 400
+
+    sheets = data['sheets']
+    filename = data.get('filename', 'packing_list') + '_EXTRACTED.xlsx'
+
+    s3_base_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/PHOTOS+INVENTORY"
+
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb.set_properties({'title': 'Packing List Extract', 'author': 'Versa Inventory System'})
+
+    # Formats matching catalog export
+    fmt_header = wb.add_format({
+        'bold': True, 'font_name': 'Calibri', 'font_size': 11,
+        'bg_color': '#ADD8E6', 'font_color': '#000000',
+        'border': 1, 'border_color': '#000000',
+        'align': 'center', 'valign': 'vcenter'
+    })
+    base = {
+        'font_name': 'Calibri', 'font_size': 10,
+        'text_wrap': True, 'valign': 'vcenter', 'align': 'center',
+        'border': 1, 'border_color': '#000000'
+    }
+    fmts = {
+        'odd':  wb.add_format({**base, 'bg_color': '#FFFFFF'}),
+        'even': wb.add_format({**base, 'bg_color': '#F0F4F8'}),
+        'num_odd':  wb.add_format({**base, 'bg_color': '#FFFFFF', 'num_format': '#,##0'}),
+        'num_even': wb.add_format({**base, 'bg_color': '#F0F4F8', 'num_format': '#,##0'}),
+    }
+    # Size scale formats
+    sc_title = wb.add_format({'bold': True, 'font_name': 'Calibri', 'font_size': 11,
+                              'bg_color': '#FFFFFF', 'border': 0, 'align': 'left', 'valign': 'vcenter'})
+    sc_label = wb.add_format({'bold': True, 'font_name': 'Calibri', 'font_size': 10,
+                              'bg_color': '#FFFFFF', 'font_color': '#FF0000', 'border': 0,
+                              'align': 'center', 'valign': 'vcenter'})
+    sc_head = wb.add_format({'bold': True, 'font_name': 'Calibri', 'font_size': 10,
+                             'border': 1, 'align': 'center', 'valign': 'vcenter', 'bg_color': '#FFFFFF'})
+    sc_data = wb.add_format({'font_name': 'Calibri', 'font_size': 10,
+                             'border': 1, 'align': 'center', 'valign': 'vcenter', 'bg_color': '#FFFFFF'})
+
+    for si, sheet in enumerate(sheets):
+        styles = sheet.get('styles', [])
+        if not styles:
+            continue
+
+        sheet_name = (sheet.get('po_number') or sheet.get('sheet_name') or f'Sheet{si+1}')
+        safe_name = re.sub(r'[\\/*?\[\]:]', '', sheet_name)[:31] or f'Sheet{si+1}'
+        ws = wb.add_worksheet(safe_name)
+        ws.hide_gridlines(2)
+        ws.freeze_panes(1, 0)
+
+        # Headers: IMAGE, Style #, Brand, Color, Fit, Fabrication, Total Qty
+        headers = ['IMAGE', 'Style #', 'Brand', 'Color', 'Fit', 'Fabrication', 'Total Qty']
+        ws.set_row(0, 25)
+        for c, h in enumerate(headers):
+            ws.write(0, c, h, fmt_header)
+
+        ws.set_column(0, 0, COL_WIDTH_UNITS)   # IMAGE
+        ws.set_column(1, 1, 20)                 # Style
+        ws.set_column(2, 2, 18)                 # Brand
+        ws.set_column(3, 3, 30)                 # Color
+        ws.set_column(4, 4, 18)                 # Fit
+        ws.set_column(5, 5, 35)                 # Fabrication
+        ws.set_column(6, 6, 12)                 # Total Qty
+        ws.set_default_row(112.5)
+
+        # Fetch images for all styles in this sheet
+        img_items = []
+        for s in styles:
+            style_sku = s.get('style', '')
+            brand_key = s.get('brandKey', '')
+            img_items.append({
+                'sku': style_sku,
+                'brand_abbr': brand_key,
+                'brand': brand_key
+            })
+        images = download_images_for_items(img_items, s3_base_url, use_cache=True)
+
+        # Write data rows
+        for r, s in enumerate(styles):
+            row = r + 1
+            even = r % 2 == 1
+            cf = fmts['even'] if even else fmts['odd']
+            nf = fmts['num_even'] if even else fmts['num_odd']
+
+            ws.write(row, 0, '', cf)  # Image placeholder
+            ws.write(row, 1, s.get('style', ''), cf)
+            ws.write(row, 2, s.get('brand', ''), cf)
+            ws.write(row, 3, s.get('color', ''), cf)
+            ws.write(row, 4, s.get('fit', ''), cf)
+            ws.write(row, 5, s.get('fabric', ''), cf)
+            ws.write(row, 6, s.get('total_qty', 0), nf)
+
+            img = images.get(r)
+            if img:
+                try:
+                    ws.insert_image(row, 0, "img.png", {
+                        'image_data': img['image_data'],
+                        'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
+                        'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
+                        'object_position': 1, 'url': img.get('url', '')
+                    })
+                except Exception:
+                    ws.write(row, 0, "No Image", cf)
+            else:
+                ws.write(row, 0, "No Image", cf)
+
+        # --- Size Scale Section ---
+        pack_qty = sheet.get('pack_qty', 0)
+        # Collect prepack ratios — use first style that has them
+        prepack = {}
+        for s in styles:
+            pp = s.get('prepack_ratio', {})
+            if pp:
+                prepack = pp
+                break
+
+        if prepack:
+            start_row = len(styles) + 3  # 2 blank rows after data
+
+            # Determine if this is a shirt (size like "S 14-14.5 32/33") or pants (size like "30 X 30")
+            size_keys = list(prepack.keys())
+            is_pants = any('x' in sk.lower() or 'X' in sk for sk in size_keys)
+
+            if is_pants:
+                # Parse waist x inseam sizes into a grid
+                waists = sorted(set())
+                inseams = sorted(set())
+                size_grid = {}
+                for sk, qty in prepack.items():
+                    parts = re.split(r'\s*[xX]\s*', sk.strip())
+                    if len(parts) == 2:
+                        w, i = parts[0].strip(), parts[1].strip()
+                        size_grid[(w, i)] = qty
+                        waists = sorted(set(list(dict.fromkeys([p[0] for p in size_grid.keys()]))))
+                        inseams = sorted(set(list(dict.fromkeys([p[1] for p in size_grid.keys()]))))
+
+                if waists and inseams:
+                    total_per_ctn = sum(prepack.values())
+                    title = f"Pre-Pack Ratio — {total_per_ctn} pcs per carton"
+                    ws.set_row(start_row, 20)
+                    ws.write(start_row, 0, title, sc_title)
+
+                    start_row += 1
+                    merge_end = len(waists)
+                    if merge_end > 0:
+                        ws.merge_range(start_row, 0, start_row, merge_end, 'SIZE SCALE (Waist x Inseam)', sc_label)
+                    ws.set_row(start_row, 18)
+
+                    # Header row: blank + waist sizes
+                    start_row += 1
+                    ws.set_row(start_row, 25)
+                    ws.write(start_row, 0, 'Inseam ↓ / Waist →', sc_head)
+                    for ci, w in enumerate(waists):
+                        ws.write(start_row, ci + 1, w, sc_head)
+
+                    # Data rows: one per inseam
+                    for ii, ins in enumerate(inseams):
+                        r = start_row + 1 + ii
+                        ws.set_row(r, 25)
+                        ws.write(r, 0, ins, sc_head)
+                        for ci, w in enumerate(waists):
+                            val = size_grid.get((w, ins), '')
+                            ws.write(r, ci + 1, val, sc_data)
+
+            else:
+                # Shirt sizes — simple horizontal layout
+                total_per_ctn = sum(prepack.values())
+                title = f"Pre-Pack Ratio — {total_per_ctn} pcs per carton"
+                ws.set_row(start_row, 20)
+                ws.write(start_row, 0, title, sc_title)
+
+                start_row += 1
+                merge_end = len(size_keys)
+                if merge_end > 0:
+                    ws.merge_range(start_row, 0, start_row, merge_end, 'SIZE SCALE', sc_label)
+                ws.set_row(start_row, 18)
+
+                start_row += 1
+                ws.set_row(start_row, 25)
+                ws.write(start_row, 0, 'Size', sc_head)
+                for ci, sk in enumerate(size_keys):
+                    ws.write(start_row, ci + 1, sk, sc_head)
+
+                start_row += 1
+                ws.set_row(start_row, 25)
+                ws.write(start_row, 0, 'Qty', sc_head)
+                for ci, sk in enumerate(size_keys):
+                    ws.write(start_row, ci + 1, prepack.get(sk, ''), sc_data)
+
+    wb.close()
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
@@ -1484,6 +1697,4 @@ def startup_sync():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-
 
