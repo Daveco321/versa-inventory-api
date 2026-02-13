@@ -29,11 +29,10 @@ CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-        "expose_headers": ["X-Original-Size", "X-Compressed-Size", "X-Pages", "X-Images-Total", "X-Images-Compressed"]
+        "allow_headers": ["Content-Type"]
     }
 })
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB for PDF uploads
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 AWS_REGION       = os.environ.get('AWS_REGION', 'us-east-2')
 S3_BUCKET        = os.environ.get('S3_BUCKET', 'nauticaslimfit')
@@ -1393,106 +1392,6 @@ def parse_packing_list():
         return jsonify({"error": "Claude API request timed out"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-###############################################################################
-# FILE COMPRESSION — PDF (server-side with image recompression)
-###############################################################################
-
-@app.route('/api/compress-pdf', methods=['POST', 'OPTIONS'])
-def compress_pdf():
-    """Compress a PDF by recompressing embedded images at lower quality."""
-    if request.method == 'OPTIONS':
-        return '', 204
-
-    if 'file' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-
-    file = request.files['file']
-    quality = int(request.form.get('quality', 65))  # JPEG quality 1-100
-    quality = max(20, min(95, quality))
-
-    try:
-        import fitz  # pymupdf
-
-        original_data = file.read()
-        original_size = len(original_data)
-
-        doc = fitz.open(stream=original_data, filetype="pdf")
-        page_count = len(doc)
-
-        images_processed = 0
-        images_total = 0
-
-        for page_num in range(page_count):
-            page = doc[page_num]
-            image_list = page.get_images(full=True)
-            images_total += len(image_list)
-
-            for img_index, img_info in enumerate(image_list):
-                xref = img_info[0]
-                try:
-                    base_image = doc.extract_image(xref)
-                    if not base_image:
-                        continue
-
-                    img_bytes = base_image["image"]
-                    img_ext = base_image.get("ext", "png")
-
-                    # Only recompress if image is large enough to matter
-                    if len(img_bytes) < 5000:
-                        continue
-
-                    # Open with PIL and recompress as JPEG
-                    pil_img = PilImage.open(BytesIO(img_bytes))
-
-                    # Convert CMYK/RGBA to RGB for JPEG
-                    if pil_img.mode in ('CMYK', 'RGBA', 'P', 'LA'):
-                        pil_img = pil_img.convert('RGB')
-
-                    # Recompress
-                    buf = BytesIO()
-                    pil_img.save(buf, format='JPEG', quality=quality, optimize=True)
-                    new_bytes = buf.getvalue()
-
-                    # Only replace if actually smaller
-                    if len(new_bytes) < len(img_bytes):
-                        doc.update_stream(xref, new_bytes)
-                        images_processed += 1
-
-                except Exception:
-                    continue
-
-        # Save with garbage collection and deflate compression
-        compressed_data = doc.tobytes(
-            garbage=4,        # Maximum garbage collection
-            deflate=True,     # Compress streams
-            clean=True,       # Clean up content streams
-            linear=False      # Linearization not needed
-        )
-        doc.close()
-
-        compressed_size = len(compressed_data)
-
-        # Build response
-        response = Response(
-            compressed_data,
-            mimetype='application/pdf',
-            headers={
-                'Content-Disposition': f'attachment; filename="compressed.pdf"',
-                'X-Original-Size': str(original_size),
-                'X-Compressed-Size': str(compressed_size),
-                'X-Pages': str(page_count),
-                'X-Images-Total': str(images_total),
-                'X-Images-Compressed': str(images_processed)
-            }
-        )
-        return response
-
-    except ImportError:
-        return jsonify({"error": "pymupdf not installed on server. Add PyMuPDF to requirements.txt"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Compression failed: {str(e)}"}), 500
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
