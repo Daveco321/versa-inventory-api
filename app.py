@@ -1293,6 +1293,18 @@ def regenerate_exports():
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
 
+_worker_initialized = False
+
+@app.before_request
+def ensure_worker_initialized():
+    """Trigger startup sync on the first request to this worker process.
+    This is the only reliable way to initialize with gunicorn's fork model."""
+    global _worker_initialized
+    if not _worker_initialized:
+        _worker_initialized = True
+        print("\n  [before_request] First request — triggering startup sync...")
+        threading.Thread(target=startup_sync, daemon=True).start()
+
 
 def hourly_resync():
     """Background loop: re-sync from Dropbox and regenerate exports every hour"""
@@ -1320,7 +1332,6 @@ def hourly_resync():
 
 
 def startup_sync():
-    time.sleep(3)
     print("\n" + "="*60)
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
     print(f"  Dropbox URL configured: {'YES' if DROPBOX_URL else 'NO'}")
@@ -1346,11 +1357,10 @@ def startup_sync():
     # Start hourly re-sync loop
     if DROPBOX_URL:
         print(f"  ⏰ Hourly Dropbox re-sync enabled (every {DROPBOX_RESYNC_INTERVAL//3600}h)")
-        threading.Thread(target=hourly_resync, daemon=True).start()
-
-threading.Thread(target=startup_sync, daemon=True).start()
+        hourly_resync()  # This runs forever in the same thread
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
