@@ -1297,40 +1297,44 @@ def regenerate_exports():
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
-PACKING_LIST_SYSTEM_PROMPT = """You are an expert at parsing packing list spreadsheets for apparel manufacturers.
-You receive raw cell data from Excel packing lists. These come in varying formats:
+PACKING_LIST_SYSTEM_PROMPT = """You are an expert at parsing packing list and inventory spreadsheets for apparel manufacturers.
+You receive raw cell data from Excel files. These come in varying formats:
 
-FORMAT A (Pants/Bottoms): Columns are STYLE, COLOUR, CARTON NO., SIZE (e.g. "30 X 30" = waist x inseam), TTL CTN, quantity columns, TOTAL QUANTITY.
+FORMAT A (Pants/Bottoms Packing Lists): Columns typically include STYLE, COLOUR, CARTON NO., SIZE (e.g. "30 X 30" = waist x inseam), TTL CTN, quantity columns, TOTAL QUANTITY.
 - Styles appear once and subsequent rows with empty STYLE belong to the same style+color.
 - A style+color combo can span many rows (different carton groups and sizes).
 - Sometimes the same style appears again later with a different color, or even re-appears with the same color (combine them).
 
-FORMAT B (Dress Shirts): Columns are STYLE, COLOUR, CARTON NO., TTL CTN, then SIZE COLUMNS with pre-pack quantities in the header row (like 4, 8, 4, 4, 8, 8). A sub-header row shows actual size labels (S 14-14.5 32/33, M 15-15.5 32/33, etc.). QTY PER CARTON and TOTAL QUANTITY at the end.
+FORMAT B (Dress Shirts Packing Lists): Columns are STYLE, COLOUR, CARTON NO., TTL CTN, then SIZE COLUMNS with pre-pack quantities in the header row (like 4, 8, 4, 4, 8, 8). A sub-header row shows actual size labels (S 14-14.5 32/33, M 15-15.5 32/33, etc.). QTY PER CARTON and TOTAL QUANTITY at the end.
 - The pre-pack ratio per size is the number in the header (e.g., 4 for S means 4 of size S per carton).
 - Styles repeat across rows for different carton groupings — combine them.
 
-RULES:
-- IGNORE rows about TOTAL, CTNS, MEASUREMENT, CBM, G.W, N.W, SEAL NO, CONTAINER NO.
-- For each unique STYLE + COLOR combination, sum ALL quantities across ALL rows and ALL sizes.
-- Return the size breakdown: for each size, the total quantity across all rows.
-- Identify the pre-pack ratio (units per carton per size).
-- If a workbook has multiple sheets, process ALL sheets.
-- Return ONLY valid JSON, no markdown fences, no explanation.
+FORMAT C (ATS / Inventory Selection sheets): These may have columns like STYLE/SKU, COLOR/DESCRIPTION, QTY/ATS/TOTAL, and possibly size breakdowns. Extract whatever style, color, and quantity information is available.
 
-OUTPUT FORMAT (strict JSON):
+RULES:
+- IGNORE rows about TOTAL, CTNS, MEASUREMENT, CBM, G.W, N.W, SEAL NO, CONTAINER NO, and shipping logistics.
+- For each unique STYLE + COLOR combination, sum ALL quantities across ALL rows and ALL sizes.
+- Return the size breakdown if available: for each size, the total quantity across all rows.
+- Identify the pre-pack ratio (units per carton per size) if available.
+- If a workbook has multiple sheets, process ALL sheets.
+- CRITICAL: You MUST return ONLY valid JSON. No markdown fences, no explanation, no text before or after the JSON.
+- Even if the data looks unusual or you are unsure, still return your best-effort JSON extraction.
+- If no data can be extracted, return: {"sheets": []}
+
+OUTPUT FORMAT (strict JSON only — nothing else):
 {
   "sheets": [
     {
       "sheet_name": "PO#...",
-      "po_number": "extracted PO number",
+      "po_number": "extracted PO number or sheet name",
       "pack_qty_per_carton": 36,
       "styles": [
         {
           "style": "TJVCCN069SLY",
           "color": "WHITE GRND W/ LT BLUE & BLK STRIPES",
           "total_qty": 1449,
-          "sizes": {"S 14-14.5 32/33": 161, "M 15-15.5 32/33": 322, ...},
-          "prepack_ratio": {"S 14-14.5 32/33": 4, "M 15-15.5 32/33": 8, ...}
+          "sizes": {"S 14-14.5 32/33": 161, "M 15-15.5 32/33": 322},
+          "prepack_ratio": {"S 14-14.5 32/33": 4, "M 15-15.5 32/33": 8}
         }
       ]
     }
@@ -1382,12 +1386,26 @@ def parse_packing_list():
         if text.startswith('```'):
             text = re.sub(r'^```\w*\n?', '', text)
             text = re.sub(r'\n?```$', '', text)
+            text = text.strip()
 
-        parsed = json.loads(text)
-        return jsonify({"status": "success", "data": parsed})
+        # Try direct parse first
+        try:
+            parsed = json.loads(text)
+            return jsonify({"status": "success", "data": parsed})
+        except json.JSONDecodeError:
+            pass
 
-    except json.JSONDecodeError as e:
-        return jsonify({"error": "Failed to parse Claude response as JSON", "raw": text[:2000]}), 502
+        # Try to find JSON object within the response text
+        json_match = re.search(r'\{[\s\S]*"sheets"[\s\S]*\}', text)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group())
+                return jsonify({"status": "success", "data": parsed})
+            except json.JSONDecodeError:
+                pass
+
+        # Nothing worked — return raw so user can see what Claude said
+        return jsonify({"error": "Could not extract structured data from this file", "raw": text[:3000]}), 502
     except http_requests.exceptions.Timeout:
         return jsonify({"error": "Claude API request timed out"}), 504
     except Exception as e:
@@ -1466,5 +1484,6 @@ def startup_sync():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
 
 
