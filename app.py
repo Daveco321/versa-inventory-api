@@ -16,7 +16,7 @@ from io import BytesIO
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, make_response
 from flask_cors import CORS
 import xlsxwriter
 import requests as http_requests
@@ -1325,6 +1325,8 @@ def regenerate_exports():
     # Clear image cache to force re-download
     with _img_lock:
         _img_cache.clear()
+    with _web_img_lock:
+        _web_img_cache.clear()
 
     updated = sync_inventory()
     trigger_background_generation()
@@ -1342,8 +1344,93 @@ def regenerate_exports():
 
 
 ###############################################################################
-# PACKING LIST EXTRACTION — Claude API proxy
+# IMAGE PROXY — Serve product images through the API
+# Solves S3 browser-access issues (CORS, bucket policies, etc.)
+# Serves original-resolution images (not resized like Excel thumbnails)
 ###############################################################################
+
+_web_img_cache = {}   # base_style → (content_bytes, content_type)
+_web_img_lock = threading.Lock()
+
+
+def _fetch_raw_image(base_style, brand_abbr):
+    """Download raw image bytes from S3 (override → brand folder, .jpg → .png)"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    # Try STYLE+OVERRIDES first
+    override_base = f"{S3_OVERRIDES_IMG_URL}/{base_style}"
+    # Then brand folder
+    folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
+    image_code = extract_image_code(base_style, brand_abbr)
+    brand_base = f"{S3_PHOTOS_URL}/{folder_name}/{image_code}"
+
+    for base_url in [override_base, brand_base]:
+        for ext in ['.jpg', '.png', '.jpeg']:
+            try:
+                url = base_url + ext
+                resp = http_requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    ct = resp.headers.get('Content-Type', '').lower()
+                    if 'image' in ct:
+                        return resp.content, ct
+            except Exception:
+                continue
+    return None, None
+
+
+@app.route('/image/<base_style>', methods=['GET', 'OPTIONS'])
+def proxy_image(base_style):
+    """Serve a product image by base style code, with server-side S3 caching."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    base_style = base_style.upper().split('.')[0]  # strip extension if present
+
+    # Check web image cache first
+    with _web_img_lock:
+        cached = _web_img_cache.get(base_style, 'MISS')
+    if cached is None:
+        return '', 404  # Previously failed — skip
+    if cached != 'MISS':
+        resp = make_response(cached[0])
+        resp.headers['Content-Type'] = cached[1]
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+    # Get brand from query param or look up from inventory
+    brand_abbr = request.args.get('brand', '').upper()
+    if not brand_abbr:
+        with _inv_lock:
+            for item in (_inventory.get('items') or []):
+                if item.get('sku', '').split('-')[0].upper() == base_style:
+                    brand_abbr = item.get('brand_abbr', item.get('brand', ''))
+                    break
+
+    # Fetch raw image from S3
+    raw_bytes, content_type = _fetch_raw_image(base_style, brand_abbr)
+
+    if raw_bytes:
+        # Cache for future requests (limit cache to ~500 images to control memory)
+        with _web_img_lock:
+            if len(_web_img_cache) > 500:
+                # Evict oldest ~100 entries
+                keys = list(_web_img_cache.keys())[:100]
+                for k in keys:
+                    del _web_img_cache[k]
+            _web_img_cache[base_style] = (raw_bytes, content_type)
+
+        resp = make_response(raw_bytes)
+        resp.headers['Content-Type'] = content_type
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+    # Cache the miss too (avoid re-fetching failures)
+    with _web_img_lock:
+        _web_img_cache[base_style] = None
+
+    return '', 404
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
@@ -1418,6 +1505,4 @@ def startup_sync():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-
 
