@@ -428,7 +428,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
 
 
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
-                     is_order=False, incoming_only=False):
+                     is_order=False, incoming_only=False, catalog_mode=False):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -450,8 +450,27 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
     worksheet.hide_gridlines(2)
     worksheet.freeze_panes(1, 0)
 
-    if view_mode == 'incoming':
-        # Overseas view: no warehouse columns, add dates
+    if catalog_mode:
+        # ── Catalog exports: no committed/allocated, simplified layout ──
+        if view_mode == 'incoming':
+            headers = ['IMAGE', 'SKU', 'Brand']
+            if has_color:
+                headers.append('Color')
+            headers.extend(['Fit', 'Fabrication'])
+            if is_order:
+                headers.append('Qty Selected')
+            headers.extend(['Incoming', 'Overseas ATS', 'Ex-Factory', 'Arrival'])
+        else:
+            # Warehouse / All view: show warehouse names column instead of per-WH quantities
+            headers = ['IMAGE', 'SKU', 'Brand']
+            if has_color:
+                headers.append('Color')
+            headers.extend(['Fit', 'Fabrication'])
+            if is_order:
+                headers.append('Qty Selected')
+            headers.extend(['Warehouse', 'Total ATS'])
+    elif view_mode == 'incoming':
+        # Admin overseas view: no warehouse columns, add dates
         headers = ['IMAGE', 'SKU', 'Brand']
         if has_color:
             headers.append('Color')
@@ -461,7 +480,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         headers.extend(['Incoming', 'Committed', 'Allocated', 'Overseas ATS',
                         'Ex-Factory', 'Arrival'])
     else:
-        # Standard / ATS / All view — dynamically build columns
+        # Admin standard / ATS / All view — full columns
         headers = ['IMAGE', 'SKU', 'Brand']
         if has_color:
             headers.append('Color')
@@ -486,6 +505,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
+        'Warehouse': 18,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -522,6 +542,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Allocated': lambda item: item.get('allocated', 0),
         'Ex-Factory': lambda item: item.get('ex_factory', ''),
         'Arrival': lambda item: item.get('arrival', ''),
+        'Warehouse': lambda item: item.get('warehouse', ''),
     }
 
     # Determine which columns are numeric for formatting
@@ -584,13 +605,14 @@ def _add_size_charts(workbook, worksheet, start):
     for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,7+c,v,gd)
 
 
-def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False):
+def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False,
+                      catalog_mode=False):
     has_color = any(item.get('color') for item in items)
 
     # Auto-detect incoming_only: all items have zero warehouse stock
     # (only applies to non-incoming view modes — incoming view already omits warehouse)
     incoming_only = False
-    if view_mode != 'incoming' and items:
+    if view_mode != 'incoming' and items and not catalog_mode:
         incoming_only = all(
             item.get('total_warehouse', 0) == 0
             for item in items
@@ -601,7 +623,8 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
-                                     is_order=is_order, incoming_only=incoming_only)
+                                     is_order=is_order, incoming_only=incoming_only,
+                                     catalog_mode=catalog_mode)
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers)
@@ -610,9 +633,10 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     return buf.getvalue()
 
 
-def build_multi_brand_excel(brands_list, s3_base_url):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all'):
     for b in brands_list:
-        b['items'] = sorted(b['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
+        sort_key = 'total_ats' if catalog_mode else 'total_warehouse'
+        b['items'] = sorted(b['items'], key=lambda x: x.get(sort_key, 0), reverse=True)
 
     has_color = any(item.get('color') for b in brands_list for item in b['items'])
 
@@ -633,7 +657,8 @@ def build_multi_brand_excel(brands_list, s3_base_url):
     for bi, brand in enumerate(brands_list):
         safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
         ws = wb.add_worksheet(safe)
-        fmts, headers = _setup_worksheet(wb, ws, has_color=has_color)
+        fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
+                                         catalog_mode=catalog_mode, view_mode=view_mode)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -1224,11 +1249,12 @@ def export_single():
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
         is_order = req.get('is_order', False)
+        catalog_mode = req.get('catalog_mode', False)
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
-                                     is_order=is_order)
+                                     is_order=is_order, catalog_mode=catalog_mode)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1249,10 +1275,13 @@ def export_multi():
         brands_data = req['brands']
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
+        catalog_mode = req.get('catalog_mode', False)
+        view_mode = req.get('view_mode', 'all')
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
 
-        xl_bytes = build_multi_brand_excel(brands_data, s3_url)
+        xl_bytes = build_multi_brand_excel(brands_data, s3_url,
+                                           catalog_mode=catalog_mode, view_mode=view_mode)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
