@@ -427,7 +427,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
     return results
 
 
-def _setup_worksheet(workbook, worksheet, has_color=False):
+def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all'):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -449,62 +449,118 @@ def _setup_worksheet(workbook, worksheet, has_color=False):
     worksheet.hide_gridlines(2)
     worksheet.freeze_panes(1, 0)
 
-    if has_color:
-        headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabric Code', 'Fabrication',
-                   'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
+    if view_mode == 'incoming':
+        # Overseas view: no Fabric Code, no warehouse columns, add dates
+        if has_color:
+            headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
+                       'Incoming', 'Committed', 'Allocated', 'Overseas ATS', 'Ex-Factory', 'Arrival']
+        else:
+            headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabrication',
+                       'Incoming', 'Committed', 'Allocated', 'Overseas ATS', 'Ex-Factory', 'Arrival']
+        worksheet.set_row(0, 25)
+        for c, h in enumerate(headers):
+            worksheet.write(0, c, h, fmt_header)
+        worksheet.set_column(0, 0, COL_WIDTH_UNITS)
+        worksheet.set_column(1, 1, 20)
+        worksheet.set_column(2, 2, 20)
+        if has_color:
+            worksheet.set_column(3, 3, 18)
+            worksheet.set_column(4, 4, 12)
+            worksheet.set_column(5, 5, 35)
+            worksheet.set_column(6, 11, 14)
+        else:
+            worksheet.set_column(3, 3, 12)
+            worksheet.set_column(4, 4, 35)
+            worksheet.set_column(5, 10, 14)
     else:
-        headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabric Code', 'Fabrication',
-                   'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
-    worksheet.set_row(0, 25)
-    for c, h in enumerate(headers):
-        worksheet.write(0, c, h, fmt_header)
+        if has_color:
+            headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication', 'Delivery',
+                       'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
+        else:
+            headers = ['IMAGE', 'SKU', 'Brand', 'Fit', 'Fabrication', 'Delivery',
+                       'JTW', 'TR', 'DCW', 'QA', 'Incoming', 'Total Warehouse', 'Total ATS']
+        worksheet.set_row(0, 25)
+        for c, h in enumerate(headers):
+            worksheet.write(0, c, h, fmt_header)
+        worksheet.set_column(0, 0, COL_WIDTH_UNITS)
+        worksheet.set_column(1, 1, 20)
+        worksheet.set_column(2, 2, 20)
+        if has_color:
+            worksheet.set_column(3, 3, 18)
+            worksheet.set_column(4, 4, 12)
+            worksheet.set_column(5, 5, 35)
+            worksheet.set_column(6, 6, 14)
+            worksheet.set_column(7, 13, 12)
+        else:
+            worksheet.set_column(3, 3, 12)
+            worksheet.set_column(4, 4, 35)
+            worksheet.set_column(5, 5, 14)
+            worksheet.set_column(6, 12, 12)
 
-    worksheet.set_column(0, 0, COL_WIDTH_UNITS)
-    worksheet.set_column(1, 1, 20)
-    worksheet.set_column(2, 2, 20)
-    if has_color:
-        worksheet.set_column(3, 3, 18)
-        worksheet.set_column(4, 4, 12)
-        worksheet.set_column(5, 5, 12)
-        worksheet.set_column(6, 6, 35)
-        worksheet.set_column(7, 13, 12)
-    else:
-        worksheet.set_column(3, 3, 12)
-        worksheet.set_column(4, 4, 12)
-        worksheet.set_column(5, 5, 35)
-        worksheet.set_column(6, 12, 12)
     worksheet.set_default_row(112.5)
     return fmts
 
 
-def _write_rows(workbook, worksheet, data, images, fmts, has_color=False):
+def _write_rows(workbook, worksheet, data, images, fmts, has_color=False, view_mode='all'):
     for r, item in enumerate(data):
         row = r + 1
         even = r % 2 == 1
         cf = fmts['even'] if even else fmts['odd']
-        if has_color:
-            vals = [
-                '', item.get('sku',''), item.get('brand_full',''),
-                item.get('color',''),
-                item.get('fit','N/A'), item.get('fabric_code','N/A'),
-                item.get('fabrication','Standard Fabric'),
-                item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
-                item.get('qa',0), item.get('incoming',0),
-                item.get('total_warehouse',0), item.get('total_ats',0)
-            ]
-            num_start = 7
-            num_end = 13
+
+        if view_mode == 'incoming':
+            # Overseas view: no Fabric Code, no warehouse breakdown, add dates
+            if has_color:
+                vals = [
+                    '', item.get('sku',''), item.get('brand_full',''),
+                    item.get('color',''),
+                    item.get('fit','N/A'),
+                    item.get('fabrication','Standard Fabric'),
+                    item.get('incoming',0),
+                    item.get('committed',0), item.get('allocated',0),
+                    item.get('total_ats',0),
+                    item.get('ex_factory',''), item.get('arrival','')
+                ]
+                num_start = 6
+                num_end = 9
+            else:
+                vals = [
+                    '', item.get('sku',''), item.get('brand_full',''),
+                    item.get('fit','N/A'),
+                    item.get('fabrication','Standard Fabric'),
+                    item.get('incoming',0),
+                    item.get('committed',0), item.get('allocated',0),
+                    item.get('total_ats',0),
+                    item.get('ex_factory',''), item.get('arrival','')
+                ]
+                num_start = 5
+                num_end = 8
         else:
-            vals = [
-                '', item.get('sku',''), item.get('brand_full',''),
-                item.get('fit','N/A'), item.get('fabric_code','N/A'),
-                item.get('fabrication','Standard Fabric'),
-                item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
-                item.get('qa',0), item.get('incoming',0),
-                item.get('total_warehouse',0), item.get('total_ats',0)
-            ]
-            num_start = 6
-            num_end = 12
+            if has_color:
+                vals = [
+                    '', item.get('sku',''), item.get('brand_full',''),
+                    item.get('color',''),
+                    item.get('fit','N/A'),
+                    item.get('fabrication','Standard Fabric'),
+                    item.get('delivery','ATS'),
+                    item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                    item.get('qa',0), item.get('incoming',0),
+                    item.get('total_warehouse',0), item.get('total_ats',0)
+                ]
+                num_start = 7
+                num_end = 13
+            else:
+                vals = [
+                    '', item.get('sku',''), item.get('brand_full',''),
+                    item.get('fit','N/A'),
+                    item.get('fabrication','Standard Fabric'),
+                    item.get('delivery','ATS'),
+                    item.get('jtw',0), item.get('tr',0), item.get('dcw',0),
+                    item.get('qa',0), item.get('incoming',0),
+                    item.get('total_warehouse',0), item.get('total_ats',0)
+                ]
+                num_start = 6
+                num_end = 12
+
         for c, v in enumerate(vals):
             f = (fmts['num_even'] if even else fmts['num_odd']) if num_start <= c <= num_end else cf
             worksheet.write(row, c, v, f)
@@ -550,15 +606,15 @@ def _add_size_charts(workbook, worksheet, start):
     for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,7+c,v,gd)
 
 
-def build_brand_excel(brand_name, items, s3_base_url):
+def build_brand_excel(brand_name, items, s3_base_url, view_mode='all'):
     has_color = any(item.get('color') for item in items)
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
-    fmts = _setup_worksheet(wb, ws, has_color=has_color)
+    fmts = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode)
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
-    n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color)
+    n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color, view_mode=view_mode)
     _add_size_charts(wb, ws, n + 2)
     wb.close()
     return buf.getvalue()
@@ -1175,10 +1231,11 @@ def export_single():
         data = req['data']
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
+        view_mode = req.get('view_mode', 'all')
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
-        xl_bytes = build_brand_excel(fname, data, s3_url)
+        xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
