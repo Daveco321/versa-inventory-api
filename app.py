@@ -62,11 +62,9 @@ DROPBOX_URL = os.environ.get('DROPBOX_URL',
     'https://www.dropbox.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&dl=1')
 
 COL_WIDTH_UNITS = 22
-# Cell pixel dimensions for image canvas:
-#   Column: 22 char units ≈ 165px (7.5px per unit)
+# Cell pixel dimensions for image sizing:
 #   Row: 112.5pt ≈ 150px
-# Image must fill full cell for object_position:1 to scale with BOTH row and column
-CELL_PX_W = 165
+CELL_PX_W = 150
 CELL_PX_H = 150
 
 BRAND_IMAGE_PREFIX = {
@@ -302,9 +300,8 @@ def get_style_override_url(sku):
 
 def _process_image_from_url(url):
     """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions.
-    Creates a cell-sized canvas with the product image centered on it.
-    This ensures the image fills the entire cell so object_position:1
-    scales correctly when resizing BOTH rows and columns."""
+    Resizes to fit cell dimensions. object_position:3 keeps image fixed in place
+    and allows manual resizing by dragging corners."""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
 
@@ -325,30 +322,26 @@ def _process_image_from_url(url):
                 im = ImageOps.exif_transpose(im)
 
                 cpw, cph = CELL_PX_W, CELL_PX_H
-
-                # Resize product image to fit within cell (maintain aspect ratio)
                 iw, ih = im.size
                 scale = min(cpw / iw, cph / ih)
                 new_w = int(iw * scale)
                 new_h = int(ih * scale)
                 im = im.resize((new_w, new_h), PilImage.Resampling.LANCZOS)
 
-                # Create white canvas at exact cell dimensions, paste product centered
                 if im.mode != "RGB":
                     im = im.convert("RGB")
-                canvas = PilImage.new("RGB", (cpw, cph), (255, 255, 255))
-                paste_x = (cpw - new_w) // 2
-                paste_y = (cph - new_h) // 2
-                canvas.paste(im, (paste_x, paste_y))
 
                 buf = BytesIO()
-                canvas.save(buf, format="JPEG", quality=85, optimize=True)
+                im.save(buf, format="JPEG", quality=85, optimize=True)
                 raw = buf.getvalue()
 
+            # Center in cell
+            x_off = max(0, (cpw - new_w) / 2)
+            y_off = max(0, (cph - new_h) / 2)
             return {
                 'raw_bytes': raw,
                 'x_scale': 1, 'y_scale': 1,
-                'x_offset': 0, 'y_offset': 0,
+                'x_offset': x_off, 'y_offset': y_off,
                 'url': try_url
             }
         except Exception:
@@ -375,7 +368,7 @@ def get_image_cached(item, s3_base_url):
                 'image_data': BytesIO(c['raw_bytes']),
                 'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
                 'x_offset': c['x_offset'], 'y_offset': c['y_offset'],
-                'object_position': 1, 'url': c['url']
+                'object_position': 3
             }
 
     # Try STYLE+OVERRIDES first (primary — matches frontend)
@@ -396,7 +389,7 @@ def get_image_cached(item, s3_base_url):
             'image_data': BytesIO(result['raw_bytes']),
             'x_scale': result['x_scale'], 'y_scale': result['y_scale'],
             'x_offset': result['x_offset'], 'y_offset': result['y_offset'],
-            'object_position': 1, 'url': result['url']
+            'object_position': 3
         }
     return None
 
@@ -437,7 +430,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
                                 'image_data': BytesIO(cached['raw_bytes']),
                                 'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
                                 'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
-                                'object_position': 1, 'url': cached['url']
+                                'object_position': 3
                             }
             except Exception:
                 pass
@@ -589,7 +582,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
                     'image_data': img['image_data'],
                     'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
                     'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
-                    'object_position': 1, 'url': img.get('url', '')
+                    'object_position': 3
                 })
             except Exception:
                 worksheet.write(row, 0, "Error", cf)
