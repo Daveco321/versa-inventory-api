@@ -412,15 +412,16 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
     unique_pairs = list(unique_items.items())
     print(f"    Fetching images: {len(unique_pairs)} unique styles for {len(items)} items")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(_fetch, pair): pair[0] for pair in unique_pairs}
-        for f in concurrent.futures.as_completed(futures):
+    # Use gevent pool if available (gevent monkey-patches break ThreadPoolExecutor)
+    try:
+        import gevent.pool
+        pool = gevent.pool.Pool(size=20)
+        fetch_results = pool.map(_fetch, unique_pairs)
+        for result in fetch_results:
             try:
-                base_style, img = f.result()
+                base_style, img = result
                 if img:
-                    # Apply this image to ALL items with this base_style
                     for idx in style_to_indices.get(base_style, []):
-                        # Each index needs its own BytesIO copy
                         cached = _img_cache.get(base_style)
                         if cached:
                             results[idx] = {
@@ -431,6 +432,25 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
                             }
             except Exception:
                 pass
+    except ImportError:
+        # Fallback to ThreadPoolExecutor if gevent not installed
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+            futures = {pool.submit(_fetch, pair): pair[0] for pair in unique_pairs}
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    base_style, img = f.result()
+                    if img:
+                        for idx in style_to_indices.get(base_style, []):
+                            cached = _img_cache.get(base_style)
+                            if cached:
+                                results[idx] = {
+                                    'image_data': BytesIO(cached['raw_bytes']),
+                                    'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
+                                    'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
+                                    'object_position': 1, 'url': cached['url']
+                                }
+                except Exception:
+                    pass
 
     return results
 
