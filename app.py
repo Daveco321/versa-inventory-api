@@ -5,6 +5,14 @@ VERSA INVENTORY EXPORT API v3
 - Size-suffix stripping for correct image URLs
 """
 
+# Gevent monkey-patch MUST happen before any other imports
+# to avoid SSL recursion errors with boto3/urllib3
+try:
+    from gevent import monkey
+    monkey.patch_all()
+except ImportError:
+    pass  # gevent not installed — run with sync workers
+
 import os
 import re
 import json
