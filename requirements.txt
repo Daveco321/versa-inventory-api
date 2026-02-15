@@ -6,3 +6,4 @@ openpyxl
 requests
 Pillow
 gunicorn
+gevent
