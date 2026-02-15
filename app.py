@@ -61,11 +61,9 @@ S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+I
 DROPBOX_URL = os.environ.get('DROPBOX_URL',
     'https://www.dropbox.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&dl=1')
 
+TARGET_W = 150
+TARGET_H = 150
 COL_WIDTH_UNITS = 22
-# Cell pixel dimensions for image sizing:
-#   Row: 112.5pt ≈ 150px
-CELL_PX_W = 150
-CELL_PX_H = 150
 
 BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
@@ -298,10 +296,8 @@ def get_style_override_url(sku):
     return f"{S3_OVERRIDES_IMG_URL}/{base_style}.jpg"
 
 
-def _process_image_from_url(url):
-    """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions.
-    Resizes to fit cell dimensions. object_position:3 keeps image fixed in place
-    and allows manual resizing by dragging corners."""
+def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
+    """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions"""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
 
@@ -320,28 +316,29 @@ def _process_image_from_url(url):
 
             with PilImage.open(BytesIO(resp.content)) as im:
                 im = ImageOps.exif_transpose(im)
+                im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
 
-                cpw, cph = CELL_PX_W, CELL_PX_H
-                iw, ih = im.size
-                scale = min(cpw / iw, cph / ih)
-                new_w = int(iw * scale)
-                new_h = int(ih * scale)
-                im = im.resize((new_w, new_h), PilImage.Resampling.LANCZOS)
-
-                if im.mode != "RGB":
-                    im = im.convert("RGB")
+                fmt = "PNG"
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    fmt = "PNG"
+                else:
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    fmt = "JPEG"
 
                 buf = BytesIO()
-                im.save(buf, format="JPEG", quality=85, optimize=True)
+                im.save(buf, format=fmt, quality=85, optimize=True)
                 raw = buf.getvalue()
+                ow, oh = im.size
 
-            # Center in cell
-            x_off = max(0, (cpw - new_w) / 2)
-            y_off = max(0, (cph - new_h) / 2)
+            wr = tw / ow
+            hr = th / oh
+            sf = min(wr, hr)
             return {
                 'raw_bytes': raw,
-                'x_scale': 1, 'y_scale': 1,
-                'x_offset': x_off, 'y_offset': y_off,
+                'x_scale': sf, 'y_scale': sf,
+                'x_offset': (tw - ow * sf) / 2,
+                'y_offset': (th - oh * sf) / 2,
                 'url': try_url
             }
         except Exception:
@@ -368,7 +365,7 @@ def get_image_cached(item, s3_base_url):
                 'image_data': BytesIO(c['raw_bytes']),
                 'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
                 'x_offset': c['x_offset'], 'y_offset': c['y_offset'],
-                'object_position': 3
+                'object_position': 1, 'url': c['url']
             }
 
     # Try STYLE+OVERRIDES first (primary — matches frontend)
@@ -389,7 +386,7 @@ def get_image_cached(item, s3_base_url):
             'image_data': BytesIO(result['raw_bytes']),
             'x_scale': result['x_scale'], 'y_scale': result['y_scale'],
             'x_offset': result['x_offset'], 'y_offset': result['y_offset'],
-            'object_position': 3
+            'object_position': 1, 'url': result['url']
         }
     return None
 
@@ -430,7 +427,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
                                 'image_data': BytesIO(cached['raw_bytes']),
                                 'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
                                 'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
-                                'object_position': 3
+                                'object_position': 1, 'url': cached['url']
                             }
             except Exception:
                 pass
@@ -582,7 +579,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
                     'image_data': img['image_data'],
                     'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
                     'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
-                    'object_position': 3
+                    'object_position': 1, 'url': img.get('url', '')
                 })
             except Exception:
                 worksheet.write(row, 0, "Error", cf)
