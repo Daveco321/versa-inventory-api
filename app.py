@@ -53,9 +53,12 @@ S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+I
 DROPBOX_URL = os.environ.get('DROPBOX_URL',
     'https://www.dropbox.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&dl=1')
 
-TARGET_W = 150
-TARGET_H = 150
 COL_WIDTH_UNITS = 22
+# Cell pixel dimensions (for image fitting):
+#   Column: 22 char units ≈ 159px, Row: 112.5pt ≈ 150px
+#   Match original 150x150 display area exactly
+CELL_PX_W = 150
+CELL_PX_H = 150
 
 BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
@@ -288,8 +291,9 @@ def get_style_override_url(sku):
     return f"{S3_OVERRIDES_IMG_URL}/{base_style}.jpg"
 
 
-def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
-    """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions"""
+def _process_image_from_url(url):
+    """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions.
+    Resizes to exact cell pixel dimensions so object_position:1 scales cleanly."""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
 
@@ -308,7 +312,14 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
 
             with PilImage.open(BytesIO(resp.content)) as im:
                 im = ImageOps.exif_transpose(im)
-                im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
+
+                # Resize to fit exactly within cell pixel dimensions (maintain aspect ratio)
+                cpw, cph = CELL_PX_W, CELL_PX_H
+                iw, ih = im.size
+                scale = min(cpw / iw, cph / ih)
+                new_w = int(iw * scale)
+                new_h = int(ih * scale)
+                im = im.resize((new_w, new_h), PilImage.Resampling.LANCZOS)
 
                 fmt = "PNG"
                 if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
@@ -321,16 +332,14 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
                 buf = BytesIO()
                 im.save(buf, format=fmt, quality=85, optimize=True)
                 raw = buf.getvalue()
-                ow, oh = im.size
 
-            wr = tw / ow
-            hr = th / oh
-            sf = min(wr, hr)
+            # Center the image in the cell
+            x_off = max(0, (cpw - new_w) / 2)
+            y_off = max(0, (cph - new_h) / 2)
             return {
                 'raw_bytes': raw,
-                'x_scale': sf, 'y_scale': sf,
-                'x_offset': (tw - ow * sf) / 2,
-                'y_offset': (th - oh * sf) / 2,
+                'x_scale': 1, 'y_scale': 1,
+                'x_offset': x_off, 'y_offset': y_off,
                 'url': try_url
             }
         except Exception:
