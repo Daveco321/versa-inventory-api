@@ -62,10 +62,11 @@ DROPBOX_URL = os.environ.get('DROPBOX_URL',
     'https://www.dropbox.com/scl/fi/de3nzb66mx41un0j69kyk/Inventory_ATS.xlsx?rlkey=ihoxu4s7gpb5ei14w2cl9dvyw&dl=1')
 
 COL_WIDTH_UNITS = 22
-# Cell pixel dimensions (for image fitting):
-#   Column: 22 char units ≈ 159px, Row: 112.5pt ≈ 150px
-#   Match original 150x150 display area exactly
-CELL_PX_W = 150
+# Cell pixel dimensions for image canvas:
+#   Column: 22 char units ≈ 165px (7.5px per unit)
+#   Row: 112.5pt ≈ 150px
+# Image must fill full cell for object_position:1 to scale with BOTH row and column
+CELL_PX_W = 165
 CELL_PX_H = 150
 
 BRAND_IMAGE_PREFIX = {
@@ -301,7 +302,9 @@ def get_style_override_url(sku):
 
 def _process_image_from_url(url):
     """Download and resize an image from URL, trying .jpg/.png/.jpeg extensions.
-    Resizes to exact cell pixel dimensions so object_position:1 scales cleanly."""
+    Creates a cell-sized canvas with the product image centered on it.
+    This ensures the image fills the entire cell so object_position:1
+    scales correctly when resizing BOTH rows and columns."""
     if not (isinstance(url, str) and url.startswith('http')):
         return None
 
@@ -321,33 +324,31 @@ def _process_image_from_url(url):
             with PilImage.open(BytesIO(resp.content)) as im:
                 im = ImageOps.exif_transpose(im)
 
-                # Resize to fit exactly within cell pixel dimensions (maintain aspect ratio)
                 cpw, cph = CELL_PX_W, CELL_PX_H
+
+                # Resize product image to fit within cell (maintain aspect ratio)
                 iw, ih = im.size
                 scale = min(cpw / iw, cph / ih)
                 new_w = int(iw * scale)
                 new_h = int(ih * scale)
                 im = im.resize((new_w, new_h), PilImage.Resampling.LANCZOS)
 
-                fmt = "PNG"
-                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-                    fmt = "PNG"
-                else:
-                    if im.mode != "RGB":
-                        im = im.convert("RGB")
-                    fmt = "JPEG"
+                # Create white canvas at exact cell dimensions, paste product centered
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                canvas = PilImage.new("RGB", (cpw, cph), (255, 255, 255))
+                paste_x = (cpw - new_w) // 2
+                paste_y = (cph - new_h) // 2
+                canvas.paste(im, (paste_x, paste_y))
 
                 buf = BytesIO()
-                im.save(buf, format=fmt, quality=85, optimize=True)
+                canvas.save(buf, format="JPEG", quality=85, optimize=True)
                 raw = buf.getvalue()
 
-            # Center the image in the cell
-            x_off = max(0, (cpw - new_w) / 2)
-            y_off = max(0, (cph - new_h) / 2)
             return {
                 'raw_bytes': raw,
                 'x_scale': 1, 'y_scale': 1,
-                'x_offset': x_off, 'y_offset': y_off,
+                'x_offset': 0, 'y_offset': 0,
                 'url': try_url
             }
         except Exception:
