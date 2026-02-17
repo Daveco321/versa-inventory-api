@@ -598,64 +598,78 @@ def get_dropbox_image_bytes(image_code):
 
 
 def prewarm_dropbox_cache():
-    """Background job: download ALL Dropbox images to disk cache."""
-    if not _dropbox_photo_index:
-        return
-
-    # Count how many are already cached
-    already_cached = 0
-    to_download = []
-    for key in _dropbox_photo_index:
-        disk_path = _get_disk_cache_path(key)
-        if os.path.exists(disk_path + '.jpg') or os.path.exists(disk_path + '.png'):
-            already_cached += 1
-        else:
-            to_download.append(key)
-
-    total = len(_dropbox_photo_index)
-    print(f"[Dropbox Pre-warm] {already_cached}/{total} already cached, downloading {len(to_download)} remaining...", flush=True)
-
-    if not to_download:
-        print(f"[Dropbox Pre-warm] ✓ All {total} images already cached on disk", flush=True)
-        return
-
-    downloaded = 0
-    failed = 0
-
-    def _download_one(key):
-        nonlocal downloaded, failed
-        dropbox_path = _dropbox_photo_index.get(key)
-        if not dropbox_path:
-            return
-        data, ct = _download_dropbox_file(dropbox_path)
-        if data:
-            ext = '.png' if 'png' in ct else '.jpg'
-            try:
-                disk_path = _get_disk_cache_path(key)
-                with open(disk_path + ext, 'wb') as f:
-                    f.write(data)
-                downloaded += 1
-            except Exception:
-                failed += 1
-        else:
-            failed += 1
-
-        # Progress update every 100 images
-        done = downloaded + failed
-        if done % 100 == 0:
-            print(f"[Dropbox Pre-warm] Progress: {done}/{len(to_download)} ({downloaded} ok, {failed} failed)", flush=True)
-
-    # Use gevent pool for parallel downloads
+    """Background job: download ALL Dropbox images to disk cache. Only one worker runs this."""
+    # Use a file lock so only one worker pre-warms
+    lock_file = '/tmp/dropbox_prewarm.lock'
     try:
-        from gevent.pool import Pool
-        pool = Pool(size=10)  # 10 concurrent downloads
-        pool.map(_download_one, to_download)
-    except ImportError:
-        # Fallback to sequential
-        for key in to_download:
-            _download_one(key)
+        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        print(f"[Dropbox Pre-warm] Another worker is already pre-warming, skipping", flush=True)
+        return
 
-    print(f"[Dropbox Pre-warm] ✓ Done! {downloaded} downloaded, {failed} failed, {already_cached + downloaded}/{total} total cached", flush=True)
+    try:
+        if not _dropbox_photo_index:
+            return
+
+        # Count how many are already cached
+        already_cached = 0
+        to_download = []
+        for key in _dropbox_photo_index:
+            disk_path = _get_disk_cache_path(key)
+            if os.path.exists(disk_path + '.jpg') or os.path.exists(disk_path + '.png'):
+                already_cached += 1
+            else:
+                to_download.append(key)
+
+        total = len(_dropbox_photo_index)
+        print(f"[Dropbox Pre-warm] {already_cached}/{total} already cached, downloading {len(to_download)} remaining...", flush=True)
+
+        if not to_download:
+            print(f"[Dropbox Pre-warm] ✓ All {total} images already cached on disk", flush=True)
+            return
+
+        downloaded = [0]
+        failed = [0]
+
+        def _download_one(key):
+            dropbox_path = _dropbox_photo_index.get(key)
+            if not dropbox_path:
+                return
+            data, ct = _download_dropbox_file(dropbox_path)
+            if data:
+                ext = '.png' if 'png' in ct else '.jpg'
+                try:
+                    disk_path = _get_disk_cache_path(key)
+                    with open(disk_path + ext, 'wb') as f:
+                        f.write(data)
+                    downloaded[0] += 1
+                except Exception:
+                    failed[0] += 1
+            else:
+                failed[0] += 1
+
+            # Progress update every 200 images
+            done = downloaded[0] + failed[0]
+            if done % 200 == 0:
+                print(f"[Dropbox Pre-warm] Progress: {done}/{len(to_download)} ({downloaded[0]} ok, {failed[0]} failed)", flush=True)
+
+        # Use gevent pool — only 3 concurrent to limit memory
+        try:
+            from gevent.pool import Pool
+            pool = Pool(size=3)
+            pool.map(_download_one, to_download)
+        except ImportError:
+            for key in to_download:
+                _download_one(key)
+
+        print(f"[Dropbox Pre-warm] ✓ Done! {downloaded[0]} downloaded, {failed[0]} failed, {already_cached + downloaded[0]}/{total} total cached", flush=True)
+    finally:
+        try:
+            os.unlink(lock_file)
+        except Exception:
+            pass
 
 
 def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
