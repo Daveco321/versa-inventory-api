@@ -392,6 +392,48 @@ def sync_dropbox_photos():
         if resp.status_code == 401:
             print(f"[Dropbox Photos] Auth failed (401) — token may be expired", flush=True)
             return
+
+        # If path not found, try to discover it
+        if resp.status_code == 409:
+            print(f"[Dropbox Photos] Path '{DROPBOX_PHOTOS_PATH}' not found, searching root...", flush=True)
+            # List root to find the right folder
+            root_resp = http_requests.post(
+                'https://api.dropboxapi.com/2/files/list_folder',
+                headers=headers,
+                json={'path': '', 'recursive': False, 'limit': 500},
+                timeout=30
+            )
+            if root_resp.status_code == 200:
+                root_data = root_resp.json()
+                folders = [e['path_display'] for e in root_data.get('entries', []) if e['.tag'] == 'folder']
+                print(f"[Dropbox Photos] Root folders: {folders}", flush=True)
+                # Try to find PHOTOS INVENTORY anywhere
+                for folder in folders:
+                    sub_resp = http_requests.post(
+                        'https://api.dropboxapi.com/2/files/list_folder',
+                        headers=headers,
+                        json={'path': folder, 'recursive': False, 'limit': 500},
+                        timeout=30
+                    )
+                    if sub_resp.status_code == 200:
+                        sub_data = sub_resp.json()
+                        sub_folders = [e['path_display'] for e in sub_data.get('entries', []) if e['.tag'] == 'folder']
+                        for sf in sub_folders:
+                            if 'photo' in sf.lower() and 'inventory' in sf.lower():
+                                print(f"[Dropbox Photos] Found photos folder: {sf}", flush=True)
+                                # Re-do the listing with discovered path
+                                payload['path'] = sf
+                                resp = http_requests.post(
+                                    'https://api.dropboxapi.com/2/files/list_folder',
+                                    headers=headers, json=payload, timeout=60
+                                )
+                                break
+                        if resp.status_code == 200:
+                            break
+            if resp.status_code != 200:
+                print(f"[Dropbox Photos] Could not find photos folder. API response: {resp.text[:300]}", flush=True)
+                return
+
         if resp.status_code != 200:
             print(f"[Dropbox Photos] API error: {resp.status_code} {resp.text[:200]}", flush=True)
             return
