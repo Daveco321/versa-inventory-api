@@ -502,7 +502,7 @@ def sync_dropbox_photos():
 # Cache for downloaded Dropbox images — disk-based for persistence across requests
 _dropbox_img_cache = {}  # image_code → (bytes, content_type) — small in-memory LRU for hot images
 _dropbox_img_cache_lock = threading.Lock()
-DROPBOX_DISK_CACHE = '/tmp/dropbox_cache'
+DROPBOX_DISK_CACHE = os.environ.get('DROPBOX_DISK_CACHE', '/var/data/dropbox_cache')
 os.makedirs(DROPBOX_DISK_CACHE, exist_ok=True)
 
 
