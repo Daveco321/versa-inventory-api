@@ -499,9 +499,11 @@ def sync_dropbox_photos():
         traceback.print_exc()
 
 
-# Cache for downloaded Dropbox images (raw bytes)
-_dropbox_img_cache = {}  # image_code → (bytes, content_type)
+# Cache for downloaded Dropbox images — disk-based for persistence across requests
+_dropbox_img_cache = {}  # image_code → (bytes, content_type) — small in-memory LRU for hot images
 _dropbox_img_cache_lock = threading.Lock()
+DROPBOX_DISK_CACHE = '/tmp/dropbox_cache'
+os.makedirs(DROPBOX_DISK_CACHE, exist_ok=True)
 
 
 def _download_dropbox_file(dropbox_path):
@@ -528,11 +530,16 @@ def _download_dropbox_file(dropbox_path):
     return None, None
 
 
+def _get_disk_cache_path(image_code):
+    """Get the disk cache file path for an image code."""
+    return os.path.join(DROPBOX_DISK_CACHE, image_code)
+
+
 def get_dropbox_image_bytes(image_code):
-    """Get raw image bytes from Dropbox (cached). Returns (bytes, content_type) or (None, None)."""
+    """Get raw image bytes from Dropbox (disk-cached). Returns (bytes, content_type) or (None, None)."""
     key = image_code.upper().replace('-', '_')
 
-    # Check cache first
+    # 1. Check in-memory hot cache
     with _dropbox_img_cache_lock:
         cached = _dropbox_img_cache.get(key, 'MISS')
     if cached is None:
@@ -540,24 +547,115 @@ def get_dropbox_image_bytes(image_code):
     if cached != 'MISS':
         return cached
 
-    # Check if this image exists in the index
+    # 2. Check disk cache
+    disk_path = _get_disk_cache_path(key)
+    if os.path.exists(disk_path + '.jpg'):
+        try:
+            with open(disk_path + '.jpg', 'rb') as f:
+                data = f.read()
+            result = (data, 'image/jpeg')
+            with _dropbox_img_cache_lock:
+                if len(_dropbox_img_cache) > 200:
+                    _dropbox_img_cache.clear()
+                _dropbox_img_cache[key] = result
+            return result
+        except Exception:
+            pass
+    elif os.path.exists(disk_path + '.png'):
+        try:
+            with open(disk_path + '.png', 'rb') as f:
+                data = f.read()
+            result = (data, 'image/png')
+            with _dropbox_img_cache_lock:
+                if len(_dropbox_img_cache) > 200:
+                    _dropbox_img_cache.clear()
+                _dropbox_img_cache[key] = result
+            return result
+        except Exception:
+            pass
+
+    # 3. Check if this image exists in the index
     dropbox_path = _dropbox_photo_index.get(key)
     if not dropbox_path:
         return None, None
 
-    # Download on demand
+    # 4. Download on demand and save to disk
     data, ct = _download_dropbox_file(dropbox_path)
+    if data:
+        ext = '.png' if 'png' in ct else '.jpg'
+        try:
+            with open(disk_path + ext, 'wb') as f:
+                f.write(data)
+        except Exception:
+            pass
+        with _dropbox_img_cache_lock:
+            if len(_dropbox_img_cache) > 200:
+                _dropbox_img_cache.clear()
+            _dropbox_img_cache[key] = (data, ct)
+        return data, ct
 
-    # Cache result (even failures to avoid re-downloading)
-    with _dropbox_img_cache_lock:
-        if len(_dropbox_img_cache) > 2000:
-            # Evict oldest ~500 entries
-            keys = list(_dropbox_img_cache.keys())[:500]
-            for k in keys:
-                del _dropbox_img_cache[k]
-        _dropbox_img_cache[key] = (data, ct) if data else None
+    return None, None
 
-    return data, ct if data else (None, None)
+
+def prewarm_dropbox_cache():
+    """Background job: download ALL Dropbox images to disk cache."""
+    if not _dropbox_photo_index:
+        return
+
+    # Count how many are already cached
+    already_cached = 0
+    to_download = []
+    for key in _dropbox_photo_index:
+        disk_path = _get_disk_cache_path(key)
+        if os.path.exists(disk_path + '.jpg') or os.path.exists(disk_path + '.png'):
+            already_cached += 1
+        else:
+            to_download.append(key)
+
+    total = len(_dropbox_photo_index)
+    print(f"[Dropbox Pre-warm] {already_cached}/{total} already cached, downloading {len(to_download)} remaining...", flush=True)
+
+    if not to_download:
+        print(f"[Dropbox Pre-warm] ✓ All {total} images already cached on disk", flush=True)
+        return
+
+    downloaded = 0
+    failed = 0
+
+    def _download_one(key):
+        nonlocal downloaded, failed
+        dropbox_path = _dropbox_photo_index.get(key)
+        if not dropbox_path:
+            return
+        data, ct = _download_dropbox_file(dropbox_path)
+        if data:
+            ext = '.png' if 'png' in ct else '.jpg'
+            try:
+                disk_path = _get_disk_cache_path(key)
+                with open(disk_path + ext, 'wb') as f:
+                    f.write(data)
+                downloaded += 1
+            except Exception:
+                failed += 1
+        else:
+            failed += 1
+
+        # Progress update every 100 images
+        done = downloaded + failed
+        if done % 100 == 0:
+            print(f"[Dropbox Pre-warm] Progress: {done}/{len(to_download)} ({downloaded} ok, {failed} failed)", flush=True)
+
+    # Use gevent pool for parallel downloads
+    try:
+        from gevent.pool import Pool
+        pool = Pool(size=10)  # 10 concurrent downloads
+        pool.map(_download_one, to_download)
+    except ImportError:
+        # Fallback to sequential
+        for key in to_download:
+            _download_one(key)
+
+    print(f"[Dropbox Pre-warm] ✓ Done! {downloaded} downloaded, {failed} failed, {already_cached + downloaded}/{total} total cached", flush=True)
 
 
 def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
@@ -1388,6 +1486,7 @@ def health():
         "images_cached": img_count,
         "images_found": img_found,
         "dropbox_photos_indexed": len(_dropbox_photo_index),
+        "dropbox_photos_cached": len([f for f in os.listdir(DROPBOX_DISK_CACHE) if f.endswith(('.jpg', '.png'))]) if os.path.exists(DROPBOX_DISK_CACHE) else 0,
         "dropbox_photos_last_sync": _dropbox_photos_last_sync,
     })
 
@@ -1842,10 +1941,13 @@ def dropbox_photo_list():
 
 @app.route('/dropbox-photos/sync', methods=['POST', 'OPTIONS'])
 def trigger_dropbox_photo_sync():
-    """Manually trigger Dropbox photo sync."""
+    """Manually trigger Dropbox photo sync + pre-warm."""
     if request.method == 'OPTIONS':
         return '', 204
-    threading.Thread(target=sync_dropbox_photos, daemon=True).start()
+    def _sync_and_warm():
+        sync_dropbox_photos()
+        prewarm_dropbox_cache()
+    threading.Thread(target=_sync_and_warm, daemon=True).start()
     return jsonify({'status': 'sync_started', 'current_count': len(_dropbox_photo_index)})
 
 
@@ -1912,6 +2014,10 @@ def startup_sync():
     if DROPBOX_PHOTOS_TOKEN:
         print("  → Syncing Dropbox photos index...", flush=True)
         sync_dropbox_photos()
+        # Start background pre-warm of all images to disk
+        if _dropbox_photo_index:
+            import threading as _th
+            _th.Thread(target=prewarm_dropbox_cache, daemon=True).start()
 
     # Sync inventory: Dropbox first, then S3 fallback
     try:
