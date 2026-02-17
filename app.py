@@ -367,19 +367,31 @@ def sync_dropbox_photos():
     try:
         import zipfile
         import shutil
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-        # Ensure dl=1 for direct ZIP download
+        # Clean the URL: ensure dl=1, remove session-specific 'st' parameter
         url = DROPBOX_PHOTOS_URL
-        if 'dl=0' in url:
-            url = url.replace('dl=0', 'dl=1')
-        elif 'dl=1' not in url:
-            url += ('&' if '?' in url else '?') + 'dl=1'
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params.pop('st', None)      # Remove session token (expires)
+        params['dl'] = ['1']         # Force direct download
+        clean_query = urlencode({k: v[0] for k, v in params.items()})
+        url = urlunparse(parsed._replace(query=clean_query))
 
         print(f"[Dropbox Photos] Downloading ZIP from Dropbox...")
+        print(f"[Dropbox Photos] URL: {url[:80]}...")
         resp = http_requests.get(url, stream=True, timeout=600, allow_redirects=True)
+
+        print(f"[Dropbox Photos] Response status: {resp.status_code}")
+        print(f"[Dropbox Photos] Content-Type: {resp.headers.get('Content-Type', 'unknown')}")
 
         if resp.status_code != 200:
             print(f"[Dropbox Photos] Download failed: HTTP {resp.status_code}")
+            return
+
+        ct = resp.headers.get('Content-Type', '').lower()
+        if 'html' in ct:
+            print(f"[Dropbox Photos] Got HTML instead of ZIP — link may require auth or has expired")
             return
 
         # Save to temp file
@@ -392,6 +404,12 @@ def sync_dropbox_photos():
 
         print(f"[Dropbox Photos] Downloaded {total_bytes / 1024 / 1024:.1f} MB")
 
+        if total_bytes < 1000:
+            print(f"[Dropbox Photos] File too small ({total_bytes} bytes) — probably not a valid ZIP")
+            with open(tmp_path, 'r', errors='replace') as f:
+                print(f"[Dropbox Photos] Content preview: {f.read(500)}")
+            return
+
         # Extract
         extract_dir = '/tmp/dropbox_photos'
         if os.path.exists(extract_dir):
@@ -399,13 +417,16 @@ def sync_dropbox_photos():
         os.makedirs(extract_dir, exist_ok=True)
 
         with zipfile.ZipFile(tmp_path, 'r') as z:
+            extracted = 0
             for info in z.infolist():
                 if info.is_dir():
                     continue
                 lower = info.filename.lower()
-                # Only extract image files, skip "1x" folder
-                if lower.endswith(('.jpg', '.jpeg', '.png')) and '/1x/' not in lower:
+                # Only extract image files, skip "1x" folder and macOS metadata
+                if lower.endswith(('.jpg', '.jpeg', '.png')) and '/1x/' not in lower and '__macosx' not in lower:
                     z.extract(info, extract_dir)
+                    extracted += 1
+            print(f"[Dropbox Photos] Extracted {extracted} image files from ZIP")
 
         # Clean up zip
         try:
