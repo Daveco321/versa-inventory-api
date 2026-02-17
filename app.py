@@ -63,7 +63,7 @@ DROPBOX_URL = os.environ.get('DROPBOX_URL',
 
 # Dropbox shared folder link for PHOTOS INVENTORY (daily image sync)
 DROPBOX_PHOTOS_URL = os.environ.get('DROPBOX_PHOTOS_URL', '')
-DROPBOX_PHOTOS_TOKEN = os.environ.get('DROPBOX_PHOTOS_TOKEN', '').strip()
+DROPBOX_PHOTOS_TOKEN = re.sub(r'\s+', '', os.environ.get('DROPBOX_PHOTOS_TOKEN', ''))
 DROPBOX_PHOTOS_PATH = os.environ.get('DROPBOX_PHOTOS_PATH', '/Versa Share Files/PHOTOS INVENTORY')
 DROPBOX_PHOTOS_SYNC_HOURS = int(os.environ.get('DROPBOX_PHOTOS_SYNC_HOURS', 24))
 
@@ -363,11 +363,12 @@ def sync_dropbox_photos():
     """List files in Dropbox PHOTOS INVENTORY folder via API — just metadata, no downloading."""
     global _dropbox_photo_index, _dropbox_photos_last_sync
     if not DROPBOX_PHOTOS_TOKEN:
-        print("[Dropbox Photos] No DROPBOX_PHOTOS_TOKEN configured, skipping")
+        print("[Dropbox Photos] No DROPBOX_PHOTOS_TOKEN configured, skipping", flush=True)
         return
 
     try:
-        print(f"[Dropbox Photos] Listing files via API in: {DROPBOX_PHOTOS_PATH}")
+        print(f"[Dropbox Photos] Listing files via API in: {DROPBOX_PHOTOS_PATH}", flush=True)
+        print(f"[Dropbox Photos] Token length: {len(DROPBOX_PHOTOS_TOKEN)}", flush=True)
         headers = {
             'Authorization': f'Bearer {DROPBOX_PHOTOS_TOKEN}',
             'Content-Type': 'application/json'
@@ -389,10 +390,10 @@ def sync_dropbox_photos():
         )
 
         if resp.status_code == 401:
-            print(f"[Dropbox Photos] Auth failed (401) — token may be expired")
+            print(f"[Dropbox Photos] Auth failed (401) — token may be expired", flush=True)
             return
         if resp.status_code != 200:
-            print(f"[Dropbox Photos] API error: {resp.status_code} {resp.text[:200]}")
+            print(f"[Dropbox Photos] API error: {resp.status_code} {resp.text[:200]}", flush=True)
             return
 
         data = resp.json()
@@ -435,7 +436,7 @@ def sync_dropbox_photos():
                 timeout=60
             )
             if resp.status_code != 200:
-                print(f"[Dropbox Photos] Continue error: {resp.status_code}")
+                print(f"[Dropbox Photos] Continue error: {resp.status_code}", flush=True)
                 break
             data = resp.json()
 
@@ -448,10 +449,10 @@ def sync_dropbox_photos():
         _web_img_cache.clear()
         _img_cache.clear()
 
-        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files)")
+        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files)", flush=True)
 
     except Exception as e:
-        print(f"[Dropbox Photos] Error: {e}")
+        print(f"[Dropbox Photos] Error: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
@@ -1805,13 +1806,15 @@ def startup_sync():
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
     print(f"  Dropbox URL configured: {'YES' if DROPBOX_URL else 'NO'}")
     print(f"  Dropbox Photos Token configured: {'YES' if DROPBOX_PHOTOS_TOKEN else 'NO'}")
+    if DROPBOX_PHOTOS_TOKEN:
+        print(f"  Dropbox Photos Token length: {len(DROPBOX_PHOTOS_TOKEN)}, starts: {DROPBOX_PHOTOS_TOKEN[:10]}..., ends: ...{DROPBOX_PHOTOS_TOKEN[-10:]}")
     print("="*60)
 
     load_overrides_from_s3()
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
     if DROPBOX_PHOTOS_TOKEN:
-        print("  → Syncing Dropbox photos index...")
+        print("  → Syncing Dropbox photos index...", flush=True)
         sync_dropbox_photos()
 
     # Sync inventory: Dropbox first, then S3 fallback
