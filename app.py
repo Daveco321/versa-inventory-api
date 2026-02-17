@@ -63,6 +63,8 @@ DROPBOX_URL = os.environ.get('DROPBOX_URL',
 
 # Dropbox shared folder link for PHOTOS INVENTORY (daily image sync)
 DROPBOX_PHOTOS_URL = os.environ.get('DROPBOX_PHOTOS_URL', '')
+DROPBOX_PHOTOS_TOKEN = os.environ.get('DROPBOX_PHOTOS_TOKEN', '')
+DROPBOX_PHOTOS_PATH = os.environ.get('DROPBOX_PHOTOS_PATH', '/Versa Share Files/PHOTOS INVENTORY')
 DROPBOX_PHOTOS_SYNC_HOURS = int(os.environ.get('DROPBOX_PHOTOS_SYNC_HOURS', 24))
 
 TARGET_W = 150
@@ -358,110 +360,95 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
 
 
 def sync_dropbox_photos():
-    """Download Dropbox PHOTOS INVENTORY folder as ZIP, extract & index images."""
+    """List files in Dropbox PHOTOS INVENTORY folder via API — just metadata, no downloading."""
     global _dropbox_photo_index, _dropbox_photos_last_sync
-    if not DROPBOX_PHOTOS_URL:
-        print("[Dropbox Photos] No DROPBOX_PHOTOS_URL configured, skipping")
+    if not DROPBOX_PHOTOS_TOKEN:
+        print("[Dropbox Photos] No DROPBOX_PHOTOS_TOKEN configured, skipping")
         return
 
     try:
-        import zipfile
-        import shutil
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        print(f"[Dropbox Photos] Listing files via API in: {DROPBOX_PHOTOS_PATH}")
+        headers = {
+            'Authorization': f'Bearer {DROPBOX_PHOTOS_TOKEN}',
+            'Content-Type': 'application/json'
+        }
 
-        # Clean the URL: ensure dl=1, remove session-specific 'st' parameter
-        url = DROPBOX_PHOTOS_URL
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params.pop('st', None)      # Remove session token (expires)
-        params['dl'] = ['1']         # Force direct download
-        clean_query = urlencode({k: v[0] for k, v in params.items()})
-        url = urlunparse(parsed._replace(query=clean_query))
+        new_index = {}  # image_code (uppercase) → dropbox_path
+        cursor = None
+        total_files = 0
 
-        print(f"[Dropbox Photos] Downloading ZIP from Dropbox...")
-        print(f"[Dropbox Photos] URL: {url[:80]}...")
-        resp = http_requests.get(url, stream=True, timeout=600, allow_redirects=True)
+        # Initial list_folder call
+        payload = {
+            'path': DROPBOX_PHOTOS_PATH,
+            'recursive': True,
+            'limit': 2000
+        }
+        resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers, json=payload, timeout=60
+        )
 
-        print(f"[Dropbox Photos] Response status: {resp.status_code}")
-        print(f"[Dropbox Photos] Content-Type: {resp.headers.get('Content-Type', 'unknown')}")
-
+        if resp.status_code == 401:
+            print(f"[Dropbox Photos] Auth failed (401) — token may be expired")
+            return
         if resp.status_code != 200:
-            print(f"[Dropbox Photos] Download failed: HTTP {resp.status_code}")
+            print(f"[Dropbox Photos] API error: {resp.status_code} {resp.text[:200]}")
             return
 
-        ct = resp.headers.get('Content-Type', '').lower()
-        if 'html' in ct:
-            print(f"[Dropbox Photos] Got HTML instead of ZIP — link may require auth or has expired")
-            return
+        data = resp.json()
 
-        # Save to temp file
-        tmp_path = '/tmp/dropbox_photos_download.zip'
-        total_bytes = 0
-        with open(tmp_path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-                total_bytes += len(chunk)
-
-        print(f"[Dropbox Photos] Downloaded {total_bytes / 1024 / 1024:.1f} MB")
-
-        if total_bytes < 1000:
-            print(f"[Dropbox Photos] File too small ({total_bytes} bytes) — probably not a valid ZIP")
-            with open(tmp_path, 'r', errors='replace') as f:
-                print(f"[Dropbox Photos] Content preview: {f.read(500)}")
-            return
-
-        # Extract
-        extract_dir = '/tmp/dropbox_photos'
-        if os.path.exists(extract_dir):
-            shutil.rmtree(extract_dir)
-        os.makedirs(extract_dir, exist_ok=True)
-
-        with zipfile.ZipFile(tmp_path, 'r') as z:
-            extracted = 0
-            for info in z.infolist():
-                if info.is_dir():
+        while True:
+            for entry in data.get('entries', []):
+                if entry['.tag'] != 'file':
                     continue
-                lower = info.filename.lower()
-                # Only extract image files, skip "1x" folder and macOS metadata
-                if lower.endswith(('.jpg', '.jpeg', '.png')) and '/1x/' not in lower and '__macosx' not in lower:
-                    z.extract(info, extract_dir)
-                    extracted += 1
-            print(f"[Dropbox Photos] Extracted {extracted} image files from ZIP")
+                name = entry['name']
+                path_lower = entry['path_lower']
+                lower = name.lower()
 
-        # Clean up zip
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-        # Build index keyed by image code (uppercase, no extension)
-        new_index = {}
-        for root, dirs, files in os.walk(extract_dir):
-            for f in files:
-                lower = f.lower()
+                # Only image files, skip 1x folder and macOS metadata
                 if not lower.endswith(('.jpg', '.jpeg', '.png')):
                     continue
-                name_no_ext = os.path.splitext(f)[0]
+                if '/1x/' in path_lower or '__macosx' in path_lower:
+                    continue
+
+                name_no_ext = os.path.splitext(name)[0]
                 # Clean: remove " copy", " Copy 2", etc.
                 clean = re.sub(r'\s*copy\s*\d*$', '', name_no_ext, flags=re.IGNORECASE).strip()
                 # Normalize separators: both - and _ → _
                 clean = clean.replace('-', '_')
                 key = clean.upper()
-                full_path = os.path.join(root, f)
+
+                # Store the Dropbox path (for on-demand download)
                 # Prefer .jpg over .png if duplicates exist
                 if key not in new_index or lower.endswith('.jpg'):
-                    new_index[key] = full_path
+                    new_index[key] = entry['path_display']
+                total_files += 1
+
+            if not data.get('has_more'):
+                break
+
+            # Continue listing
+            resp = http_requests.post(
+                'https://api.dropboxapi.com/2/files/list_folder/continue',
+                headers=headers,
+                json={'cursor': data['cursor']},
+                timeout=60
+            )
+            if resp.status_code != 200:
+                print(f"[Dropbox Photos] Continue error: {resp.status_code}")
+                break
+            data = resp.json()
 
         with _dropbox_photo_lock:
             _dropbox_photo_index = new_index
             _dropbox_photos_last_sync = time.time()
 
-        # Clear caches so they rebuild with fresh Dropbox images
-        _dropbox_thumb_cache.clear()
+        # Clear image caches so they rebuild with Dropbox awareness
+        _dropbox_img_cache.clear()
         _web_img_cache.clear()
         _img_cache.clear()
 
-        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} images from Dropbox")
+        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files)")
 
     except Exception as e:
         print(f"[Dropbox Photos] Error: {e}")
@@ -469,37 +456,84 @@ def sync_dropbox_photos():
         traceback.print_exc()
 
 
+# Cache for downloaded Dropbox images (raw bytes)
+_dropbox_img_cache = {}  # image_code → (bytes, content_type)
+_dropbox_img_cache_lock = threading.Lock()
+
+
+def _download_dropbox_file(dropbox_path):
+    """Download a single file from Dropbox via API."""
+    if not DROPBOX_PHOTOS_TOKEN:
+        return None, None
+    try:
+        headers = {
+            'Authorization': f'Bearer {DROPBOX_PHOTOS_TOKEN}',
+            'Dropbox-API-Arg': json.dumps({'path': dropbox_path})
+        }
+        resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers=headers, timeout=30
+        )
+        if resp.status_code == 200:
+            ct = resp.headers.get('Content-Type', 'application/octet-stream').lower()
+            if 'image' not in ct:
+                ext = dropbox_path.lower().rsplit('.', 1)[-1]
+                ct = 'image/jpeg' if ext in ('jpg', 'jpeg') else 'image/png'
+            return resp.content, ct
+    except Exception as e:
+        print(f"[Dropbox Photos] Download error for {dropbox_path}: {e}")
+    return None, None
+
+
 def get_dropbox_image_bytes(image_code):
-    """Get raw image bytes from Dropbox cache. Returns (bytes, content_type) or (None, None)."""
+    """Get raw image bytes from Dropbox (cached). Returns (bytes, content_type) or (None, None)."""
     key = image_code.upper().replace('-', '_')
 
-    path = _dropbox_photo_index.get(key)
-    if not path or not os.path.exists(path):
+    # Check cache first
+    with _dropbox_img_cache_lock:
+        cached = _dropbox_img_cache.get(key, 'MISS')
+    if cached is None:
+        return None, None  # Previously failed
+    if cached != 'MISS':
+        return cached
+
+    # Check if this image exists in the index
+    dropbox_path = _dropbox_photo_index.get(key)
+    if not dropbox_path:
         return None, None
 
-    try:
-        with open(path, 'rb') as f:
-            data = f.read()
-        ext = os.path.splitext(path)[1].lower()
-        ct = 'image/jpeg' if ext in ('.jpg', '.jpeg') else 'image/png'
-        return data, ct
-    except Exception:
-        return None, None
+    # Download on demand
+    data, ct = _download_dropbox_file(dropbox_path)
+
+    # Cache result (even failures to avoid re-downloading)
+    with _dropbox_img_cache_lock:
+        if len(_dropbox_img_cache) > 2000:
+            # Evict oldest ~500 entries
+            keys = list(_dropbox_img_cache.keys())[:500]
+            for k in keys:
+                del _dropbox_img_cache[k]
+        _dropbox_img_cache[key] = (data, ct) if data else None
+
+    return data, ct if data else (None, None)
 
 
 def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
-    """Get resized thumbnail from Dropbox cache for Excel exports."""
+    """Get resized thumbnail from Dropbox for Excel exports."""
     key = image_code.upper().replace('-', '_')
 
     if key in _dropbox_thumb_cache:
         return _dropbox_thumb_cache[key]
 
-    path = _dropbox_photo_index.get(key)
-    if not path or not os.path.exists(path):
+    # Check index first (avoid unnecessary download)
+    if key not in _dropbox_photo_index:
+        return None
+
+    raw_bytes, ct = get_dropbox_image_bytes(image_code)
+    if not raw_bytes:
         return None
 
     try:
-        with PilImage.open(path) as im:
+        with PilImage.open(BytesIO(raw_bytes)) as im:
             im = ImageOps.exif_transpose(im)
             im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
@@ -1576,6 +1610,7 @@ def regenerate_exports():
     with _web_img_lock:
         _web_img_cache.clear()
     _dropbox_thumb_cache.clear()
+    _dropbox_img_cache.clear()
 
     updated = sync_inventory()
     trigger_background_generation()
@@ -1739,7 +1774,7 @@ def hourly_resync():
         print(f"\n  ⏰ Hourly re-sync triggered...")
 
         # Daily Dropbox photo sync
-        if DROPBOX_PHOTOS_URL and (time.time() - _dropbox_photos_last_sync > DROPBOX_PHOTOS_SYNC_HOURS * 3600):
+        if DROPBOX_PHOTOS_TOKEN and (time.time() - _dropbox_photos_last_sync > DROPBOX_PHOTOS_SYNC_HOURS * 3600):
             print(f"  📷 Dropbox photos sync due (every {DROPBOX_PHOTOS_SYNC_HOURS}h)...")
             try:
                 sync_dropbox_photos()
@@ -1769,14 +1804,14 @@ def startup_sync():
     print("\n" + "="*60)
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
     print(f"  Dropbox URL configured: {'YES' if DROPBOX_URL else 'NO'}")
-    print(f"  Dropbox Photos URL configured: {'YES' if DROPBOX_PHOTOS_URL else 'NO'}")
+    print(f"  Dropbox Photos Token configured: {'YES' if DROPBOX_PHOTOS_TOKEN else 'NO'}")
     print("="*60)
 
     load_overrides_from_s3()
 
-    # Sync Dropbox photos (before inventory so images are ready for export generation)
-    if DROPBOX_PHOTOS_URL:
-        print("  → Syncing Dropbox photos...")
+    # Sync Dropbox photos index (before inventory so images are ready for export generation)
+    if DROPBOX_PHOTOS_TOKEN:
+        print("  → Syncing Dropbox photos index...")
         sync_dropbox_photos()
 
     # Sync inventory: Dropbox first, then S3 fallback
