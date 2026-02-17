@@ -63,7 +63,7 @@ DROPBOX_URL = os.environ.get('DROPBOX_URL',
 
 # Dropbox shared folder link for PHOTOS INVENTORY (daily image sync)
 DROPBOX_PHOTOS_URL = os.environ.get('DROPBOX_PHOTOS_URL', '')
-DROPBOX_PHOTOS_TOKEN = os.environ.get('DROPBOX_PHOTOS_TOKEN', '')
+DROPBOX_PHOTOS_TOKEN = os.environ.get('DROPBOX_PHOTOS_TOKEN', '').strip()
 DROPBOX_PHOTOS_PATH = os.environ.get('DROPBOX_PHOTOS_PATH', '/Versa Share Files/PHOTOS INVENTORY')
 DROPBOX_PHOTOS_SYNC_HOURS = int(os.environ.get('DROPBOX_PHOTOS_SYNC_HOURS', 24))
 
