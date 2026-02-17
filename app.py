@@ -609,7 +609,7 @@ def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
 def get_image_cached(item, s3_base_url):
     """
     Get image for an item, using cache keyed by base_style.
-    Priority: STYLE+OVERRIDES → brand folder fallback.
+    Priority: base64 override → STYLE+OVERRIDES → Dropbox → brand folder fallback.
     All size variants of the same style share one cache entry.
     """
     sku = item.get('sku', '')
@@ -628,17 +628,56 @@ def get_image_cached(item, s3_base_url):
                 'object_position': 1, 'url': c['url']
             }
 
-    # Try STYLE+OVERRIDES on S3 first (override folder)
-    override_url = get_style_override_url(sku)
-    result = _process_image_from_url(override_url)
+    result = None
 
-    # Try Dropbox photos (priority over S3 brand folder)
+    # 1. Platform base64 override (highest priority)
+    override_data = _style_overrides.get(base_style)
+    if override_data and isinstance(override_data, dict) and override_data.get('image'):
+        try:
+            import base64
+            img_str = override_data['image']
+            # Strip data URI prefix if present
+            if ',' in img_str:
+                img_str = img_str.split(',', 1)[1]
+            raw = base64.b64decode(img_str)
+            with PilImage.open(BytesIO(raw)) as im:
+                im = ImageOps.exif_transpose(im)
+                tw, th = TARGET_W, TARGET_H
+                im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    fmt = "PNG"
+                else:
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    fmt = "JPEG"
+                buf = BytesIO()
+                im.save(buf, format=fmt, quality=85, optimize=True)
+                ow, oh = im.size
+            wr = tw / ow
+            hr = th / oh
+            sf = min(wr, hr)
+            result = {
+                'raw_bytes': buf.getvalue(),
+                'x_scale': sf, 'y_scale': sf,
+                'x_offset': (tw - ow * sf) / 2,
+                'y_offset': (th - oh * sf) / 2,
+                'url': f'override://{base_style}'
+            }
+        except Exception:
+            pass
+
+    # 2. Try STYLE+OVERRIDES on S3
+    if not result:
+        override_url = get_style_override_url(sku)
+        result = _process_image_from_url(override_url)
+
+    # 3. Try Dropbox photos
     if not result:
         brand_abbr = item.get('brand_abbr', item.get('brand', ''))
         image_code = extract_image_code(sku, brand_abbr)
         result = get_dropbox_thumbnail(image_code)
 
-    # Fallback to S3 brand folder
+    # 4. Fallback to S3 brand folder
     if not result:
         brand_url = get_image_url(item, s3_base_url)
         result = _process_image_from_url(brand_url)
@@ -1681,9 +1720,24 @@ _web_img_lock = threading.Lock()
 
 
 def _fetch_raw_image(base_style, brand_abbr):
-    """Download raw image bytes: S3 override → Dropbox → S3 brand folder"""
+    """Download raw image bytes: base64 override → S3 override → Dropbox → S3 brand folder"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     image_code = extract_image_code(base_style, brand_abbr)
+
+    # 0. Platform base64 override (highest priority)
+    override_data = _style_overrides.get(base_style)
+    if override_data and isinstance(override_data, dict) and override_data.get('image'):
+        try:
+            import base64
+            img_str = override_data['image']
+            if ',' in img_str:
+                img_str = img_str.split(',', 1)[1]
+            raw = base64.b64decode(img_str)
+            # Detect content type
+            ct = 'image/png' if raw[:4] == b'\x89PNG' else 'image/jpeg'
+            return raw, ct
+        except Exception:
+            pass
 
     # 1. Try STYLE+OVERRIDES on S3 first
     override_base = f"{S3_OVERRIDES_IMG_URL}/{base_style}"
