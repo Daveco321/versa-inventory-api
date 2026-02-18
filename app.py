@@ -55,6 +55,8 @@ S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_P
 
 # STYLE+OVERRIDES — primary image source (matches frontend logic)
 S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
+S3_DROPBOX_SYNC_PREFIX = 'ALL INVENTORY Photos/DROPBOX_SYNC'
+S3_DROPBOX_SYNC_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/DROPBOX_SYNC"
 
 # Dropbox direct download URL for hourly inventory file
 # Dropbox shared link — will be converted to direct download at runtime
@@ -597,6 +599,25 @@ def get_dropbox_image_bytes(image_code):
     return None, None
 
 
+def _upload_to_s3_sync(image_code, data, content_type):
+    """Upload an image to S3 DROPBOX_SYNC folder for CDN delivery."""
+    try:
+        s3 = get_s3_client()
+        ext = '.png' if 'png' in content_type else '.jpg'
+        key = f"{S3_DROPBOX_SYNC_PREFIX}/{image_code}{ext}"
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+            CacheControl='public, max-age=86400'
+        )
+        return True
+    except Exception as e:
+        print(f"[S3 Sync] Upload failed for {image_code}: {e}")
+        return False
+
+
 def prewarm_dropbox_cache():
     """Background job: download ALL Dropbox images to disk cache. Only one worker runs this."""
     # Use a file lock so only one worker pre-warms
@@ -624,47 +645,95 @@ def prewarm_dropbox_cache():
                 to_download.append(key)
 
         total = len(_dropbox_photo_index)
-        print(f"[Dropbox Pre-warm] {already_cached}/{total} already cached, downloading {len(to_download)} remaining...", flush=True)
+        print(f"[Dropbox Pre-warm] {already_cached}/{total} already cached on disk, {len(to_download)} to download...", flush=True)
 
-        if not to_download:
-            print(f"[Dropbox Pre-warm] ✓ All {total} images already cached on disk", flush=True)
+        # Check which images already exist in S3 DROPBOX_SYNC
+        s3_synced = set()
+        try:
+            s3 = get_s3_client()
+            paginator = s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_DROPBOX_SYNC_PREFIX + '/'):
+                for obj in page.get('Contents', []):
+                    fname = obj['Key'].rsplit('/', 1)[-1]
+                    code = os.path.splitext(fname)[0].upper()
+                    s3_synced.add(code)
+            print(f"[Dropbox Pre-warm] {len(s3_synced)} images already in S3 DROPBOX_SYNC", flush=True)
+        except Exception as e:
+            print(f"[Dropbox Pre-warm] Could not list S3 sync folder: {e}", flush=True)
+
+        # If everything is on disk AND S3, nothing to do
+        if not to_download and s3_synced.issuperset(_dropbox_photo_index.keys()):
+            print(f"[Dropbox Pre-warm] ✓ All {total} images on disk and S3", flush=True)
             return
 
         downloaded = [0]
         failed = [0]
+        s3_uploaded = [0]
 
         def _download_one(key):
             dropbox_path = _dropbox_photo_index.get(key)
             if not dropbox_path:
                 return
-            data, ct = _download_dropbox_file(dropbox_path)
-            if data:
-                ext = '.png' if 'png' in ct else '.jpg'
+
+            # Check if already on disk
+            disk_path = _get_disk_cache_path(key)
+            already_on_disk = os.path.exists(disk_path + '.jpg') or os.path.exists(disk_path + '.png')
+            already_on_s3 = key in s3_synced
+
+            # Skip if both disk and S3 are done
+            if already_on_disk and already_on_s3:
+                return
+
+            # Read from disk if available, otherwise download from Dropbox
+            data = None
+            ct = None
+            if already_on_disk:
                 try:
-                    disk_path = _get_disk_cache_path(key)
-                    with open(disk_path + ext, 'wb') as f:
-                        f.write(data)
-                    downloaded[0] += 1
+                    ext = '.jpg' if os.path.exists(disk_path + '.jpg') else '.png'
+                    with open(disk_path + ext, 'rb') as f:
+                        data = f.read()
+                    ct = 'image/jpeg' if ext == '.jpg' else 'image/png'
                 except Exception:
+                    pass
+
+            if not data:
+                data, ct = _download_dropbox_file(dropbox_path)
+                if data:
+                    ext = '.png' if 'png' in ct else '.jpg'
+                    try:
+                        with open(disk_path + ext, 'wb') as f:
+                            f.write(data)
+                        downloaded[0] += 1
+                    except Exception:
+                        failed[0] += 1
+                        return
+                else:
                     failed[0] += 1
-            else:
-                failed[0] += 1
+                    return
+
+            # Upload to S3 if not already there
+            if not already_on_s3 and data:
+                if _upload_to_s3_sync(key, data, ct):
+                    s3_uploaded[0] += 1
 
             # Progress update every 200 images
-            done = downloaded[0] + failed[0]
-            if done % 200 == 0:
-                print(f"[Dropbox Pre-warm] Progress: {done}/{len(to_download)} ({downloaded[0]} ok, {failed[0]} failed)", flush=True)
+            done = downloaded[0] + s3_uploaded[0]
+            if done % 200 == 0 and done > 0:
+                print(f"[Dropbox Pre-warm] Progress: {downloaded[0]} downloaded, {s3_uploaded[0]} synced to S3, {failed[0]} failed", flush=True)
+
+        # Process ALL keys — some may be on disk but not S3 yet
+        all_keys = list(_dropbox_photo_index.keys())
 
         # Use gevent pool — only 3 concurrent to limit memory
         try:
             from gevent.pool import Pool
             pool = Pool(size=3)
-            pool.map(_download_one, to_download)
+            pool.map(_download_one, all_keys)
         except ImportError:
-            for key in to_download:
+            for key in all_keys:
                 _download_one(key)
 
-        print(f"[Dropbox Pre-warm] ✓ Done! {downloaded[0]} downloaded, {failed[0]} failed, {already_cached + downloaded[0]}/{total} total cached", flush=True)
+        print(f"[Dropbox Pre-warm] ✓ Done! {downloaded[0]} new downloads, {s3_uploaded[0]} synced to S3, {failed[0]} failed", flush=True)
     finally:
         try:
             os.unlink(lock_file)
@@ -1949,7 +2018,8 @@ def dropbox_photo_list():
     return jsonify({
         'codes': list(_dropbox_photo_index.keys()),
         'count': len(_dropbox_photo_index),
-        'last_sync': _dropbox_photos_last_sync
+        'last_sync': _dropbox_photos_last_sync,
+        's3_sync_url': S3_DROPBOX_SYNC_URL
     })
 
 
@@ -1986,11 +2056,12 @@ def hourly_resync():
         time.sleep(DROPBOX_RESYNC_INTERVAL)
         print(f"\n  ⏰ Hourly re-sync triggered...")
 
-        # Daily Dropbox photo sync
+        # Periodic Dropbox photo sync + S3 upload
         if DROPBOX_PHOTOS_TOKEN and (time.time() - _dropbox_photos_last_sync > DROPBOX_PHOTOS_SYNC_HOURS * 3600):
             print(f"  📷 Dropbox photos sync due (every {DROPBOX_PHOTOS_SYNC_HOURS}h)...")
             try:
                 sync_dropbox_photos()
+                prewarm_dropbox_cache()  # Downloads new images + uploads to S3
             except Exception as e:
                 print(f"  ⚠ Dropbox photos sync failed: {e}")
 
