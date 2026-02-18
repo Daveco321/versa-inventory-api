@@ -610,7 +610,8 @@ def _upload_to_s3_sync(image_code, data, content_type):
             Key=key,
             Body=data,
             ContentType=content_type,
-            CacheControl='public, max-age=86400'
+            CacheControl='public, max-age=86400',
+            ACL='public-read'
         )
         return True
     except Exception as e:
