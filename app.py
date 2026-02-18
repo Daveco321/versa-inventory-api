@@ -434,8 +434,22 @@ def sync_dropbox_photos():
         )
 
         if resp.status_code == 401:
-            print(f"[Dropbox Photos] Auth failed (401) — token may be expired", flush=True)
-            return
+            print(f"[Dropbox Photos] Auth failed (401) — forcing token refresh...", flush=True)
+            # Force refresh by resetting expiry
+            global _dropbox_token_expires
+            _dropbox_token_expires = 0
+            token = get_dropbox_token()
+            if not token:
+                print(f"[Dropbox Photos] Could not refresh token, giving up", flush=True)
+                return
+            headers['Authorization'] = f'Bearer {token}'
+            resp = http_requests.post(
+                'https://api.dropboxapi.com/2/files/list_folder',
+                headers=headers, json=payload, timeout=60
+            )
+            if resp.status_code == 401:
+                print(f"[Dropbox Photos] Still 401 after refresh — check credentials", flush=True)
+                return
 
         # If path not found, try to discover it
         if resp.status_code == 409:
@@ -667,6 +681,15 @@ def prewarm_dropbox_cache():
     # Use a file lock so only one worker pre-warms
     lock_file = '/tmp/dropbox_prewarm.lock'
     try:
+        # Check for stale lock (older than 30 minutes)
+        if os.path.exists(lock_file):
+            lock_age = time.time() - os.path.getmtime(lock_file)
+            if lock_age > 1800:  # 30 min stale threshold
+                print(f"[Dropbox Pre-warm] Removing stale lock ({lock_age:.0f}s old)", flush=True)
+                os.unlink(lock_file)
+            else:
+                print(f"[Dropbox Pre-warm] Another worker is already pre-warming, skipping", flush=True)
+                return
         fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
@@ -1978,12 +2001,26 @@ def _fetch_raw_image(base_style, brand_abbr):
         except Exception:
             continue
 
-    # 2. Try Dropbox photos
+    # 2. Try S3 DROPBOX_SYNC (fast CDN — images pre-synced from Dropbox)
+    if image_code.upper() in _dropbox_photo_index:
+        sync_base = f"{S3_DROPBOX_SYNC_URL}/{image_code}"
+        for ext in ['.jpg', '.png']:
+            try:
+                url = sync_base + ext
+                resp = http_requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    ct = resp.headers.get('Content-Type', '').lower()
+                    if 'image' in ct:
+                        return resp.content, ct
+            except Exception:
+                continue
+
+    # 3. Try Dropbox photos (disk cache → API download)
     dbx_bytes, dbx_ct = get_dropbox_image_bytes(image_code)
     if dbx_bytes:
         return dbx_bytes, dbx_ct
 
-    # 3. Fallback to S3 brand folder
+    # 4. Fallback to S3 brand folder
     folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
     brand_base = f"{S3_PHOTOS_URL}/{folder_name}/{image_code}"
     for ext in ['.jpg', '.png', '.jpeg']:
@@ -2034,9 +2071,9 @@ def proxy_image(base_style):
     if raw_bytes:
         # Cache for future requests (limit cache to ~500 images to control memory)
         with _web_img_lock:
-            if len(_web_img_cache) > 500:
-                # Evict oldest ~100 entries
-                keys = list(_web_img_cache.keys())[:100]
+            if len(_web_img_cache) > 200:
+                # Evict oldest ~50 entries
+                keys = list(_web_img_cache.keys())[:50]
                 for k in keys:
                     del _web_img_cache[k]
             _web_img_cache[base_style] = (raw_bytes, content_type)
