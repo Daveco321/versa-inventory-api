@@ -50,6 +50,7 @@ S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
                                    'ALL+INVENTORY+Photos/PHOTOS+INVENTORY')
 
 S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides.json')
+S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
 
@@ -2034,6 +2035,78 @@ def trigger_dropbox_photo_sync():
         prewarm_dropbox_cache()
     threading.Thread(target=_sync_and_warm, daemon=True).start()
     return jsonify({'status': 'sync_started', 'current_count': len(_dropbox_photo_index)})
+
+
+# ============================================
+# SAVED CATALOGS — S3 persistence
+# ============================================
+
+def _load_saved_catalogs():
+    """Load saved catalogs from S3."""
+    try:
+        s3 = get_s3_client()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY)
+        return json.loads(resp['Body'].read().decode('utf-8'))
+    except s3.exceptions.NoSuchKey:
+        return []
+    except Exception as e:
+        if 'NoSuchKey' in str(e):
+            return []
+        print(f"[Saved Catalogs] Load error: {e}", flush=True)
+        return []
+
+def _save_saved_catalogs(catalogs):
+    """Save catalogs list to S3."""
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=S3_SAVED_CATALOGS_KEY,
+        Body=json.dumps(catalogs, indent=2),
+        ContentType='application/json'
+    )
+
+@app.route('/saved-catalogs', methods=['GET', 'OPTIONS'])
+def get_saved_catalogs():
+    if request.method == 'OPTIONS':
+        return '', 204
+    return jsonify(_load_saved_catalogs())
+
+@app.route('/saved-catalogs', methods=['POST'])
+def save_catalog():
+    data = request.get_json()
+    if not data or not data.get('name') or not data.get('url'):
+        return jsonify({'error': 'name and url required'}), 400
+
+    catalogs = _load_saved_catalogs()
+    entry = {
+        'name': data['name'],
+        'url': data['url'],
+        'brands': data.get('brands', []),
+        'savedAt': int(time.time() * 1000)
+    }
+
+    # Update existing or add new
+    existing_idx = next((i for i, c in enumerate(catalogs) if c['name'].lower() == data['name'].lower()), -1)
+    if existing_idx >= 0:
+        catalogs[existing_idx] = entry
+        action = 'updated'
+    else:
+        catalogs.insert(0, entry)
+        action = 'created'
+
+    _save_saved_catalogs(catalogs)
+    return jsonify({'status': action, 'catalogs': catalogs})
+
+@app.route('/saved-catalogs/<int:idx>', methods=['DELETE', 'OPTIONS'])
+def delete_saved_catalog(idx):
+    if request.method == 'OPTIONS':
+        return '', 204
+    catalogs = _load_saved_catalogs()
+    if idx < 0 or idx >= len(catalogs):
+        return jsonify({'error': 'invalid index'}), 404
+    removed = catalogs.pop(idx)
+    _save_saved_catalogs(catalogs)
+    return jsonify({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
