@@ -70,6 +70,47 @@ DROPBOX_PHOTOS_TOKEN = re.sub(r'\s+', '', os.environ.get('DROPBOX_PHOTOS_TOKEN',
 DROPBOX_PHOTOS_PATH = os.environ.get('DROPBOX_PHOTOS_PATH', '/Versa Share Files/PHOTOS INVENTORY')
 DROPBOX_PHOTOS_SYNC_HOURS = int(os.environ.get('DROPBOX_PHOTOS_SYNC_HOURS', 8))
 
+# Dropbox OAuth2 refresh token (never expires — auto-refreshes access tokens)
+DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY', '')
+DROPBOX_APP_SECRET = os.environ.get('DROPBOX_APP_SECRET', '')
+DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN', '')
+
+# Auto-refresh state
+_dropbox_access_token = DROPBOX_PHOTOS_TOKEN  # fallback to legacy token
+_dropbox_token_expires = 0
+
+def get_dropbox_token():
+    """Get a valid Dropbox access token, auto-refreshing if needed."""
+    global _dropbox_access_token, _dropbox_token_expires
+    
+    # If we have refresh token config, use auto-refresh
+    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
+        if time.time() < _dropbox_token_expires - 300:  # 5 min buffer
+            return _dropbox_access_token
+        
+        try:
+            print("[Dropbox Auth] Refreshing access token...", flush=True)
+            resp = http_requests.post('https://api.dropbox.com/oauth2/token', data={
+                'grant_type': 'refresh_token',
+                'refresh_token': DROPBOX_REFRESH_TOKEN,
+                'client_id': DROPBOX_APP_KEY,
+                'client_secret': DROPBOX_APP_SECRET,
+            }, timeout=30)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                _dropbox_access_token = data['access_token']
+                _dropbox_token_expires = time.time() + data.get('expires_in', 14400)
+                print(f"[Dropbox Auth] ✓ Token refreshed, expires in {data.get('expires_in', '?')}s", flush=True)
+                return _dropbox_access_token
+            else:
+                print(f"[Dropbox Auth] ✗ Refresh failed ({resp.status_code}): {resp.text[:200]}", flush=True)
+        except Exception as e:
+            print(f"[Dropbox Auth] ✗ Refresh error: {e}", flush=True)
+    
+    # Fallback to legacy static token
+    return DROPBOX_PHOTOS_TOKEN
+
 TARGET_W = 150
 TARGET_H = 150
 COL_WIDTH_UNITS = 22
@@ -365,15 +406,15 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
 def sync_dropbox_photos():
     """List files in Dropbox PHOTOS INVENTORY folder via API — just metadata, no downloading."""
     global _dropbox_photo_index, _dropbox_photos_last_sync
-    if not DROPBOX_PHOTOS_TOKEN:
-        print("[Dropbox Photos] No DROPBOX_PHOTOS_TOKEN configured, skipping", flush=True)
+    token = get_dropbox_token()
+    if not token:
+        print("[Dropbox Photos] No Dropbox token configured, skipping", flush=True)
         return
 
     try:
         print(f"[Dropbox Photos] Listing files via API in: {DROPBOX_PHOTOS_PATH}", flush=True)
-        print(f"[Dropbox Photos] Token length: {len(DROPBOX_PHOTOS_TOKEN)}", flush=True)
         headers = {
-            'Authorization': f'Bearer {DROPBOX_PHOTOS_TOKEN}',
+            'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json'
         }
 
@@ -511,11 +552,12 @@ os.makedirs(DROPBOX_DISK_CACHE, exist_ok=True)
 
 def _download_dropbox_file(dropbox_path):
     """Download a single file from Dropbox via API."""
-    if not DROPBOX_PHOTOS_TOKEN:
+    token = get_dropbox_token()
+    if not token:
         return None, None
     try:
         headers = {
-            'Authorization': f'Bearer {DROPBOX_PHOTOS_TOKEN}',
+            'Authorization': f'Bearer {token}',
             'Dropbox-API-Arg': json.dumps({'path': dropbox_path})
         }
         resp = http_requests.post(
@@ -2136,7 +2178,7 @@ def hourly_resync():
         print(f"\n  ⏰ Hourly re-sync triggered...")
 
         # Periodic Dropbox photo sync + S3 upload
-        if DROPBOX_PHOTOS_TOKEN and (time.time() - _dropbox_photos_last_sync > DROPBOX_PHOTOS_SYNC_HOURS * 3600):
+        if (DROPBOX_PHOTOS_TOKEN or DROPBOX_REFRESH_TOKEN) and (time.time() - _dropbox_photos_last_sync > DROPBOX_PHOTOS_SYNC_HOURS * 3600):
             print(f"  📷 Dropbox photos sync due (every {DROPBOX_PHOTOS_SYNC_HOURS}h)...")
             try:
                 sync_dropbox_photos()
@@ -2167,15 +2209,14 @@ def startup_sync():
     print("\n" + "="*60)
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
     print(f"  Dropbox URL configured: {'YES' if DROPBOX_URL else 'NO'}")
-    print(f"  Dropbox Photos Token configured: {'YES' if DROPBOX_PHOTOS_TOKEN else 'NO'}")
-    if DROPBOX_PHOTOS_TOKEN:
-        print(f"  Dropbox Photos Token length: {len(DROPBOX_PHOTOS_TOKEN)}, starts: {DROPBOX_PHOTOS_TOKEN[:10]}..., ends: ...{DROPBOX_PHOTOS_TOKEN[-10:]}")
+    _dbx_configured = bool(DROPBOX_PHOTOS_TOKEN or DROPBOX_REFRESH_TOKEN)
+    print(f"  Dropbox Photos configured: {'YES (refresh token)' if DROPBOX_REFRESH_TOKEN else ('YES (static token)' if DROPBOX_PHOTOS_TOKEN else 'NO')}")
     print("="*60)
 
     load_overrides_from_s3()
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
-    if DROPBOX_PHOTOS_TOKEN:
+    if _dbx_configured:
         print("  → Syncing Dropbox photos index...", flush=True)
         sync_dropbox_photos()
         # Start background pre-warm of all images to disk
