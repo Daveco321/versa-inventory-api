@@ -36,7 +36,7 @@ app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
         "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
+        "methods": ["GET", "POST", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type"]
     }
 })
@@ -2047,10 +2047,8 @@ def _load_saved_catalogs():
         s3 = get_s3_client()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY)
         return json.loads(resp['Body'].read().decode('utf-8'))
-    except s3.exceptions.NoSuchKey:
-        return []
     except Exception as e:
-        if 'NoSuchKey' in str(e):
+        if 'NoSuchKey' in str(e) or '404' in str(e):
             return []
         print(f"[Saved Catalogs] Load error: {e}", flush=True)
         return []
@@ -2065,48 +2063,55 @@ def _save_saved_catalogs(catalogs):
         ContentType='application/json'
     )
 
-@app.route('/saved-catalogs', methods=['GET', 'OPTIONS'])
-def get_saved_catalogs():
+@app.route('/saved-catalogs', methods=['GET', 'POST', 'OPTIONS'])
+def handle_saved_catalogs():
     if request.method == 'OPTIONS':
         return '', 204
-    return jsonify(_load_saved_catalogs())
+    if request.method == 'GET':
+        return jsonify(_load_saved_catalogs())
+    
+    # POST
+    try:
+        data = request.get_json()
+        if not data or not data.get('name') or not data.get('url'):
+            return jsonify({'error': 'name and url required'}), 400
 
-@app.route('/saved-catalogs', methods=['POST'])
-def save_catalog():
-    data = request.get_json()
-    if not data or not data.get('name') or not data.get('url'):
-        return jsonify({'error': 'name and url required'}), 400
+        catalogs = _load_saved_catalogs()
+        entry = {
+            'name': data['name'],
+            'url': data['url'],
+            'brands': data.get('brands', []),
+            'savedAt': int(time.time() * 1000)
+        }
 
-    catalogs = _load_saved_catalogs()
-    entry = {
-        'name': data['name'],
-        'url': data['url'],
-        'brands': data.get('brands', []),
-        'savedAt': int(time.time() * 1000)
-    }
+        existing_idx = next((i for i, c in enumerate(catalogs) if c['name'].lower() == data['name'].lower()), -1)
+        if existing_idx >= 0:
+            catalogs[existing_idx] = entry
+            action = 'updated'
+        else:
+            catalogs.insert(0, entry)
+            action = 'created'
 
-    # Update existing or add new
-    existing_idx = next((i for i, c in enumerate(catalogs) if c['name'].lower() == data['name'].lower()), -1)
-    if existing_idx >= 0:
-        catalogs[existing_idx] = entry
-        action = 'updated'
-    else:
-        catalogs.insert(0, entry)
-        action = 'created'
-
-    _save_saved_catalogs(catalogs)
-    return jsonify({'status': action, 'catalogs': catalogs})
+        _save_saved_catalogs(catalogs)
+        return jsonify({'status': action, 'catalogs': catalogs})
+    except Exception as e:
+        print(f"[Saved Catalogs] Save error: {e}", flush=True)
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/saved-catalogs/<int:idx>', methods=['DELETE', 'OPTIONS'])
 def delete_saved_catalog(idx):
     if request.method == 'OPTIONS':
         return '', 204
-    catalogs = _load_saved_catalogs()
-    if idx < 0 or idx >= len(catalogs):
-        return jsonify({'error': 'invalid index'}), 404
-    removed = catalogs.pop(idx)
-    _save_saved_catalogs(catalogs)
-    return jsonify({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
+    try:
+        catalogs = _load_saved_catalogs()
+        if idx < 0 or idx >= len(catalogs):
+            return jsonify({'error': 'invalid index'}), 404
+        removed = catalogs.pop(idx)
+        _save_saved_catalogs(catalogs)
+        return jsonify({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
+    except Exception as e:
+        print(f"[Saved Catalogs] Delete error: {e}", flush=True)
+        return jsonify({'error': str(e)}), 500
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
