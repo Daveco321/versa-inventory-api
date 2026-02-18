@@ -2127,33 +2127,52 @@ def _load_saved_catalogs():
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY)
         return json.loads(resp['Body'].read().decode('utf-8'))
     except Exception as e:
-        if 'NoSuchKey' in str(e) or '404' in str(e):
+        err_str = str(e)
+        if 'NoSuchKey' in err_str or '404' in err_str or 'does not exist' in err_str.lower():
             return []
         print(f"[Saved Catalogs] Load error: {e}", flush=True)
         return []
 
 def _save_saved_catalogs(catalogs):
     """Save catalogs list to S3."""
-    s3 = get_s3_client()
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=S3_SAVED_CATALOGS_KEY,
-        Body=json.dumps(catalogs, indent=2),
-        ContentType='application/json'
-    )
+    try:
+        s3 = get_s3_client()
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_SAVED_CATALOGS_KEY,
+            Body=json.dumps(catalogs, indent=2),
+            ContentType='application/json'
+        )
+        return True
+    except Exception as e:
+        print(f"[Saved Catalogs] Save to S3 error: {e}", flush=True)
+        return False
+
+def _cors_json(data, status=200):
+    """Return JSON response with explicit CORS headers."""
+    resp = make_response(jsonify(data), status)
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return resp
 
 @app.route('/saved-catalogs', methods=['GET', 'POST', 'OPTIONS'])
 def handle_saved_catalogs():
     if request.method == 'OPTIONS':
-        return '', 204
-    if request.method == 'GET':
-        return jsonify(_load_saved_catalogs())
-    
-    # POST
+        resp = make_response('', 204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
     try:
-        data = request.get_json()
+        if request.method == 'GET':
+            return _cors_json(_load_saved_catalogs())
+        
+        # POST
+        data = request.get_json(force=True, silent=True)
         if not data or not data.get('name') or not data.get('url'):
-            return jsonify({'error': 'name and url required'}), 400
+            return _cors_json({'error': 'name and url required'}, 400)
 
         catalogs = _load_saved_catalogs()
         entry = {
@@ -2171,26 +2190,33 @@ def handle_saved_catalogs():
             catalogs.insert(0, entry)
             action = 'created'
 
-        _save_saved_catalogs(catalogs)
-        return jsonify({'status': action, 'catalogs': catalogs})
+        if _save_saved_catalogs(catalogs):
+            return _cors_json({'status': action, 'catalogs': catalogs})
+        else:
+            return _cors_json({'error': 'Failed to save to S3'}, 500)
     except Exception as e:
-        print(f"[Saved Catalogs] Save error: {e}", flush=True)
-        return jsonify({'error': str(e)}), 500
+        print(f"[Saved Catalogs] Endpoint error: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        return _cors_json({'error': str(e)}, 500)
 
 @app.route('/saved-catalogs/<int:idx>', methods=['DELETE', 'OPTIONS'])
 def delete_saved_catalog(idx):
     if request.method == 'OPTIONS':
-        return '', 204
+        resp = make_response('', 204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
     try:
         catalogs = _load_saved_catalogs()
         if idx < 0 or idx >= len(catalogs):
-            return jsonify({'error': 'invalid index'}), 404
+            return _cors_json({'error': 'invalid index'}, 404)
         removed = catalogs.pop(idx)
         _save_saved_catalogs(catalogs)
-        return jsonify({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
+        return _cors_json({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
     except Exception as e:
         print(f"[Saved Catalogs] Delete error: {e}", flush=True)
-        return jsonify({'error': str(e)}), 500
+        return _cors_json({'error': str(e)}, 500)
 
 
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
