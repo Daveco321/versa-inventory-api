@@ -659,7 +659,7 @@ def get_dropbox_image_bytes(image_code):
 def _upload_to_s3_sync(image_code, data, content_type):
     """Upload an image to S3 DROPBOX_SYNC folder for CDN delivery."""
     try:
-        s3 = get_s3_client()
+        s3 = get_s3()
         ext = '.png' if 'png' in content_type else '.jpg'
         key = f"{S3_DROPBOX_SYNC_PREFIX}/{image_code}{ext}"
         s3.put_object(
@@ -717,7 +717,7 @@ def prewarm_dropbox_cache():
         # Check which images already exist in S3 DROPBOX_SYNC
         s3_synced = set()
         try:
-            s3 = get_s3_client()
+            s3 = get_s3()
             paginator = s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_DROPBOX_SYNC_PREFIX + '/'):
                 for obj in page.get('Contents', []):
@@ -2123,7 +2123,7 @@ def trigger_dropbox_photo_sync():
 def _load_saved_catalogs():
     """Load saved catalogs from S3."""
     try:
-        s3 = get_s3_client()
+        s3 = get_s3()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY)
         return json.loads(resp['Body'].read().decode('utf-8'))
     except Exception as e:
@@ -2136,7 +2136,7 @@ def _load_saved_catalogs():
 def _save_saved_catalogs(catalogs):
     """Save catalogs list to S3."""
     try:
-        s3 = get_s3_client()
+        s3 = get_s3()
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=S3_SAVED_CATALOGS_KEY,
