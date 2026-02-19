@@ -1097,7 +1097,7 @@ def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
         return _cache_in_memory(result)
     except Exception:
         return None
-def get_image_cached(item, s3_base_url):
+def get_image_cached(item, s3_base_url, skip_ecom_fallback=False):
     """
     Get image for an item, using cache keyed by base_style.
     Priority: base64 override → STYLE+OVERRIDES → Dropbox → brand folder fallback.
@@ -1178,7 +1178,8 @@ def get_image_cached(item, s3_base_url):
         result = _process_image_from_url(brand_url)
 
     # 5. Final fallback — use first ecom photo (closeup preferred) if all else fails
-    if not result:
+    # Skipped during Excel exports to avoid slow Dropbox API calls per missing image
+    if not result and not skip_ecom_fallback:
         with _ecom_photo_lock:
             ecom_photos = _ecom_photo_index.get(base_style, [])
         if ecom_photos:
@@ -1240,7 +1241,7 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
 
     def _fetch(base_style_item):
         base_style, item = base_style_item
-        return base_style, get_image_cached(item, s3_base_url)
+        return base_style, get_image_cached(item, s3_base_url, skip_ecom_fallback=True)
 
     unique_pairs = list(unique_items.items())
     print(f"    Fetching images: {len(unique_pairs)} unique styles for {len(items)} items")
