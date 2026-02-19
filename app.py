@@ -58,6 +58,11 @@ S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_P
 S3_OVERRIDES_IMG_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
 S3_DROPBOX_SYNC_PREFIX = 'ALL INVENTORY Photos/DROPBOX_SYNC'
 S3_DROPBOX_SYNC_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/ALL+INVENTORY+Photos/DROPBOX_SYNC"
+CLOUDFRONT_URL = os.environ.get('CLOUDFRONT_URL', 'https://duv8yzuad6dsp.cloudfront.net')
+# Derive CloudFront equivalents of S3 prefixes
+CLOUDFRONT_OVERRIDES_URL = f"{CLOUDFRONT_URL}/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
+CLOUDFRONT_DROPBOX_SYNC_URL = f"{CLOUDFRONT_URL}/ALL+INVENTORY+Photos/DROPBOX_SYNC"
+CLOUDFRONT_PHOTOS_URL = f"{CLOUDFRONT_URL}/{S3_PHOTOS_PREFIX}" 
 
 # Dropbox direct download URL for hourly inventory file
 # Dropbox shared link — will be converted to direct download at runtime
@@ -955,9 +960,10 @@ def get_image_cached(item, s3_base_url):
         except Exception:
             pass
 
-    # 2. Try STYLE+OVERRIDES on S3
+    # 2. Try STYLE+OVERRIDES via CloudFront
     if not result:
-        override_url = get_style_override_url(sku)
+        base_style_for_url = get_base_style(sku)
+        override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style_for_url}.jpg"
         result = _process_image_from_url(override_url)
 
     # 3. Try Dropbox photos
@@ -966,9 +972,12 @@ def get_image_cached(item, s3_base_url):
         image_code = extract_image_code(sku, brand_abbr)
         result = get_dropbox_thumbnail(image_code)
 
-    # 4. Fallback to S3 brand folder
+    # 4. Fallback to CloudFront brand folder
     if not result:
-        brand_url = get_image_url(item, s3_base_url)
+        brand_abbr_cf = item.get('brand_abbr', item.get('brand', ''))
+        folder_name_cf = FOLDER_MAPPING.get(brand_abbr_cf, brand_abbr_cf)
+        image_code_cf = extract_image_code(sku, brand_abbr_cf)
+        brand_url = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name_cf}/{image_code_cf}.jpg"
         result = _process_image_from_url(brand_url)
 
     # Cache result (even None to avoid re-fetching failures)
@@ -2029,8 +2038,8 @@ def _fetch_raw_image(base_style, brand_abbr):
         except Exception:
             pass
 
-    # 1. Try STYLE+OVERRIDES on S3 first
-    override_base = f"{S3_OVERRIDES_IMG_URL}/{base_style}"
+    # 1. Try STYLE+OVERRIDES via CloudFront (fast CDN)
+    override_base = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style}"
     for ext in ['.jpg', '.png', '.jpeg']:
         try:
             url = override_base + ext
@@ -2042,9 +2051,9 @@ def _fetch_raw_image(base_style, brand_abbr):
         except Exception:
             continue
 
-    # 2. Try S3 DROPBOX_SYNC (fast CDN — images pre-synced from Dropbox)
+    # 2. Try CloudFront DROPBOX_SYNC (fastest — edge cached)
     if image_code.upper() in _dropbox_photo_index:
-        sync_base = f"{S3_DROPBOX_SYNC_URL}/{image_code}"
+        sync_base = f"{CLOUDFRONT_DROPBOX_SYNC_URL}/{image_code}"
         for ext in ['.jpg', '.png']:
             try:
                 url = sync_base + ext
@@ -2063,7 +2072,7 @@ def _fetch_raw_image(base_style, brand_abbr):
 
     # 4. Fallback to S3 brand folder
     folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
-    brand_base = f"{S3_PHOTOS_URL}/{folder_name}/{image_code}"
+    brand_base = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name}/{image_code}"
     for ext in ['.jpg', '.png', '.jpeg']:
         try:
             url = brand_base + ext
