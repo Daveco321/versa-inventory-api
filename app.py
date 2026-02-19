@@ -444,6 +444,31 @@ def _is_300dpi_path(path_lower):
     p = path_lower.lower()
     return '300' in p
 
+def _load_ecom_index_from_disk():
+    """Load ecom photo index from disk — instant, no Dropbox scan needed."""
+    try:
+        if os.path.exists(ECOM_INDEX_DISK_PATH):
+            with open(ECOM_INDEX_DISK_PATH, 'r') as f:
+                data = json.load(f)
+            index = data.get('index', {})
+            last_sync = data.get('last_sync', 0)
+            print(f"[Ecom Photos] ✓ Loaded index from disk: {len(index)} styles (synced {int((time.time()-last_sync)//3600)}h ago)", flush=True)
+            return index, last_sync
+    except Exception as e:
+        print(f"[Ecom Photos] Could not load disk index: {e}", flush=True)
+    return None, 0
+
+
+def _save_ecom_index_to_disk(index, last_sync):
+    """Persist ecom photo index to disk so restarts are instant."""
+    try:
+        with open(ECOM_INDEX_DISK_PATH, 'w') as f:
+            json.dump({'index': index, 'last_sync': last_sync, 'saved_at': time.time()}, f)
+        print(f"[Ecom Photos] ✓ Saved index to disk: {len(index)} styles", flush=True)
+    except Exception as e:
+        print(f"[Ecom Photos] Could not save disk index: {e}", flush=True)
+
+
 def sync_ecom_photos():
     """Recursively index all ecom photos from David - Dropbox/Ecom_Photos.
     Groups images by style code, deduplicates 72dpi vs 300dpi (prefers 72dpi),
@@ -559,6 +584,7 @@ def sync_ecom_photos():
             _ecom_photo_index = new_index
             _ecom_photos_last_sync = time.time()
 
+        _save_ecom_index_to_disk(new_index, _ecom_photos_last_sync)
         total_images = sum(len(v) for v in new_index.values())
         print(f"[Ecom Photos] ✓ Indexed {len(new_index)} styles, {total_images} total images", flush=True)
 
@@ -734,6 +760,7 @@ os.makedirs(DROPBOX_ECOM_CACHE_DIR, exist_ok=True)
 _ecom_photo_index = {}   # style_code → [{'path': dropbox_path, 'type': 'model'|'ghost'|'closeup', 'name': filename}]
 _ecom_photo_lock = threading.Lock()
 _ecom_photos_last_sync = 0
+ECOM_INDEX_DISK_PATH = os.path.join(os.path.dirname(DROPBOX_ECOM_CACHE_DIR), 'ecom_index.json')
 
 
 def _download_dropbox_file(dropbox_path):
@@ -2719,8 +2746,23 @@ def startup_sync():
     if _dbx_configured:
         print("  → Syncing Dropbox photos index...", flush=True)
         sync_dropbox_photos()
-        # Sync ecom photos index in background
-        threading.Thread(target=sync_ecom_photos, daemon=True).start()
+        # Load ecom index from disk if fresh, otherwise do full scan in background
+        disk_index, disk_last_sync = _load_ecom_index_from_disk()
+        if disk_index and (time.time() - disk_last_sync) < DROPBOX_PHOTOS_SYNC_HOURS * 3600:
+            # Fresh enough — load instantly, schedule background refresh later
+            with _ecom_photo_lock:
+                _ecom_photo_index.update(disk_index)
+                _ecom_photos_last_sync = disk_last_sync
+            print(f"[Ecom Photos] Using disk index ({len(disk_index)} styles), background refresh skipped", flush=True)
+        else:
+            # Stale or missing — full scan in background
+            if disk_index:
+                # Load stale index immediately so buttons show while scan runs
+                with _ecom_photo_lock:
+                    _ecom_photo_index.update(disk_index)
+                    _ecom_photos_last_sync = disk_last_sync
+                print(f"[Ecom Photos] Loaded stale disk index ({len(disk_index)} styles), refreshing in background...", flush=True)
+            threading.Thread(target=sync_ecom_photos, daemon=True).start()
         # Start background pre-warm of all images to disk
         if _dropbox_photo_index:
             import threading as _th
