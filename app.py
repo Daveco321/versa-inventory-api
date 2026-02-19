@@ -1388,49 +1388,51 @@ def _group_by_brand(items):
 # ============================================
 # DROPBOX SYNC — primary inventory source
 # ============================================
+DROPBOX_INVENTORY_PATH = os.environ.get('DROPBOX_INVENTORY_PATH', '/Versa Share Files/Hourly ATS/Inventory_ATS.xlsx')
+
 def sync_from_dropbox():
-    """Fetch inventory directly from Dropbox shared link"""
-    if not DROPBOX_URL:
-        print("  No DROPBOX_URL configured, skipping Dropbox sync")
+    """Fetch inventory directly via Dropbox API — uses OAuth, never expires, no shared link needed."""
+    token = get_dropbox_token()
+    if not token:
+        print("  ⚠ No Dropbox token available, skipping Dropbox sync")
         return False
 
-    # Convert any Dropbox URL format to direct download
-    url = DROPBOX_URL.strip()
-    # Remove st= param (session-specific, expires)
-    url = re.sub(r'[&?]st=[^&]*', '', url)
-    # Ensure dl=1 for direct download
-    url = re.sub(r'[&?]dl=\d', '', url)
-    url += ('&' if '?' in url else '?') + 'dl=1'
-
-    print(f"  📂 Fetching inventory from Dropbox...")
-    print(f"     URL: {url[:80]}...")
+    print(f"  📂 Fetching inventory from Dropbox API: {DROPBOX_INVENTORY_PATH}")
     try:
-        # Use a session to follow redirects properly
-        session = http_requests.Session()
-        resp = session.get(url, timeout=60, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }, allow_redirects=True)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_INVENTORY_PATH})
+        }
+        resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers=headers, timeout=60
+        )
 
-        print(f"     HTTP {resp.status_code}, Content-Type: {resp.headers.get('Content-Type', 'unknown')}")
-        print(f"     Size: {len(resp.content)} bytes, Redirects: {len(resp.history)}")
+        # Auto-refresh token if expired
+        if resp.status_code == 401:
+            print("  ⚠ Dropbox auth failed (401) — forcing token refresh...")
+            global _dropbox_token_expires
+            _dropbox_token_expires = 0
+            token = get_dropbox_token()
+            if not token:
+                print("  ⚠ Could not refresh token, giving up")
+                return False
+            headers['Authorization'] = f'Bearer {token}'
+            resp = http_requests.post(
+                'https://content.dropboxapi.com/2/files/download',
+                headers=headers, timeout=60
+            )
 
         if resp.status_code != 200:
-            print(f"  ⚠ Dropbox returned HTTP {resp.status_code}")
-            return False
-
-        # Verify we got an Excel file, not an HTML page
-        ct = resp.headers.get('Content-Type', '').lower()
-        if 'html' in ct:
-            print(f"  ⚠ Dropbox returned HTML instead of Excel (likely auth/redirect issue)")
-            print(f"     First 200 chars: {resp.text[:200]}")
+            print(f"  ⚠ Dropbox API returned HTTP {resp.status_code}: {resp.text[:200]}")
             return False
 
         data = resp.content
         if len(data) < 1000:
-            print(f"  ⚠ Dropbox file too small ({len(data)} bytes), likely error page")
+            print(f"  ⚠ Dropbox file too small ({len(data)} bytes), likely error")
             return False
 
-        print(f"  📂 Downloaded {len(data):,} bytes from Dropbox")
+        print(f"  📂 Downloaded {len(data):,} bytes from Dropbox API")
 
         items = parse_inventory_excel(data)
         if not items:
@@ -1502,8 +1504,8 @@ def s3_upload_export(key, file_bytes):
 
 def sync_inventory():
     """Sync inventory: try Dropbox first, then S3 fallback"""
-    # Try Dropbox first
-    if DROPBOX_URL:
+    # Try Dropbox API first
+    if DROPBOX_REFRESH_TOKEN or DROPBOX_PHOTOS_TOKEN:
         if sync_from_dropbox():
             return True
         print("  Dropbox failed, falling back to S3...")
@@ -1948,6 +1950,7 @@ def save_overrides():
             return jsonify({"error": "'overrides' must be an object"}), 400
 
         # Find which styles have new/changed images (for CloudFront invalidation)
+        global _style_overrides
         with _overrides_lock:
             old_overrides = dict(_style_overrides)
         changed_styles = [
@@ -1957,7 +1960,6 @@ def save_overrides():
         ]
 
         with _overrides_lock:
-            global _style_overrides
             _style_overrides = overrides
 
         success = save_overrides_to_s3()
