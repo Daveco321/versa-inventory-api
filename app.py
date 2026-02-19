@@ -2174,7 +2174,7 @@ def handle_saved_catalogs():
         if not data or not data.get('name') or not data.get('url'):
             return _cors_json({'error': 'name and url required'}, 400)
 
-      catalogs = _load_saved_catalogs()
+        catalogs = _load_saved_catalogs()
 
         existing_idx = next((i for i, c in enumerate(catalogs) if c['name'].lower() == data['name'].lower()), -1)
 
