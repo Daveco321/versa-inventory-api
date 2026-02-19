@@ -668,7 +668,6 @@ def _upload_to_s3_sync(image_code, data, content_type):
             Body=data,
             ContentType=content_type,
             CacheControl='public, max-age=86400',
-            ACL='public-read'
         )
         return True
     except Exception as e:
@@ -808,21 +807,59 @@ def prewarm_dropbox_cache():
             pass
 
 
+DROPBOX_THUMB_CACHE_DIR = os.path.join(os.path.dirname(DROPBOX_DISK_CACHE), 'dropbox_thumbs')
+os.makedirs(DROPBOX_THUMB_CACHE_DIR, exist_ok=True)
+
+def _get_thumb_disk_path(key):
+    return os.path.join(DROPBOX_THUMB_CACHE_DIR, key + '.thumb')
+
 def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
-    """Get resized thumbnail from Dropbox for Excel exports."""
+    """Get resized thumbnail from Dropbox for Excel exports.
+    Priority: in-memory → disk thumb cache → raw disk cache → Dropbox download.
+    Thumbnails are persisted to disk so PIL processing only ever happens once."""
+    import struct
     key = image_code.upper().replace('-', '_')
 
+    # 1. In-memory hot cache (fastest)
     if key in _dropbox_thumb_cache:
         return _dropbox_thumb_cache[key]
 
-    # Check index first (avoid unnecessary download)
+    # Check index first — skip entirely for unknown images
     if key not in _dropbox_photo_index:
         return None
 
+    def _cache_in_memory(result):
+        """Add to in-memory cache with soft cap — disk is the real cache."""
+        if len(_dropbox_thumb_cache) > 500:
+            for old_key in list(_dropbox_thumb_cache.keys())[:100]:
+                del _dropbox_thumb_cache[old_key]
+        _dropbox_thumb_cache[key] = result
+        return result
+
+    # 2. Disk thumb cache — pre-processed, no PIL needed
+    thumb_path = _get_thumb_disk_path(key)
+    if os.path.exists(thumb_path):
+        try:
+            with open(thumb_path, 'rb') as f:
+                meta = f.read(32)
+                raw = f.read()
+            x_scale, y_scale, x_offset, y_offset = struct.unpack('4d', meta)
+            result = {
+                'raw_bytes': raw,
+                'x_scale': x_scale, 'y_scale': y_scale,
+                'x_offset': x_offset, 'y_offset': y_offset,
+                'url': f'dropbox://{key}'
+            }
+            return _cache_in_memory(result)
+        except Exception:
+            pass  # Corrupted — fall through to regenerate
+
+    # 3. Get raw image bytes (disk or Dropbox API)
     raw_bytes, ct = get_dropbox_image_bytes(image_code)
     if not raw_bytes:
         return None
 
+    # 4. PIL resize — happens at most once per image ever
     try:
         with PilImage.open(BytesIO(raw_bytes)) as im:
             im = ImageOps.exif_transpose(im)
@@ -835,25 +872,29 @@ def get_dropbox_thumbnail(image_code, tw=TARGET_W, th=TARGET_H):
                 fmt = "JPEG"
             buf = BytesIO()
             im.save(buf, format=fmt, quality=85, optimize=True)
-            raw = buf.getvalue()
+            processed = buf.getvalue()
             ow, oh = im.size
-
         wr = tw / ow
         hr = th / oh
         sf = min(wr, hr)
+        x_off = (tw - ow * sf) / 2
+        y_off = (th - oh * sf) / 2
         result = {
-            'raw_bytes': raw,
+            'raw_bytes': processed,
             'x_scale': sf, 'y_scale': sf,
-            'x_offset': (tw - ow * sf) / 2,
-            'y_offset': (th - oh * sf) / 2,
+            'x_offset': x_off, 'y_offset': y_off,
             'url': f'dropbox://{key}'
         }
-        _dropbox_thumb_cache[key] = result
-        return result
+        # Persist to disk — next server restart skips PIL entirely
+        try:
+            with open(thumb_path, 'wb') as f:
+                f.write(struct.pack('4d', sf, sf, x_off, y_off))
+                f.write(processed)
+        except Exception:
+            pass
+        return _cache_in_memory(result)
     except Exception:
         return None
-
-
 def get_image_cached(item, s3_base_url):
     """
     Get image for an item, using cache keyed by base_style.
