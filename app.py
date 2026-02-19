@@ -674,6 +674,9 @@ def _upload_to_s3_sync(image_code, data, content_type):
             ContentType=content_type,
             CacheControl='public, max-age=86400',
         )
+        # Invalidate CloudFront so new/updated image is instantly live
+        cf_path = f"/ALL+INVENTORY+Photos/DROPBOX_SYNC/{image_code}{ext}"
+        threading.Thread(target=_invalidate_cloudfront, args=([cf_path],), daemon=True).start()
         return True
     except Exception as e:
         print(f"[S3 Sync] Upload failed for {image_code}: {e}")
@@ -1944,6 +1947,15 @@ def save_overrides():
         if not isinstance(overrides, dict):
             return jsonify({"error": "'overrides' must be an object"}), 400
 
+        # Find which styles have new/changed images (for CloudFront invalidation)
+        with _overrides_lock:
+            old_overrides = dict(_style_overrides)
+        changed_styles = [
+            style for style, data in overrides.items()
+            if isinstance(data, dict) and data.get('image') and
+               data.get('image') != (old_overrides.get(style) or {}).get('image')
+        ]
+
         with _overrides_lock:
             global _style_overrides
             _style_overrides = overrides
@@ -1951,7 +1963,12 @@ def save_overrides():
         success = save_overrides_to_s3()
 
         if success:
-            return jsonify({"success": True, "count": len(overrides)})
+            # Invalidate CloudFront cache for changed override images — instant update
+            if changed_styles:
+                paths = [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.jpg" for s in changed_styles]
+                paths += [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.png" for s in changed_styles]
+                threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+            return jsonify({"success": True, "count": len(overrides), "invalidated": len(changed_styles)})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
@@ -2205,6 +2222,30 @@ def _cors_json(data, status=200):
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return resp
+
+def _invalidate_cloudfront(paths):
+    """Invalidate specific CloudFront paths so updates are instant.
+    paths: list of strings like ['/ALL+INVENTORY+Photos/STYLE+OVERRIDES/NA5001.jpg']
+    First 1000 invalidation paths/month are free."""
+    try:
+        distribution_id = os.environ.get('CLOUDFRONT_DISTRIBUTION_ID', '')
+        if not distribution_id:
+            return  # Silently skip if not configured
+        cf = boto3.client('cloudfront',
+            aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', ''),
+            aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', ''),
+            region_name='us-east-1'  # CloudFront is always us-east-1
+        )
+        cf.create_invalidation(
+            DistributionId=distribution_id,
+            InvalidationBatch={
+                'Paths': {'Quantity': len(paths), 'Items': paths},
+                'CallerReference': str(int(time.time()))
+            }
+        )
+        print(f"[CloudFront] Invalidated {len(paths)} path(s): {paths}", flush=True)
+    except Exception as e:
+        print(f"[CloudFront] Invalidation failed (non-fatal): {e}", flush=True)
 
 @app.route('/saved-catalogs', methods=['GET', 'POST', 'OPTIONS'])
 def handle_saved_catalogs():
