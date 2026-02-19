@@ -408,6 +408,165 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
     return None
 
 
+def _extract_style_code_from_path(path_lower):
+    """Extract style code (e.g. CH_001) from a Dropbox path segment."""
+    import re
+    # Match folder names like CH_001, BE_001, NA_025, BE_ 299 (with space)
+    # Look at each path segment
+    segments = path_lower.replace('\\', '/').split('/')
+    for seg in reversed(segments):  # Check deepest first
+        # Normalize: remove trailing stuff like " crop", " copy", spaces
+        clean = re.sub(r'\s+(crop|copy\s*\d*|wht|blk|dobby).*$', '', seg, flags=re.IGNORECASE).strip()
+        clean = clean.replace(' ', '_')
+        m = re.match(r'^([a-z]{2}_\d+)', clean, re.IGNORECASE)
+        if m:
+            return m.group(1).upper().replace(' ', '_')
+    return None
+
+def _classify_ecom_type(path_lower):
+    """Classify image as model, ghost, or closeup based on path."""
+    p = path_lower.lower()
+    if 'model' in p:
+        return 'model'
+    if 'ghost' in p:
+        return 'ghost'
+    if 'close' in p:
+        return 'closeup'
+    return 'model'  # default for flat-structure brands like JNY/OVERSTOCK
+
+def _is_72dpi_path(path_lower):
+    """Return True if path suggests 72dpi resolution."""
+    p = path_lower.lower()
+    return '72' in p
+
+def _is_300dpi_path(path_lower):
+    """Return True if path suggests 300dpi resolution."""
+    p = path_lower.lower()
+    return '300' in p
+
+def sync_ecom_photos():
+    """Recursively index all ecom photos from David - Dropbox/Ecom_Photos.
+    Groups images by style code, deduplicates 72dpi vs 300dpi (prefers 72dpi),
+    sorts model first then ghost/closeup."""
+    global _ecom_photo_index, _ecom_photos_last_sync
+    token = get_dropbox_token()
+    if not token:
+        print("[Ecom Photos] No token, skipping", flush=True)
+        return
+
+    print(f"[Ecom Photos] Recursive scan of {DROPBOX_ECOM_PHOTOS_PATH}...", flush=True)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    try:
+        # Recursive list of entire ecom photos folder
+        all_files = []
+        resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers,
+            json={'path': DROPBOX_ECOM_PHOTOS_PATH, 'recursive': True, 'limit': 2000},
+            timeout=120
+        )
+        if resp.status_code != 200:
+            print(f"[Ecom Photos] API error {resp.status_code}: {resp.text[:200]}", flush=True)
+            return
+
+        data = resp.json()
+        while True:
+            for entry in data.get('entries', []):
+                if entry['.tag'] != 'file':
+                    continue
+                name = entry['name'].lower()
+                if not name.endswith(('.jpg', '.jpeg', '.png')):
+                    continue
+                if '__macosx' in entry['path_lower']:
+                    continue
+                all_files.append(entry)
+            if not data.get('has_more'):
+                break
+            resp = http_requests.post(
+                'https://api.dropboxapi.com/2/files/list_folder/continue',
+                headers=headers,
+                json={'cursor': data['cursor']},
+                timeout=60
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+
+        print(f"[Ecom Photos] Found {len(all_files)} image files, building index...", flush=True)
+
+        # Group by style code
+        # raw_index: style_code → {dedup_key → {path, type, name, is_72dpi}}
+        raw_index = {}
+        for entry in all_files:
+            path = entry['path_display']
+            path_lower = entry['path_lower']
+            filename = entry['name']
+
+            style_code = _extract_style_code_from_path(path_lower)
+            if not style_code:
+                continue
+
+            img_type = _classify_ecom_type(path_lower)
+            is_72 = _is_72dpi_path(path_lower)
+            is_300 = _is_300dpi_path(path_lower)
+
+            if style_code not in raw_index:
+                raw_index[style_code] = {}
+
+            # Dedup key: style_code + filename (without extension)
+            name_no_ext = os.path.splitext(filename)[0].lower()
+            # Normalize name for dedup (strip _back/_front/_side suffixes for counting)
+            dedup_key = f"{img_type}:{name_no_ext}"
+
+            existing = raw_index[style_code].get(dedup_key)
+            if existing is None:
+                raw_index[style_code][dedup_key] = {
+                    'path': path,
+                    'type': img_type,
+                    'name': filename,
+                    'is_72': is_72,
+                    'is_300': is_300,
+                }
+            else:
+                # Prefer 72dpi over 300dpi
+                if is_72 and not existing['is_72']:
+                    raw_index[style_code][dedup_key] = {
+                        'path': path,
+                        'type': img_type,
+                        'name': filename,
+                        'is_72': is_72,
+                        'is_300': is_300,
+                    }
+
+        # Build final sorted index: model first, then ghost, then closeup
+        TYPE_ORDER = {'model': 0, 'ghost': 1, 'closeup': 2}
+        new_index = {}
+        for style_code, images_dict in raw_index.items():
+            images = list(images_dict.values())
+            def _photo_sort_key(x):
+                name_lower = x['name'].lower()
+                name_no_ext = os.path.splitext(name_lower)[0]
+                if 'front' in name_no_ext:   pos = 0
+                elif 'side' in name_no_ext:  pos = 1
+                elif 'back' in name_no_ext:  pos = 2
+                else:                         pos = 3
+                return (TYPE_ORDER.get(x['type'], 3), pos, name_no_ext)
+            images.sort(key=_photo_sort_key)
+            new_index[style_code] = [{'path': img['path'], 'type': img['type'], 'name': img['name']} for img in images]
+
+        with _ecom_photo_lock:
+            _ecom_photo_index = new_index
+            _ecom_photos_last_sync = time.time()
+
+        total_images = sum(len(v) for v in new_index.values())
+        print(f"[Ecom Photos] ✓ Indexed {len(new_index)} styles, {total_images} total images", flush=True)
+
+    except Exception as e:
+        print(f"[Ecom Photos] Error: {e}", flush=True)
+        import traceback; traceback.print_exc()
+
+
 def sync_dropbox_photos():
     """List files in Dropbox PHOTOS INVENTORY folder via API — just metadata, no downloading."""
     global _dropbox_photo_index, _dropbox_photos_last_sync
@@ -567,6 +726,14 @@ _dropbox_img_cache = {}  # image_code → (bytes, content_type) — small in-mem
 _dropbox_img_cache_lock = threading.Lock()
 DROPBOX_DISK_CACHE = os.environ.get('DROPBOX_DISK_CACHE', '/var/data/dropbox_cache')
 os.makedirs(DROPBOX_DISK_CACHE, exist_ok=True)
+
+# Ecom photos index — maps style_code (e.g. 'CH_001') → sorted list of {path, type}
+DROPBOX_ECOM_PHOTOS_PATH = os.environ.get('DROPBOX_ECOM_PHOTOS_PATH', '/Versa Share Files/David - Dropbox/Ecom_Photos')
+DROPBOX_ECOM_CACHE_DIR = os.environ.get('DROPBOX_ECOM_CACHE_DIR', '/var/data/ecom_cache')
+os.makedirs(DROPBOX_ECOM_CACHE_DIR, exist_ok=True)
+_ecom_photo_index = {}   # style_code → [{'path': dropbox_path, 'type': 'model'|'ghost'|'closeup', 'name': filename}]
+_ecom_photo_lock = threading.Lock()
+_ecom_photos_last_sync = 0
 
 
 def _download_dropbox_file(dropbox_path):
@@ -982,6 +1149,39 @@ def get_image_cached(item, s3_base_url):
         image_code_cf = extract_image_code(sku, brand_abbr_cf)
         brand_url = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name_cf}/{image_code_cf}.jpg"
         result = _process_image_from_url(brand_url)
+
+    # 5. Final fallback — use first ecom photo (closeup preferred) if all else fails
+    if not result:
+        with _ecom_photo_lock:
+            ecom_photos = _ecom_photo_index.get(base_style, [])
+        if ecom_photos:
+            # For main image fallback: prefer closeup → model → ghost
+            FALLBACK_ORDER = {'closeup': 0, 'model': 1, 'ghost': 2}
+            fallback_sorted = sorted(ecom_photos, key=lambda x: FALLBACK_ORDER.get(x['type'], 3))
+            first_photo = fallback_sorted[0]
+            raw_bytes, ct = _download_dropbox_file(first_photo['path'])
+            if raw_bytes:
+                try:
+                    with PilImage.open(BytesIO(raw_bytes)) as im:
+                        im = ImageOps.exif_transpose(im)
+                        tw, th = TARGET_W, TARGET_H
+                        im.thumbnail((tw * 2, th * 2), PilImage.Resampling.LANCZOS)
+                        if im.mode not in ('RGB', 'RGBA'):
+                            im = im.convert('RGB')
+                        fmt = 'PNG' if im.mode == 'RGBA' else 'JPEG'
+                        buf = BytesIO()
+                        im.save(buf, format=fmt, quality=85, optimize=True)
+                        ow, oh = im.size
+                    sf = min(tw / ow, th / oh)
+                    result = {
+                        'raw_bytes': buf.getvalue(),
+                        'x_scale': sf, 'y_scale': sf,
+                        'x_offset': (tw - ow * sf) / 2,
+                        'y_offset': (th - oh * sf) / 2,
+                        'url': f'ecom://{base_style}'
+                    }
+                except Exception:
+                    pass
 
     # Cache result (even None to avoid re-fetching failures)
     with _img_lock:
@@ -2102,6 +2302,17 @@ def _fetch_raw_image(base_style, brand_abbr):
                     return resp.content, ct
         except Exception:
             continue
+
+    # 5. Final fallback — first ecom photo for this style (closeup preferred)
+    with _ecom_photo_lock:
+        ecom_photos = _ecom_photo_index.get(base_style, [])
+    if ecom_photos:
+        FALLBACK_ORDER = {'closeup': 0, 'model': 1, 'ghost': 2}
+        fallback_sorted = sorted(ecom_photos, key=lambda x: FALLBACK_ORDER.get(x['type'], 3))
+        data, ct = _download_dropbox_file(fallback_sorted[0]['path'])
+        if data:
+            return data, ct or 'image/jpeg'
+
     return None, None
 
 
@@ -2183,6 +2394,128 @@ def trigger_dropbox_photo_sync():
         prewarm_dropbox_cache()
     threading.Thread(target=_sync_and_warm, daemon=True).start()
     return jsonify({'status': 'sync_started', 'current_count': len(_dropbox_photo_index)})
+
+
+@app.route('/ecom-photos/index', methods=['GET', 'OPTIONS'])
+def ecom_photos_index():
+    """Return dict of style_code → image count for all styles with ecom photos."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _ecom_photo_lock:
+        index = {k: len(v) for k, v in _ecom_photo_index.items()}
+    return jsonify({
+        'index': index,
+        'total_styles': len(index),
+        'last_sync': _ecom_photos_last_sync
+    })
+
+
+@app.route('/ecom-photos/<style_code>', methods=['GET', 'OPTIONS'])
+def ecom_photos_for_style(style_code):
+    """Return ordered list of ecom photo URLs for a style code."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    style_code = style_code.upper().replace('-', '_')
+    with _ecom_photo_lock:
+        photos = _ecom_photo_index.get(style_code, [])
+    if not photos:
+        return jsonify({'photos': [], 'count': 0})
+    # Build proxy URLs for each photo
+    import base64
+    urls = []
+    for i, photo in enumerate(photos):
+        path_b64 = base64.urlsafe_b64encode(photo['path'].encode()).decode()
+        urls.append({
+            'url': f"/ecom-image/{path_b64}",
+            'type': photo['type'],
+            'name': photo['name'],
+            'index': i
+        })
+    return jsonify({'photos': urls, 'count': len(urls)})
+
+
+_ecom_img_cache = {}  # path → (bytes, content_type)
+_ecom_img_lock = threading.Lock()
+ECOM_DISK_CACHE = DROPBOX_ECOM_CACHE_DIR
+
+@app.route('/ecom-image/<path_b64>', methods=['GET', 'OPTIONS'])
+def serve_ecom_image(path_b64):
+    """Serve an ecom photo by base64-encoded Dropbox path. Disk cached."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    import base64
+    try:
+        dropbox_path = base64.urlsafe_b64decode(path_b64.encode()).decode()
+    except Exception:
+        return '', 400
+
+    cache_key = path_b64[:100]  # safe filename prefix
+
+    # 1. In-memory cache
+    with _ecom_img_lock:
+        cached = _ecom_img_cache.get(cache_key)
+    if cached:
+        resp = make_response(cached[0])
+        resp.headers['Content-Type'] = cached[1]
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+    # 2. Disk cache
+    disk_path_jpg = os.path.join(ECOM_DISK_CACHE, cache_key + '.jpg')
+    disk_path_png = os.path.join(ECOM_DISK_CACHE, cache_key + '.png')
+    for dp, ct in [(disk_path_jpg, 'image/jpeg'), (disk_path_png, 'image/png')]:
+        if os.path.exists(dp):
+            try:
+                with open(dp, 'rb') as f:
+                    data = f.read()
+                with _ecom_img_lock:
+                    if len(_ecom_img_cache) > 200:
+                        for k in list(_ecom_img_cache.keys())[:50]:
+                            del _ecom_img_cache[k]
+                    _ecom_img_cache[cache_key] = (data, ct)
+                resp = make_response(data)
+                resp.headers['Content-Type'] = ct
+                resp.headers['Cache-Control'] = 'public, max-age=86400'
+                resp.headers['Access-Control-Allow-Origin'] = '*'
+                return resp
+            except Exception:
+                pass
+
+    # 3. Download from Dropbox
+    data, ct = _download_dropbox_file(dropbox_path)
+    if not data:
+        return '', 404
+
+    ext = '.png' if ct and 'png' in ct else '.jpg'
+    ct = ct or 'image/jpeg'
+    disk_save = os.path.join(ECOM_DISK_CACHE, cache_key + ext)
+    try:
+        with open(disk_save, 'wb') as f:
+            f.write(data)
+    except Exception:
+        pass
+
+    with _ecom_img_lock:
+        if len(_ecom_img_cache) > 200:
+            for k in list(_ecom_img_cache.keys())[:50]:
+                del _ecom_img_cache[k]
+        _ecom_img_cache[cache_key] = (data, ct)
+
+    resp = make_response(data)
+    resp.headers['Content-Type'] = ct
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
+
+
+@app.route('/ecom-photos/sync', methods=['POST', 'OPTIONS'])
+def trigger_ecom_photo_sync():
+    """Manually trigger ecom photo index sync."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    threading.Thread(target=sync_ecom_photos, daemon=True).start()
+    return jsonify({'status': 'sync_started'})
 
 
 # ============================================
@@ -2348,6 +2681,10 @@ def hourly_resync():
                 prewarm_dropbox_cache()  # Downloads new images + uploads to S3
             except Exception as e:
                 print(f"  ⚠ Dropbox photos sync failed: {e}")
+            try:
+                sync_ecom_photos()  # Re-index ecom photos for any new additions
+            except Exception as e:
+                print(f"  ⚠ Ecom photos sync failed: {e}")
 
         with _export_lock:
             if _exports['generating']:
@@ -2382,6 +2719,8 @@ def startup_sync():
     if _dbx_configured:
         print("  → Syncing Dropbox photos index...", flush=True)
         sync_dropbox_photos()
+        # Sync ecom photos index in background
+        threading.Thread(target=sync_ecom_photos, daemon=True).start()
         # Start background pre-warm of all images to disk
         if _dropbox_photo_index:
             import threading as _th
