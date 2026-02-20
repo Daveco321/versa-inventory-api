@@ -51,6 +51,7 @@ S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
 
 S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides.json')
 S3_MANUAL_ALLOC_KEY = os.environ.get('S3_MANUAL_ALLOC_KEY', 'inventory/manual_allocations.json')
+S3_DEDUCTION_ASSIGN_KEY = os.environ.get('S3_DEDUCTION_ASSIGN_KEY', 'inventory/deduction_assignments.json')
 S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
@@ -197,6 +198,8 @@ _overrides_lock = threading.Lock()
 _style_overrides = {}
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
+_deduction_assign_lock = threading.Lock()
+_deduction_assignments = {}  # dict: { sku: 'warehouse' | 'overseas' }
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
@@ -270,6 +273,44 @@ def save_manual_allocations_to_s3():
         return True
     except Exception as e:
         print(f"  ✗ Failed to save manual allocations to S3: {e}")
+        return False
+
+
+def load_deduction_assignments_from_s3():
+    """Load deduction assignments (sku -> warehouse|overseas) from S3"""
+    global _deduction_assignments
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_DEDUCTION_ASSIGN_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _deduction_assign_lock:
+            _deduction_assignments = data if isinstance(data, dict) else {}
+        print(f"  ✓ Loaded {len(_deduction_assignments)} deduction assignments from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No deduction assignments in S3 yet")
+        else:
+            print(f"  ⚠ Could not load deduction assignments: {e}")
+    except Exception as e:
+        print(f"  ⚠ Deduction assignment load error: {e}")
+
+
+def save_deduction_assignments_to_s3():
+    """Save deduction assignments to S3"""
+    try:
+        s3 = get_s3()
+        with _deduction_assign_lock:
+            data = json.dumps(_deduction_assignments)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_DEDUCTION_ASSIGN_KEY,
+            Body=data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Saved {len(_deduction_assignments)} deduction assignments to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save deduction assignments: {e}")
         return False
 
 
@@ -2052,6 +2093,35 @@ def get_allocations_version():
     return jsonify({"version": version, "count": len(_manual_allocations)})
 
 
+@app.route('/deduction-assignments', methods=['GET', 'OPTIONS'])
+def get_deduction_assignments():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _deduction_assign_lock:
+        data = dict(_deduction_assignments)
+    return jsonify({"assignments": data})
+
+
+@app.route('/deduction-assignments', methods=['POST'])
+def save_deduction_assignments():
+    try:
+        req = request.get_json()
+        if not req or 'assignments' not in req:
+            return jsonify({"error": "Missing 'assignments'"}), 400
+        assignments = req['assignments']
+        if not isinstance(assignments, dict):
+            return jsonify({"error": "'assignments' must be an object"}), 400
+        global _deduction_assignments
+        with _deduction_assign_lock:
+            _deduction_assignments = assignments
+        success = save_deduction_assignments_to_s3()
+        if success:
+            return jsonify({"success": True, "count": len(assignments)})
+        return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
 def get_manual_allocations():
     if request.method == 'OPTIONS':
@@ -2478,6 +2548,7 @@ def startup_sync():
 
     load_overrides_from_s3()
     load_manual_allocations_from_s3()
+    load_deduction_assignments_from_s3()
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
     if _dbx_configured:
