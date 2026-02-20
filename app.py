@@ -2038,6 +2038,18 @@ def get_allocations():
     return jsonify({"allocations": merged})
 
 
+@app.route('/allocations/version', methods=['GET', 'OPTIONS'])
+def get_allocations_version():
+    """Returns a lightweight version hash of manual allocations — for live sync polling"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    import hashlib
+    with _manual_alloc_lock:
+        data = json.dumps(_manual_allocations, sort_keys=True)
+    version = hashlib.md5(data.encode()).hexdigest()[:12]
+    return jsonify({"version": version, "count": len(_manual_allocations)})
+
+
 @app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
 def get_manual_allocations():
     if request.method == 'OPTIONS':
