@@ -2045,7 +2045,9 @@ def get_allocations_version():
         return '', 204
     import hashlib
     with _manual_alloc_lock:
-        data = json.dumps(_manual_allocations, sort_keys=True)
+        # Sort by id for deterministic hash regardless of list order or server restarts
+        sorted_allocs = sorted(_manual_allocations, key=lambda x: x.get('id', ''))
+        data = json.dumps(sorted_allocs, sort_keys=True)
     version = hashlib.md5(data.encode()).hexdigest()[:12]
     return jsonify({"version": version, "count": len(_manual_allocations)})
 
