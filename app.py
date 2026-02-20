@@ -50,6 +50,7 @@ S3_PHOTOS_PREFIX = os.environ.get('S3_PHOTOS_PREFIX',
                                    'ALL+INVENTORY+Photos/PHOTOS+INVENTORY')
 
 S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides.json')
+S3_MANUAL_ALLOC_KEY = os.environ.get('S3_MANUAL_ALLOC_KEY', 'inventory/manual_allocations.json')
 S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
@@ -194,6 +195,8 @@ _exports = {
 
 _overrides_lock = threading.Lock()
 _style_overrides = {}
+_manual_alloc_lock = threading.Lock()
+_manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
@@ -229,6 +232,44 @@ def save_overrides_to_s3():
         return True
     except Exception as e:
         print(f"  ✗ Failed to save overrides to S3: {e}")
+        return False
+
+
+def load_manual_allocations_from_s3():
+    """Load manual allocation entries from S3 JSON on startup"""
+    global _manual_allocations
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_MANUAL_ALLOC_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _manual_alloc_lock:
+            _manual_allocations = data if isinstance(data, list) else []
+        print(f"  ✓ Loaded {len(_manual_allocations)} manual allocation entries from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No manual allocations in S3 yet (will create on first save)")
+        else:
+            print(f"  ⚠ Could not load manual allocations from S3: {e}")
+    except Exception as e:
+        print(f"  ⚠ Manual allocation load error: {e}")
+
+
+def save_manual_allocations_to_s3():
+    """Persist manual allocation entries to S3"""
+    try:
+        s3 = get_s3()
+        with _manual_alloc_lock:
+            data = json.dumps(_manual_allocations)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_MANUAL_ALLOC_KEY,
+            Body=data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Saved {len(_manual_allocations)} manual allocations to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save manual allocations to S3: {e}")
         return False
 
 
@@ -1984,8 +2025,48 @@ def save_overrides():
 def get_allocations():
     if request.method == 'OPTIONS':
         return '', 204
-    data = load_allocation_from_s3()
+    # Merge S3 sheet entries with manual entries
+    s3_data = load_allocation_from_s3()
+    for row in s3_data:
+        row['source'] = 's3'
+    with _manual_alloc_lock:
+        manual = list(_manual_allocations)
+    for row in manual:
+        row_copy = dict(row)
+        row_copy['source'] = 'manual'
+    merged = s3_data + [dict(r, source='manual') for r in manual]
+    return jsonify({"allocations": merged})
+
+
+@app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
+def get_manual_allocations():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _manual_alloc_lock:
+        data = list(_manual_allocations)
     return jsonify({"allocations": data})
+
+
+@app.route('/manual-allocations', methods=['POST'])
+def save_manual_allocations():
+    try:
+        req = request.get_json()
+        if not req or 'allocations' not in req:
+            return jsonify({"error": "Missing 'allocations' in request body"}), 400
+        entries = req['allocations']
+        if not isinstance(entries, list):
+            return jsonify({"error": "'allocations' must be a list"}), 400
+        global _manual_allocations
+        with _manual_alloc_lock:
+            _manual_allocations = entries
+        success = save_manual_allocations_to_s3()
+        if success:
+            return jsonify({"success": True, "count": len(entries)})
+        else:
+            return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.route('/production', methods=['GET', 'OPTIONS'])
@@ -2382,6 +2463,7 @@ def startup_sync():
     print("="*60)
 
     load_overrides_from_s3()
+    load_manual_allocations_from_s3()
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
     if _dbx_configured:
