@@ -1187,6 +1187,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             if is_order:
                 headers.append('Qty Selected')
             headers.extend(['Warehouse', 'Total ATS'])
+            # All Inventory catalog view: include date columns for items with incoming stock
+            if view_mode == 'all':
+                headers.extend(['Ex-Factory', 'Arrival'])
     elif view_mode == 'incoming':
         # Admin overseas view: no warehouse columns, add dates
         headers = ['IMAGE', 'SKU', 'Brand']
