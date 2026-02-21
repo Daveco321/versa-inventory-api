@@ -2497,6 +2497,30 @@ def delete_saved_catalog(idx):
         return _cors_json({'error': str(e)}, 500)
 
 
+@app.route('/saved-catalogs/reorder', methods=['POST', 'OPTIONS'])
+def reorder_saved_catalogs():
+    if request.method == 'OPTIONS':
+        resp = make_response('', 204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+    try:
+        data = request.get_json()
+        order = data.get('order', [])  # list of original indices in new order
+        catalogs = _load_saved_catalogs()
+        if len(order) != len(catalogs):
+            return _cors_json({'error': 'order length mismatch'}, 400)
+        reordered = [catalogs[i] for i in order if 0 <= i < len(catalogs)]
+        if len(reordered) != len(catalogs):
+            return _cors_json({'error': 'invalid indices'}, 400)
+        _save_saved_catalogs(reordered)
+        return _cors_json({'status': 'reordered', 'catalogs': reordered})
+    except Exception as e:
+        print(f"[Saved Catalogs] Reorder error: {e}", flush=True)
+        return _cors_json({'error': str(e)}, 500)
+
+
 DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
 
 _worker_initialized = False
