@@ -1962,6 +1962,170 @@ def upload_inventory():
     return jsonify({"status": "ok", "message": f"Uploaded and synced. {count} items.", "item_count": count})
 
 
+@app.route('/export-overseas-summary', methods=['POST', 'OPTIONS'])
+def export_overseas_summary():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req or 'data' not in req:
+            return jsonify({"error": "Missing 'data'"}), 400
+        data = req['data']
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Overseas_Summary')
+        if not data:
+            return jsonify({"error": "Empty data"}), 400
+
+        xl_bytes = build_overseas_summary_excel(fname, data, s3_url)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+def build_overseas_summary_excel(title, items, s3_base_url):
+    """Build a formatted overseas summary Excel with images, date banners, brand separators."""
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb.set_properties({'title': f'Versa - {title}', 'author': 'Versa Inventory System'})
+    ws = wb.add_worksheet('Overseas Summary')
+
+    # ── Formats ──
+    font = STYLE_CONFIG['font_name']
+    fmt_header = wb.add_format({
+        'bold': True, 'font_name': font, 'font_size': 11,
+        'bg_color': '#1E293B', 'font_color': '#FFFFFF',
+        'border': 1, 'border_color': '#1E293B',
+        'align': 'center', 'valign': 'vcenter'
+    })
+    base = {
+        'font_name': font, 'font_size': 10,
+        'text_wrap': True, 'valign': 'vcenter', 'align': 'center',
+        'border': 1, 'border_color': '#D1D5DB'
+    }
+    fmt_odd = wb.add_format({**base, 'bg_color': '#FFFFFF'})
+    fmt_even = wb.add_format({**base, 'bg_color': '#F8FAFC'})
+    fmt_num_odd = wb.add_format({**base, 'bg_color': '#FFFFFF', 'num_format': '#,##0'})
+    fmt_num_even = wb.add_format({**base, 'bg_color': '#F8FAFC', 'num_format': '#,##0'})
+    fmt_neg_odd = wb.add_format({**base, 'bg_color': '#FFFFFF', 'num_format': '#,##0', 'font_color': '#DC2626'})
+    fmt_neg_even = wb.add_format({**base, 'bg_color': '#F8FAFC', 'num_format': '#,##0', 'font_color': '#DC2626'})
+    fmt_ats_odd = wb.add_format({**base, 'bg_color': '#FFFFFF', 'num_format': '#,##0', 'bold': True, 'font_size': 11})
+    fmt_ats_even = wb.add_format({**base, 'bg_color': '#F8FAFC', 'num_format': '#,##0', 'bold': True, 'font_size': 11})
+    fmt_date_banner = wb.add_format({
+        'bold': True, 'font_name': font, 'font_size': 12,
+        'bg_color': '#FEF3C7', 'font_color': '#92400E',
+        'border': 1, 'border_color': '#F59E0B',
+        'align': 'left', 'valign': 'vcenter'
+    })
+    fmt_brand_sep = wb.add_format({
+        'bold': True, 'font_name': font, 'font_size': 10,
+        'bg_color': '#F1F5F9', 'font_color': '#475569',
+        'border': 1, 'border_color': '#E2E8F0',
+        'align': 'left', 'valign': 'vcenter'
+    })
+    fmt_sku_odd = wb.add_format({**base, 'bg_color': '#FFFFFF', 'bold': True, 'align': 'left'})
+    fmt_sku_even = wb.add_format({**base, 'bg_color': '#F8FAFC', 'bold': True, 'align': 'left'})
+
+    # ── Headers ──
+    headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
+               'Production', 'PO', 'Ex-Factory', 'Arrival',
+               'Produced', 'Deducted', 'Flow ATS']
+    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 22, 14, 14, 12, 12, 12]
+
+    ws.hide_gridlines(2)
+    ws.freeze_panes(1, 0)
+    ws.set_row(0, 28)
+    for c, h in enumerate(headers):
+        ws.write(0, c, h, fmt_header)
+        ws.set_column(c, c, col_widths[c])
+
+    # ── Download images ──
+    img_items = [{'sku': d.get('sku', ''), 'brand_abbr': d.get('brand_abbr', ''),
+                  'brand': d.get('brand_abbr', '')} for d in items]
+    imgs = download_images_for_items(img_items, s3_base_url, use_cache=True)
+
+    # ── Write rows with date banners & brand separators ──
+    row = 1
+    data_row_idx = 0  # for alternating colors
+    last_date_key = None
+    last_brand = None
+    num_cols = len(headers)
+
+    for i, item in enumerate(items):
+        date_key = item.get('arrival', '') or item.get('ex_factory', '') or 'No Date'
+
+        # Date group banner
+        if date_key != last_date_key:
+            etd = item.get('ex_factory', '—') or '—'
+            arr = item.get('arrival', '—') or '—'
+            ws.set_row(row, 26)
+            ws.merge_range(row, 0, row, num_cols - 1,
+                           f"  📅  Ex-Factory: {etd}  →  Arrival: {arr}", fmt_date_banner)
+            row += 1
+            last_date_key = date_key
+            last_brand = None
+            data_row_idx = 0
+
+        # Brand separator
+        brand = item.get('brand_full', '') or item.get('brand_abbr', '')
+        brand_key = item.get('brand_abbr', '')
+        if brand_key != last_brand:
+            ws.set_row(row, 20)
+            ws.merge_range(row, 0, row, num_cols - 1,
+                           f"  ▸  {brand}", fmt_brand_sep)
+            row += 1
+            last_brand = brand_key
+            data_row_idx = 0
+
+        # Data row
+        even = data_row_idx % 2 == 1
+        cf = fmt_even if even else fmt_odd
+        nf = fmt_num_even if even else fmt_num_odd
+        sf = fmt_sku_even if even else fmt_sku_odd
+        deducted_fmt = fmt_neg_even if even else fmt_neg_odd
+        ats_fmt = fmt_ats_even if even else fmt_ats_odd
+
+        ws.set_row(row, 112.5)
+
+        # Image
+        img = imgs.get(i)
+        if img:
+            try:
+                ws.insert_image(row, 0, "img.png", {
+                    'image_data': img['image_data'],
+                    'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
+                    'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
+                    'object_position': 1, 'url': img.get('url', '')
+                })
+            except Exception:
+                ws.write(row, 0, "Error", cf)
+        else:
+            ws.write(row, 0, "No Image", cf)
+
+        ws.write(row, 1, item.get('sku', ''), sf)
+        ws.write(row, 2, item.get('brand_abbr', ''), cf)
+        ws.write(row, 3, item.get('color', ''), cf)
+        ws.write(row, 4, item.get('fit', ''), cf)
+        ws.write(row, 5, item.get('fabrication', ''), cf)
+        ws.write(row, 6, item.get('production', ''), cf)
+        ws.write(row, 7, item.get('po', ''), cf)
+        ws.write(row, 8, item.get('ex_factory', ''), cf)
+        ws.write(row, 9, item.get('arrival', ''), cf)
+        ws.write(row, 10, item.get('produced', 0), nf)
+        deducted = item.get('deducted', 0)
+        ws.write(row, 11, deducted, deducted_fmt if deducted else nf)
+        ws.write(row, 12, item.get('flow_ats', 0), ats_fmt)
+
+        row += 1
+        data_row_idx += 1
+
+    wb.close()
+    return buf.getvalue()
+
+
 @app.route('/export', methods=['POST', 'OPTIONS'])
 def export_single():
     if request.method == 'OPTIONS':
