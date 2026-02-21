@@ -2447,12 +2447,17 @@ def handle_saved_catalogs():
         # Preserve existing slug if updating, otherwise use the one sent from frontend
         existing_slug = catalogs[existing_idx].get('slug', '') if existing_idx >= 0 else ''
         slug = existing_slug or data.get('slug', '')
+        
+        # Preserve existing folder if not explicitly provided
+        existing_folder = catalogs[existing_idx].get('folder', '') if existing_idx >= 0 else ''
+        folder = data.get('folder') if 'folder' in data else existing_folder
 
         entry = {
             'name': data['name'],
             'url': data['url'],
             'brands': data.get('brands', []),
             'slug': slug,
+            'folder': folder,
             'savedAt': int(time.time() * 1000)
         }
 
