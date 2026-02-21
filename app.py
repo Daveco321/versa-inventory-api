@@ -2477,26 +2477,6 @@ def handle_saved_catalogs():
         import traceback; traceback.print_exc()
         return _cors_json({'error': str(e)}, 500)
 
-@app.route('/saved-catalogs/<int:idx>', methods=['DELETE', 'OPTIONS'])
-def delete_saved_catalog(idx):
-    if request.method == 'OPTIONS':
-        resp = make_response('', 204)
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        return resp
-    try:
-        catalogs = _load_saved_catalogs()
-        if idx < 0 or idx >= len(catalogs):
-            return _cors_json({'error': 'invalid index'}, 404)
-        removed = catalogs.pop(idx)
-        _save_saved_catalogs(catalogs)
-        return _cors_json({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
-    except Exception as e:
-        print(f"[Saved Catalogs] Delete error: {e}", flush=True)
-        return _cors_json({'error': str(e)}, 500)
-
-
 @app.route('/saved-catalogs/reorder', methods=['POST', 'OPTIONS'])
 def reorder_saved_catalogs():
     if request.method == 'OPTIONS':
@@ -2518,6 +2498,26 @@ def reorder_saved_catalogs():
         return _cors_json({'status': 'reordered', 'catalogs': reordered})
     except Exception as e:
         print(f"[Saved Catalogs] Reorder error: {e}", flush=True)
+        return _cors_json({'error': str(e)}, 500)
+
+
+@app.route('/saved-catalogs/<int:idx>', methods=['DELETE', 'OPTIONS'])
+def delete_saved_catalog(idx):
+    if request.method == 'OPTIONS':
+        resp = make_response('', 204)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+    try:
+        catalogs = _load_saved_catalogs()
+        if idx < 0 or idx >= len(catalogs):
+            return _cors_json({'error': 'invalid index'}, 404)
+        removed = catalogs.pop(idx)
+        _save_saved_catalogs(catalogs)
+        return _cors_json({'status': 'deleted', 'name': removed['name'], 'catalogs': catalogs})
+    except Exception as e:
+        print(f"[Saved Catalogs] Delete error: {e}", flush=True)
         return _cors_json({'error': str(e)}, 500)
 
 
