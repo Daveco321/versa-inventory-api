@@ -2486,12 +2486,22 @@ def get_allocations_version():
     if request.method == 'OPTIONS':
         return '', 204
     import hashlib
-    with _manual_alloc_lock:
-        # Sort by id for deterministic hash regardless of list order or server restarts
-        sorted_allocs = sorted(_manual_allocations, key=lambda x: x.get('id', ''))
-        data = json.dumps(sorted_allocs, sort_keys=True)
-    version = hashlib.md5(data.encode()).hexdigest()[:12]
-    return jsonify({"version": version, "count": len(_manual_allocations)})
+    # Read from S3 for multi-worker consistency
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_MANUAL_ALLOC_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        allocs = data if isinstance(data, list) else []
+        # Also update in-memory
+        global _manual_allocations
+        with _manual_alloc_lock:
+            _manual_allocations = allocs
+    except Exception:
+        with _manual_alloc_lock:
+            allocs = list(_manual_allocations)
+    sorted_allocs = sorted(allocs, key=lambda x: x.get('id', ''))
+    version = hashlib.md5(json.dumps(sorted_allocs, sort_keys=True).encode()).hexdigest()[:12]
+    return jsonify({"version": version, "count": len(allocs)})
 
 
 @app.route('/deduction-assignments', methods=['GET', 'OPTIONS'])
@@ -2527,9 +2537,29 @@ def save_deduction_assignments():
 def get_manual_allocations():
     if request.method == 'OPTIONS':
         return '', 204
-    with _manual_alloc_lock:
-        data = list(_manual_allocations)
-    return jsonify({"allocations": data})
+    # Always read from S3 for multi-worker consistency
+    # (POST saves to S3, but other workers keep stale in-memory copies)
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_MANUAL_ALLOC_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        fresh = data if isinstance(data, list) else []
+        # Update in-memory copy so this worker stays current
+        global _manual_allocations
+        with _manual_alloc_lock:
+            _manual_allocations = fresh
+        return jsonify({"allocations": fresh})
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return jsonify({"allocations": []})
+        # Fallback to in-memory if S3 read fails
+        with _manual_alloc_lock:
+            data = list(_manual_allocations)
+        return jsonify({"allocations": data})
+    except Exception:
+        with _manual_alloc_lock:
+            data = list(_manual_allocations)
+        return jsonify({"allocations": data})
 
 
 @app.route('/manual-allocations', methods=['POST'])
@@ -2549,6 +2579,120 @@ def save_manual_allocations():
             return jsonify({"success": True, "count": len(entries)})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route('/allocations/delete-entries', methods=['POST', 'OPTIONS'])
+def delete_allocation_entries():
+    """Delete specific entries from S3 CSV and/or manual allocations.
+    Accepts: { entries: [{sku, po, customer, qty, source}], delete_po: "PO#123" }
+    - If delete_po is set, removes ALL entries (S3+manual) matching that PO.
+    - If entries is set, removes each matching entry individually.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req:
+            return jsonify({"error": "Missing request body"}), 400
+
+        delete_po = req.get('delete_po', '').strip()
+        entries_to_delete = req.get('entries', [])
+        deleted_s3 = 0
+        deleted_manual = 0
+
+        # ── Load current CSV from S3 ──
+        s3 = get_s3()
+        try:
+            resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_ALLOCATION_KEY)
+            csv_text = resp['Body'].read().decode('utf-8-sig')
+            csv_lines = csv_text.strip().split('\n')
+        except ClientError:
+            csv_lines = []
+
+        if len(csv_lines) >= 2:
+            header_line = csv_lines[0]
+            headers = [h.strip() for h in header_line.split(',')]
+            po_idx = next((i for i, h in enumerate(headers) if 'po' in h.lower()), 0)
+            cust_idx = next((i for i, h in enumerate(headers) if 'customer' in h.lower()), 1)
+            sku_idx = next((i for i, h in enumerate(headers) if 'sku' in h.lower()), 2)
+            qty_idx = next((i for i, h in enumerate(headers) if 'qty' in h.lower()), 3)
+
+            original_count = len(csv_lines) - 1  # minus header
+
+            if delete_po:
+                # Remove ALL rows matching this PO
+                kept_lines = [header_line]
+                for line in csv_lines[1:]:
+                    cols = [c.strip() for c in line.split(',')]
+                    row_po = cols[po_idx] if len(cols) > po_idx else ''
+                    if row_po.strip().upper() == delete_po.upper():
+                        deleted_s3 += 1
+                    else:
+                        kept_lines.append(line)
+                csv_lines = kept_lines
+            elif entries_to_delete:
+                # Build set of entries to delete (sku+po+qty)
+                delete_set = set()
+                for e in entries_to_delete:
+                    if e.get('source') == 's3':
+                        key = (e.get('sku', '').upper(), e.get('po', '').strip(), str(e.get('qty', 0)))
+                        delete_set.add(key)
+                if delete_set:
+                    kept_lines = [header_line]
+                    for line in csv_lines[1:]:
+                        cols = [c.strip() for c in line.split(',')]
+                        sku = cols[sku_idx].upper() if len(cols) > sku_idx else ''
+                        po = cols[po_idx] if len(cols) > po_idx else ''
+                        qty = cols[qty_idx] if len(cols) > qty_idx else '0'
+                        key = (sku, po, qty)
+                        if key in delete_set:
+                            deleted_s3 += 1
+                            delete_set.discard(key)  # only remove first match
+                        else:
+                            kept_lines.append(line)
+                    csv_lines = kept_lines
+
+            # Write updated CSV back to S3
+            if deleted_s3 > 0:
+                new_csv = '\n'.join(csv_lines)
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=S3_ALLOCATION_KEY,
+                    Body=new_csv.encode('utf-8'),
+                    ContentType='text/csv'
+                )
+                print(f"  ✓ Deleted {deleted_s3} S3 CSV entries, {len(csv_lines) - 1} remaining")
+
+        # ── Also handle manual allocation deletions ──
+        global _manual_allocations
+        if delete_po:
+            with _manual_alloc_lock:
+                before = len(_manual_allocations)
+                _manual_allocations = [r for r in _manual_allocations
+                                       if (r.get('po', '').strip().upper() != delete_po.upper())]
+                deleted_manual = before - len(_manual_allocations)
+            if deleted_manual > 0:
+                save_manual_allocations_to_s3()
+        elif entries_to_delete:
+            manual_ids = [e.get('id') for e in entries_to_delete if e.get('source') == 'manual' and e.get('id')]
+            if manual_ids:
+                id_set = set(manual_ids)
+                with _manual_alloc_lock:
+                    before = len(_manual_allocations)
+                    _manual_allocations = [r for r in _manual_allocations if r.get('id') not in id_set]
+                    deleted_manual = before - len(_manual_allocations)
+                if deleted_manual > 0:
+                    save_manual_allocations_to_s3()
+
+        return jsonify({
+            "success": True,
+            "deleted_s3": deleted_s3,
+            "deleted_manual": deleted_manual,
+            "total_deleted": deleted_s3 + deleted_manual
+        })
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
