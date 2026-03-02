@@ -196,7 +196,8 @@ _exports = {
 
 _overrides_lock = threading.Lock()
 _style_overrides = {}
-_overrides_loaded = False  # set True once S3 load completes — prevents race condition on fresh workers
+_overrides_loaded = False       # True once S3 load completes — prevents race on fresh workers
+_overrides_last_saved = 0.0    # epoch timestamp of last POST save — used for version polling
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
 _deduction_assign_lock = threading.Lock()
@@ -218,10 +219,10 @@ def load_overrides_from_s3():
             print("  No existing style overrides in S3 (will create on first save)")
         else:
             print(f"  ⚠ Could not load overrides from S3: {e}")
-        _overrides_loaded = True  # mark loaded even on miss — nothing to load
+        _overrides_loaded = True  # mark loaded even on miss
     except Exception as e:
         print(f"  ⚠ Override load error: {e}")
-        _overrides_loaded = True  # mark loaded on error — don't block forever
+        _overrides_loaded = True  # mark loaded on error
 
 def save_overrides_to_s3():
     """Save style overrides to S3"""
@@ -2190,14 +2191,25 @@ def export_multi():
 def get_overrides():
     if request.method == 'OPTIONS':
         return '', 204
-    # If this worker hasn't loaded overrides yet (race with startup thread),
-    # load synchronously now so we never return stale empty data.
     global _overrides_loaded
     if not _overrides_loaded:
         print("  [overrides] Worker not yet initialized — loading from S3 synchronously...", flush=True)
         load_overrides_from_s3()
     with _overrides_lock:
         return jsonify({"overrides": _style_overrides})
+
+@app.route('/overrides/version', methods=['GET', 'OPTIONS'])
+def get_overrides_version():
+    """Lightweight version endpoint for frontend polling — avoids stale worker data."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    import hashlib
+    with _overrides_lock:
+        count = len(_style_overrides)
+        # Hash just the keys + last_saved for a fast fingerprint
+        keys_str = ','.join(sorted(_style_overrides.keys()))
+    fingerprint = hashlib.md5(f"{keys_str}:{_overrides_last_saved}".encode()).hexdigest()[:12]
+    return jsonify({"version": fingerprint, "count": count, "last_saved": _overrides_last_saved})
 
 @app.route('/overrides', methods=['POST'])
 def save_overrides():
@@ -2222,6 +2234,8 @@ def save_overrides():
 
         with _overrides_lock:
             _style_overrides = overrides
+        global _overrides_last_saved
+        _overrides_last_saved = time.time()
 
         success = save_overrides_to_s3()
 
