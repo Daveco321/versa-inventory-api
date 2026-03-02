@@ -196,6 +196,7 @@ _exports = {
 
 _overrides_lock = threading.Lock()
 _style_overrides = {}
+_overrides_loaded = False  # set True once S3 load completes — prevents race condition on fresh workers
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
 _deduction_assign_lock = threading.Lock()
@@ -203,21 +204,24 @@ _deduction_assignments = {}  # dict: { sku: 'warehouse' | 'overseas' }
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
-    global _style_overrides
+    global _style_overrides, _overrides_loaded
     try:
         s3 = get_s3()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
         data = json.loads(resp['Body'].read().decode('utf-8'))
         with _overrides_lock:
             _style_overrides = data
+        _overrides_loaded = True
         print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3")
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             print("  No existing style overrides in S3 (will create on first save)")
         else:
             print(f"  ⚠ Could not load overrides from S3: {e}")
+        _overrides_loaded = True  # mark loaded even on miss — nothing to load
     except Exception as e:
         print(f"  ⚠ Override load error: {e}")
+        _overrides_loaded = True  # mark loaded on error — don't block forever
 
 def save_overrides_to_s3():
     """Save style overrides to S3"""
@@ -2186,6 +2190,12 @@ def export_multi():
 def get_overrides():
     if request.method == 'OPTIONS':
         return '', 204
+    # If this worker hasn't loaded overrides yet (race with startup thread),
+    # load synchronously now so we never return stale empty data.
+    global _overrides_loaded
+    if not _overrides_loaded:
+        print("  [overrides] Worker not yet initialized — loading from S3 synchronously...", flush=True)
+        load_overrides_from_s3()
     with _overrides_lock:
         return jsonify({"overrides": _style_overrides})
 
