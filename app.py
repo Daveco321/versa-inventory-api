@@ -31,6 +31,10 @@ import requests as http_requests
 import openpyxl
 from PIL import Image as PilImage
 from PIL import ImageOps
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.colors import Color, HexColor
+from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.lib.utils import ImageReader
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -1399,6 +1403,184 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     return buf.getvalue()
 
 
+# ============================================
+# PDF TILE EXPORT — 3×3 grid with cached images
+# ============================================
+def build_brand_pdf(title, items, s3_base_url, subtitle='', show_qty=False):
+    """Generate a PDF with 3×3 product tile grid, using server-cached images."""
+
+    page_w, page_h = letter  # 612 × 792 points
+    margin = 34  # ~12mm
+    cols, rows_per_page = 3, 3
+    gap_x, gap_y = 14, 14
+    usable_w = page_w - margin * 2
+    usable_h = page_h - margin * 2 - 28  # room for header
+    tile_w = (usable_w - gap_x * (cols - 1)) / cols
+    tile_h = (usable_h - gap_y * (rows_per_page - 1)) / rows_per_page
+    img_h = tile_h * 0.55
+    img_w = tile_w - 18
+    tiles_per_page = cols * rows_per_page
+
+    # Pre-fetch images using existing server cache (fast, parallel, disk-cached)
+    imgs = download_images_for_items(items, s3_base_url, use_cache=True)
+
+    buf = BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=letter)
+    c.setTitle(title)
+
+    total_pages = max(1, -(-len(items) // tiles_per_page))
+    date_str = datetime.now().strftime('%m/%d/%Y')
+
+    for page in range(total_pages):
+        if page > 0:
+            c.showPage()
+
+        # ── Header ──
+        c.setFont('Helvetica-Bold', 14)
+        c.setFillColor(HexColor('#1e1e1e'))
+        c.drawString(margin, page_h - margin + 4, title)
+        c.setFont('Helvetica', 9)
+        c.setFillColor(HexColor('#787878'))
+        header_right = f"{date_str}  \u2022  {subtitle}  \u2022  Page {page + 1} of {total_pages}"
+        c.drawRightString(page_w - margin, page_h - margin + 4, header_right)
+        c.setStrokeColor(HexColor('#c8c8c8'))
+        c.setLineWidth(0.5)
+        c.line(margin, page_h - margin - 6, page_w - margin, page_h - margin - 6)
+
+        start_y = page_h - margin - 10
+
+        page_items = items[page * tiles_per_page:(page + 1) * tiles_per_page]
+
+        for idx, item in enumerate(page_items):
+            col_idx = idx % cols
+            row_idx = idx // cols
+            x = margin + col_idx * (tile_w + gap_x)
+            y = start_y - row_idx * (tile_h + gap_y)
+
+            # Tile background + border
+            c.setStrokeColor(HexColor('#d2d2d2'))
+            c.setLineWidth(0.5)
+            c.setFillColor(HexColor('#ffffff'))
+            c.roundRect(x, y - tile_h, tile_w, tile_h, 5, fill=1, stroke=1)
+
+            # ── Image ──
+            img_x = x + (tile_w - img_w) / 2
+            img_y_top = y - 6  # 6pt padding from tile top
+            img_y_bottom = img_y_top - img_h
+            global_idx = page * tiles_per_page + idx
+            img_data = imgs.get(global_idx)
+
+            drew_image = False
+            if img_data and img_data.get('image_data'):
+                try:
+                    img_data['image_data'].seek(0)
+                    pil_img = PilImage.open(img_data['image_data'])
+                    ow, oh = pil_img.size
+                    ratio = ow / oh
+                    draw_w, draw_h = img_w, img_h
+                    if ratio > img_w / img_h:
+                        draw_h = img_w / ratio
+                    else:
+                        draw_w = img_h * ratio
+                    draw_x = img_x + (img_w - draw_w) / 2
+                    draw_y = img_y_bottom + (img_h - draw_h) / 2
+
+                    img_buf = BytesIO()
+                    if pil_img.mode in ('RGBA', 'LA', 'P'):
+                        pil_img = pil_img.convert('RGBA')
+                        pil_img.save(img_buf, format='PNG')
+                    else:
+                        if pil_img.mode != 'RGB':
+                            pil_img = pil_img.convert('RGB')
+                        pil_img.save(img_buf, format='JPEG', quality=85)
+                    img_buf.seek(0)
+                    c.drawImage(ImageReader(img_buf), draw_x, draw_y, draw_w, draw_h,
+                                preserveAspectRatio=True, mask='auto')
+                    drew_image = True
+                except Exception:
+                    pass
+
+            if not drew_image:
+                c.setFillColor(HexColor('#f3f4f6'))
+                c.rect(img_x, img_y_bottom, img_w, img_h, fill=1, stroke=0)
+                c.setFillColor(HexColor('#a0a0a0'))
+                c.setFont('Helvetica', 8)
+                c.drawCentredString(x + tile_w / 2, img_y_bottom + img_h / 2, 'No Image')
+
+            # ── Short Sleeve badge ──
+            fit_str = item.get('fit', '')
+            if 'short sleeve' in fit_str.lower():
+                badge_text = 'SHORT SLEEVE'
+                c.setFont('Helvetica-Bold', 6)
+                bw = c.stringWidth(badge_text, 'Helvetica-Bold', 6) + 8
+                bh = 10
+                bx = img_x + 3
+                by = img_y_bottom + 3
+                c.setFillColor(Color(14/255, 165/255, 233/255, 0.9))
+                c.roundRect(bx, by, bw, bh, 3, fill=1, stroke=0)
+                c.setFillColor(HexColor('#ffffff'))
+                c.drawString(bx + 4, by + 3, badge_text)
+
+            # ── Text below image ──
+            text_x = x + 9
+            ty = img_y_bottom - 12
+            line_step = 11
+
+            # SKU
+            c.setFont('Helvetica-Bold', 9)
+            c.setFillColor(HexColor('#1e1e1e'))
+            c.drawString(text_x, ty, str(item.get('sku', '')))
+            ty -= line_step
+
+            # Brand
+            c.setFont('Helvetica', 7.5)
+            c.setFillColor(HexColor('#505050'))
+            c.drawString(text_x, ty, str(item.get('brand_full', item.get('brand_abbr', '')))[:35])
+            ty -= line_step
+
+            # Color
+            color_str = item.get('color', '')
+            if color_str:
+                c.setFillColor(HexColor('#6d28d9'))
+                c.setFont('Helvetica-Bold', 7)
+                c.drawString(text_x, ty, color_str[:40])
+                ty -= line_step
+
+            # Fit + Fabric
+            fabric = item.get('fabrication', '')
+            fit = item.get('fit', '')
+            fit_fab = f"{fit} \u2022 {fabric[:25] + '...' if len(fabric) > 25 else fabric}"
+            c.setFont('Helvetica', 6.5)
+            c.setFillColor(HexColor('#787878'))
+            c.drawString(text_x, ty, fit_fab[:55])
+            ty -= line_step
+
+            # Qty / ATS
+            if show_qty:
+                qty = item.get('quantity_ordered', item.get('quantity', 0)) or 0
+                c.setFont('Helvetica-Bold', 8)
+                c.setFillColor(HexColor('#16a34a'))
+                c.drawString(text_x, ty, f"Qty: {qty:,}")
+                c.setFont('Helvetica', 7)
+                c.setFillColor(HexColor('#646464'))
+                c.drawRightString(x + tile_w - 9, ty, f"ATS: {item.get('total_ats', 0):,}")
+            else:
+                c.setFont('Helvetica-Bold', 8)
+                c.setFillColor(HexColor('#16a34a'))
+                c.drawString(text_x, ty, f"ATS: {item.get('total_ats', 0):,}")
+
+            # Delivery
+            delivery = item.get('delivery', '')
+            if delivery and delivery not in ('ATS', ''):
+                ty -= line_step
+                c.setFont('Helvetica', 6.5)
+                c.setFillColor(HexColor('#d97706'))
+                c.drawString(text_x, ty, f"Delivery: {delivery}")
+
+    c.save()
+    return buf.getvalue()
+
+
 def _col_val(row_dict, name):
     if name in row_dict:
         return row_dict[name]
@@ -2154,6 +2336,34 @@ def export_single():
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route('/export-pdf', methods=['POST', 'OPTIONS'])
+def export_pdf():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json()
+        if not req or 'data' not in req:
+            return jsonify({"error": "Missing 'data'"}), 400
+        data = req['data']
+        if not data:
+            return jsonify({"error": "Empty data"}), 400
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        title = req.get('title', 'Export')
+        subtitle = req.get('subtitle', f"{len(data)} styles")
+        show_qty = req.get('show_qty', False)
+        fname = req.get('filename', 'Export')
+
+        pdf_bytes = build_brand_pdf(title, data, s3_url,
+                                    subtitle=subtitle, show_qty=show_qty)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(pdf_bytes),
+            mimetype='application/pdf',
+            as_attachment=True, download_name=f"{fname}_{ts}.pdf")
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
