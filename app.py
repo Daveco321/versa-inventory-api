@@ -31,10 +31,15 @@ import requests as http_requests
 import openpyxl
 from PIL import Image as PilImage
 from PIL import ImageOps
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import Color, HexColor
-from reportlab.pdfgen import canvas as pdf_canvas
-from reportlab.lib.utils import ImageReader
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.colors import Color, HexColor
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from reportlab.lib.utils import ImageReader
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+    print("⚠ reportlab not installed — PDF export will be unavailable. Add 'reportlab' to requirements.txt")
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -2345,6 +2350,8 @@ def export_single():
 def export_pdf():
     if request.method == 'OPTIONS':
         return '', 204
+    if not HAS_REPORTLAB:
+        return jsonify({"error": "reportlab not installed on server. Add 'reportlab' to requirements.txt and redeploy."}), 500
     try:
         req = request.get_json()
         if not req or 'data' not in req:
