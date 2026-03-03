@@ -465,7 +465,7 @@ def _process_image_from_url(url, tw=TARGET_W, th=TARGET_H):
     for ext in ['.jpg', '.png', '.jpeg']:
         try_url = base_url + ext
         try:
-            resp = http_requests.get(try_url, headers=headers, timeout=10)
+            resp = http_requests.get(try_url, headers=headers, timeout=5)
             if resp.status_code != 200:
                 continue
             ct = resp.headers.get('Content-Type', '').lower()
@@ -1111,51 +1111,66 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
 
     def _fetch(base_style_item):
         base_style, item = base_style_item
-        return base_style, get_image_cached(item, s3_base_url)
+        try:
+            img = get_image_cached(item, s3_base_url)
+            return base_style, img
+        except Exception:
+            return base_style, None
+
+    # Clear previously-failed cache entries so they get retried
+    with _img_lock:
+        failed_keys = [k for k, v in _img_cache.items() if v is None]
+        for k in failed_keys:
+            del _img_cache[k]
 
     unique_pairs = list(unique_items.items())
     print(f"    Fetching images: {len(unique_pairs)} unique styles for {len(items)} items")
 
+    def _store_results(base_style, img):
+        """Store fetched image data for all item indices sharing this base_style."""
+        if not img:
+            return
+        for idx in style_to_indices.get(base_style, []):
+            # Use the returned image data directly — don't re-read from cache
+            try:
+                raw = img.get('image_data')
+                if raw:
+                    raw.seek(0)
+                    raw_bytes = raw.read()
+                    results[idx] = {
+                        'image_data': BytesIO(raw_bytes),
+                        'x_scale': img.get('x_scale', 1), 'y_scale': img.get('y_scale', 1),
+                        'x_offset': img.get('x_offset', 0), 'y_offset': img.get('y_offset', 0),
+                        'object_position': 1, 'url': img.get('url', '')
+                    }
+            except Exception:
+                pass
+
     # Use gevent pool if available (gevent monkey-patches break ThreadPoolExecutor)
     try:
         import gevent.pool
-        pool = gevent.pool.Pool(size=20)
+        pool = gevent.pool.Pool(size=30)
         fetch_results = pool.map(_fetch, unique_pairs)
         for result in fetch_results:
             try:
                 base_style, img = result
-                if img:
-                    for idx in style_to_indices.get(base_style, []):
-                        cached = _img_cache.get(base_style)
-                        if cached:
-                            results[idx] = {
-                                'image_data': BytesIO(cached['raw_bytes']),
-                                'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
-                                'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
-                                'object_position': 1, 'url': cached['url']
-                            }
+                _store_results(base_style, img)
             except Exception:
                 pass
     except ImportError:
         # Fallback to ThreadPoolExecutor if gevent not installed
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
             futures = {pool.submit(_fetch, pair): pair[0] for pair in unique_pairs}
             for f in concurrent.futures.as_completed(futures):
                 try:
                     base_style, img = f.result()
-                    if img:
-                        for idx in style_to_indices.get(base_style, []):
-                            cached = _img_cache.get(base_style)
-                            if cached:
-                                results[idx] = {
-                                    'image_data': BytesIO(cached['raw_bytes']),
-                                    'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
-                                    'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
-                                    'object_position': 1, 'url': cached['url']
-                                }
+                    _store_results(base_style, img)
                 except Exception:
                     pass
 
+    found = len(results)
+    missed = len(items) - found
+    print(f"    Image results: {found}/{len(items)} found, {missed} missing")
     return results
 
 
