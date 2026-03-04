@@ -207,6 +207,7 @@ _overrides_lock = threading.Lock()
 _style_overrides = {}
 _overrides_loaded = False       # True once S3 load completes — prevents race on fresh workers
 _overrides_last_saved = 0.0    # epoch timestamp of last POST save — used for version polling
+_s3_overrides_etag = None      # ETag from S3 — used to detect cross-worker staleness
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
 _deduction_assign_lock = threading.Lock()
@@ -214,15 +215,17 @@ _deduction_assignments = {}  # dict: { sku: 'warehouse' | 'overseas' }
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
-    global _style_overrides, _overrides_loaded
+    global _style_overrides, _overrides_loaded, _s3_overrides_etag
     try:
         s3 = get_s3()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
         data = json.loads(resp['Body'].read().decode('utf-8'))
+        etag = resp.get('ETag', '').strip('"')
         with _overrides_lock:
             _style_overrides = data
+            _s3_overrides_etag = etag
         _overrides_loaded = True
-        print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3")
+        print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3 (ETag: {etag[:8]})")
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             print("  No existing style overrides in S3 (will create on first save)")
@@ -235,17 +238,21 @@ def load_overrides_from_s3():
 
 def save_overrides_to_s3():
     """Save style overrides to S3"""
+    global _s3_overrides_etag
     try:
         s3 = get_s3()
         with _overrides_lock:
             data = json.dumps(_style_overrides)
-        s3.put_object(
+        resp = s3.put_object(
             Bucket=S3_BUCKET,
             Key=S3_OVERRIDES_KEY,
             Body=data.encode('utf-8'),
             ContentType='application/json'
         )
-        print(f"  ✓ Saved {len(_style_overrides)} style overrides to S3")
+        etag = resp.get('ETag', '').strip('"')
+        with _overrides_lock:
+            _s3_overrides_etag = etag
+        print(f"  ✓ Saved {len(_style_overrides)} style overrides to S3 (ETag: {etag[:8]})")
         return True
     except Exception as e:
         print(f"  ✗ Failed to save overrides to S3: {e}")
@@ -2423,25 +2430,50 @@ def export_multi():
 def get_overrides():
     if request.method == 'OPTIONS':
         return '', 204
-    global _overrides_loaded
-    if not _overrides_loaded:
-        print("  [overrides] Worker not yet initialized — loading from S3 synchronously...", flush=True)
-        load_overrides_from_s3()
+    # ALWAYS reload from S3 to prevent stale-worker data loss.
+    # This endpoint is only called on page load and when version polling detects a change,
+    # so the extra S3 read is infrequent and worth the consistency guarantee.
+    load_overrides_from_s3()
     with _overrides_lock:
         return jsonify({"overrides": _style_overrides})
 
 @app.route('/overrides/version', methods=['GET', 'OPTIONS'])
 def get_overrides_version():
-    """Lightweight version endpoint for frontend polling — avoids stale worker data."""
+    """Lightweight version endpoint for frontend polling — uses S3 ETag as cross-worker source of truth."""
     if request.method == 'OPTIONS':
         return '', 204
-    import hashlib
-    with _overrides_lock:
-        count = len(_style_overrides)
-        # Hash just the keys + last_saved for a fast fingerprint
-        keys_str = ','.join(sorted(_style_overrides.keys()))
-    fingerprint = hashlib.md5(f"{keys_str}:{_overrides_last_saved}".encode()).hexdigest()[:12]
-    return jsonify({"version": fingerprint, "count": count, "last_saved": _overrides_last_saved})
+    try:
+        s3 = get_s3()
+        head = s3.head_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
+        s3_etag = head['ETag'].strip('"')
+
+        # If S3 ETag differs from our local copy, another worker saved — reload
+        with _overrides_lock:
+            local_etag = _s3_overrides_etag
+        if local_etag != s3_etag:
+            print(f"  [overrides/version] ETag mismatch (local={local_etag}, s3={s3_etag[:8]}) — reloading from S3", flush=True)
+            load_overrides_from_s3()
+
+        with _overrides_lock:
+            count = len(_style_overrides)
+        return jsonify({"version": s3_etag, "count": count, "last_saved": _overrides_last_saved})
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return jsonify({"version": "none", "count": 0, "last_saved": 0})
+        # Fallback to local hash on S3 errors
+        import hashlib
+        with _overrides_lock:
+            count = len(_style_overrides)
+            keys_str = ','.join(sorted(_style_overrides.keys()))
+        fingerprint = hashlib.md5(f"{keys_str}:{_overrides_last_saved}".encode()).hexdigest()[:12]
+        return jsonify({"version": fingerprint, "count": count, "last_saved": _overrides_last_saved})
+    except Exception:
+        import hashlib
+        with _overrides_lock:
+            count = len(_style_overrides)
+            keys_str = ','.join(sorted(_style_overrides.keys()))
+        fingerprint = hashlib.md5(f"{keys_str}:{_overrides_last_saved}".encode()).hexdigest()[:12]
+        return jsonify({"version": fingerprint, "count": count, "last_saved": _overrides_last_saved})
 
 @app.route('/overrides', methods=['POST'])
 def save_overrides():
