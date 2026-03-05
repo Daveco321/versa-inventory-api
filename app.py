@@ -2910,19 +2910,6 @@ def get_apo_debug():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-                'qty': qty
-            })
-
-        with _apo_lock:
-            _apo_data = results
-            _apo_last_sync = time.time()
-
-        print(f"  ✓ APO sync: {len(results)} allocation rows loaded", flush=True)
-        return True
-
-    except Exception as e:
-        print(f"  ⚠ APO sync failed: {type(e).__name__}: {e}")
-        return False
 
 
 @app.route('/apo', methods=['GET', 'OPTIONS'])
