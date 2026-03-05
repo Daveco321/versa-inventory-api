@@ -2815,23 +2815,31 @@ def load_apo_from_dropbox():
         text = resp.content.decode('utf-8-sig', errors='replace')
         lines = [l for l in text.strip().splitlines() if l.strip()]
         if len(lines) < 2:
-            print("  ⚠ APO sync: file has fewer than 2 lines")
+            print(f"  ⚠ APO sync: file has fewer than 2 lines (got {len(lines)})")
             return False
 
-        # Parse header row to find column indices dynamically
-        raw_headers = [h.strip().lower() for h in lines[0].split(',')]
+        # Log raw headers and first 3 data rows so we can verify structure
+        raw_headers = [h.strip() for h in lines[0].split(',')]
+        print(f"  📋 APO headers ({len(raw_headers)} cols): {raw_headers[:10]}")
+        for i, row in enumerate(lines[1:4]):
+            print(f"  📋 APO row {i+1}: {row[:200]}")
 
-        # Try to find columns by name first, fall back to position (B=1, E=4)
+        headers_lower = [h.lower() for h in raw_headers]
+
+        # Find columns by header name, fall back to fixed positions (B=1, E=4, 0-indexed)
         def find_col(names, fallback):
             for n in names:
-                for i, h in enumerate(raw_headers):
+                for i, h in enumerate(headers_lower):
                     if n in h:
                         return i
             return fallback
 
-        cust_idx  = find_col(['customer', 'cust'], 1)   # col B
-        style_idx = find_col(['style', 'sku', 'item'], 4)  # col E
-        qty_idx   = find_col(['qty', 'quantity', 'units', 'allocated'], -1)
+        cust_idx  = find_col(['customer', 'cust', 'account'], 1)   # col B
+        style_idx = find_col(['style', 'sku', 'item #', 'item#', 'style #', 'style#', 'part'], 4)  # col E
+        qty_idx   = find_col(['qty', 'quantity', 'units', 'allocated', 'open qty', 'openqty'], -1)
+        po_idx    = find_col(['po', 'order', 'po #', 'po#', 'order #'], -1)
+
+        print(f"  📋 APO cols → cust:{cust_idx} style:{style_idx} qty:{qty_idx} po:{po_idx}")
 
         results = []
         for line in lines[1:]:
@@ -2839,7 +2847,9 @@ def load_apo_from_dropbox():
             if len(cols) <= max(cust_idx, style_idx):
                 continue
             customer = cols[cust_idx] if len(cols) > cust_idx else ''
-            style    = cols[style_idx].upper() if len(cols) > style_idx else ''
+            style_raw = cols[style_idx] if len(cols) > style_idx else ''
+            # Strip size suffix (e.g. "ASU201SLS" or "TJNASU201SLS-2XL" → keep base)
+            style = style_raw.upper().split('-')[0].strip()
             if not style:
                 continue
             qty = 0
@@ -2848,9 +2858,58 @@ def load_apo_from_dropbox():
                     qty = int(float(cols[qty_idx].replace(',', '') or 0))
                 except (ValueError, TypeError):
                     qty = 0
+            po = cols[po_idx].strip() if po_idx >= 0 and len(cols) > po_idx else ''
             results.append({
                 'customer': customer,
                 'style': style,
+                'qty': qty,
+                'po': po
+            })
+
+        print(f"  📋 APO sample styles: {list(set(r['style'] for r in results[:10]))}")
+
+        with _apo_lock:
+            _apo_data = results
+            _apo_last_sync = time.time()
+
+        print(f"  ✓ APO sync: {len(results)} allocation rows loaded", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"  ⚠ APO sync failed: {type(e).__name__}: {e}")
+        return False
+
+
+@app.route('/apo/debug', methods=['GET', 'OPTIONS'])
+def get_apo_debug():
+    """Returns raw first rows of APO file for debugging column structure."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    token = get_dropbox_token()
+    if not token:
+        return jsonify({'error': 'No Dropbox token'}), 500
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})
+        }
+        resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers=headers, timeout=30
+        )
+        if resp.status_code != 200:
+            return jsonify({'error': f'HTTP {resp.status_code}', 'body': resp.text[:300]}), 500
+        text = resp.content.decode('utf-8-sig', errors='replace')
+        lines = [l for l in text.strip().splitlines() if l.strip()]
+        return jsonify({
+            'path': DROPBOX_APO_PATH,
+            'total_lines': len(lines),
+            'headers': lines[0] if lines else '',
+            'headers_split': [h.strip() for h in lines[0].split(',')] if lines else [],
+            'sample_rows': [l for l in lines[1:6]]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
                 'qty': qty
             })
 
