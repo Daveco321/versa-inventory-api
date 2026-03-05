@@ -2816,16 +2816,18 @@ def load_apo_from_dropbox():
             return False
 
         text = resp.content.decode('utf-8-sig', errors='replace')
-        lines = [l for l in text.strip().splitlines() if l.strip()]
-        if len(lines) < 2:
-            print(f"  ⚠ APO sync: file has fewer than 2 lines (got {len(lines)})")
+        import csv as _csv, io as _io
+        reader = list(_csv.reader(_io.StringIO(text)))
+        rows = [r for r in reader if any(c.strip() for c in r)]
+        if len(rows) < 2:
+            print(f"  ⚠ APO sync: file has fewer than 2 lines (got {len(rows)})")
             return False
 
         # Log raw headers and first 3 data rows so we can verify structure
-        raw_headers = [h.strip() for h in lines[0].split(',')]
+        raw_headers = [h.strip() for h in rows[0]]
         print(f"  📋 APO headers ({len(raw_headers)} cols): {raw_headers[:10]}")
-        for i, row in enumerate(lines[1:4]):
-            print(f"  📋 APO row {i+1}: {row[:200]}")
+        for i, row in enumerate(rows[1:4]):
+            print(f"  📋 APO row {i+1}: {row[:11]}")
 
         headers_lower = [h.lower() for h in raw_headers]
 
@@ -2845,8 +2847,7 @@ def load_apo_from_dropbox():
         print(f"  📋 APO cols → cust:{cust_idx} style:{style_idx} qty:{qty_idx} po:{po_idx}")
 
         results = []
-        for line in lines[1:]:
-            cols = [c.strip() for c in line.split(',')]
+        for cols in rows[1:]:
             if len(cols) <= max(cust_idx, style_idx):
                 continue
             customer = cols[cust_idx] if len(cols) > cust_idx else ''
