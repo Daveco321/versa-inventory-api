@@ -338,6 +338,14 @@ def save_deduction_assignments_to_s3():
 S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL WAREHOUSE ALLOCATION.csv')
 S3_PRODUCTION_KEY = os.environ.get('S3_PRODUCTION_KEY', 'inventory/Style Ledger.xlsx')
 
+# APO allocation file — Dropbox path
+DROPBOX_APO_PATH = os.environ.get('DROPBOX_APO_PATH', '/EDI Team/Nuri/Python Macros/APO.csv')
+
+# In-memory APO cache
+_apo_data = []
+_apo_lock = threading.Lock()
+_apo_last_sync = 0
+
 
 def load_allocation_from_s3():
     """Load allocation CSV from S3 and return as list of dicts"""
@@ -2760,6 +2768,120 @@ def get_production():
     return jsonify({"production": data})
 
 
+# ============================================
+# APO ALLOCATION — Dropbox CSV (hourly sync)
+# Path: /EDI Team/Nuri/Python Macros/APO.csv
+# Columns: B=Customer, E=Style#
+# ============================================
+
+def load_apo_from_dropbox():
+    """Download APO.csv from Dropbox, parse customer (col B) and style (col E),
+    cache in memory. Returns list of {customer, style, qty} dicts."""
+    global _apo_data, _apo_last_sync
+
+    token = get_dropbox_token()
+    if not token:
+        print("  ⚠ APO sync: no Dropbox token available")
+        return False
+
+    print(f"  📋 Fetching APO allocation file from Dropbox: {DROPBOX_APO_PATH}", flush=True)
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})
+        }
+        resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers=headers, timeout=30
+        )
+
+        if resp.status_code == 401:
+            print("  ⚠ APO sync: token expired, refreshing...")
+            global _dropbox_token_expires
+            _dropbox_token_expires = 0
+            token = get_dropbox_token()
+            if not token:
+                return False
+            headers['Authorization'] = f'Bearer {token}'
+            resp = http_requests.post(
+                'https://content.dropboxapi.com/2/files/download',
+                headers=headers, timeout=30
+            )
+
+        if resp.status_code != 200:
+            print(f"  ⚠ APO sync: HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
+
+        text = resp.content.decode('utf-8-sig', errors='replace')
+        lines = [l for l in text.strip().splitlines() if l.strip()]
+        if len(lines) < 2:
+            print("  ⚠ APO sync: file has fewer than 2 lines")
+            return False
+
+        # Parse header row to find column indices dynamically
+        raw_headers = [h.strip().lower() for h in lines[0].split(',')]
+
+        # Try to find columns by name first, fall back to position (B=1, E=4)
+        def find_col(names, fallback):
+            for n in names:
+                for i, h in enumerate(raw_headers):
+                    if n in h:
+                        return i
+            return fallback
+
+        cust_idx  = find_col(['customer', 'cust'], 1)   # col B
+        style_idx = find_col(['style', 'sku', 'item'], 4)  # col E
+        qty_idx   = find_col(['qty', 'quantity', 'units', 'allocated'], -1)
+
+        results = []
+        for line in lines[1:]:
+            cols = [c.strip() for c in line.split(',')]
+            if len(cols) <= max(cust_idx, style_idx):
+                continue
+            customer = cols[cust_idx] if len(cols) > cust_idx else ''
+            style    = cols[style_idx].upper() if len(cols) > style_idx else ''
+            if not style:
+                continue
+            qty = 0
+            if qty_idx >= 0 and len(cols) > qty_idx:
+                try:
+                    qty = int(float(cols[qty_idx].replace(',', '') or 0))
+                except (ValueError, TypeError):
+                    qty = 0
+            results.append({
+                'customer': customer,
+                'style': style,
+                'qty': qty
+            })
+
+        with _apo_lock:
+            _apo_data = results
+            _apo_last_sync = time.time()
+
+        print(f"  ✓ APO sync: {len(results)} allocation rows loaded", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"  ⚠ APO sync failed: {type(e).__name__}: {e}")
+        return False
+
+
+@app.route('/apo', methods=['GET', 'OPTIONS'])
+def get_apo():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _apo_lock:
+        data = list(_apo_data)
+    last_sync = _apo_last_sync
+    age_minutes = int((time.time() - last_sync) / 60) if last_sync else None
+    return jsonify({
+        'apo': data,
+        'count': len(data),
+        'last_sync': datetime.utcfromtimestamp(last_sync).isoformat() + 'Z' if last_sync else None,
+        'age_minutes': age_minutes
+    })
+
+
 @app.route('/regenerate', methods=['POST', 'OPTIONS'])
 def regenerate_exports():
     """Force re-sync inventory and regenerate all exports"""
@@ -3165,6 +3287,12 @@ def hourly_resync():
         except Exception as e:
             print(f"  ⚠ Hourly re-sync failed: {e}")
 
+        # Refresh APO allocation file every hour
+        try:
+            load_apo_from_dropbox()
+        except Exception as e:
+            print(f"  ⚠ APO hourly refresh failed: {e}")
+
 
 def startup_sync():
     print("\n" + "="*60)
@@ -3177,6 +3305,12 @@ def startup_sync():
     load_overrides_from_s3()
     load_manual_allocations_from_s3()
     load_deduction_assignments_from_s3()
+
+    # Load APO allocation file from Dropbox
+    try:
+        load_apo_from_dropbox()
+    except Exception as e:
+        print(f"  ⚠ APO startup load failed: {e}")
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
     if _dbx_configured:
