@@ -2885,55 +2885,50 @@ def load_apo_from_dropbox():
 
 @app.route('/apo/explore', methods=['GET', 'OPTIONS'])
 def get_apo_explore():
-    """Explore Dropbox root and team namespaces to find the correct path for APO.csv."""
+    """Drill into Dropbox folder structure to find APO.csv exact path."""
     if request.method == 'OPTIONS':
         return '', 204
     token = get_dropbox_token()
     if not token:
         return jsonify({'error': 'No Dropbox token'}), 500
 
-    results = {}
+    def list_folder(path):
+        try:
+            r = http_requests.post(
+                'https://api.dropboxapi.com/2/files/list_folder',
+                headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+                json={'path': path, 'recursive': False},
+                timeout=15
+            )
+            if r.status_code == 200:
+                return [{'name': e['name'], 'type': e['.tag']} for e in r.json().get('entries', [])]
+            return {'error': r.status_code, 'body': r.text[:200]}
+        except Exception as e:
+            return {'error': str(e)}
 
-    # 1. List personal root
-    try:
-        r = http_requests.post(
-            'https://api.dropboxapi.com/2/files/list_folder',
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            json={'path': '', 'recursive': False},
-            timeout=15
-        )
-        results['personal_root'] = {'status': r.status_code, 'entries': [e['name'] for e in r.json().get('entries', [])] if r.status_code == 200 else r.text[:300]}
-    except Exception as e:
-        results['personal_root'] = {'error': str(e)}
+    results = {
+        'configured_path': DROPBOX_APO_PATH,
+        'edi_team_root': list_folder('/EDI Team'),
+    }
 
-    # 2. Get team namespaces
-    try:
-        r = http_requests.post(
-            'https://api.dropboxapi.com/2/team/namespaces/list',
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            json={'limit': 100},
-            timeout=15
-        )
-        if r.status_code == 200:
-            ns_data = r.json().get('namespaces', [])
-            results['namespaces'] = [{'name': n.get('name'), 'id': n.get('namespace_id'), 'type': n.get('namespace_type', {}).get('.tag')} for n in ns_data]
-        else:
-            results['namespaces'] = {'status': r.status_code, 'body': r.text[:300]}
-    except Exception as e:
-        results['namespaces'] = {'error': str(e)}
+    # Drill into Nuri if it exists
+    edi_entries = results['edi_team_root']
+    if isinstance(edi_entries, list):
+        nuri_match = next((e for e in edi_entries if 'nuri' in e['name'].lower()), None)
+        if nuri_match:
+            nuri_path = f"/EDI Team/{nuri_match['name']}"
+            results['nuri_folder_name'] = nuri_match['name']
+            results['nuri_contents'] = list_folder(nuri_path)
 
-    # 3. Try direct download with current path (baseline)
-    try:
-        r = http_requests.post(
-            'https://content.dropboxapi.com/2/files/download',
-            headers={'Authorization': f'Bearer {token}', 'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})},
-            timeout=15
-        )
-        results['direct_download'] = {'status': r.status_code, 'body': r.text[:200]}
-    except Exception as e:
-        results['direct_download'] = {'error': str(e)}
+            # Drill into Python Macros if it exists
+            nuri_entries = results['nuri_contents']
+            if isinstance(nuri_entries, list):
+                macro_match = next((e for e in nuri_entries if 'macro' in e['name'].lower() or 'python' in e['name'].lower()), None)
+                if macro_match:
+                    macro_path = f"{nuri_path}/{macro_match['name']}"
+                    results['macros_folder_name'] = macro_match['name']
+                    results['macros_contents'] = list_folder(macro_path)
 
-    results['configured_path'] = DROPBOX_APO_PATH
     return jsonify(results)
 
 
