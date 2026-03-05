@@ -2784,12 +2784,15 @@ def load_apo_from_dropbox():
         print("  ⚠ APO sync: no Dropbox token available")
         return False
 
-    print(f"  📋 Fetching APO allocation file from Dropbox: {DROPBOX_APO_PATH}", flush=True)
+    ns_id = os.environ.get('DROPBOX_APO_NAMESPACE_ID', '')
+    print(f"  📋 Fetching APO allocation file from Dropbox: {DROPBOX_APO_PATH} (namespace: {ns_id or 'none'})", flush=True)
     try:
         headers = {
             'Authorization': f'Bearer {token}',
             'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})
         }
+        if ns_id:
+            headers['Dropbox-API-Path-Root'] = json.dumps({'.tag': 'namespace_id', 'namespace_id': ns_id})
         resp = http_requests.post(
             'https://content.dropboxapi.com/2/files/download',
             headers=headers, timeout=30
@@ -2880,6 +2883,60 @@ def load_apo_from_dropbox():
         return False
 
 
+@app.route('/apo/explore', methods=['GET', 'OPTIONS'])
+def get_apo_explore():
+    """Explore Dropbox root and team namespaces to find the correct path for APO.csv."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    token = get_dropbox_token()
+    if not token:
+        return jsonify({'error': 'No Dropbox token'}), 500
+
+    results = {}
+
+    # 1. List personal root
+    try:
+        r = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'path': '', 'recursive': False},
+            timeout=15
+        )
+        results['personal_root'] = {'status': r.status_code, 'entries': [e['name'] for e in r.json().get('entries', [])] if r.status_code == 200 else r.text[:300]}
+    except Exception as e:
+        results['personal_root'] = {'error': str(e)}
+
+    # 2. Get team namespaces
+    try:
+        r = http_requests.post(
+            'https://api.dropboxapi.com/2/team/namespaces/list',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'limit': 100},
+            timeout=15
+        )
+        if r.status_code == 200:
+            ns_data = r.json().get('namespaces', [])
+            results['namespaces'] = [{'name': n.get('name'), 'id': n.get('namespace_id'), 'type': n.get('namespace_type', {}).get('.tag')} for n in ns_data]
+        else:
+            results['namespaces'] = {'status': r.status_code, 'body': r.text[:300]}
+    except Exception as e:
+        results['namespaces'] = {'error': str(e)}
+
+    # 3. Try direct download with current path (baseline)
+    try:
+        r = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers={'Authorization': f'Bearer {token}', 'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})},
+            timeout=15
+        )
+        results['direct_download'] = {'status': r.status_code, 'body': r.text[:200]}
+    except Exception as e:
+        results['direct_download'] = {'error': str(e)}
+
+    results['configured_path'] = DROPBOX_APO_PATH
+    return jsonify(results)
+
+
 @app.route('/apo/debug', methods=['GET', 'OPTIONS'])
 def get_apo_debug():
     """Returns raw first rows of APO file for debugging column structure."""
@@ -2889,20 +2946,27 @@ def get_apo_debug():
     if not token:
         return jsonify({'error': 'No Dropbox token'}), 500
     try:
-        headers = {
+        # Try with namespace header if APO_NAMESPACE_ID env var is set
+        ns_id = os.environ.get('DROPBOX_APO_NAMESPACE_ID', '')
+        api_arg = {'path': DROPBOX_APO_PATH}
+        req_headers = {
             'Authorization': f'Bearer {token}',
-            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_APO_PATH})
+            'Dropbox-API-Arg': json.dumps(api_arg)
         }
+        if ns_id:
+            req_headers['Dropbox-API-Path-Root'] = json.dumps({'.tag': 'namespace_id', 'namespace_id': ns_id})
+
         resp = http_requests.post(
             'https://content.dropboxapi.com/2/files/download',
-            headers=headers, timeout=30
+            headers=req_headers, timeout=30
         )
         if resp.status_code != 200:
-            return jsonify({'error': f'HTTP {resp.status_code}', 'body': resp.text[:300]}), 500
+            return jsonify({'error': f'HTTP {resp.status_code}', 'body': resp.text[:300], 'namespace_used': ns_id or 'none'}), 500
         text = resp.content.decode('utf-8-sig', errors='replace')
         lines = [l for l in text.strip().splitlines() if l.strip()]
         return jsonify({
             'path': DROPBOX_APO_PATH,
+            'namespace_used': ns_id or 'none',
             'total_lines': len(lines),
             'headers': lines[0] if lines else '',
             'headers_split': [h.strip() for h in lines[0].split(',')] if lines else [],
