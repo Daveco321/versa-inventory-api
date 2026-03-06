@@ -341,6 +341,9 @@ S3_PRODUCTION_KEY = os.environ.get('S3_PRODUCTION_KEY', 'inventory/Style Ledger.
 # APO allocation file — Dropbox path
 DROPBOX_APO_PATH = os.environ.get('DROPBOX_APO_PATH', '/EDI Team/Nuri/Python Macros/Inventory RAW/APO.csv')
 
+# Color map folder — always contains exactly one xlsx file regardless of name/version
+DROPBOX_COLOR_MAP_FOLDER = os.environ.get('DROPBOX_COLOR_MAP_FOLDER', '/Versa Share Files/David - Dropbox/Inventory Color Data')
+
 # In-memory APO cache
 _apo_data = []
 _apo_lock = threading.Lock()
@@ -2969,6 +2972,54 @@ def get_apo_debug():
             'sample_rows': [l for l in lines[1:6]]
         })
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/color-map', methods=['GET', 'OPTIONS'])
+def get_color_map():
+    """Download the color map xlsx from Dropbox — picks the first (only) file in the folder."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    token = get_dropbox_token()
+    if not token:
+        return jsonify({'error': 'No Dropbox token configured'}), 500
+    try:
+        # List the folder to find the file (name may have version suffix like " (7)")
+        list_resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'path': DROPBOX_COLOR_MAP_FOLDER, 'recursive': False},
+            timeout=20
+        )
+        if list_resp.status_code != 200:
+            return jsonify({'error': f'Dropbox list failed: {list_resp.status_code}', 'body': list_resp.text[:200]}), 500
+
+        entries = [e for e in list_resp.json().get('entries', []) if e['.tag'] == 'file' and e['name'].lower().endswith('.xlsx')]
+        if not entries:
+            return jsonify({'error': 'No xlsx file found in color map folder'}), 404
+
+        file_path = entries[0]['path_display']
+        print(f"[Color Map] Downloading: {file_path}", flush=True)
+
+        dl_resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Dropbox-API-Arg': json.dumps({'path': file_path})
+            },
+            timeout=30
+        )
+        if dl_resp.status_code != 200:
+            return jsonify({'error': f'Dropbox download failed: {dl_resp.status_code}'}), 500
+
+        resp = make_response(dl_resp.content)
+        resp.headers['Content-Type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        resp.headers['Cache-Control'] = 'public, max-age=3600'  # cache 1 hour, matches frontend
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+    except Exception as e:
+        print(f"[Color Map] Error: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
 
 
