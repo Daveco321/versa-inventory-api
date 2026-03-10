@@ -3335,15 +3335,26 @@ def _load_saved_catalogs():
         return []
 
 def _save_saved_catalogs(catalogs):
-    """Save catalogs list to S3."""
+    """Save catalogs list to S3 with timestamped backup."""
     try:
         s3 = get_s3()
+        body = json.dumps(catalogs, indent=2)
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=S3_SAVED_CATALOGS_KEY,
-            Body=json.dumps(catalogs, indent=2),
+            Body=body,
             ContentType='application/json'
         )
+        try:
+            ts = datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=f"inventory/catalogs_backups/saved_catalogs_{ts}.json",
+                Body=body,
+                ContentType='application/json'
+            )
+        except Exception as be:
+            print(f"[Saved Catalogs] Backup failed (non-fatal): {be}", flush=True)
         return True
     except Exception as e:
         print(f"[Saved Catalogs] Save to S3 error: {e}", flush=True)
