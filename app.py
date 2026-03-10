@@ -2552,6 +2552,23 @@ def get_overrides_version():
         fingerprint = hashlib.md5(f"{keys_str}:{_overrides_last_saved}".encode()).hexdigest()[:12]
         return jsonify({"version": fingerprint, "count": count, "last_saved": _overrides_last_saved})
 
+def _backup_overrides_to_s3(overrides_dict):
+    """Write a timestamped backup copy of overrides to S3. Fire-and-forget."""
+    try:
+        s3 = get_s3()
+        ts = datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')
+        backup_key = f"inventory/overrides_backups/style_overrides_{ts}.json"
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=backup_key,
+            Body=json.dumps(overrides_dict).encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Backup saved: {backup_key}")
+    except Exception as e:
+        print(f"  ⚠ Backup failed (non-fatal): {e}")
+
+
 @app.route('/overrides', methods=['POST'])
 def save_overrides():
     try:
@@ -2563,20 +2580,36 @@ def save_overrides():
         if not isinstance(overrides, dict):
             return jsonify({"error": "'overrides' must be an object"}), 400
 
-        # Find which styles have new/changed images (for CloudFront invalidation)
         global _style_overrides
         with _overrides_lock:
-            old_overrides = dict(_style_overrides)
+            current = dict(_style_overrides)
+
+        # SAFETY: merge incoming into current — never allow a smaller payload to wipe existing data
+        # Incoming keys add/update; keys not present in incoming are preserved from S3 state
+        merged = dict(current)
+        merged.update(overrides)
+
+        # If incoming count is suspiciously low vs current, only allow it if explicitly a delete op
+        incoming_count = len(overrides)
+        current_count = len(current)
+        if incoming_count < current_count and not req.get('replace_all', False):
+            # Merge only — do not shrink
+            print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
+
+        # Find which styles have new/changed images (for CloudFront invalidation)
         changed_styles = [
             style for style, data in overrides.items()
             if isinstance(data, dict) and data.get('image') and
-               data.get('image') != (old_overrides.get(style) or {}).get('image')
+               data.get('image') != (current.get(style) or {}).get('image')
         ]
 
         with _overrides_lock:
-            _style_overrides = overrides
+            _style_overrides = merged
         global _overrides_last_saved
         _overrides_last_saved = time.time()
+
+        # Async backup before saving canonical file
+        threading.Thread(target=_backup_overrides_to_s3, args=(merged,), daemon=True).start()
 
         success = save_overrides_to_s3()
 
@@ -2586,12 +2619,45 @@ def save_overrides():
                 paths = [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.jpg" for s in changed_styles]
                 paths += [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.png" for s in changed_styles]
                 threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
-            return jsonify({"success": True, "count": len(overrides), "invalidated": len(changed_styles)})
+            return jsonify({"success": True, "count": len(merged), "invalidated": len(changed_styles)})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route('/overrides/backups', methods=['GET', 'OPTIONS'])
+def list_overrides_backups():
+    """List available override backup files in S3, newest first."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        s3 = get_s3()
+        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix='inventory/overrides_backups/')
+        items = resp.get('Contents', [])
+        backups = sorted(
+            [{'key': o['Key'], 'size': o['Size'], 'last_modified': o['LastModified'].isoformat()} for o in items],
+            key=lambda x: x['last_modified'], reverse=True
+        )
+        return jsonify({'backups': backups, 'count': len(backups)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/overrides/backups/<path:backup_key>', methods=['GET', 'OPTIONS'])
+def restore_overrides_backup(backup_key):
+    """Download a specific backup file contents."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        s3 = get_s3()
+        full_key = f"inventory/overrides_backups/{backup_key}"
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=full_key)
+        data = json.loads(obj['Body'].read().decode('utf-8'))
+        return jsonify({'overrides': data, 'count': len(data), 'key': full_key})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/allocations', methods=['GET', 'OPTIONS'])
