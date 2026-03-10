@@ -2068,6 +2068,9 @@ def health():
         "dropbox_photos_indexed": len(_dropbox_photo_index),
         "dropbox_photos_cached": len([f for f in os.listdir(DROPBOX_DISK_CACHE) if f.endswith(('.jpg', '.png'))]) if os.path.exists(DROPBOX_DISK_CACHE) else 0,
         "dropbox_photos_last_sync": _dropbox_photos_last_sync,
+        "production_rows": len(_production_data),
+        "production_last_sync": _production_last_sync,
+        "production_folder": DROPBOX_PRODUCTION_FOLDER,
     })
 
 
