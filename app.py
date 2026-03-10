@@ -336,13 +336,12 @@ def save_deduction_assignments_to_s3():
 
 
 S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL WAREHOUSE ALLOCATION.csv')
-S3_PRODUCTION_KEY = os.environ.get('S3_PRODUCTION_KEY', 'inventory/Style Ledger.xlsx')
+# Production/Style Ledger — now Dropbox-only (S3 removed)
+DROPBOX_PRODUCTION_FOLDER = os.environ.get('DROPBOX_PRODUCTION_FOLDER',
+    '/Versa Share Files/David - Dropbox/Style Ledger')
 
 # APO allocation file — Dropbox path
 DROPBOX_APO_PATH = os.environ.get('DROPBOX_APO_PATH', '/EDI Team/Nuri/Python Macros/Inventory RAW/APO.csv')
-
-# Color map folder — always contains exactly one xlsx file regardless of name/version
-DROPBOX_COLOR_MAP_FOLDER = os.environ.get('DROPBOX_COLOR_MAP_FOLDER', '/Versa Share Files/David - Dropbox/Inventory Color Data')
 
 # In-memory APO cache
 _apo_data = []
@@ -393,13 +392,74 @@ def load_allocation_from_s3():
         return []
 
 
-def load_production_from_s3():
-    """Load Style Ledger xlsx from S3 and return as list of dicts"""
+# Production data cache — loaded from Dropbox, refreshed hourly
+_production_data = []
+_production_last_sync = 0
+_production_lock = threading.Lock()
+_PRODUCTION_TTL = 3600  # 1 hour
+
+
+def load_production_from_dropbox():
+    """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
+    Caches result in memory; returns cached data if under 1 hour old."""
+    global _production_data, _production_last_sync
+
+    # Return cache if fresh
+    with _production_lock:
+        if _production_data and (time.time() - _production_last_sync < _PRODUCTION_TTL):
+            return _production_data
+
+    token = get_dropbox_token()
+    if not token:
+        print("  ⚠ Production sync: no Dropbox token available")
+        with _production_lock:
+            return list(_production_data)  # return stale if any
+
     try:
-        s3 = get_s3()
-        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_PRODUCTION_KEY)
-        data = resp['Body'].read()
-        wb = openpyxl.load_workbook(BytesIO(data), read_only=True)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+
+        # List the Style Ledger folder — pick first .xlsx file found
+        list_resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers,
+            json={'path': DROPBOX_PRODUCTION_FOLDER, 'recursive': False, 'limit': 50},
+            timeout=20
+        )
+        if list_resp.status_code != 200:
+            print(f"  ⚠ Production: could not list Dropbox folder ({list_resp.status_code}): {list_resp.text[:200]}")
+            with _production_lock:
+                return list(_production_data)
+
+        entries = list_resp.json().get('entries', [])
+        xlsx_files = [e for e in entries if e['.tag'] == 'file' and e['name'].lower().endswith('.xlsx')]
+        if not xlsx_files:
+            print(f"  ⚠ Production: no .xlsx file found in {DROPBOX_PRODUCTION_FOLDER}")
+            with _production_lock:
+                return list(_production_data)
+
+        # Pick first xlsx (folder should only have one, but prefer any with "ledger" in name)
+        xlsx_files.sort(key=lambda e: (0 if 'ledger' in e['name'].lower() else 1, e['name']))
+        chosen = xlsx_files[0]
+        print(f"  📋 Loading production data from Dropbox: {chosen['name']}", flush=True)
+
+        # Download file bytes
+        dl_resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Dropbox-API-Arg': json.dumps({'path': chosen['path_display']})
+            },
+            timeout=30
+        )
+        if dl_resp.status_code != 200:
+            print(f"  ⚠ Production: download failed ({dl_resp.status_code})")
+            with _production_lock:
+                return list(_production_data)
+
+        wb = openpyxl.load_workbook(BytesIO(dl_resp.content), read_only=True)
         ws = wb[wb.sheetnames[0]]
         results = []
         for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
@@ -428,17 +488,20 @@ def load_production_from_s3():
                 'etd': etd
             })
         wb.close()
-        print(f"  ✓ Loaded {len(results)} production rows from S3")
+
+        with _production_lock:
+            _production_data = results
+            _production_last_sync = time.time()
+
+        print(f"  ✓ Loaded {len(results)} production rows from Dropbox ({chosen['name']})")
         return results
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
-            print("  No Style Ledger found in S3")
-        else:
-            print(f"  ⚠ Could not load production from S3: {e}")
-        return []
+
     except Exception as e:
+        import traceback
         print(f"  ⚠ Production load error: {e}")
-        return []
+        traceback.print_exc()
+        with _production_lock:
+            return list(_production_data)  # return stale on error
 
 
 def extract_image_code(sku, brand_abbr):
@@ -2767,7 +2830,7 @@ def delete_allocation_entries():
 def get_production():
     if request.method == 'OPTIONS':
         return '', 204
-    data = load_production_from_s3()
+    data = load_production_from_dropbox()
     return jsonify({"production": data})
 
 
@@ -2972,54 +3035,6 @@ def get_apo_debug():
             'sample_rows': [l for l in lines[1:6]]
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/color-map', methods=['GET', 'OPTIONS'])
-def get_color_map():
-    """Download the color map xlsx from Dropbox — picks the first (only) file in the folder."""
-    if request.method == 'OPTIONS':
-        return '', 204
-    token = get_dropbox_token()
-    if not token:
-        return jsonify({'error': 'No Dropbox token configured'}), 500
-    try:
-        # List the folder to find the file (name may have version suffix like " (7)")
-        list_resp = http_requests.post(
-            'https://api.dropboxapi.com/2/files/list_folder',
-            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
-            json={'path': DROPBOX_COLOR_MAP_FOLDER, 'recursive': False},
-            timeout=20
-        )
-        if list_resp.status_code != 200:
-            return jsonify({'error': f'Dropbox list failed: {list_resp.status_code}', 'body': list_resp.text[:200]}), 500
-
-        entries = [e for e in list_resp.json().get('entries', []) if e['.tag'] == 'file' and e['name'].lower().endswith('.xlsx')]
-        if not entries:
-            return jsonify({'error': 'No xlsx file found in color map folder'}), 404
-
-        file_path = entries[0]['path_display']
-        print(f"[Color Map] Downloading: {file_path}", flush=True)
-
-        dl_resp = http_requests.post(
-            'https://content.dropboxapi.com/2/files/download',
-            headers={
-                'Authorization': f'Bearer {token}',
-                'Dropbox-API-Arg': json.dumps({'path': file_path})
-            },
-            timeout=30
-        )
-        if dl_resp.status_code != 200:
-            return jsonify({'error': f'Dropbox download failed: {dl_resp.status_code}'}), 500
-
-        resp = make_response(dl_resp.content)
-        resp.headers['Content-Type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        resp.headers['Cache-Control'] = 'public, max-age=3600'  # cache 1 hour, matches frontend
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        return resp
-
-    except Exception as e:
-        print(f"[Color Map] Error: {e}", flush=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -3450,6 +3465,15 @@ def hourly_resync():
         except Exception as e:
             print(f"  ⚠ APO hourly refresh failed: {e}")
 
+        # Refresh Style Ledger (production data) every hour
+        try:
+            # Force reload by resetting timestamp
+            global _production_last_sync
+            _production_last_sync = 0
+            load_production_from_dropbox()
+        except Exception as e:
+            print(f"  ⚠ Production hourly refresh failed: {e}")
+
 
 def startup_sync():
     print("\n" + "="*60)
@@ -3468,6 +3492,12 @@ def startup_sync():
         load_apo_from_dropbox()
     except Exception as e:
         print(f"  ⚠ APO startup load failed: {e}")
+
+    # Load Style Ledger (production data) from Dropbox
+    try:
+        load_production_from_dropbox()
+    except Exception as e:
+        print(f"  ⚠ Production startup load failed: {e}")
 
     # Sync Dropbox photos index (before inventory so images are ready for export generation)
     if _dbx_configured:
