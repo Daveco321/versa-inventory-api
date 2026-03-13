@@ -2108,6 +2108,36 @@ def sync():
 def inventory():
     if request.method == 'OPTIONS':
         return '', 204
+
+    # ── STALE-WORKER GUARD ──────────────────────────────────────────────────
+    # Render runs multiple gunicorn workers, each with independent in-memory
+    # _inventory. The admin's /sync call only updates whichever worker handles
+    # it. Customers hitting a different worker would see stale data indefinitely.
+    # Fix: if this worker's data is older than INVENTORY_MAX_AGE_SECONDS, force
+    # a sync right now before responding — guarantees customers always get fresh data.
+    INVENTORY_MAX_AGE_SECONDS = 300  # 5 minutes
+    needs_sync = False
+    with _inv_lock:
+        last_sync_str = _inventory.get('last_sync')
+        has_items = bool(_inventory['items'])
+
+    if not has_items:
+        needs_sync = True
+    elif last_sync_str:
+        try:
+            last_sync_dt = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
+            age = (datetime.now(last_sync_dt.tzinfo) - last_sync_dt).total_seconds()
+            if age > INVENTORY_MAX_AGE_SECONDS:
+                needs_sync = True
+        except Exception:
+            needs_sync = True
+
+    if needs_sync:
+        try:
+            sync_inventory()
+        except Exception as e:
+            print(f"  [/inventory] Stale-worker sync failed: {e}")
+
     with _inv_lock:
         return jsonify({
             "status": "ok",
