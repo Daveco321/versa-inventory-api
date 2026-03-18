@@ -1505,20 +1505,20 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
 
 
 # ============================================
-# PDF TILE EXPORT — 3×3 grid with cached images
+# PDF TILE EXPORT — 2×2 grid with cached images
 # ============================================
 def build_brand_pdf(title, items, s3_base_url, subtitle='', show_qty=False):
-    """Generate a PDF with 3×3 product tile grid, using server-cached images."""
+    """Generate a PDF with 2×2 product tile grid, using server-cached images."""
 
     page_w, page_h = letter  # 612 × 792 points
     margin = 34  # ~12mm
-    cols, rows_per_page = 3, 3
-    gap_x, gap_y = 14, 14
+    cols, rows_per_page = 2, 2
+    gap_x, gap_y = 18, 18
     usable_w = page_w - margin * 2
     usable_h = page_h - margin * 2 - 28  # room for header
     tile_w = (usable_w - gap_x * (cols - 1)) / cols
     tile_h = (usable_h - gap_y * (rows_per_page - 1)) / rows_per_page
-    img_h = tile_h * 0.55
+    img_h = tile_h * 0.65
     img_w = tile_w - 18
     tiles_per_page = cols * rows_per_page
 
