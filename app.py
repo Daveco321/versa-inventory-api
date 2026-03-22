@@ -63,6 +63,7 @@ S3_MANUAL_ALLOC_KEY = os.environ.get('S3_MANUAL_ALLOC_KEY', 'inventory/manual_al
 S3_DEDUCTION_ASSIGN_KEY = os.environ.get('S3_DEDUCTION_ASSIGN_KEY', 'inventory/deduction_assignments.json')
 S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
 S3_PREPACK_DEFAULTS_KEY = os.environ.get('S3_PREPACK_DEFAULTS_KEY', 'inventory/prepack_defaults.json')
+S3_SUPPRESSION_OVERRIDES_KEY = os.environ.get('S3_SUPPRESSION_OVERRIDES_KEY', 'inventory/suppression_overrides.json')
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
 
@@ -215,6 +216,8 @@ _deduction_assign_lock = threading.Lock()
 _deduction_assignments = {}  # dict: { sku: 'warehouse' | 'overseas' }
 _prepack_defaults_lock = threading.Lock()
 _prepack_defaults = []  # list of dicts: {id, category, fit, label, master_qty, inner_qty, sizes}
+_suppression_overrides_lock = threading.Lock()
+_suppression_overrides = []  # list of SKU strings that should NOT be suppressed
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
@@ -373,6 +376,37 @@ def save_prepack_defaults_to_s3():
         return True
     except Exception as e:
         print(f"  ✗ Failed to save prepack defaults: {e}")
+        return False
+
+
+def load_suppression_overrides_from_s3():
+    global _suppression_overrides
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SUPPRESSION_OVERRIDES_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _suppression_overrides_lock:
+            _suppression_overrides = data if isinstance(data, list) else []
+        print(f"  ✓ Loaded {len(_suppression_overrides)} suppression overrides from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No suppression overrides in S3 yet")
+        else:
+            print(f"  ⚠ Could not load suppression overrides: {e}")
+    except Exception as e:
+        print(f"  ⚠ Suppression overrides load error: {e}")
+
+
+def save_suppression_overrides_to_s3():
+    try:
+        s3 = get_s3()
+        with _suppression_overrides_lock:
+            data = json.dumps(_suppression_overrides)
+        s3.put_object(Bucket=S3_BUCKET, Key=S3_SUPPRESSION_OVERRIDES_KEY, Body=data.encode('utf-8'), ContentType='application/json')
+        print(f"  ✓ Saved {len(_suppression_overrides)} suppression overrides to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save suppression overrides: {e}")
         return False
 
 
@@ -3144,6 +3178,35 @@ def save_prepack_defaults_route():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/suppression-overrides', methods=['GET', 'OPTIONS'])
+def get_suppression_overrides():
+    if request.method == 'OPTIONS':
+        return '', 204
+    load_suppression_overrides_from_s3()
+    with _suppression_overrides_lock:
+        return jsonify({"overrides": list(_suppression_overrides)})
+
+
+@app.route('/suppression-overrides', methods=['POST'])
+def save_suppression_overrides_route():
+    try:
+        req = request.get_json()
+        if not req or 'overrides' not in req:
+            return jsonify({"error": "Missing 'overrides'"}), 400
+        overrides = req['overrides']
+        if not isinstance(overrides, list):
+            return jsonify({"error": "'overrides' must be an array"}), 400
+        global _suppression_overrides
+        with _suppression_overrides_lock:
+            _suppression_overrides = overrides
+        success = save_suppression_overrides_to_s3()
+        if success:
+            return jsonify({"ok": True, "count": len(overrides)})
+        return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
 def get_manual_allocations():
     if request.method == 'OPTIONS':
@@ -3981,6 +4044,7 @@ def startup_sync():
     load_manual_allocations_from_s3()
     load_deduction_assignments_from_s3()
     load_prepack_defaults_from_s3()
+    load_suppression_overrides_from_s3()
 
     # Load APO allocation file from Dropbox
     try:
