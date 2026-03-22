@@ -1687,7 +1687,8 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
         label  = rule.get('label') or rule.get('category', '?')
 
         worksheet.set_row(r, 20)
-        worksheet.write(r, 0, '{} | {}, {} pcs / box'.format(label, inner, master), t)
+        inner_part = '{}, '.format(inner) if inner and inner != '—' else ''
+        worksheet.write(r, 0, '{} | {}{} pcs / box'.format(label, inner_part, master), t)
         r += 1
 
         worksheet.set_row(r, 16)
