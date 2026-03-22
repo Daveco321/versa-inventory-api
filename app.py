@@ -64,6 +64,7 @@ S3_DEDUCTION_ASSIGN_KEY = os.environ.get('S3_DEDUCTION_ASSIGN_KEY', 'inventory/d
 S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
 S3_PREPACK_DEFAULTS_KEY = os.environ.get('S3_PREPACK_DEFAULTS_KEY', 'inventory/prepack_defaults.json')
 S3_SUPPRESSION_OVERRIDES_KEY = os.environ.get('S3_SUPPRESSION_OVERRIDES_KEY', 'inventory/suppression_overrides.json')
+S3_BANNER_RULES_KEY = os.environ.get('S3_BANNER_RULES_KEY', 'inventory/banner_rules.json')
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
 
@@ -218,6 +219,8 @@ _prepack_defaults_lock = threading.Lock()
 _prepack_defaults = []  # list of dicts: {id, category, fit, label, master_qty, inner_qty, sizes}
 _suppression_overrides_lock = threading.Lock()
 _suppression_overrides = []  # list of SKU strings that should NOT be suppressed
+_banner_rules_lock = threading.Lock()
+_banner_rules = []  # list of banner rule dicts
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
@@ -407,6 +410,37 @@ def save_suppression_overrides_to_s3():
         return True
     except Exception as e:
         print(f"  ✗ Failed to save suppression overrides: {e}")
+        return False
+
+
+def load_banner_rules_from_s3():
+    global _banner_rules
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_BANNER_RULES_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _banner_rules_lock:
+            _banner_rules = data if isinstance(data, list) else []
+        print(f"  ✓ Loaded {len(_banner_rules)} banner rules from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No banner rules in S3 yet")
+        else:
+            print(f"  ⚠ Could not load banner rules: {e}")
+    except Exception as e:
+        print(f"  ⚠ Banner rules load error: {e}")
+
+
+def save_banner_rules_to_s3():
+    try:
+        s3 = get_s3()
+        with _banner_rules_lock:
+            data = json.dumps(_banner_rules)
+        s3.put_object(Bucket=S3_BUCKET, Key=S3_BANNER_RULES_KEY, Body=data.encode('utf-8'), ContentType='application/json')
+        print(f"  ✓ Saved {len(_banner_rules)} banner rules to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save banner rules: {e}")
         return False
 
 
@@ -1640,50 +1674,66 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     break
 
             matched = sku_matched
-            if not matched and cat and fit:
-                # PRIORITY C: Category + Fit + Customer
-                def _rule_fits(r):
-                    f = r.get('fits')
-                    if isinstance(f, list):
-                        return [x for x in f if x and x != 'any']
-                    legacy = r.get('fit', '')
-                    return [legacy] if legacy and legacy != 'any' else []
-                def _has_fits(r):
-                    return len(_rule_fits(r)) > 0
-                def _fits_match(r):
-                    return fit in _rule_fits(r)
-                def _has_cust(r):
-                    custs = r.get('customers')
-                    if isinstance(custs, list):
-                        return len([c for c in custs if c and c.strip()]) > 0
-                    return bool((r.get('customer') or '').strip())
-                def _cust_match(r):
-                    if not cust:
-                        return False
-                    custs = r.get('customers')
-                    if isinstance(custs, list):
-                        return cust.upper() in [c.upper().strip() for c in custs if c]
-                    legacy = (r.get('customer') or '').strip()
-                    return legacy and legacy.upper() == cust.upper()
+            if not matched:
+                # PRIORITY C: Score-based dimension matching (category, fit, customer, brand)
+                brand_abbr = item.get('brand_abbr', item.get('brand', '')).upper()
+                best_score = -1
+                best_rule = None
 
-                matched = (
-                    # cat+fit+customer
-                    next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r) and _cust_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r) and not _has_cust(r)), None)
-                    # cat+anyfit+customer
-                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r) and _cust_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r) and not _has_cust(r)), None)
-                    # any+fit+customer
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r) and _cust_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r) and not _has_cust(r)), None)
-                    # any+anyfit+customer
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r) and _cust_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r) and not _has_cust(r)), None)
-                )
+                for r in prepack_defaults:
+                    # Category must match or be 'any'
+                    r_cat = r.get('category', 'any')
+                    if r_cat != cat and r_cat != 'any':
+                        continue
+
+                    # Fits: if specified, item must match
+                    r_fits = r.get('fits')
+                    if isinstance(r_fits, list):
+                        r_fits = [x for x in r_fits if x and x != 'any']
+                    else:
+                        legacy = r.get('fit', '')
+                        r_fits = [legacy] if legacy and legacy != 'any' else []
+                    if r_fits and fit not in r_fits:
+                        continue
+
+                    # Customers: if specified, item must match
+                    r_custs = r.get('customers')
+                    if isinstance(r_custs, list):
+                        r_custs = [c.upper().strip() for c in r_custs if c and c.strip()]
+                    else:
+                        legacy_c = (r.get('customer') or '').strip()
+                        r_custs = [legacy_c.upper()] if legacy_c else []
+                    if r_custs and (not cust or cust.upper() not in r_custs):
+                        continue
+
+                    # Brands: if specified, item must match
+                    r_brands = r.get('brands')
+                    if isinstance(r_brands, list):
+                        r_brands = [b.upper().strip() for b in r_brands if b and b.strip()]
+                    else:
+                        r_brands = []
+                    if r_brands and (not brand_abbr or brand_abbr not in r_brands):
+                        continue
+
+                    # Score: +1 per specific dimension
+                    score = 0
+                    if r_cat != 'any':
+                        score += 1
+                    if r_fits:
+                        score += 1
+                    if r_custs:
+                        score += 1
+                    if r_brands:
+                        score += 1
+
+                    if score > best_score:
+                        best_score = score
+                        best_rule = r
+
+                matched = best_rule
 
             if matched:
-                fits_key = tuple(sorted(_rule_fits(matched))) if _has_fits(matched) else ('any',)
-                key = (matched.get('category', ''), fits_key, matched.get('id', id(matched)))
+                key = matched.get('id', id(matched))
                 if key not in seen_keys:
                     seen_keys[key] = matched
 
@@ -3161,13 +3211,20 @@ def get_prepack_defaults():
 @app.route('/prepack-defaults', methods=['POST'])
 def save_prepack_defaults_route():
     try:
+        global _prepack_defaults
         req = request.get_json()
         if not req or 'defaults' not in req:
             return jsonify({"error": "Missing 'defaults' in request body"}), 400
         defaults = req['defaults']
         if not isinstance(defaults, list):
             return jsonify({"error": "'defaults' must be an array"}), 400
-        global _prepack_defaults
+        # SAFETY: refuse to save empty array if we already have rules
+        # (prevents accidental wipe from failed client load)
+        with _prepack_defaults_lock:
+            current_count = len(_prepack_defaults)
+        if len(defaults) == 0 and current_count > 0:
+            print(f"  ⚠ BLOCKED: attempted to save 0 prepack defaults (server has {current_count})")
+            return jsonify({"error": f"Refusing to delete all {current_count} rules. Use the UI to delete rules individually."}), 400
         with _prepack_defaults_lock:
             _prepack_defaults = defaults
         success = save_prepack_defaults_to_s3()
@@ -3202,6 +3259,35 @@ def save_suppression_overrides_route():
         success = save_suppression_overrides_to_s3()
         if success:
             return jsonify({"ok": True, "count": len(overrides)})
+        return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/banner-rules', methods=['GET', 'OPTIONS'])
+def get_banner_rules():
+    if request.method == 'OPTIONS':
+        return '', 204
+    load_banner_rules_from_s3()
+    with _banner_rules_lock:
+        return jsonify({"rules": list(_banner_rules)})
+
+
+@app.route('/banner-rules', methods=['POST'])
+def save_banner_rules_route():
+    try:
+        global _banner_rules
+        req = request.get_json()
+        if not req or 'rules' not in req:
+            return jsonify({"error": "Missing 'rules'"}), 400
+        rules = req['rules']
+        if not isinstance(rules, list):
+            return jsonify({"error": "'rules' must be an array"}), 400
+        with _banner_rules_lock:
+            _banner_rules = rules
+        success = save_banner_rules_to_s3()
+        if success:
+            return jsonify({"ok": True, "count": len(rules)})
         return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4045,8 +4131,7 @@ def startup_sync():
     load_deduction_assignments_from_s3()
     load_prepack_defaults_from_s3()
     load_suppression_overrides_from_s3()
-
-    # Load APO allocation file from Dropbox
+    load_banner_rules_from_s3()
     try:
         load_apo_from_dropbox()
     except Exception as e:
