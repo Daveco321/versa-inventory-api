@@ -1605,16 +1605,27 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
             matched = sku_matched
             if not matched and cat and fit:
-                # PRIORITY C: Category + Fit
+                # PRIORITY C: Category + Fit (supports fits array or legacy fit string)
+                def _rule_fits(r):
+                    f = r.get('fits')
+                    if isinstance(f, list):
+                        return [x for x in f if x and x != 'any']
+                    legacy = r.get('fit', '')
+                    return [legacy] if legacy and legacy != 'any' else []
+                def _has_fits(r):
+                    return len(_rule_fits(r)) > 0
+                def _fits_match(r):
+                    return fit in _rule_fits(r)
                 matched = (
-                    next((r for r in prepack_defaults if r.get('category') == cat and r.get('fit') == fit), None)
-                    or next((r for r in prepack_defaults if r.get('category') == cat and r.get('fit') == 'any'), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and r.get('fit') == fit), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and r.get('fit') == 'any'), None)
+                    next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r)), None)
                 )
 
             if matched:
-                key = (matched.get('category', ''), matched.get('fit', ''), matched.get('id', id(matched)))
+                fits_key = tuple(sorted(_rule_fits(matched))) if _has_fits(matched) else ('any',)
+                key = (matched.get('category', ''), fits_key, matched.get('id', id(matched)))
                 if key not in seen_keys:
                     seen_keys[key] = matched
 
@@ -1643,14 +1654,26 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
     # ── Fallback: hardcoded Slim + Regular ────────────────────────────────
     if not packs_to_render:
         packs_to_render = [
-            {'label': 'Slim Fit', 'master_qty': 36, 'inner_qty': 9,
+            {'label': 'Slim Fit', 'master_qty': 36, 'inner_qty': '4 - 9pc Inners',
              'sizes': [['14-14.5 / 32-33', 4], ['15-15.5 / 32-33', 8], ['15-15.5 / 34-35', 4],
                        ['16-16.5 / 32-33', 4], ['16-16.5 / 34-35', 8], ['17-17.5 / 34-35', 8]]},
-            {'label': 'Regular Fit', 'master_qty': 36, 'inner_qty': 9,
+            {'label': 'Regular Fit', 'master_qty': 36, 'inner_qty': '4 - 9pc Inners',
              'sizes': [['15-15.5 / 32-33', 8], ['15-15.5 / 34-35', 8], ['16-16.5 / 32-33', 4],
                        ['16-16.5 / 34-35', 4], ['17-17.5 / 34-35', 4], ['17-17.5 / 36-37', 4],
                        ['18-18.5 / 36-37', 4]]},
         ]
+
+    # ── Compute ratios helper ─────────────────────────────────────────────
+    from math import gcd
+    from functools import reduce
+    def _compute_ratios(sizes):
+        if not sizes:
+            return []
+        qtys = [q for _, q in sizes if q > 0]
+        if not qtys:
+            return [(n, 0) for n, _ in sizes]
+        g = reduce(gcd, qtys)
+        return [(n, q // g) for n, q in sizes] if g > 0 else sizes
 
     # ── Render each rule as a vertical block ──────────────────────────────
     r = start
@@ -1658,32 +1681,35 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
     for rule in packs_to_render:
         sizes  = rule.get('sizes', [])
         master = rule.get('master_qty', '?')
-        inner  = rule.get('inner_qty', '?')
-        label  = rule.get('label') or '{} — {}'.format(rule.get('fit', '?'), rule.get('category', '?'))
+        inner  = rule.get('inner_qty', '—')  # free-text string
+        if isinstance(inner, (int, float)):
+            inner = str(inner)  # legacy numeric → string
+        label  = rule.get('label') or rule.get('category', '?')
 
         worksheet.set_row(r, 20)
-        worksheet.write(r, 0, '{} | {} pcs inner, {} pcs / box'.format(label, inner, master), t)
+        worksheet.write(r, 0, '{} | {}, {} pcs / box'.format(label, inner, master), t)
         r += 1
 
         worksheet.set_row(r, 16)
-        worksheet.write(r, 0, '{} PC. {} SIZE SCALE TO USE'.format(inner, label.upper()), s)
+        worksheet.write(r, 0, '{} SIZE SCALE TO USE'.format(label.upper()), s)
         r += 1
 
+        ratios = _compute_ratios(sizes)
         is_neck_sleeve = any('/' in str(sz[0]) for sz in sizes if sz)
 
         if is_neck_sleeve:
-            # Parse neck/sleeve — e.g. "15-15.5 / 32-33"
-            neck_map   = {}   # neck -> {sleeve: qty}
+            # Parse neck/sleeve — e.g. "15-15.5 / 32-33" — using ratios
+            neck_map   = {}   # neck -> {sleeve: ratio}
             neck_order = []
             slv_order  = []
-            for sz, qty in sizes:
+            for (sz, _), (_, ratio) in zip(sizes, ratios):
                 parts = [p.strip() for p in sz.split('/')]
                 neck  = parts[0]
                 slv   = parts[1] if len(parts) > 1 else ''
                 if neck not in neck_map:
                     neck_map[neck] = {}
                     neck_order.append(neck)
-                neck_map[neck][slv] = qty
+                neck_map[neck][slv] = ratio
                 if slv not in slv_order:
                     slv_order.append(slv)
 
@@ -1704,17 +1730,17 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                 r += 1
 
         else:
-            # Flat S/M/L — header row then qty row
+            # Flat S/M/L — header row then ratio row
             worksheet.set_row(r, 22)
             worksheet.write(r, 0, 'Size', gh)
-            for ci, (sz, _) in enumerate(sizes):
+            for ci, (sz, _) in enumerate(ratios):
                 worksheet.write(r, 1 + ci, sz, gh)
             r += 1
 
             worksheet.set_row(r, 22)
-            worksheet.write(r, 0, 'Qty', gh)
-            for ci, (_, qty) in enumerate(sizes):
-                worksheet.write(r, 1 + ci, qty, gd)
+            worksheet.write(r, 0, 'Ratio', gh)
+            for ci, (_, ratio) in enumerate(ratios):
+                worksheet.write(r, 1 + ci, ratio, gd)
             r += 1
 
         # Blank gap row between grids
