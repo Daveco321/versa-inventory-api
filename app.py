@@ -62,6 +62,7 @@ S3_OVERRIDES_KEY = os.environ.get('S3_OVERRIDES_KEY', 'inventory/style_overrides
 S3_MANUAL_ALLOC_KEY = os.environ.get('S3_MANUAL_ALLOC_KEY', 'inventory/manual_allocations.json')
 S3_DEDUCTION_ASSIGN_KEY = os.environ.get('S3_DEDUCTION_ASSIGN_KEY', 'inventory/deduction_assignments.json')
 S3_SAVED_CATALOGS_KEY = 'inventory/saved_catalogs.json'
+S3_PREPACK_DEFAULTS_KEY = os.environ.get('S3_PREPACK_DEFAULTS_KEY', 'inventory/prepack_defaults.json')
 
 S3_PHOTOS_URL = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{S3_PHOTOS_PREFIX}"
 
@@ -212,6 +213,8 @@ _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
 _deduction_assign_lock = threading.Lock()
 _deduction_assignments = {}  # dict: { sku: 'warehouse' | 'overseas' }
+_prepack_defaults_lock = threading.Lock()
+_prepack_defaults = []  # list of dicts: {id, category, fit, label, master_qty, inner_qty, sizes}
 
 def load_overrides_from_s3():
     """Load style overrides from S3 on startup"""
@@ -332,6 +335,44 @@ def save_deduction_assignments_to_s3():
         return True
     except Exception as e:
         print(f"  ✗ Failed to save deduction assignments: {e}")
+        return False
+
+
+def load_prepack_defaults_from_s3():
+    """Load prepack default rules from S3"""
+    global _prepack_defaults
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_PREPACK_DEFAULTS_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        with _prepack_defaults_lock:
+            _prepack_defaults = data if isinstance(data, list) else []
+        print(f"  ✓ Loaded {len(_prepack_defaults)} prepack defaults from S3")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("  No prepack defaults in S3 yet (will create on first save)")
+        else:
+            print(f"  ⚠ Could not load prepack defaults from S3: {e}")
+    except Exception as e:
+        print(f"  ⚠ Prepack defaults load error: {e}")
+
+
+def save_prepack_defaults_to_s3():
+    """Persist prepack default rules to S3"""
+    try:
+        s3 = get_s3()
+        with _prepack_defaults_lock:
+            data = json.dumps(_prepack_defaults)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_PREPACK_DEFAULTS_KEY,
+            Body=data.encode('utf-8'),
+            ContentType='application/json'
+        )
+        print(f"  ✓ Saved {len(_prepack_defaults)} prepack defaults to S3")
+        return True
+    except Exception as e:
+        print(f"  ✗ Failed to save prepack defaults: {e}")
         return False
 
 
@@ -519,6 +560,104 @@ def extract_image_code(sku, brand_abbr):
 def get_base_style(sku):
     """Get base style from SKU by stripping size suffix — matches frontend logic"""
     return sku.split('-')[0].upper()
+
+
+# ── Python-side category + fit derivation (mirrors frontend logic) ────────
+# Used by background/server-side exports to annotate items so _add_size_charts
+# can match prepack default rules without needing the frontend to send _export_* fields.
+
+_PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
+_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST'}
+_PY_YM_FABRIC_CODES    = {
+    'YM','YB','YR','YG','YS','YT','YP','YA','YO','YE',
+    '1Y','2Y','3Y','4Y','5Y','6Y','7Y','8Y','9Y',
+    '10','11','12','13','14','15','16','17','18',
+}
+
+def _py_extract_fit_code(sku):
+    """Extract 2-char fit code from base style — mirrors extractFitCode() in JS."""
+    base = sku.split('-')[0].upper().rstrip('V').rstrip('-')
+    if len(base) >= 3:
+        candidate = base[-3:-1]   # 2nd & 3rd from end (last char = collar)
+        known = {'SL','RF','BT','BB','TT','TF','MF','SS','SR','SB','ST',
+                 'SE','SH','CE','CH','CR','SF','SC','RR'}
+        if candidate in known:
+            return candidate
+    # fallback: dash suffix e.g. NONAU175-SL
+    parts = sku.upper().split('-')
+    if len(parts) > 1 and parts[-1] in {'SL','RF','BT','TF','MF','SS','SR'}:
+        return parts[-1]
+    return 'RF'
+
+def _py_is_short_sleeve(sku):
+    base = sku.split('-')[0].upper()
+    fit = _py_extract_fit_code(sku)
+    return fit in {'SS','SR','SB','ST'} or (len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS)
+
+def _py_is_young_men(sku):
+    base = sku.split('-')[0].upper()
+    if len(base) >= 6:
+        return base[4:6] in _PY_YM_FABRIC_CODES
+    return False
+
+def _py_is_big_tall(sku):
+    base = sku.split('-')[0].upper()
+    if len(base) >= 11:
+        return base[9:11] in _PY_BT_FIT_CODES
+    return False
+
+def _py_get_item_category(sku, brand_abbr):
+    """Returns category string matching frontend getDetailedCategory() values."""
+    base = sku.split('-')[0].upper()
+    # Pants: position 6 = 'P', positions 7-8 = digits, position 9 = letter
+    if (len(base) >= 10 and base[6] == 'P'
+            and base[7].isdigit() and base[8].isdigit() and base[9].isalpha()):
+        return 'pants'
+    # Sportswear
+    if len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS:
+        return 'sportswear'
+    # Accessories (Chaps ties, Shaq ties)
+    brand_up = (brand_abbr or '').upper()
+    if brand_up == 'CHAPS' and base.startswith('CTH'):
+        return 'accessories'
+    if brand_up == 'SHAQ' and len(base) >= 3 and 'T' in base[:3]:
+        return 'accessories'
+    # Young Men (fabric-code based)
+    if _py_is_young_men(sku):
+        return 'young_men'
+    # Big & Tall
+    if _py_is_big_tall(sku):
+        return 'big_tall'
+    # Shirts: split by sleeve
+    return 'short_sleeve' if _py_is_short_sleeve(sku) else 'long_sleeve'
+
+def _annotate_items_for_prepack(items):
+    """Add _export_category, _export_fit, and _override_size_pack to raw inventory items (returns new list)."""
+    result = []
+    with _overrides_lock:
+        overrides_snap = dict(_style_overrides)
+    for item in items:
+        sku        = item.get('sku', '')
+        brand_abbr = item.get('brand_abbr', item.get('brand', ''))
+        annotated  = dict(item)
+        annotated.setdefault('_export_category', _py_get_item_category(sku, brand_abbr))
+        annotated.setdefault('_export_fit',      _py_extract_fit_code(sku))
+        # Check for per-item size pack override (from Override Tool)
+        if '_override_size_pack' not in annotated:
+            sku_up = sku.upper()
+            ov = overrides_snap.get(sku_up)
+            if not ov:
+                # Prefix match — keys ending with '-'
+                for key in overrides_snap:
+                    if key.endswith('-') and sku_up.startswith(key[:-1]):
+                        ov = overrides_snap[key]
+                        break
+            if ov and ov.get('sizePack') and ov['sizePack'].get('sizes'):
+                annotated['_override_size_pack'] = ov['sizePack']
+            else:
+                annotated['_override_size_pack'] = None
+        result.append(annotated)
+    return result
 
 
 def get_image_url(item, s3_base_url):
@@ -1411,33 +1550,180 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     return len(data)
 
 
-def _add_size_charts(workbook, worksheet, start):
-    t = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':11,'bg_color':'#FFFFFF','border':0,'align':'left','valign':'vcenter'})
-    s = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':10,'bg_color':'#FFFFFF','font_color':'#FF0000','border':0,'align':'center','valign':'vcenter'})
-    gh = workbook.add_format({'bold':True,'font_name':'Calibri','font_size':10,'border':1,'align':'center','valign':'vcenter','bg_color':'#FFFFFF'})
-    gd = workbook.add_format({'font_name':'Calibri','font_size':10,'border':1,'align':'center','valign':'vcenter','bg_color':'#FFFFFF'})
+def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=None):
+    """
+    Render prepack size scale grids vertically at the bottom of the worksheet.
+    One grid per block of rows, stacked top-to-bottom.
+    Only shows rules that match items on THIS tab — so each brand tab is independent.
+    Falls back to hardcoded Slim/Regular if no rules matched.
+    """
+    t  = workbook.add_format({'bold':True, 'font_name':'Calibri', 'font_size':11,
+                               'bg_color':'#FFFFFF', 'border':0, 'align':'left', 'valign':'vcenter'})
+    s  = workbook.add_format({'bold':True, 'font_name':'Calibri', 'font_size':10,
+                               'bg_color':'#FFFFFF', 'font_color':'#CC0000', 'border':0,
+                               'align':'left', 'valign':'vcenter'})
+    gh = workbook.add_format({'bold':True, 'font_name':'Calibri', 'font_size':10,
+                               'border':1, 'align':'center', 'valign':'vcenter', 'bg_color':'#F3F4F6'})
+    gd = workbook.add_format({'font_name':'Calibri', 'font_size':10,
+                               'border':1, 'align':'center', 'valign':'vcenter', 'bg_color':'#FFFFFF'})
+
+    # ── Determine which rules to show ─────────────────────────────────────
+    packs_to_render = []
+
+    if prepack_defaults and items:
+        seen_keys = {}
+        for item in items:
+            cat = item.get('_export_category', '')
+            fit = item.get('_export_fit', '')
+            sku = item.get('sku', '').upper()
+            base = sku.split('-')[0]
+
+            # PRIORITY A: Per-item Override Tool size pack
+            override_pack = item.get('_override_size_pack')
+            if override_pack and isinstance(override_pack, dict) and override_pack.get('sizes'):
+                key = ('__override__', sku)
+                if key not in seen_keys:
+                    seen_keys[key] = {
+                        'label': f"Override: {base}",
+                        'master_qty': override_pack.get('master_qty', '?'),
+                        'inner_qty':  override_pack.get('inner_qty', '?'),
+                        'sizes':      override_pack.get('sizes', []),
+                        '_is_override': True
+                    }
+                continue  # This item is handled — don't also add a prepack rule for it
+
+            # PRIORITY B: SKU-specific assignment on any prepack rule
+            sku_matched = None
+            for rule in prepack_defaults:
+                for s in (rule.get('skus') or []):
+                    su = s.upper().strip()
+                    if su and (su == sku or su == base or sku.startswith(su)):
+                        sku_matched = rule
+                        break
+                if sku_matched:
+                    break
+
+            matched = sku_matched
+            if not matched and cat and fit:
+                # PRIORITY C: Category + Fit
+                matched = (
+                    next((r for r in prepack_defaults if r.get('category') == cat and r.get('fit') == fit), None)
+                    or next((r for r in prepack_defaults if r.get('category') == cat and r.get('fit') == 'any'), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and r.get('fit') == fit), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and r.get('fit') == 'any'), None)
+                )
+
+            if matched:
+                key = (matched.get('category', ''), matched.get('fit', ''), matched.get('id', id(matched)))
+                if key not in seen_keys:
+                    seen_keys[key] = matched
+
+        # Render override grids first (sorted by SKU), then rule-based grids
+        override_packs = [(k, v) for k, v in seen_keys.items() if k[0] == '__override__']
+        rule_packs     = [(k, v) for k, v in seen_keys.items() if k[0] != '__override__']
+        packs_to_render = [v for _, v in sorted(override_packs, key=lambda x: x[0][1])] + [v for _, v in rule_packs]
+
+    elif items:
+        # No prepack_defaults supplied — still check for item-level overrides
+        seen_overrides = {}
+        for item in items:
+            override_pack = item.get('_override_size_pack')
+            sku = item.get('sku', '').upper()
+            base = sku.split('-')[0]
+            if override_pack and isinstance(override_pack, dict) and override_pack.get('sizes'):
+                if base not in seen_overrides:
+                    seen_overrides[base] = {
+                        'label': f"Override: {base}",
+                        'master_qty': override_pack.get('master_qty', '?'),
+                        'inner_qty':  override_pack.get('inner_qty', '?'),
+                        'sizes':      override_pack.get('sizes', []),
+                    }
+        packs_to_render = list(seen_overrides.values())
+
+    # ── Fallback: hardcoded Slim + Regular ────────────────────────────────
+    if not packs_to_render:
+        packs_to_render = [
+            {'label': 'Slim Fit', 'master_qty': 36, 'inner_qty': 9,
+             'sizes': [['14-14.5 / 32-33', 4], ['15-15.5 / 32-33', 8], ['15-15.5 / 34-35', 4],
+                       ['16-16.5 / 32-33', 4], ['16-16.5 / 34-35', 8], ['17-17.5 / 34-35', 8]]},
+            {'label': 'Regular Fit', 'master_qty': 36, 'inner_qty': 9,
+             'sizes': [['15-15.5 / 32-33', 8], ['15-15.5 / 34-35', 8], ['16-16.5 / 32-33', 4],
+                       ['16-16.5 / 34-35', 4], ['17-17.5 / 34-35', 4], ['17-17.5 / 36-37', 4],
+                       ['18-18.5 / 36-37', 4]]},
+        ]
+
+    # ── Render each rule as a vertical block ──────────────────────────────
     r = start
-    for i in range(5): worksheet.set_row(r+i, [20,18,25,25,25][i])
 
-    worksheet.write(r,0,'Slim Fit 9 pcs inner, 36 pcs / box (4 inners)',t)
-    worksheet.merge_range(r+1,0,r+1,4,'9 PC. Slim Fit SIZE SCALE TO USE',s)
-    for c,v in enumerate(['','14-14.5','15-15.5','16-16.5','17-17.5']): worksheet.write(r+2,c,v,gh)
-    worksheet.write(r+3,0,'32/33',gh)
-    for c,v in enumerate([1,2,1,''],1): worksheet.write(r+3,c,v,gd)
-    worksheet.write(r+4,0,'34/35',gh)
-    for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,c,v,gd)
+    for rule in packs_to_render:
+        sizes  = rule.get('sizes', [])
+        master = rule.get('master_qty', '?')
+        inner  = rule.get('inner_qty', '?')
+        label  = rule.get('label') or '{} — {}'.format(rule.get('fit', '?'), rule.get('category', '?'))
 
-    worksheet.write(r,7,'Regular Fit 9 pcs inner, 36 pcs / box (4 inners)',t)
-    worksheet.merge_range(r+1,7,r+1,11,'9 PC. CLASSIC FIT & REGULAR FIT SIZE SCALE TO USE',s)
-    for c,v in enumerate(['','15-15.5','16-16.5','17-17.5','18-18.5']): worksheet.write(r+2,7+c,v,gh)
-    worksheet.write(r+3,7,'32/33',gh)
-    for c,v in enumerate([1,2,1,''],1): worksheet.write(r+3,7+c,v,gd)
-    worksheet.write(r+4,7,'34/35',gh)
-    for c,v in enumerate(['',1,2,2],1): worksheet.write(r+4,7+c,v,gd)
+        worksheet.set_row(r, 20)
+        worksheet.write(r, 0, '{} | {} pcs inner, {} pcs / box'.format(label, inner, master), t)
+        r += 1
+
+        worksheet.set_row(r, 16)
+        worksheet.write(r, 0, '{} PC. {} SIZE SCALE TO USE'.format(inner, label.upper()), s)
+        r += 1
+
+        is_neck_sleeve = any('/' in str(sz[0]) for sz in sizes if sz)
+
+        if is_neck_sleeve:
+            # Parse neck/sleeve — e.g. "15-15.5 / 32-33"
+            neck_map   = {}   # neck -> {sleeve: qty}
+            neck_order = []
+            slv_order  = []
+            for sz, qty in sizes:
+                parts = [p.strip() for p in sz.split('/')]
+                neck  = parts[0]
+                slv   = parts[1] if len(parts) > 1 else ''
+                if neck not in neck_map:
+                    neck_map[neck] = {}
+                    neck_order.append(neck)
+                neck_map[neck][slv] = qty
+                if slv not in slv_order:
+                    slv_order.append(slv)
+
+            # Column header row: blank corner + neck sizes as columns
+            worksheet.set_row(r, 22)
+            worksheet.write(r, 0, '', gh)
+            for ci, neck in enumerate(neck_order):
+                worksheet.write(r, 1 + ci, neck, gh)
+            r += 1
+
+            # One data row per sleeve length
+            for slv in slv_order:
+                worksheet.set_row(r, 22)
+                worksheet.write(r, 0, slv, gh)
+                for ci, neck in enumerate(neck_order):
+                    val = neck_map[neck].get(slv, '')
+                    worksheet.write(r, 1 + ci, val if val != '' else '', gd)
+                r += 1
+
+        else:
+            # Flat S/M/L — header row then qty row
+            worksheet.set_row(r, 22)
+            worksheet.write(r, 0, 'Size', gh)
+            for ci, (sz, _) in enumerate(sizes):
+                worksheet.write(r, 1 + ci, sz, gh)
+            r += 1
+
+            worksheet.set_row(r, 22)
+            worksheet.write(r, 0, 'Qty', gh)
+            for ci, (_, qty) in enumerate(sizes):
+                worksheet.write(r, 1 + ci, qty, gd)
+            r += 1
+
+        # Blank gap row between grids
+        worksheet.set_row(r, 10)
+        r += 1
 
 
 def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False,
-                      catalog_mode=False):
+                      catalog_mode=False, prepack_defaults=None):
     has_color = any(item.get('color') for item in items)
 
     # Auto-detect incoming_only: all items have zero warehouse stock
@@ -1459,12 +1745,12 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers)
-    _add_size_charts(wb, ws, n + 2)
+    _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
     wb.close()
     return buf.getvalue()
 
 
-def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all'):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', prepack_defaults=None):
     for b in brands_list:
         sort_key = 'total_ats' if catalog_mode else 'total_warehouse'
         b['items'] = sorted(b['items'], key=lambda x: x.get(sort_key, 0), reverse=True)
@@ -1498,7 +1784,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
                         has_color=has_color, headers=headers)
-        _add_size_charts(wb, ws, n + 2)
+        _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
 
     wb.close()
     return buf.getvalue()
@@ -1969,7 +2255,11 @@ def generate_all_exports():
             sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
 
             try:
-                xl_bytes = build_brand_excel(name, sorted_items, S3_PHOTOS_URL)
+                annotated_items = _annotate_items_for_prepack(sorted_items)
+                with _prepack_defaults_lock:
+                    pd_snap = list(_prepack_defaults)
+                xl_bytes = build_brand_excel(name, annotated_items, S3_PHOTOS_URL,
+                                             prepack_defaults=pd_snap)
 
                 with _export_lock:
                     _exports['brands'][abbr] = {
@@ -1985,7 +2275,7 @@ def generate_all_exports():
 
                 brands_list_for_multi.append({
                     'brand_name': name,
-                    'items': sorted_items
+                    'items': annotated_items
                 })
             except Exception as e:
                 print(f"    Failed: {e}")
@@ -1993,7 +2283,10 @@ def generate_all_exports():
         if brands_list_for_multi:
             print(f"\n  [ALL] Multi-tab ({len(brands_list_for_multi)} brands)...")
             try:
-                multi_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL)
+                with _prepack_defaults_lock:
+                    pd_snap = list(_prepack_defaults)
+                multi_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL,
+                                                      prepack_defaults=pd_snap)
                 with _export_lock:
                     _exports['all_brands'] = {
                         'bytes': multi_bytes,
@@ -2243,7 +2536,13 @@ def download_multi_selected():
         key=lambda b: sum(i.get('total_warehouse', 0) for i in b['items']),
         reverse=True)
 
-    xl_bytes = build_multi_brand_excel(brands_list, S3_PHOTOS_URL)
+    # Annotate items with category/fit for prepack chart matching
+    for b in brands_list:
+        b['items'] = _annotate_items_for_prepack(b['items'])
+    with _prepack_defaults_lock:
+        pd_snap = list(_prepack_defaults)
+
+    xl_bytes = build_multi_brand_excel(brands_list, S3_PHOTOS_URL, prepack_defaults=pd_snap)
     date_str = datetime.utcnow().strftime('%Y-%m-%d')
 
     return send_file(
@@ -2461,11 +2760,13 @@ def export_single():
         view_mode = req.get('view_mode', 'all')
         is_order = req.get('is_order', False)
         catalog_mode = req.get('catalog_mode', False)
+        prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
-                                     is_order=is_order, catalog_mode=catalog_mode)
+                                     is_order=is_order, catalog_mode=catalog_mode,
+                                     prepack_defaults=prepack_defaults)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -2518,11 +2819,13 @@ def export_multi():
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
         view_mode = req.get('view_mode', 'all')
+        prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
 
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
-                                           catalog_mode=catalog_mode, view_mode=view_mode)
+                                           catalog_mode=catalog_mode, view_mode=view_mode,
+                                           prepack_defaults=prepack_defaults)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -2755,6 +3058,36 @@ def save_deduction_assignments():
         success = save_deduction_assignments_to_s3()
         if success:
             return jsonify({"success": True, "count": len(assignments)})
+        return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/prepack-defaults', methods=['GET', 'OPTIONS'])
+def get_prepack_defaults():
+    if request.method == 'OPTIONS':
+        return '', 204
+    # Always reload from S3 for multi-worker consistency
+    load_prepack_defaults_from_s3()
+    with _prepack_defaults_lock:
+        return jsonify({"defaults": list(_prepack_defaults)})
+
+
+@app.route('/prepack-defaults', methods=['POST'])
+def save_prepack_defaults_route():
+    try:
+        req = request.get_json()
+        if not req or 'defaults' not in req:
+            return jsonify({"error": "Missing 'defaults' in request body"}), 400
+        defaults = req['defaults']
+        if not isinstance(defaults, list):
+            return jsonify({"error": "'defaults' must be an array"}), 400
+        global _prepack_defaults
+        with _prepack_defaults_lock:
+            _prepack_defaults = defaults
+        success = save_prepack_defaults_to_s3()
+        if success:
+            return jsonify({"ok": True, "count": len(defaults)})
         return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3596,6 +3929,7 @@ def startup_sync():
     load_overrides_from_s3()
     load_manual_allocations_from_s3()
     load_deduction_assignments_from_s3()
+    load_prepack_defaults_from_s3()
 
     # Load APO allocation file from Dropbox
     try:
