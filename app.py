@@ -642,6 +642,7 @@ def _annotate_items_for_prepack(items):
         annotated  = dict(item)
         annotated.setdefault('_export_category', _py_get_item_category(sku, brand_abbr))
         annotated.setdefault('_export_fit',      _py_extract_fit_code(sku))
+        annotated.setdefault('_export_customer',  sku[:2].upper() if len(sku) >= 2 else '')
         # Check for per-item size pack override (from Override Tool)
         if '_override_size_pack' not in annotated:
             sku_up = sku.upper()
@@ -1575,6 +1576,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
         for item in items:
             cat = item.get('_export_category', '')
             fit = item.get('_export_fit', '')
+            cust = item.get('_export_customer', '')
             sku = item.get('sku', '').upper()
             base = sku.split('-')[0]
 
@@ -1605,7 +1607,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
             matched = sku_matched
             if not matched and cat and fit:
-                # PRIORITY C: Category + Fit (supports fits array or legacy fit string)
+                # PRIORITY C: Category + Fit + Customer
                 def _rule_fits(r):
                     f = r.get('fits')
                     if isinstance(f, list):
@@ -1616,11 +1618,33 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     return len(_rule_fits(r)) > 0
                 def _fits_match(r):
                     return fit in _rule_fits(r)
+                def _has_cust(r):
+                    custs = r.get('customers')
+                    if isinstance(custs, list):
+                        return len([c for c in custs if c and c.strip()]) > 0
+                    return bool((r.get('customer') or '').strip())
+                def _cust_match(r):
+                    if not cust:
+                        return False
+                    custs = r.get('customers')
+                    if isinstance(custs, list):
+                        return cust.upper() in [c.upper().strip() for c in custs if c]
+                    legacy = (r.get('customer') or '').strip()
+                    return legacy and legacy.upper() == cust.upper()
+
                 matched = (
-                    next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r)), None)
-                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r)), None)
+                    # cat+fit+customer
+                    next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r) and _cust_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == cat and _has_fits(r) and _fits_match(r) and not _has_cust(r)), None)
+                    # cat+anyfit+customer
+                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r) and _cust_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == cat and not _has_fits(r) and not _has_cust(r)), None)
+                    # any+fit+customer
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r) and _cust_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and _has_fits(r) and _fits_match(r) and not _has_cust(r)), None)
+                    # any+anyfit+customer
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r) and _cust_match(r)), None)
+                    or next((r for r in prepack_defaults if r.get('category') == 'any' and not _has_fits(r) and not _has_cust(r)), None)
                 )
 
             if matched:
