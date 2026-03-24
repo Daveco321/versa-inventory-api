@@ -2913,11 +2913,7 @@ def export_single():
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
-        # Annotate items for prepack matching (category, fit, customer, override size packs)
-        try:
-            data = _annotate_items_for_prepack(data)
-        except Exception:
-            pass  # Non-fatal — export still works without prepack annotations
+        print(f"[Export] {fname}: {len(data)} items, view={view_mode}, prepack_rules={len(prepack_defaults)}")
 
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
                                      is_order=is_order, catalog_mode=catalog_mode,
@@ -2928,6 +2924,8 @@ def export_single():
             as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
     except Exception as e:
         import traceback
+        traceback.print_exc()
+        print(f"[Export] FAILED for {fname}: {e}")
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
@@ -2977,14 +2975,6 @@ def export_multi():
         prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
-
-        # Annotate items for prepack matching
-        try:
-            for b in brands_data:
-                if 'items' in b:
-                    b['items'] = _annotate_items_for_prepack(b['items'])
-        except Exception:
-            pass
 
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
                                            catalog_mode=catalog_mode, view_mode=view_mode,
