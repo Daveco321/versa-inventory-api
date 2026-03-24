@@ -1882,17 +1882,44 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     wb = xlsxwriter.Workbook(buf, {'in_memory': True})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
+    print(f"  [build_brand_excel] Step 1: setup worksheet")
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                      is_order=is_order, incoming_only=incoming_only,
                                      catalog_mode=catalog_mode)
+    print(f"  [build_brand_excel] Step 2: download images")
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
+    print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers)
+    print(f"  [build_brand_excel] Step 4: add size charts (prepack_defaults={type(prepack_defaults).__name__}, len={len(prepack_defaults) if prepack_defaults else 0})")
     try:
         _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
+        print(f"  [build_brand_excel] Step 4: size charts OK")
     except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
         print(f"  ⚠ Size charts failed (non-fatal): {e}")
-    wb.close()
+    print(f"  [build_brand_excel] Step 5: wb.close()")
+    try:
+        wb.close()
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"  ⚠ wb.close() failed: {e}")
+        # Try again without size charts — rebuild from scratch
+        print(f"  [build_brand_excel] Retrying WITHOUT size charts...")
+        buf = BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
+        ws = wb.add_worksheet(brand_name[:31])
+        fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
+                                         is_order=is_order, incoming_only=incoming_only,
+                                         catalog_mode=catalog_mode)
+        imgs = download_images_for_items(items, s3_base_url, use_cache=True)
+        _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
+                    view_mode=view_mode, headers=headers)
+        wb.close()
+        print(f"  [build_brand_excel] Retry succeeded (no size charts)")
     return buf.getvalue()
 
 
