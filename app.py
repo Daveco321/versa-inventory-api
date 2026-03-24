@@ -1882,6 +1882,21 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     wb = xlsxwriter.Workbook(buf, {'in_memory': True})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
+    # Monkey-patch worksheet.write to catch string-as-format bugs
+    _orig_ws_write = ws.write
+    def _safe_ws_write(r, c, val=None, fmt=None, *args):
+        if fmt is not None and isinstance(fmt, str):
+            import traceback as _tb
+            print(f"  🚨 STRING-AS-FORMAT at row={r} col={c} val={repr(val)[:80]} fmt={repr(fmt)[:80]}")
+            _tb.print_stack()
+            return  # skip the bad write
+        if fmt is not None:
+            _orig_ws_write(r, c, val, fmt, *args)
+        elif val is not None:
+            _orig_ws_write(r, c, val)
+        else:
+            _orig_ws_write(r, c)
+    ws.write = _safe_ws_write
     print(f"  [build_brand_excel] Step 1: setup worksheet")
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                      is_order=is_order, incoming_only=incoming_only,
