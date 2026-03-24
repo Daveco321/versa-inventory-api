@@ -1888,7 +1888,10 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers)
-    _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
+    try:
+        _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
+    except Exception as e:
+        print(f"  ⚠ Size charts failed (non-fatal): {e}")
     wb.close()
     return buf.getvalue()
 
@@ -1927,7 +1930,10 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
                         has_color=has_color, headers=headers)
-        _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
+        try:
+            _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
+        except Exception as e:
+            print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
 
     wb.close()
     return buf.getvalue()
@@ -2907,6 +2913,12 @@ def export_single():
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
+        # Annotate items for prepack matching (category, fit, customer, override size packs)
+        try:
+            data = _annotate_items_for_prepack(data)
+        except Exception:
+            pass  # Non-fatal — export still works without prepack annotations
+
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
                                      is_order=is_order, catalog_mode=catalog_mode,
                                      prepack_defaults=prepack_defaults)
@@ -2965,6 +2977,14 @@ def export_multi():
         prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
+
+        # Annotate items for prepack matching
+        try:
+            for b in brands_data:
+                if 'items' in b:
+                    b['items'] = _annotate_items_for_prepack(b['items'])
+        except Exception:
+            pass
 
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
                                            catalog_mode=catalog_mode, view_mode=view_mode,
