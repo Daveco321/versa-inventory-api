@@ -1787,7 +1787,15 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
     r = start
 
     for rule in packs_to_render:
-        sizes  = rule.get('sizes', [])
+        sizes  = rule.get('sizes') or []
+        # Ensure sizes is a list of [name, qty] pairs with numeric qty
+        safe_sizes = []
+        for sz in sizes:
+            if isinstance(sz, (list, tuple)) and len(sz) >= 2:
+                safe_sizes.append([str(sz[0]), int(sz[1]) if sz[1] else 0])
+        sizes = safe_sizes
+        if not sizes:
+            continue  # Skip rules with no sizes defined
         master = rule.get('master_qty', '?')
         inner  = rule.get('inner_qty', '—')  # free-text string
         if isinstance(inner, (int, float)):
