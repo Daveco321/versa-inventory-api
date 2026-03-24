@@ -1681,6 +1681,12 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                 best_rule = None
 
                 for r in prepack_defaults:
+                    # Skip rules that have a SKU list — they should ONLY match via Priority B (exact SKU),
+                    # never act as a catch-all through dimension scoring
+                    r_skus = r.get('skus') or []
+                    if isinstance(r_skus, list) and len([s for s in r_skus if s and s.strip()]) > 0:
+                        continue
+
                     # Category must match or be 'any'
                     r_cat = r.get('category', 'any')
                     if r_cat != cat and r_cat != 'any':
