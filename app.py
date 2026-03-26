@@ -3239,6 +3239,8 @@ def get_allocations_version():
 def get_deduction_assignments():
     if request.method == 'OPTIONS':
         return '', 204
+    # Always reload from S3 for multi-worker consistency
+    load_deduction_assignments_from_s3()
     with _deduction_assign_lock:
         data = dict(_deduction_assignments)
     return jsonify({"assignments": data})
