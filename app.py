@@ -1968,6 +1968,19 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     for bi, brand in enumerate(brands_list):
         safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
         ws = wb.add_worksheet(safe)
+        # Monkey-patch worksheet.write to catch string-as-format bugs
+        _orig_ws_write = ws.write
+        def _safe_ws_write(r, c, val=None, fmt=None, *args, _orig=_orig_ws_write):
+            if fmt is not None and isinstance(fmt, str):
+                print(f"  🚨 STRING-AS-FORMAT at row={r} col={c} val={repr(val)[:80]} fmt={repr(fmt)[:80]}")
+                return  # skip the bad write
+            if fmt is not None:
+                _orig(r, c, val, fmt, *args)
+            elif val is not None:
+                _orig(r, c, val)
+            else:
+                _orig(r, c)
+        ws.write = _safe_ws_write
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                          catalog_mode=catalog_mode, view_mode=view_mode)
         start, count = offsets[bi]
@@ -1983,7 +1996,31 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         except Exception as e:
             print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
 
-    wb.close()
+    try:
+        wb.close()
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"  ⚠ wb.close() failed in multi-brand: {e} — retrying WITHOUT size charts...")
+        # Retry from scratch without size charts
+        buf = BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
+        for bi, brand in enumerate(brands_list):
+            safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
+            ws = wb.add_worksheet(safe)
+            fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
+                                             catalog_mode=catalog_mode, view_mode=view_mode)
+            start, count = offsets[bi]
+            local_imgs = {}
+            for li in range(count):
+                gi = start + li
+                if gi in all_imgs:
+                    local_imgs[li] = all_imgs[gi]
+            _write_rows(wb, ws, brand['items'], local_imgs, fmts,
+                        has_color=has_color, headers=headers)
+        wb.close()
+        print(f"  ✓ Multi-brand retry succeeded (no size charts)")
     return buf.getvalue()
 
 
