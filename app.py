@@ -138,8 +138,8 @@ BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
     'BEN': 'BE', 'USPA': 'US', 'CHAPS': 'CH', 'LUCKY': 'LB', 'JNY': 'JN',
     'BEENE': 'GB', 'NICOLE': 'NM', 'SHAQ': 'SH', 'TAYION': 'TA', 'STRAHAN': 'MS',
-    'VD': 'VD', 'VERSA': 'VR', 'CHEROKEE': 'CK', 'AMERICA': 'AC', 'BLO': 'BL', 'DN': 'D9',
-    'KL': 'KL', 'NE': 'NE'
+    'VD': 'VD', 'VERSA': 'VR', 'CHEROKEE': 'CK', 'AMERICA': 'AC', 'BLO': 'BL', 'BLACK': 'BL', 'DN': 'D9',
+    'KL': 'KL', 'RG': 'RG', 'NE': 'NE'
 }
 
 BRAND_FULL_NAMES = {
@@ -148,8 +148,8 @@ BRAND_FULL_NAMES = {
     'CHAPS': 'Chaps', 'LUCKY': 'Lucky Brand', 'JNY': 'Jones New York',
     'BEENE': 'Geoffrey Beene', 'NICOLE': 'Nicole Miller', 'SHAQ': "Shaquille O'Neal",
     'TAYION': 'Tayion', 'STRAHAN': 'Michael Strahan', 'VD': 'Von Dutch',
-    'VERSA': 'Versa', 'CHEROKEE': 'Cherokee', 'AMERICA': 'American Crew', 'BLO': 'Bloomingdales', 'DN': 'Divine 9',
-    'KL': 'Karl Lagerfeld Paris', 'NE': 'Neiman Marcus'
+    'VERSA': 'Versa', 'CHEROKEE': 'Cherokee', 'AMERICA': 'American Crew', 'BLO': 'Bloomingdales', 'BLACK': 'Black Label', 'DN': 'Divine 9',
+    'KL': 'Karl Lagerfeld Paris', 'RG': 'Robert Graham', 'NE': 'Neiman Marcus'
 }
 
 FOLDER_MAPPING = {
@@ -157,7 +157,8 @@ FOLDER_MAPPING = {
     'LUCKY': 'LUCKY+BRAND', 'BEN': 'BEN+SHERMAN', 'BEENE': 'GEOFFREY+BEENE',
     'NICOLE': 'NICOLE+MILLER', 'AMERICA': 'AMERICAN+CREW',
     'TAYION': 'TAYON', 'VD': 'Von+Dutch',
-    'KL': 'KARL+LAGERFELD'
+    'KL': 'KARL+LAGERFELD',
+    'BLACK': 'Black'
 }
 
 STYLE_CONFIG = {
@@ -635,6 +636,7 @@ def get_base_style(sku):
 # can match prepack default rules without needing the frontend to send _export_* fields.
 
 _PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
+_PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE'}
 _PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST'}
 _PY_YM_FABRIC_CODES    = {
     'YM','YB','YR','YG','YS','YT','YP','YA','YO','YE',
@@ -670,6 +672,11 @@ def _py_is_young_men(sku):
 
 def _py_is_big_tall(sku):
     base = sku.split('-')[0].upper()
+    # Von Dutch special B&T prefixes: WBJ, BTC, BTS, WBK (after customer+brand code)
+    if len(base) >= 7 and base[2:4] == 'VD':
+        suffix = base[4:]
+        if suffix.startswith(('WBJ', 'BTC', 'BTS', 'WBK')):
+            return True
     if len(base) >= 11:
         return base[9:11] in _PY_BT_FIT_CODES
     return False
@@ -681,8 +688,11 @@ def _py_get_item_category(sku, brand_abbr):
     if (len(base) >= 10 and base[6] == 'P'
             and base[7].isdigit() and base[8].isdigit() and base[9].isalpha()):
         return 'pants'
-    # Sportswear
+    # Sportswear by collar code
     if len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS:
+        return 'sportswear'
+    # Sportswear by fabric code: polo/tee/henley fabrics
+    if len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_FABRICS:
         return 'sportswear'
     # Accessories (Chaps ties, Shaq ties)
     brand_up = (brand_abbr or '').upper()
