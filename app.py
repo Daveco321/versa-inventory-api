@@ -132,7 +132,30 @@ def get_dropbox_token():
 
 TARGET_W = 150
 TARGET_H = 150
+# Inward padding (px) so image bottom-right anchor stays inside the row.
+# Without this, the twoCellAnchor 'to' cell bleeds into the next row and
+# images don't hide when Excel filters — causing the "jumbled images" bug.
+_IMG_CELL_PAD = 4
 COL_WIDTH_UNITS = 22
+
+
+def _padded_image_opts(img, pad=_IMG_CELL_PAD):
+    """Shrink scale & shift offsets so the image stays strictly inside the cell.
+
+    This ensures xlsxwriter's twoCellAnchor 'to' reference never bleeds into
+    the next row, which is what causes images to jumble when filtering in Excel.
+    The visual difference is ~2 px extra whitespace per side — imperceptible.
+    """
+    ratio = (TARGET_W - pad) / TARGET_W  # same for W and H (both 150)
+    return {
+        'image_data': img['image_data'],
+        'x_scale':  img['x_scale']  * ratio,
+        'y_scale':  img['y_scale']  * ratio,
+        'x_offset': img['x_offset'] * ratio + pad / 2,
+        'y_offset': img['y_offset'] * ratio + pad / 2,
+        'object_position': 1,
+        'url': img.get('url', ''),
+    }
 
 BRAND_IMAGE_PREFIX = {
     'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
@@ -1616,12 +1639,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         img = images.get(r)
         if img:
             try:
-                worksheet.insert_image(row, 0, "img.png", {
-                    'image_data': img['image_data'],
-                    'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
-                    'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
-                    'object_position': 1, 'url': img.get('url', '')
-                })
+                worksheet.insert_image(row, 0, "img.png", _padded_image_opts(img))
             except Exception:
                 worksheet.write(row, 0, "Error", cf)
         else:
@@ -2958,12 +2976,7 @@ def build_overseas_summary_excel(title, items, s3_base_url):
         img = imgs.get(i)
         if img:
             try:
-                ws.insert_image(row, 0, "img.png", {
-                    'image_data': img['image_data'],
-                    'x_scale': img['x_scale'], 'y_scale': img['y_scale'],
-                    'x_offset': img['x_offset'], 'y_offset': img['y_offset'],
-                    'object_position': 1, 'url': img.get('url', '')
-                })
+                ws.insert_image(row, 0, "img.png", _padded_image_opts(img))
             except Exception:
                 ws.write(row, 0, "Error", cf)
         else:
