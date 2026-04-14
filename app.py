@@ -592,10 +592,12 @@ def load_production_from_dropbox():
             with _production_lock:
                 return list(_production_data)
 
-        wb = openpyxl.load_workbook(BytesIO(dl_resp.content), read_only=True)
+        wb = openpyxl.load_workbook(BytesIO(dl_resp.content), read_only=False, data_only=True)
         ws = wb[wb.sheetnames[0]]
         results = []
+        row_count = 0
         for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+            row_count += 1
             style = str(row[2] or '').strip().upper()
             if not style:
                 continue
@@ -626,7 +628,7 @@ def load_production_from_dropbox():
             _production_data = results
             _production_last_sync = time.time()
 
-        print(f"  ✓ Loaded {len(results)} production rows from Dropbox ({chosen['name']})")
+        print(f"  ✓ Loaded {len(results)} production rows from {row_count} Excel rows ({chosen['name']})")
         return results
 
     except Exception as e:
