@@ -1499,7 +1499,8 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
 
 
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
-                     is_order=False, incoming_only=False, catalog_mode=False):
+                     is_order=False, incoming_only=False, catalog_mode=False,
+                     flow_mode=False):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -1549,6 +1550,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         if has_color:
             headers.append('Color')
         headers.extend(['Fit', 'Fabrication'])
+        # Flow mode (admin only): add Production # and PO Name columns
+        if flow_mode and not catalog_mode:
+            headers.extend(['Production #', 'PO Name'])
         if is_order:
             headers.append('Qty Selected')
         headers.extend(['Incoming', 'Committed', 'Allocated', 'Overseas ATS',
@@ -1576,6 +1580,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
     col_widths = {
         'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
+        'Production #': 16, 'PO Name': 30,
         'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
@@ -1603,6 +1608,8 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Fit': lambda item: item.get('fit', 'N/A'),
         'Fabrication': lambda item: item.get('fabrication', 'Standard Fabric'),
         'Delivery': lambda item: item.get('delivery', 'ATS'),
+        'Production #': lambda item: item.get('production', ''),
+        'PO Name': lambda item: item.get('po_name', ''),
         'Qty Selected': lambda item: item.get('quantity_ordered', 0),
         'JTW': lambda item: item.get('jtw', 0),
         'TR': lambda item: item.get('tr', 0),
@@ -1902,7 +1909,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
 
 def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False,
-                      catalog_mode=False, prepack_defaults=None):
+                      catalog_mode=False, prepack_defaults=None, flow_mode=False):
     has_color = any(item.get('color') for item in items)
 
     # Auto-detect incoming_only: all items have zero warehouse stock
@@ -1936,7 +1943,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     print(f"  [build_brand_excel] Step 1: setup worksheet")
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                      is_order=is_order, incoming_only=incoming_only,
-                                     catalog_mode=catalog_mode)
+                                     catalog_mode=catalog_mode, flow_mode=flow_mode)
     print(f"  [build_brand_excel] Step 2: download images")
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
@@ -1965,7 +1972,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
         ws = wb.add_worksheet(brand_name[:31])
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                          is_order=is_order, incoming_only=incoming_only,
-                                         catalog_mode=catalog_mode)
+                                         catalog_mode=catalog_mode, flow_mode=flow_mode)
         imgs = download_images_for_items(items, s3_base_url, use_cache=True)
         _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers)
@@ -3019,15 +3026,17 @@ def export_single():
         view_mode = req.get('view_mode', 'all')
         is_order = req.get('is_order', False)
         catalog_mode = req.get('catalog_mode', False)
+        flow_mode = req.get('flow_mode', False)
         prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
-        print(f"[Export] {fname}: {len(data)} items, view={view_mode}, prepack_rules={len(prepack_defaults)}")
+        print(f"[Export] {fname}: {len(data)} items, view={view_mode}, flow={flow_mode}, prepack_rules={len(prepack_defaults)}")
 
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
                                      is_order=is_order, catalog_mode=catalog_mode,
-                                     prepack_defaults=prepack_defaults)
+                                     prepack_defaults=prepack_defaults,
+                                     flow_mode=flow_mode)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
