@@ -1827,12 +1827,16 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     # Tier A (Specific) requires BOTH a specific category AND specific fabrics
                     is_specific = 1 if (r_cat and r_cat != 'any' and r_fabs) else 0
 
-                    # Secondary score: +1 per specified dimension
+                    # Secondary score: weighted dimensions.
+                    # Brand and customer count as +2 (harder constraints — "who the item is FOR"),
+                    # everything else as +1 (softer constraints — "what the item IS").
+                    # This means a brand-specific or customer-specific rule beats a rule that
+                    # specifies only category + fit. Mirrors frontend matchPrepackDefault().
                     score = 0
                     if r_cat and r_cat != 'any': score += 1
                     if r_fits:                    score += 1
-                    if r_custs:                   score += 1
-                    if r_brands:                  score += 1
+                    if r_custs:                   score += 2
+                    if r_brands:                  score += 2
                     if r_fabs:                    score += 1
 
                     # Compare: tier first (primary), then dimension count
