@@ -663,11 +663,17 @@ def get_base_style(sku):
 _PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
 _PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE'}
 _PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST'}
+# Young Men / Sportswear fabric codes — mirrors frontend YOUNG_MEN_FABRIC_CODES.
+# Per Style Rules spreadsheet ("YOUNG MEN / SPORTSWEAR" section), these 18 codes belong
+# to BOTH the Young Men category AND the Sportswear category.
+# PREVIOUS VALUE WAS INCORRECT — had placeholder codes like 'YM','1Y','10'. Fixed.
 _PY_YM_FABRIC_CODES    = {
-    'YM','YB','YR','YG','YS','YT','YP','YA','YO','YE',
-    '1Y','2Y','3Y','4Y','5Y','6Y','7Y','8Y','9Y',
-    '10','11','12','13','14','15','16','17','18',
+    'KN','WT','SD','SF','SB','SL','BC','BR','BH','BA',
+    'CO','TH','PO','PW','PJ','PH','PL','HE',
 }
+# Sportswear Bottoms — subset of YM/Sportswear that ALSO belongs to the Dress Pants filter
+# (per "(BOTTOMS)" marker in spreadsheet: Carpenters, Ripstops, Heavy Weight, Pinstripe).
+_PY_SPORTSWEAR_BOTTOM_CODES = {'BC','BR','BH','BA'}
 
 def _py_extract_fit_code(sku):
     """Extract 2-char fit code from base style — mirrors extractFitCode() in JS."""
@@ -709,8 +715,14 @@ def _py_is_big_tall(sku):
 def _py_get_item_category(sku, brand_abbr):
     """Returns category string matching frontend getDetailedCategory() values."""
     base = sku.split('-')[0].upper()
-    # Pants: position 6 = 'P', positions 7-8 = digits, position 9 = letter
-    if (len(base) >= 10 and base[6] == 'P'
+    # Brand code lives at positions 2-3 of the base SKU.
+    sku_brand = base[2:4] if len(base) >= 4 else ''
+    # Pants: US POLO ONLY — uses P##X serial pattern (e.g. "CUUSPPP01SLS").
+    # Per business rule: other brands don't use P## convention; their pants are
+    # identified by fabric code — only "(BOTTOMS)" codes from Style Rules spreadsheet
+    # count as pants (BC/BR/BH/BA), handled by _py_is_pants() via _PY_SPORTSWEAR_BOTTOM_CODES.
+    if (sku_brand == 'US'
+            and len(base) >= 10 and base[6] == 'P'
             and base[7].isdigit() and base[8].isdigit() and base[9].isalpha()):
         return 'pants'
     # Sportswear by collar code
@@ -733,6 +745,39 @@ def _py_get_item_category(sku, brand_abbr):
         return 'big_tall'
     # Shirts: split by sleeve
     return 'short_sleeve' if _py_is_short_sleeve(sku) else 'long_sleeve'
+
+
+# Inclusive category helpers — mirror frontend isSportswear/isPants/matchesCategory.
+# Items with the 18 YM/Sportswear fabric codes belong to BOTH 'sportswear' AND 'young_men'.
+# Items with BC/BR/BH/BA ("bottoms" subset) ALSO belong to 'pants'.
+def _py_is_sportswear(sku, brand_abbr):
+    if not sku:
+        return False
+    if _py_get_item_category(sku, brand_abbr) == 'sportswear':
+        return True
+    return _py_is_young_men(sku)
+
+def _py_is_pants(sku, brand_abbr):
+    if not sku:
+        return False
+    if _py_get_item_category(sku, brand_abbr) == 'pants':
+        return True
+    base = sku.split('-')[0].upper()
+    return len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES
+
+def _py_matches_category(sku, brand_abbr, category):
+    """Inclusive category matcher. One SKU can match multiple categories
+    (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men')."""
+    if not category or category in ('all', 'any'):
+        return True
+    if category == 'sportswear':
+        return _py_is_sportswear(sku, brand_abbr)
+    if category == 'pants':
+        return _py_is_pants(sku, brand_abbr)
+    if category == 'young_men':
+        return _py_is_young_men(sku)
+    # Non-overlapping categories fall through to the primary-category equality check
+    return _py_get_item_category(sku, brand_abbr) == category
 
 def _annotate_items_for_prepack(items):
     """Add _export_category, _export_fit, and _override_size_pack to raw inventory items (returns new list)."""
@@ -1712,10 +1757,19 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
             matched = sku_matched
             if not matched:
-                # PRIORITY C: Score-based dimension matching (category, fit, customer, brand)
+                # PRIORITY C: Dimension matching — mirrors frontend matchPrepackDefault().
+                # Two-tier scoring:
+                #   TIER A (🎯 Specific) = rule has a specific category AND specific fabrics
+                #   TIER B (☂️ Umbrella) = everything else
+                # Within a tier, +1 per specified dimension (category, fit, customer, brand, fabrics)
+                # breaks ties. Ties within the same score fall back to list order (first wins).
                 brand_abbr = item.get('brand_abbr', item.get('brand', '')).upper()
-                best_score = -1
-                best_rule = None
+                best_fab_spec = -1  # 0 or 1: the primary tier flag
+                best_score    = -1  # secondary — dimension count within tier
+                best_rule     = None
+
+                # Extract fabric code from SKU (positions 4:6)
+                fab = base[4:6] if len(base) >= 6 else ''
 
                 for r in prepack_defaults:
                     # Skip rules that have a SKU list — they should ONLY match via Priority B (exact SKU),
@@ -1724,9 +1778,10 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     if isinstance(r_skus, list) and len([s for s in r_skus if s and s.strip()]) > 0:
                         continue
 
-                    # Category must match or be 'any'
+                    # Category — use INCLUSIVE match so a BC Carpenter (which is pants+sportswear+young_men)
+                    # can match a 'pants' rule, a 'sportswear' rule, OR a 'young_men' rule.
                     r_cat = r.get('category', 'any')
-                    if r_cat != cat and r_cat != 'any':
+                    if r_cat and r_cat != 'any' and not _py_matches_category(sku, brand_abbr, r_cat):
                         continue
 
                     # Fits: if specified, item must match
@@ -1758,20 +1813,34 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     if r_brands and (not brand_abbr or brand_abbr not in r_brands):
                         continue
 
-                    # Score: +1 per specific dimension
-                    score = 0
-                    if r_cat != 'any':
-                        score += 1
-                    if r_fits:
-                        score += 1
-                    if r_custs:
-                        score += 1
-                    if r_brands:
-                        score += 1
+                    # Fabrics: if specified, item's fabric code must match.
+                    # (This match was missing on the backend — fabric-narrowed rules used
+                    # to be silently ignored by server-side exports.)
+                    r_fabs = r.get('fabrics')
+                    if isinstance(r_fabs, list):
+                        r_fabs = [f.upper().strip() for f in r_fabs if f and f.strip()]
+                    else:
+                        r_fabs = []
+                    if r_fabs and (not fab or fab not in r_fabs):
+                        continue
 
-                    if score > best_score:
-                        best_score = score
-                        best_rule = r
+                    # Tier A (Specific) requires BOTH a specific category AND specific fabrics
+                    is_specific = 1 if (r_cat and r_cat != 'any' and r_fabs) else 0
+
+                    # Secondary score: +1 per specified dimension
+                    score = 0
+                    if r_cat and r_cat != 'any': score += 1
+                    if r_fits:                    score += 1
+                    if r_custs:                   score += 1
+                    if r_brands:                  score += 1
+                    if r_fabs:                    score += 1
+
+                    # Compare: tier first (primary), then dimension count
+                    if (is_specific > best_fab_spec
+                            or (is_specific == best_fab_spec and score > best_score)):
+                        best_fab_spec = is_specific
+                        best_score    = score
+                        best_rule     = r
 
                 matched = best_rule
 
