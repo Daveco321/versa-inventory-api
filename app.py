@@ -221,6 +221,16 @@ _dropbox_thumb_cache = {}   # image_code → thumbnail bytes (for Excel exports)
 _dropbox_photo_lock = threading.Lock()
 _dropbox_photos_last_sync = 0
 
+# Sportswear photos sub-index — populated alongside _dropbox_photo_index during sync.
+# Files inside any "/SPORTSWEAR/" subfolder of the PHOTOS INVENTORY tree get indexed
+# here by their original filename (NOT the prefix_number scheme used for shirts).
+# This is what powers find_sportswear_image_match() — a longest-prefix lookup against
+# SKU style codes, which lets a SKU like "XXGBPJ012SLZ" resolve to image "GBPJ012SL"
+# (long-sleeve variant) while "XXGBPJ012RFZ" resolves to "GBPJ012" (short-sleeve).
+_sportswear_photo_index = {}    # filename_upper (no ext, no separator normalization) → True
+_sportswear_match_cache = {}    # base_style_upper → matched_filename or None
+_sportswear_match_lock = threading.Lock()
+
 _export_lock = threading.Lock()
 _exports = {
     'brands': {},
@@ -691,6 +701,58 @@ def extract_image_code(sku, brand_abbr):
     return f"{prefix}_{base_sku}"
 
 
+def find_sportswear_image_match(base_style, brand_abbr=None):
+    """Find the best-matching sportswear image filename for a SKU.
+
+    Sportswear images live in /SPORTSWEAR/ subfolders of PHOTOS INVENTORY and are
+    named with most of the style code minus the customer code prefix. Long-sleeve
+    variants include 'SL' in the filename; short-sleeve variants typically don't.
+
+    Algorithm: strip the 2-char customer code prefix from the base style, then
+    find the longest filename in the sportswear index that is a prefix of the
+    remaining code. Longest-prefix wins, so a long-sleeve variant matches its
+    SL-suffixed image and a short-sleeve variant falls through to the bare
+    serial-number image.
+
+    Examples (Geoffrey Beene, brand prefix GB):
+        SKU 'XXGBPJ012SLZ' → strip XX → 'GBPJ012SLZ' → match 'GBPJ012SL'
+        SKU 'XXGBPJ012RFZ' → strip XX → 'GBPJ012RFZ' → match 'GBPJ012'
+        SKU 'XXGBPH002Z'   → strip XX → 'GBPH002Z'   → match 'GBPH002'
+
+    Returns the matched filename (uppercase, no extension) or None.
+    """
+    if not base_style:
+        return None
+    base = base_style.upper()
+
+    # Cache hit?
+    with _sportswear_match_lock:
+        if base in _sportswear_match_cache:
+            return _sportswear_match_cache[base]
+        if not _sportswear_photo_index:
+            return None
+        index_snap = _sportswear_photo_index  # dict reads are atomic; reading without copy is fine
+
+    # Strip 2-char customer prefix → core style code we'll match against
+    core = base[2:] if len(base) > 2 else base
+
+    # Walk progressively shorter prefixes (longest first) until one hits.
+    # Stop at length 4 to avoid spurious matches on tiny prefixes like 'GB'.
+    matched = None
+    min_match_len = 4
+    for n in range(len(core), min_match_len - 1, -1):
+        candidate = core[:n]
+        if candidate in index_snap:
+            matched = candidate
+            break
+
+    with _sportswear_match_lock:
+        if len(_sportswear_match_cache) > 5000:
+            _sportswear_match_cache.clear()
+        _sportswear_match_cache[base] = matched
+    return matched
+
+
 def get_base_style(sku):
     """Get base style from SKU by stripping size suffix — matches frontend logic"""
     return sku.split('-')[0].upper()
@@ -930,6 +992,7 @@ def sync_dropbox_photos():
         }
 
         new_index = {}  # image_code (uppercase) → dropbox_path
+        new_sportswear_index = {}  # sportswear filename (uppercase) → True
         cursor = None
         total_files = 0
 
@@ -1036,6 +1099,21 @@ def sync_dropbox_photos():
                     new_index[key] = entry['path_display']
                 total_files += 1
 
+                # ── Sportswear sub-index ──────────────────────────────────
+                # Files under any /SPORTSWEAR/ subfolder of PHOTOS INVENTORY
+                # are registered for prefix-match lookup against SKU style codes.
+                # Use the literal filename (no separator normalization) because
+                # sportswear filenames don't contain dashes — they're solid like
+                # GBPJ012, GBPJ012SL, GBPH002.
+                if '/sportswear/' in path_lower:
+                    sw_key = re.sub(r'\s*copy\s*\d*$', '', name_no_ext,
+                                    flags=re.IGNORECASE).strip().upper()
+                    new_sportswear_index[sw_key] = True
+                    # Also register the literal filename in the main index so
+                    # get_dropbox_thumbnail(matched_filename) can find the bytes.
+                    if sw_key not in new_index or lower.endswith('.jpg'):
+                        new_index[sw_key] = entry['path_display']
+
             if not data.get('has_more'):
                 break
 
@@ -1055,12 +1133,18 @@ def sync_dropbox_photos():
             _dropbox_photo_index = new_index
             _dropbox_photos_last_sync = time.time()
 
+        # Swap in the fresh sportswear sub-index and invalidate the match cache.
+        global _sportswear_photo_index
+        with _sportswear_match_lock:
+            _sportswear_photo_index = new_sportswear_index
+            _sportswear_match_cache.clear()
+
         # Clear image caches so they rebuild with Dropbox awareness
         _dropbox_img_cache.clear()
         _web_img_cache.clear()
         _img_cache.clear()
 
-        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files)", flush=True)
+        print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files), {len(new_sportswear_index)} sportswear", flush=True)
 
     except Exception as e:
         print(f"[Dropbox Photos] Error: {e}", flush=True)
@@ -1515,6 +1599,18 @@ def get_image_cached(item, s3_base_url):
     base_style_for_url = get_base_style(sku)
     override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style_for_url}.jpg"
     result = _process_image_from_url(override_url)
+
+    # 2.5. Try sportswear-folder match (longest-prefix on filename — see
+    #      find_sportswear_image_match docstring). This is what catches
+    #      Geoffrey Beene SPORTSWEAR/ photos and any other brand that
+    #      eventually adds a SPORTSWEAR/ subfolder. Runs before the
+    #      generic Dropbox call because that one uses extract_image_code's
+    #      prefix_number scheme, which doesn't match sportswear filenames.
+    if not result:
+        sw_match = find_sportswear_image_match(get_base_style(sku),
+                                               item.get('brand_abbr', item.get('brand', '')))
+        if sw_match:
+            result = get_dropbox_thumbnail(sw_match)
 
     # 3. Try Dropbox photos
     if not result:
@@ -4190,6 +4286,29 @@ def _fetch_raw_image(base_style, brand_abbr):
             except Exception:
                 continue
 
+    # 2.5. Sportswear-folder match (longest-prefix lookup) — see
+    #      find_sportswear_image_match docstring. Catches Geoffrey Beene
+    #      SPORTSWEAR/ photos and any other brand with a SPORTSWEAR/ subfolder.
+    sw_match = find_sportswear_image_match(base_style, brand_abbr)
+    if sw_match:
+        # Try CloudFront DROPBOX_SYNC first (edge-cached) for the matched filename
+        if sw_match in _dropbox_photo_index:
+            sw_sync_base = f"{CLOUDFRONT_DROPBOX_SYNC_URL}/{sw_match}"
+            for ext in ['.jpg', '.png']:
+                try:
+                    url = sw_sync_base + ext
+                    resp = http_requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        ct = resp.headers.get('Content-Type', '').lower()
+                        if 'image' in ct:
+                            return resp.content, ct
+                except Exception:
+                    continue
+        # Fallback to direct Dropbox bytes
+        sw_bytes, sw_ct = get_dropbox_image_bytes(sw_match)
+        if sw_bytes:
+            return sw_bytes, sw_ct
+
     # 3. Try Dropbox photos (disk cache → API download)
     dbx_bytes, dbx_ct = get_dropbox_image_bytes(image_code)
     if dbx_bytes:
@@ -4277,6 +4396,40 @@ def dropbox_photo_list():
         'count': len(_dropbox_photo_index),
         'last_sync': _dropbox_photos_last_sync,
         's3_sync_url': S3_DROPBOX_SYNC_URL
+    })
+
+
+@app.route('/sportswear-photos', methods=['GET', 'OPTIONS'])
+def sportswear_photo_list():
+    """List sportswear-folder image filenames currently indexed.
+    Useful for verifying the SPORTSWEAR/ subfolder sync after deploy."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _sportswear_match_lock:
+        keys = sorted(_sportswear_photo_index.keys())
+    return jsonify({
+        'count': len(keys),
+        'filenames': keys,
+        'last_sync': _dropbox_photos_last_sync
+    })
+
+
+@app.route('/sportswear-match/<base_style>', methods=['GET', 'OPTIONS'])
+def sportswear_match_test(base_style):
+    """Return which sportswear image filename a given SKU base style maps to.
+    Diagnostic only — used to verify the longest-prefix matcher is doing
+    the right thing before/after a Dropbox sync."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    brand_abbr = request.args.get('brand', '').upper() or None
+    base_style_up = base_style.upper().split('-')[0]
+    matched = find_sportswear_image_match(base_style_up, brand_abbr)
+    return jsonify({
+        'base_style': base_style_up,
+        'stripped_after_customer_code': base_style_up[2:] if len(base_style_up) > 2 else base_style_up,
+        'matched_filename': matched,
+        'in_sportswear_index': matched is not None,
+        'in_dropbox_index': matched in _dropbox_photo_index if matched else False
     })
 
 
@@ -4566,7 +4719,10 @@ def _do_full_regen(reason='scheduled'):
     _dropbox_thumb_cache.clear()
     cleared_dbx = len(_dropbox_img_cache)
     _dropbox_img_cache.clear()
-    print(f"  [DailyRegen:{reason}] Cleared: {cleared_img} img, {cleared_web} web, {cleared_thumb} thumb, {cleared_dbx} dbx")
+    with _sportswear_match_lock:
+        cleared_sw = len(_sportswear_match_cache)
+        _sportswear_match_cache.clear()
+    print(f"  [DailyRegen:{reason}] Cleared: {cleared_img} img, {cleared_web} web, {cleared_thumb} thumb, {cleared_dbx} dbx, {cleared_sw} sw-match")
 
     try:
         sync_inventory()
