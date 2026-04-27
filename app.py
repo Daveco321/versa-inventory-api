@@ -247,17 +247,57 @@ _banner_rules_lock = threading.Lock()
 _banner_rules = []  # list of banner rule dicts
 
 def load_overrides_from_s3():
-    """Load style overrides from S3 on startup"""
+    """Load style overrides from S3 on startup or when version polling detects
+    that another worker saved a change.
+
+    On reload, diff against the current in-memory copy and drop _img_cache
+    entries for any style whose override changed. This is the cross-worker
+    propagation path: worker A handles POST /overrides and updates its own
+    state; worker B picks up the new ETag via /overrides/version and ends up
+    here, where we invalidate its local image cache so its exports stop
+    serving stale fallback images.
+    """
     global _style_overrides, _overrides_loaded, _s3_overrides_etag
     try:
         s3 = get_s3()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
         data = json.loads(resp['Body'].read().decode('utf-8'))
         etag = resp.get('ETag', '').strip('"')
+
+        # Diff against current to find which styles had their override change.
+        # Compare the `image` field specifically — that's what _img_cache mirrors.
+        with _overrides_lock:
+            old = dict(_style_overrides)
+
+        def _img_of(d):
+            return d.get('image') if isinstance(d, dict) else None
+
+        changed_styles = set()
+        for style, new_val in data.items():
+            if _img_of(new_val) != _img_of(old.get(style)):
+                changed_styles.add(style)
+        for style in old:
+            if style not in data and _img_of(old.get(style)) is not None:
+                # Override was deleted — fallback chain takes over, drop cache
+                changed_styles.add(style)
+
         with _overrides_lock:
             _style_overrides = data
             _s3_overrides_etag = etag
         _overrides_loaded = True
+
+        if changed_styles:
+            with _img_lock:
+                for s in changed_styles:
+                    _img_cache.pop(s, None)
+                    stale_override_keys = [
+                        k for k in list(_img_cache.keys())
+                        if isinstance(k, str) and k.startswith(f"__override__:{s}:")
+                    ]
+                    for k in stale_override_keys:
+                        _img_cache.pop(k, None)
+            print(f"  ✓ Cross-worker sync: invalidated _img_cache for {len(changed_styles)} changed override styles")
+
         print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3 (ETag: {etag[:8]})")
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
@@ -1375,32 +1415,49 @@ def get_image_cached(item, s3_base_url):
     Get image for an item, using cache keyed by base_style.
     Priority: base64 override → STYLE+OVERRIDES → Dropbox → brand folder fallback.
     All size variants of the same style share one cache entry.
+
+    IMPORTANT: Platform base64 overrides are checked BEFORE the cache lookup so
+    that a newly-uploaded override always wins, even if a stale fallback image
+    is sitting in _img_cache from a prior export run. Override-derived bytes are
+    cached under a content-versioned key (`__override__:{style}:{hash}`), so a
+    NEW override naturally produces a new cache key and instantly takes effect
+    without manual invalidation. The plain `base_style` cache key is reserved
+    for non-override fallback images (CloudFront / Dropbox / brand folder).
     """
     sku = item.get('sku', '')
     base_style = get_base_style(sku)
 
-    # Check cache first — all size variants share same image
-    with _img_lock:
-        if base_style in _img_cache:
-            c = _img_cache[base_style]
-            if c is None:
-                return None  # Previously failed — skip
+    # ── PRIORITY 1: Platform base64 override (checked BEFORE cache lookup) ──
+    # Snapshot under lock so we don't race with /overrides POST.
+    with _overrides_lock:
+        override_data = _style_overrides.get(base_style)
+
+    if override_data and isinstance(override_data, dict) and override_data.get('image'):
+        import base64, hashlib
+        img_str_raw = override_data['image']
+        # Version the cache key on the override content so a new upload
+        # produces a different key. Hash a prefix to keep this cheap.
+        try:
+            sample = (img_str_raw[:512] + img_str_raw[-128:]) if isinstance(img_str_raw, str) else str(img_str_raw)[:512]
+            img_hash = hashlib.md5(sample.encode('utf-8', errors='ignore')).hexdigest()[:12]
+        except Exception:
+            img_hash = 'nohash'
+        override_cache_key = f"__override__:{base_style}:{img_hash}"
+
+        # Check override-versioned cache first — fast path for repeat exports
+        with _img_lock:
+            cached = _img_cache.get(override_cache_key)
+        if cached is not None:
             return {
-                'image_data': BytesIO(c['raw_bytes']),
-                'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
-                'x_offset': c['x_offset'], 'y_offset': c['y_offset'],
-                'object_position': 1, 'url': c['url']
+                'image_data': BytesIO(cached['raw_bytes']),
+                'x_scale': cached['x_scale'], 'y_scale': cached['y_scale'],
+                'x_offset': cached['x_offset'], 'y_offset': cached['y_offset'],
+                'object_position': 1, 'url': cached['url']
             }
 
-    result = None
-
-    # 1. Platform base64 override (highest priority)
-    override_data = _style_overrides.get(base_style)
-    if override_data and isinstance(override_data, dict) and override_data.get('image'):
+        # Decode + render the override image
         try:
-            import base64
-            img_str = override_data['image']
-            # Strip data URI prefix if present
+            img_str = img_str_raw
             if ',' in img_str:
                 img_str = img_str.split(',', 1)[1]
             raw = base64.b64decode(img_str)
@@ -1427,14 +1484,37 @@ def get_image_cached(item, s3_base_url):
                 'y_offset': (th - oh * sf) / 2,
                 'url': f'override://{base_style}'
             }
+            with _img_lock:
+                _img_cache[override_cache_key] = result
+            return {
+                'image_data': BytesIO(result['raw_bytes']),
+                'x_scale': result['x_scale'], 'y_scale': result['y_scale'],
+                'x_offset': result['x_offset'], 'y_offset': result['y_offset'],
+                'object_position': 1, 'url': result['url']
+            }
         except Exception:
+            # Fall through to fallback chain if override processing fails
             pass
 
+    # ── No override (or override failed) — use cache + fallback chain ──
+    with _img_lock:
+        if base_style in _img_cache:
+            c = _img_cache[base_style]
+            if c is None:
+                return None  # Previously failed — skip
+            return {
+                'image_data': BytesIO(c['raw_bytes']),
+                'x_scale': c['x_scale'], 'y_scale': c['y_scale'],
+                'x_offset': c['x_offset'], 'y_offset': c['y_offset'],
+                'object_position': 1, 'url': c['url']
+            }
+
+    result = None
+
     # 2. Try STYLE+OVERRIDES via CloudFront
-    if not result:
-        base_style_for_url = get_base_style(sku)
-        override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style_for_url}.jpg"
-        result = _process_image_from_url(override_url)
+    base_style_for_url = get_base_style(sku)
+    override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style_for_url}.jpg"
+    result = _process_image_from_url(override_url)
 
     # 3. Try Dropbox photos
     if not result:
@@ -2817,6 +2897,20 @@ def exports_manifest():
         })
 
 
+def _exports_are_stale(generated_at_iso):
+    """True if overrides were saved after the pre-built export was generated.
+    Used by /download/* to decide whether to rebuild on-demand vs serve cached bytes."""
+    if not generated_at_iso:
+        return True
+    try:
+        gen_dt = datetime.fromisoformat(generated_at_iso.replace('Z', '+00:00'))
+        gen_epoch = gen_dt.timestamp()
+    except Exception:
+        return True
+    # _overrides_last_saved is a plain epoch float; small grace to avoid races
+    return _overrides_last_saved > (gen_epoch + 1)
+
+
 @app.route('/download/brand/<abbr>', methods=['GET'])
 def download_brand(abbr):
     abbr = abbr.upper()
@@ -2827,6 +2921,44 @@ def download_brand(abbr):
 
     date_str = datetime.utcnow().strftime('%Y-%m-%d')
     filename = f"{info['name'].replace(' ', '_')}_{date_str}.xlsx"
+
+    # ── Stale-export safety net ───────────────────────────────────────────
+    # If the user uploaded an override after this export was generated, the
+    # cached bytes have outdated images. Rebuild on demand from current data.
+    if _exports_are_stale(info.get('generated_at')):
+        print(f"  [/download/brand/{abbr}] Pre-built export is stale vs overrides — rebuilding on demand")
+        try:
+            with _inv_lock:
+                brand = _inventory['brands'].get(abbr)
+            if brand:
+                sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
+                annotated_items = _annotate_items_for_prepack(sorted_items)
+                with _prepack_defaults_lock:
+                    pd_snap = list(_prepack_defaults)
+                fresh_bytes = build_brand_excel(brand['name'], annotated_items, S3_PHOTOS_URL,
+                                                prepack_defaults=pd_snap)
+                # Update cache so next request is fast
+                with _export_lock:
+                    _exports['brands'][abbr] = {
+                        'bytes': fresh_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'name': brand['name'],
+                        'items_count': len(sorted_items),
+                        'size_bytes': len(fresh_bytes),
+                    }
+                # Trigger full background regen so other brands (and All_Brands) catch up
+                with _export_lock:
+                    already_generating = _exports['generating']
+                if not already_generating:
+                    trigger_background_generation()
+                return send_file(
+                    BytesIO(fresh_bytes),
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    as_attachment=True, download_name=filename
+                )
+        except Exception as e:
+            print(f"  [/download/brand/{abbr}] On-demand rebuild failed, serving cached: {e}")
+            # Fall through to serving cached bytes
 
     return send_file(
         BytesIO(info['bytes']),
@@ -2843,6 +2975,46 @@ def download_all():
         return jsonify({"error": "No pre-generated all-brands export"}), 404
 
     date_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+    # ── Stale-export safety net (same logic as /download/brand) ──
+    if _exports_are_stale(info.get('generated_at')):
+        print("  [/download/all] Pre-built all-brands export is stale vs overrides — rebuilding on demand")
+        try:
+            with _inv_lock:
+                brands = dict(_inventory['brands'])
+            sorted_brands = sorted(brands.items(),
+                key=lambda x: sum(i.get('total_warehouse', 0) for i in x[1]['items']),
+                reverse=True)
+            brands_list_for_multi = []
+            for abbr, brand in sorted_brands:
+                sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
+                annotated_items = _annotate_items_for_prepack(sorted_items)
+                brands_list_for_multi.append({'brand_name': brand['name'], 'items': annotated_items})
+            if brands_list_for_multi:
+                with _prepack_defaults_lock:
+                    pd_snap = list(_prepack_defaults)
+                fresh_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL,
+                                                     prepack_defaults=pd_snap)
+                with _export_lock:
+                    _exports['all_brands'] = {
+                        'bytes': fresh_bytes,
+                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'brands_count': len(brands_list_for_multi),
+                        'items_count': sum(len(b['items']) for b in brands_list_for_multi),
+                        'size_bytes': len(fresh_bytes),
+                    }
+                with _export_lock:
+                    already_generating = _exports['generating']
+                if not already_generating:
+                    trigger_background_generation()
+                return send_file(
+                    BytesIO(fresh_bytes),
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    as_attachment=True, download_name=f"All_Brands_{date_str}.xlsx"
+                )
+        except Exception as e:
+            print(f"  [/download/all] On-demand rebuild failed, serving cached: {e}")
+
     return send_file(
         BytesIO(info['bytes']),
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -3297,6 +3469,36 @@ def save_overrides():
                 paths = [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.jpg" for s in changed_styles]
                 paths += [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}.png" for s in changed_styles]
                 threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+
+            # ── Invalidate in-memory _img_cache for changed styles ──
+            # The plain `base_style` cache key holds whatever fallback image
+            # (Dropbox / brand folder) was fetched before the override existed.
+            # Drop it so subsequent exports use the new override path. (The
+            # versioned `__override__:{style}:{hash}` keys are self-invalidating,
+            # but old ones for previous override versions can be cleared too.)
+            if changed_styles:
+                with _img_lock:
+                    for s in changed_styles:
+                        _img_cache.pop(s, None)
+                        stale_override_keys = [
+                            k for k in list(_img_cache.keys())
+                            if isinstance(k, str) and k.startswith(f"__override__:{s}:")
+                        ]
+                        for k in stale_override_keys:
+                            _img_cache.pop(k, None)
+                print(f"  ✓ Cleared _img_cache for {len(changed_styles)} changed override styles")
+
+            # ── Trigger background regen of pre-built exports ──
+            # /download/brand and /download/all serve bytes from _exports['brands'],
+            # which were built with old images. Without this, downloads stay stale
+            # until the next /sync or /regenerate.
+            if changed_styles:
+                with _export_lock:
+                    already_generating = _exports['generating']
+                if not already_generating:
+                    print(f"  Override change → triggering background export regeneration ({len(changed_styles)} styles)")
+                    trigger_background_generation()
+
             return jsonify({"success": True, "count": len(merged), "invalidated": len(changed_styles)})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
@@ -4330,6 +4532,82 @@ def hourly_resync():
             print(f"  ⚠ Production hourly refresh failed: {e}")
 
 
+# ────────────────────────────────────────────────────────────────────────
+# DAILY FULL REGEN — clears ALL image caches and rebuilds every export
+# ────────────────────────────────────────────────────────────────────────
+# Set DAILY_REGEN_HOUR_UTC in env to change the trigger time (0–23, UTC).
+# Defaults to 04:00 UTC = 11pm Eastern (Standard) / 9pm Pacific (Standard).
+# East Coast: 11pm EST → 04 UTC, 11pm EDT → 03 UTC
+# West Coast: 11pm PST → 07 UTC, 11pm PDT → 06 UTC
+# This is what catches new S3 STYLE+OVERRIDES uploads, new Dropbox photos,
+# and new brand-folder additions that were dropped in directly (bypassing
+# the platform). Platform overrides still propagate instantly via the POST
+# /overrides path — this is the safety net for everything else.
+DAILY_REGEN_HOUR_UTC = int(os.environ.get('DAILY_REGEN_HOUR_UTC', '4'))
+DAILY_REGEN_MINUTE_UTC = int(os.environ.get('DAILY_REGEN_MINUTE_UTC', '0'))
+
+
+def _do_full_regen(reason='scheduled'):
+    """Clear all image caches, re-sync inventory, and trigger export regeneration.
+    Same logic as POST /regenerate but callable internally from the scheduler."""
+    with _export_lock:
+        if _exports['generating']:
+            print(f"  [DailyRegen:{reason}] ⏭ Already generating, skipping cache clear")
+            return False
+
+    print(f"  [DailyRegen:{reason}] Clearing image caches...")
+    with _img_lock:
+        cleared_img = len(_img_cache)
+        _img_cache.clear()
+    with _web_img_lock:
+        cleared_web = len(_web_img_cache)
+        _web_img_cache.clear()
+    cleared_thumb = len(_dropbox_thumb_cache)
+    _dropbox_thumb_cache.clear()
+    cleared_dbx = len(_dropbox_img_cache)
+    _dropbox_img_cache.clear()
+    print(f"  [DailyRegen:{reason}] Cleared: {cleared_img} img, {cleared_web} web, {cleared_thumb} thumb, {cleared_dbx} dbx")
+
+    try:
+        sync_inventory()
+    except Exception as e:
+        print(f"  [DailyRegen:{reason}] ⚠ Sync failed (continuing anyway): {e}")
+
+    trigger_background_generation()
+    return True
+
+
+def _seconds_until_next_daily_regen():
+    """Compute seconds from now until the next scheduled regen (UTC hour/min)."""
+    now = datetime.utcnow()
+    target = now.replace(hour=DAILY_REGEN_HOUR_UTC, minute=DAILY_REGEN_MINUTE_UTC,
+                         second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds(), target
+
+
+def daily_regen_loop():
+    """Background daemon thread: triggers a full cache flush + regen once per day.
+    Runs independently in each gunicorn worker so every worker's in-memory
+    _exports['brands'] stays fresh — small redundant cost (3x image fetches at
+    off-peak hours), but it means downloads stay instant from any worker."""
+    print(f"  ⏰ Daily regen scheduler armed (target: {DAILY_REGEN_HOUR_UTC:02d}:{DAILY_REGEN_MINUTE_UTC:02d} UTC)")
+    while True:
+        try:
+            sleep_seconds, target = _seconds_until_next_daily_regen()
+            hrs = sleep_seconds / 3600
+            print(f"  ⏰ [DailyRegen] Next run at {target.isoformat()}Z (in {hrs:.1f}h)")
+            time.sleep(sleep_seconds)
+
+            print(f"\n  🌙 [DailyRegen] {DAILY_REGEN_HOUR_UTC:02d}:{DAILY_REGEN_MINUTE_UTC:02d} UTC trigger fired")
+            _do_full_regen(reason='daily')
+        except Exception as e:
+            print(f"  ⚠ [DailyRegen] Loop error: {e}")
+            # Back off an hour and retry rather than tight-looping on persistent errors
+            time.sleep(3600)
+
+
 def startup_sync():
     print("\n" + "="*60)
     print("  VERSA INVENTORY EXPORT API v3 — Startup")
@@ -4378,6 +4656,9 @@ def startup_sync():
             print("  ⚠ Startup: no inventory data")
     except Exception as e:
         print(f"  Startup sync failed: {e}")
+
+    # Start daily full-regen scheduler (clears all caches + rebuilds at 11pm/configurable)
+    threading.Thread(target=daily_regen_loop, daemon=True, name='daily-regen').start()
 
     # Start hourly re-sync loop
     if DROPBOX_URL:
