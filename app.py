@@ -1750,9 +1750,10 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             if has_color:
                 headers.append('Color')
             headers.extend(['Fit', 'Fabrication'])
-            # 📋 Customer-facing overseas: PO Name when at least one cart row maps to a specific delivery
+            # 📋 Customer-facing overseas: PO Ref # column (from style ledger column A — the
+            # production reference number) when at least one cart row maps to a specific delivery.
             if flow_mode:
-                headers.append('PO Name')
+                headers.append('PO Ref #')
             if is_order:
                 headers.append('Qty Selected')
             headers.extend(['Incoming', 'Overseas ATS', 'Ex-Factory', 'Arrival'])
@@ -1769,9 +1770,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             if view_mode == 'all':
                 headers.extend(['Ex-Factory', 'Arrival'])
                 # 📋 Mixed-cart support: when customer has overseas items in cart with specific
-                # arrivals (flow_mode=true), include PO Name. Warehouse rows get blank cells.
+                # arrivals (flow_mode=true), include PO Ref #. Warehouse rows get blank cells.
                 if flow_mode:
-                    headers.append('PO Name')
+                    headers.append('PO Ref #')
     elif view_mode == 'incoming':
         # Admin overseas view: no warehouse columns, add dates
         headers = ['IMAGE', 'SKU', 'Brand']
@@ -1808,7 +1809,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
     col_widths = {
         'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
-        'Production #': 16, 'PO Name': 30,
+        'Production #': 16, 'PO Name': 30, 'PO Ref #': 22,
         'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
@@ -1838,6 +1839,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Delivery': lambda item: item.get('delivery', 'ATS'),
         'Production #': lambda item: item.get('production', ''),
         'PO Name': lambda item: item.get('po_name', ''),
+        'PO Ref #': lambda item: item.get('po_ref', ''),
         'Qty Selected': lambda item: item.get('quantity_ordered', 0),
         'JTW': lambda item: item.get('jtw', 0),
         'TR': lambda item: item.get('tr', 0),
