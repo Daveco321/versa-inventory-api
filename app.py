@@ -1750,6 +1750,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             if has_color:
                 headers.append('Color')
             headers.extend(['Fit', 'Fabrication'])
+            # 📋 Customer-facing overseas: PO Name when at least one cart row maps to a specific delivery
+            if flow_mode:
+                headers.append('PO Name')
             if is_order:
                 headers.append('Qty Selected')
             headers.extend(['Incoming', 'Overseas ATS', 'Ex-Factory', 'Arrival'])
@@ -1765,6 +1768,10 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             # All Inventory catalog view: include date columns for items with incoming stock
             if view_mode == 'all':
                 headers.extend(['Ex-Factory', 'Arrival'])
+                # 📋 Mixed-cart support: when customer has overseas items in cart with specific
+                # arrivals (flow_mode=true), include PO Name. Warehouse rows get blank cells.
+                if flow_mode:
+                    headers.append('PO Name')
     elif view_mode == 'incoming':
         # Admin overseas view: no warehouse columns, add dates
         headers = ['IMAGE', 'SKU', 'Brand']
@@ -2230,7 +2237,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     return buf.getvalue()
 
 
-def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', prepack_defaults=None):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None):
     for b in brands_list:
         sort_key = 'total_ats' if catalog_mode else 'total_warehouse'
         b['items'] = sorted(b['items'], key=lambda x: x.get(sort_key, 0), reverse=True)
@@ -2268,7 +2275,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 _orig(r, c)
         ws.write = _safe_ws_write
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
-                                         catalog_mode=catalog_mode, view_mode=view_mode)
+                                         catalog_mode=catalog_mode, view_mode=view_mode,
+                                         flow_mode=flow_mode)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -3432,12 +3440,15 @@ def export_multi():
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
         view_mode = req.get('view_mode', 'all')
+        # 📋 flow_mode enables PO Name column in catalog overseas exports
+        flow_mode = req.get('flow_mode', False)
         prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
 
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
                                            catalog_mode=catalog_mode, view_mode=view_mode,
+                                           flow_mode=flow_mode,
                                            prepack_defaults=prepack_defaults)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
