@@ -776,6 +776,10 @@ _PY_YM_FABRIC_CODES    = {
 # Sportswear Bottoms — subset of YM/Sportswear that ALSO belongs to the Dress Pants filter
 # (per "(BOTTOMS)" marker in spreadsheet: Carpenters, Ripstops, Heavy Weight, Pinstripe).
 _PY_SPORTSWEAR_BOTTOM_CODES = {'BC','BR','BH','BA'}
+# Long-sleeve fit codes — mirrors frontend LONG_SLEEVE_FIT_CODES.
+# Used by _py_is_long_sleeve_shirt() so that YM-fabric items (VD shackets etc.) can match
+# 'long_sleeve' prepack rules on the basis of their fit code.
+_PY_LONG_SLEEVE_FIT_CODES = {'SL','RF','TF','MF','BT','BB','TT','WB','BR','DB'}
 
 def _py_extract_fit_code(sku):
     """Extract 2-char fit code from base style — mirrors extractFitCode() in JS."""
@@ -793,9 +797,20 @@ def _py_extract_fit_code(sku):
     return 'RF'
 
 def _py_is_short_sleeve(sku):
+    """Short-sleeve check. An explicit fit code wins; the sportswear-collar fallback
+    only kicks in when the fit code itself is ambiguous (not recognized as either
+    short or long sleeve). This way a long-sleeve polo (e.g. fit RF + Z collar) is
+    correctly identified as long sleeve, not force-tagged short by the collar code."""
     base = sku.split('-')[0].upper()
     fit = _py_extract_fit_code(sku)
-    return fit in {'SS','SR','SB','ST'} or (len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS)
+    if fit in {'SS','SR','SB','ST'}:
+        return True
+    # Explicit long-sleeve fit code overrides the sportswear-collar fallback below
+    if fit in _PY_LONG_SLEEVE_FIT_CODES:
+        return False
+    # Fit code is unrecognized — fall back to sportswear collar codes (polo-style
+    # items default to short sleeve when no clearer signal is available).
+    return len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS
 
 def _py_is_young_men(sku):
     base = sku.split('-')[0].upper()
@@ -867,9 +882,22 @@ def _py_is_pants(sku, brand_abbr):
     base = sku.split('-')[0].upper()
     return len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES
 
+def _py_is_long_sleeve_shirt(sku):
+    """Inclusive long-sleeve check — true for any non-bottom garment whose fit code
+    is in _PY_LONG_SLEEVE_FIT_CODES. Mirrors frontend isLongSleeveShirt(). Lets a VD
+    shacket / YM-fabric long-sleeve shirt match a 'long_sleeve' prepack rule even
+    though _py_get_item_category() classifies it as 'young_men'."""
+    if not sku or _py_is_pants(sku, ''):
+        return False
+    # short sleeve always wins when both could apply
+    if _py_is_short_sleeve(sku):
+        return False
+    return _py_extract_fit_code(sku) in _PY_LONG_SLEEVE_FIT_CODES
+
 def _py_matches_category(sku, brand_abbr, category):
     """Inclusive category matcher. One SKU can match multiple categories
-    (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men')."""
+    (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men';
+    a VD shacket with fit SS matches 'young_men', 'sportswear', AND 'short_sleeve')."""
     if not category or category in ('all', 'any'):
         return True
     if category == 'sportswear':
@@ -878,6 +906,10 @@ def _py_matches_category(sku, brand_abbr, category):
         return _py_is_pants(sku, brand_abbr)
     if category == 'young_men':
         return _py_is_young_men(sku)
+    if category == 'short_sleeve':
+        return _py_is_short_sleeve(sku)
+    if category == 'long_sleeve':
+        return _py_is_long_sleeve_shirt(sku)
     # Non-overlapping categories fall through to the primary-category equality check
     return _py_get_item_category(sku, brand_abbr) == category
 
