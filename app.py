@@ -4867,6 +4867,11 @@ def startup_sync():
         hourly_resync()  # This runs forever in the same thread
 
 
+# Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
+from swatch_extractor import register_swatch_routes
+register_swatch_routes(app, get_s3, S3_BUCKET)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
