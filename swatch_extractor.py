@@ -21,7 +21,7 @@ and after `get_s3()` / `S3_BUCKET` are defined):
     register_swatch_routes(app, get_s3, S3_BUCKET)
 
 Environment variables (all optional — sane defaults):
-    S3_COLOR_MAP_KEY       — default "Inventory+Colors+Data/style_color_map.xlsx"
+    S3_COLOR_MAP_KEY       — default "Inventory Colors Data/style_color_map.xlsx"
     S3_SWATCH_HISTORY_KEY  — default "inventory/swatch_upload_history.json"
 """
 
@@ -40,7 +40,7 @@ import requests as http_requests
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 S3_COLOR_MAP_KEY      = os.environ.get('S3_COLOR_MAP_KEY',
-                                       'Inventory+Colors+Data/style_color_map.xlsx')
+                                       'Inventory Colors Data/style_color_map.xlsx')
 S3_SWATCH_HISTORY_KEY = os.environ.get('S3_SWATCH_HISTORY_KEY',
                                        'inventory/swatch_upload_history.json')
 
