@@ -80,11 +80,55 @@ def _resolve_color_map_sheet(wb):
 
 
 def _append_rows(ws, rows):
-    """Append rows at the bottom. NEVER touches existing rows."""
+    """Append rows at the bottom. NEVER touches existing rows.
+
+    Reads the header row to figure out which column is Key and which is
+    Color_Description, then writes new values into those exact columns
+    (leaving any middle columns blank). This is critical because the
+    actual sheet may have extra columns like Brand_Prefix, Style_Number,
+    Brand_Name between Key and Color_Description — writing positionally
+    would put the color into the wrong column and the frontend would
+    silently skip the row.
+    """
+    # Empty sheet: write minimal headers and append flush-left
     if ws.max_row < 1:
         ws.append(['Key', 'Color_Description'])
+        for sku, color in rows:
+            ws.append([sku, color])
+        return
+
+    # Read header row, find the columns we care about (case-insensitive,
+    # whitespace-tolerant). Frontend's reader accepts Key OR Style_Number
+    # OR Style_Num as the SKU column — match that priority order.
+    headers = [str(c.value or '').strip() for c in ws[1]]
+    headers_lower = [h.lower() for h in headers]
+
+    def find_col(*candidates):
+        for cand in candidates:
+            if cand.lower() in headers_lower:
+                return headers_lower.index(cand.lower())  # 0-indexed
+        return None
+
+    key_col   = find_col('Key', 'Style_Number', 'Style_Num')
+    color_col = find_col('Color_Description')
+    n_cols    = max(len(headers), (key_col or 0) + 1, (color_col or 0) + 1)
+
+    # Defensive fallback: if the sheet has no recognizable schema, append
+    # in the original 2-column form rather than refusing to write.
+    if key_col is None and color_col is None:
+        for sku, color in rows:
+            ws.append([sku, color])
+        return
+
+    # If only one of the two was found, default the other to a sensible position
+    if key_col is None:    key_col = 0
+    if color_col is None:  color_col = max(1, n_cols - 1)
+
     for sku, color in rows:
-        ws.append([sku, color])
+        new_row = [None] * n_cols
+        new_row[key_col]   = sku
+        new_row[color_col] = color
+        ws.append(new_row)
 
 
 def _upload_color_map(get_s3, s3_bucket, wb) -> str:
