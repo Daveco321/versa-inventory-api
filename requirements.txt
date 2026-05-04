@@ -8,3 +8,5 @@ Pillow
 gunicorn
 gevent
 reportlab
+pymupdf
+opencv-python-headless
