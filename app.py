@@ -1788,7 +1788,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                 headers.append('PO Ref #')
             if is_order:
                 headers.append('Qty Selected')
-            headers.extend(['Incoming', 'Overseas ATS', 'Ex-Factory', 'Arrival'])
+            # Customer catalog overseas view: NO Incoming column — per-delivery rows
+            # already show Overseas ATS for each arrival date via flow_mode expansion.
+            headers.extend(['Overseas ATS', 'Ex-Factory', 'Arrival'])
         else:
             # Warehouse / All view: show warehouse names column instead of per-WH quantities
             headers = ['IMAGE', 'SKU', 'Brand']
