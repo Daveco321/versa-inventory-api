@@ -94,6 +94,14 @@ DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY', '')
 DROPBOX_APP_SECRET = os.environ.get('DROPBOX_APP_SECRET', '')
 DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN', '')
 
+# Selling-data folder paths (per-customer files synced daily from Dropbox)
+# Folder layout: /Versa Share Files/David - Dropbox/Selling Data/<Customer>/<file>.xlsx
+DROPBOX_SELLING_BASE = os.environ.get('DROPBOX_SELLING_BASE',
+    '/Versa Share Files/David - Dropbox/Selling Data')
+# Daily refresh hour (UTC). Default 06:00 UTC ≈ 1-2am US East.
+SELLING_REFRESH_HOUR_UTC = int(os.environ.get('SELLING_REFRESH_HOUR_UTC', 6))
+SELLING_REFRESH_MIN_UTC  = int(os.environ.get('SELLING_REFRESH_MIN_UTC', 0))
+
 # Auto-refresh state
 _dropbox_access_token = DROPBOX_PHOTOS_TOKEN  # fallback to legacy token
 _dropbox_token_expires = 0
@@ -4863,10 +4871,252 @@ def startup_sync():
     # Start daily full-regen scheduler (clears all caches + rebuilds at 11pm/configurable)
     threading.Thread(target=daily_regen_loop, daemon=True, name='daily-regen').start()
 
+    # Start daily selling-data Dropbox sync + warm caches now (non-blocking)
+    threading.Thread(target=daily_selling_sync_loop, daemon=True, name='selling-sync').start()
+    threading.Thread(target=lambda: refresh_selling_data('Ross'),
+                     daemon=True, name='selling-warmup').start()
+
     # Start hourly re-sync loop
     if DROPBOX_URL:
         print(f"  ⏰ Hourly Dropbox re-sync enabled (every {DROPBOX_RESYNC_INTERVAL//3600}h)")
         hourly_resync()  # This runs forever in the same thread
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOMER SELLING DATA
+# Daily Dropbox sync of /Selling Data/<Customer>/*.xlsx files. Each customer's
+# workbook has one sheet per recap date or season (e.g. "9.08", "Fall 2025"),
+# with columns: BRAND | TYPE | STYLE NO. | DESCRIPTION | LABEL (best/okay/worst).
+# Cached in memory + persisted to S3 so cold starts don't have to wait for Dropbox.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_selling_cache = {}            # { customer_lower: {sheets, fetched_at, source_filename} }
+_selling_last_synced = {}      # { customer_lower: epoch_seconds }
+_SELLING_S3_PREFIX = 'selling_data'  # S3 backup path
+
+def _normalize_label(raw):
+    """Normalize label cell values to one of: best | okay | worst | None."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s or s == 'nan':
+        return None
+    if 'best' in s or 'good' in s:    return 'best'
+    if 'worst' in s or 'bad' in s:    return 'worst'
+    if 'okay' in s or 'ok' in s or 'medium' in s: return 'okay'
+    return None  # unknown labels dropped silently
+
+def _parse_selling_workbook(xlsx_bytes):
+    """Parse the selling-data xlsx into a JSON-friendly structure.
+    Returns: { 'sheets': [ {name, rows: [{brand, type, sku, description, label}]} ] }
+    Sheet order in the output matches the source workbook (typically chronological).
+    Tolerant to:
+      - Variable column counts beyond the expected 5
+      - Header row variations
+      - Extra notes/columns in some sheets (e.g. 12.2 has commentary on the right)
+    """
+    import io
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+    out = {'sheets': []}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = []
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
+            if row_idx == 0:
+                # Header row — skip if it looks like one
+                first_cell = (str(row[0]) if row and row[0] is not None else '').strip().lower()
+                if first_cell in ('brand', 'brands', ''):
+                    continue
+            if not row or row[0] is None:
+                continue
+            brand = (str(row[0]).strip() if len(row) > 0 and row[0] is not None else '')
+            type_ = (str(row[1]).strip() if len(row) > 1 and row[1] is not None else '')
+            sku   = (str(row[2]).strip().upper() if len(row) > 2 and row[2] is not None else '')
+            desc  = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else '')
+            label = _normalize_label(row[4] if len(row) > 4 else None)
+            if not sku:
+                continue
+            rows.append({
+                'brand': brand,
+                'type': type_,
+                'sku': sku,
+                'description': desc,
+                'label': label,
+            })
+        if rows:
+            out['sheets'].append({'name': sheet_name, 'rows': rows})
+    wb.close()
+    return out
+
+def _fetch_selling_from_dropbox(customer):
+    """Download the latest selling xlsx for `customer` from Dropbox and parse it.
+    Returns dict with sheets+metadata, or None on failure. The folder may contain
+    multiple xlsx files (e.g. dated versions) — we pick the most recently modified.
+    """
+    token = get_dropbox_token()
+    if not token:
+        print(f"[Selling Sync] No Dropbox token, can't fetch {customer}", flush=True)
+        return None
+
+    folder_path = f"{DROPBOX_SELLING_BASE}/{customer}"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    # List files in the customer's folder
+    try:
+        list_resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers,
+            json={'path': folder_path, 'recursive': False, 'limit': 100},
+            timeout=30
+        )
+        if list_resp.status_code != 200:
+            print(f"[Selling Sync] list_folder for '{folder_path}' returned {list_resp.status_code}: "
+                  f"{list_resp.text[:200]}", flush=True)
+            return None
+        entries = list_resp.json().get('entries', [])
+        # Only .xlsx files, picking the one with the most recent server_modified date
+        xlsx_entries = [e for e in entries
+                        if e.get('.tag') == 'file'
+                        and e.get('name', '').lower().endswith('.xlsx')
+                        and not e.get('name', '').startswith('~$')]   # exclude lock files
+        if not xlsx_entries:
+            print(f"[Selling Sync] No .xlsx files in {folder_path}", flush=True)
+            return None
+        xlsx_entries.sort(key=lambda e: e.get('server_modified', ''), reverse=True)
+        latest = xlsx_entries[0]
+        file_path = latest['path_lower']
+        file_name = latest['name']
+        print(f"[Selling Sync] Fetching {file_name} for customer={customer}", flush=True)
+    except Exception as e:
+        print(f"[Selling Sync] list_folder failed: {e}", flush=True)
+        return None
+
+    # Download the file
+    try:
+        dl_resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers={'Authorization': f'Bearer {token}',
+                     'Dropbox-API-Arg': json.dumps({'path': file_path})},
+            timeout=60
+        )
+        if dl_resp.status_code != 200:
+            print(f"[Selling Sync] download for {file_name} returned {dl_resp.status_code}", flush=True)
+            return None
+        parsed = _parse_selling_workbook(dl_resp.content)
+        parsed['source_filename'] = file_name
+        parsed['fetched_at'] = int(time.time())
+        # Persist a backup to S3 so cold starts don't hit Dropbox
+        try:
+            s3 = get_s3()
+            if s3:
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=f"{_SELLING_S3_PREFIX}/{customer.lower()}.json",
+                    Body=json.dumps(parsed).encode('utf-8'),
+                    ContentType='application/json'
+                )
+        except Exception as s3e:
+            print(f"[Selling Sync] S3 backup write failed (non-fatal): {s3e}", flush=True)
+        total_rows = sum(len(s['rows']) for s in parsed['sheets'])
+        print(f"[Selling Sync] ✓ {customer}: {len(parsed['sheets'])} sheets, "
+              f"{total_rows} rows from {file_name}", flush=True)
+        return parsed
+    except Exception as e:
+        print(f"[Selling Sync] download/parse failed: {e}", flush=True)
+        return None
+
+def _load_selling_from_s3(customer):
+    """Fast cold-start path: read last known good data from S3."""
+    try:
+        s3 = get_s3()
+        if not s3:
+            return None
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{_SELLING_S3_PREFIX}/{customer.lower()}.json")
+        return json.loads(obj['Body'].read())
+    except Exception:
+        return None  # No backup yet — first run
+
+def refresh_selling_data(customer='Ross'):
+    """Refresh one customer's selling cache (Dropbox first, S3 backup on failure)."""
+    key = customer.lower()
+    data = _fetch_selling_from_dropbox(customer)
+    if data:
+        _selling_cache[key] = data
+        _selling_last_synced[key] = int(time.time())
+        return True
+    # Dropbox failed — keep whatever's currently in memory; if empty, try S3
+    if key not in _selling_cache:
+        backup = _load_selling_from_s3(customer)
+        if backup:
+            _selling_cache[key] = backup
+            print(f"[Selling Sync] Using S3 backup for {customer} (Dropbox unavailable)", flush=True)
+            return True
+    return False
+
+def daily_selling_sync_loop():
+    """Background daemon: refresh selling-data caches once per day."""
+    print(f"  ⏰ Daily selling-data sync armed "
+          f"(target: {SELLING_REFRESH_HOUR_UTC:02d}:{SELLING_REFRESH_MIN_UTC:02d} UTC)",
+          flush=True)
+    customers = ['Ross']  # extend list as more customer folders appear
+    while True:
+        try:
+            now = datetime.utcnow()
+            target = now.replace(hour=SELLING_REFRESH_HOUR_UTC,
+                                 minute=SELLING_REFRESH_MIN_UTC,
+                                 second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            sleep_seconds = (target - now).total_seconds()
+            time.sleep(sleep_seconds)
+            print(f"\n  🛒 [SellingSync] {SELLING_REFRESH_HOUR_UTC:02d}:"
+                  f"{SELLING_REFRESH_MIN_UTC:02d} UTC trigger fired", flush=True)
+            for c in customers:
+                refresh_selling_data(c)
+        except Exception as e:
+            print(f"  ⚠ [SellingSync] Loop error: {e}", flush=True)
+            time.sleep(3600)  # back off
+
+@app.route('/selling-data/<customer>', methods=['GET', 'OPTIONS'])
+def get_selling_data(customer):
+    """Return parsed selling data for a customer. Triggers an on-demand refresh
+    if cache is empty (e.g. first request after deploy)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    key = (customer or '').lower()
+    if key not in _selling_cache:
+        # Try S3 backup synchronously so the first user doesn't see an empty page
+        backup = _load_selling_from_s3(customer)
+        if backup:
+            _selling_cache[key] = backup
+        else:
+            # Last resort: pull from Dropbox right now
+            refresh_selling_data(customer)
+    data = _selling_cache.get(key)
+    if not data:
+        return jsonify({'error': 'No selling data available', 'customer': customer}), 404
+    return jsonify({
+        'customer': customer,
+        'fetched_at': data.get('fetched_at'),
+        'source_filename': data.get('source_filename'),
+        'sheets': data.get('sheets', []),
+    })
+
+@app.route('/selling-data/<customer>/refresh', methods=['POST', 'OPTIONS'])
+def refresh_selling_data_endpoint(customer):
+    """Manual refresh trigger — useful if you upload new data outside the daily cycle."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    ok = refresh_selling_data(customer)
+    if ok:
+        data = _selling_cache.get(customer.lower(), {})
+        return jsonify({
+            'ok': True,
+            'sheets': len(data.get('sheets', [])),
+            'source_filename': data.get('source_filename'),
+        })
+    return jsonify({'ok': False, 'error': 'Refresh failed (see server logs)'}), 502
 
 
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
