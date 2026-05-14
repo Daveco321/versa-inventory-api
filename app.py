@@ -192,6 +192,38 @@ FOLDER_MAPPING = {
     'BLACK': 'Black'
 }
 
+# Brand-name normalizer (mirrors the frontend _normalizeBrand). Maps any known
+# variant of a brand string to its canonical full name so grouping/filtering
+# isn't fragmented across e.g. "BEENE", "GEOFFREY BEENE", "GB", "Geoffrey Beene".
+# Built once at import from BRAND_FULL_NAMES + BRAND_IMAGE_PREFIX so adding a
+# new brand to those maps is automatically resolvable everywhere.
+_BRAND_NAME_ALIASES = {}
+def _build_brand_aliases():
+    """Populate _BRAND_NAME_ALIASES with every known way to refer to each brand."""
+    for abbr, full in BRAND_FULL_NAMES.items():
+        # Abbreviation key (e.g. 'BEENE'), full name (e.g. 'Geoffrey Beene'),
+        # and a stripped-punctuation form of the full name. All upper-cased.
+        _BRAND_NAME_ALIASES[abbr.upper()] = full
+        _BRAND_NAME_ALIASES[full.upper()] = full
+        stripped = re.sub(r"[.'\-]", '', full).upper()
+        _BRAND_NAME_ALIASES[stripped] = full
+    for abbr, prefix in BRAND_IMAGE_PREFIX.items():
+        if abbr in BRAND_FULL_NAMES:
+            _BRAND_NAME_ALIASES[prefix.upper()] = BRAND_FULL_NAMES[abbr]
+_build_brand_aliases()
+
+def _normalize_brand(raw):
+    """Map any brand string variant to canonical full name. Falls back to the
+    raw input (with whitespace trimmed) if no alias matches — so unknown
+    brands still pass through rather than getting silently relabeled."""
+    if not raw:
+        return ''
+    s = str(raw).strip()
+    if not s:
+        return ''
+    return _BRAND_NAME_ALIASES.get(s.upper(), s)
+
+
 STYLE_CONFIG = {
     'header_bg': '#ADD8E6', 'header_text': '#000000',
     'row_bg_odd': '#FFFFFF', 'row_bg_even': '#F0F4F8',
@@ -6126,7 +6158,9 @@ def _enrich_open_orders_with_inventory(open_styles):
             brand_code = base[2:4]
             brand_abbr = sku_brand_code_map.get(brand_code, brand_code)
         s['brand_abbr'] = brand_abbr
-        s['brand_full'] = inv.get('brand_full', '') or BRAND_FULL_NAMES.get(brand_abbr, brand_abbr)
+        s['brand_full'] = _normalize_brand(
+            inv.get('brand_full', '') or BRAND_FULL_NAMES.get(brand_abbr, brand_abbr)
+        )
 
         # Color/fabric/fit: prefer override (cleanest data), then live inventory,
         # then SKU-derived for fit/fabric (color can't be derived from SKU codes).
@@ -6800,10 +6834,14 @@ def export_predictions():
         if not preds:
             return jsonify({'error': 'No predictions in request body'}), 400
 
-        # Group predictions by brand (use brand_full where available, fall back to abbr).
+        # Group predictions by brand. Normalize so "BEENE", "GEOFFREY BEENE",
+        # "GB", and "Geoffrey Beene" all collapse to a single canonical key
+        # ("Geoffrey Beene") — one sheet per brand, not three.
         by_brand = {}
         for p in preds:
-            brand = (p.get('brand_full') or p.get('brand_abbr') or 'Unknown').strip() or 'Unknown'
+            brand = _normalize_brand(
+                p.get('brand_full') or p.get('brand_abbr') or 'Unknown'
+            ) or 'Unknown'
             by_brand.setdefault(brand, []).append(p)
         brands_sorted = sorted(by_brand.keys())
 
