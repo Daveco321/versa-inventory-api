@@ -6488,88 +6488,188 @@ def ai_open_order_predictions():
             + "NO other keys, NO commentary outside the JSON."
         )
 
-        # ── Call Claude Opus ──
-        api_resp = http_requests.post(
-            'https://api.anthropic.com/v1/messages',
-            headers={
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            json={
-                'model': AI_OPUS_MODEL,
-                'max_tokens': 16000,
-                'system': system_prompt,
-                'messages': [{'role': 'user', 'content': user_prompt}],
-                # Tool use for forced structured output — same pattern as /ai-suggestions.
-                # Without this the model can wrap JSON in fences, add prose, or embed
-                # comments from our prompt example, all of which break str→JSON parsing.
-                'tools': [{
-                    'name': 'submit_predictions',
-                    'description': 'Submit selling predictions for every open-order style.',
-                    'input_schema': {
-                        'type': 'object',
-                        'properties': {
-                            'predictions': {
-                                'type': 'array',
-                                'description': 'One prediction per open-order style — must include every style with no skipping.',
-                                'items': {
-                                    'type': 'object',
-                                    'properties': {
-                                        'style': {'type': 'string', 'description': 'Base style code from OPEN ORDERS list, verbatim'},
-                                        'verdict': {'type': 'string', 'enum': ['likely_best', 'likely_okay', 'likely_worst']},
-                                        'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
-                                        'rationale': {'type': 'string', 'description': '2-4 sentences naming the ship season and same-season historical evidence'},
-                                        'referenced_sellers': {
-                                            'type': 'array',
-                                            'items': {'type': 'string'},
-                                            'description': '1-4 SKUs from selling data that justify the prediction'
-                                        }
-                                    },
-                                    'required': ['style', 'verdict', 'confidence', 'rationale', 'referenced_sellers']
-                                }
-                            }
-                        },
-                        'required': ['predictions']
-                    }
-                }],
-                'tool_choice': {'type': 'tool', 'name': 'submit_predictions'},
-            },
-            timeout=240
+        # ── Batched parallel API calls ──
+        # 295 open-order styles × ~200 tokens/prediction = ~60k output tokens needed.
+        # That blows past max_tokens=16k, which is what made the previous single-call
+        # version silently return zero predictions. We batch into groups of ~50 styles
+        # each (~10k output tokens per call, comfortably under 16k), run in parallel,
+        # and use prompt caching so the heavy historical context (selling data + windows
+        # + recurrence table) is paid for once and read cheaply on subsequent batches.
+        BATCH_SIZE = 50
+        MAX_WORKERS = 6
+        batches = [analyzable[i:i+BATCH_SIZE]
+                   for i in range(0, len(analyzable), BATCH_SIZE)]
+
+        # The user_prompt was built above as one string. For caching we need to split
+        # it into a cacheable historical-context block and a per-batch open-orders block.
+        # We rebuild it here using the pieces already computed earlier in this function.
+        cacheable_context = (
+            f"# CUSTOMER: {customer}\n"
+            f"# TASK: Predict selling performance for open-order styles "
+            f"using SEASON-AWARE reasoning from time-windowed selling history.\n\n"
+            f"## HISTORICAL SELLING DATA (chronological)\n"
+            f"{selling_block}\n\n"
+            + (f"{recurrence_block}\n\n" if recurrence_block else "")
+            + (f"{windows_block}\n\n" if windows_block else "")
         )
-        if api_resp.status_code != 200:
+        # The per-batch tail (open orders for THIS batch + reasoning method + output spec).
+        # Built per-batch since open_block differs per batch.
+        reasoning_tail = (
+            "## REASONING METHOD (apply in order, every time):\n"
+            "1. For each open-order style, FIRST identify its SHIP_SEASON from the order row. "
+            "This is the season the goods will be on Ross's floor.\n"
+            "2. Check if the open-order style appears in the SKU SELLING WINDOWS table. If yes, "
+            "look at its most recent same-season window. That is your strongest evidence.\n"
+            "3. If the style isn't in the windows table, find OTHER SKUs whose winning or losing "
+            "windows fall in the SAME SEASON as the ship season AND whose color/fabric/fit "
+            "profile is similar to the open-order style.\n"
+            "4. Distinguish coincidence from pattern. ONE matching seller is not a pattern.\n"
+            "5. Use cross-season patterns (same color/fabric won in a different season) as "
+            "SECONDARY context only — never as the primary basis for a 'high' confidence verdict.\n"
+            "6. Cross-reference negatives.\n"
+            "7. Brand specificity matters. Same-brand evidence > cross-brand evidence.\n"
+            "8. For styles with SHIP_SEASON='unknown' (no ship date provided), use the full "
+            "history without season weighting — and lower confidence by one level.\n\n"
+            "Produce exactly ONE prediction per open-order style listed above. No skipping. "
+            "No invented styles. The `style` field MUST match the open-order row verbatim."
+        )
+
+        def _build_batch_open_block(batch_styles):
+            lines = ['## ROSS OPEN ORDERS (must produce exactly one verdict per row, no skipping)',
+                     '## Fields: style | brand | color | fabric | fit | category | qty | value | SHIP_DATE | SHIP_SEASON | DATA_SOURCE | POs']
+            for s in batch_styles:
+                lines.append(
+                    f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','') or '(no color stored)'} | "
+                    f"{s.get('fabric','') or '(no fabric)'} | {s.get('fit','') or '(no fit)'} | "
+                    f"{s.get('category','')} | "
+                    f"qty:{s['total_qty']} | ${s['total_value']:.0f} | "
+                    f"SHIP:{s.get('ship_date_str','no_date')} | "
+                    f"SEASON:{s.get('ship_season','unknown')} | "
+                    f"SRC:{s.get('_metadata_source','minimal')} | "
+                    f"PO:{','.join(s['pos'][:4])}{'+more' if len(s['pos']) > 4 else ''}"
+                )
+            return '\n'.join(lines)
+
+        def _call_one_batch(batch_styles, batch_idx):
+            """Run one prediction API call for a subset of styles.
+            Returns (parsed_dict, usage_dict, stop_reason, error_str_or_None)."""
+            open_block_batch = _build_batch_open_block(batch_styles)
+            batch_user_content = [
+                # Cacheable historical context — same for every batch, paid for once
+                # and then read from cache at 10% of the input price on subsequent batches.
+                # cache_control: ephemeral expires after 5 minutes of inactivity.
+                {'type': 'text', 'text': cacheable_context,
+                 'cache_control': {'type': 'ephemeral'}},
+                # Per-batch tail — different for each batch (the open orders to predict on).
+                {'type': 'text',
+                 'text': open_block_batch + "\n\n" + reasoning_tail}
+            ]
+            try:
+                resp = http_requests.post(
+                    'https://api.anthropic.com/v1/messages',
+                    headers={
+                        'x-api-key': ANTHROPIC_API_KEY,
+                        'anthropic-version': '2023-06-01',
+                        'content-type': 'application/json',
+                    },
+                    json={
+                        'model': AI_OPUS_MODEL,
+                        'max_tokens': 16000,
+                        'system': [{'type': 'text', 'text': system_prompt,
+                                    'cache_control': {'type': 'ephemeral'}}],
+                        'messages': [{'role': 'user', 'content': batch_user_content}],
+                        'tools': [{
+                            'name': 'submit_predictions',
+                            'description': 'Submit selling predictions for every open-order style in this batch.',
+                            'input_schema': {
+                                'type': 'object',
+                                'properties': {
+                                    'predictions': {
+                                        'type': 'array',
+                                        'description': 'One prediction per open-order style in this batch.',
+                                        'items': {
+                                            'type': 'object',
+                                            'properties': {
+                                                'style': {'type': 'string'},
+                                                'verdict': {'type': 'string', 'enum': ['likely_best', 'likely_okay', 'likely_worst']},
+                                                'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
+                                                'rationale': {'type': 'string'},
+                                                'referenced_sellers': {
+                                                    'type': 'array',
+                                                    'items': {'type': 'string'}
+                                                }
+                                            },
+                                            'required': ['style', 'verdict', 'confidence', 'rationale', 'referenced_sellers']
+                                        }
+                                    }
+                                },
+                                'required': ['predictions']
+                            }
+                        }],
+                        'tool_choice': {'type': 'tool', 'name': 'submit_predictions'},
+                    },
+                    timeout=180
+                )
+                if resp.status_code != 200:
+                    return (None, {}, '', f"Batch {batch_idx}: HTTP {resp.status_code} — {resp.text[:200]}")
+                body_b = resp.json()
+                parsed_b = None
+                for block in body_b.get('content', []):
+                    if block.get('type') == 'tool_use' and block.get('name') == 'submit_predictions':
+                        parsed_b = block.get('input') or {}
+                        break
+                stop_reason_b = body_b.get('stop_reason', '')
+                usage_b = body_b.get('usage', {})
+                if parsed_b is None:
+                    return (None, usage_b, stop_reason_b,
+                            f"Batch {batch_idx}: model did not call submit_predictions tool")
+                return (parsed_b, usage_b, stop_reason_b, None)
+            except Exception as e:
+                return (None, {}, '', f"Batch {batch_idx}: {type(e).__name__}: {str(e)[:200]}")
+
+        # ── Fire all batches in parallel ──
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        all_preds = []
+        batch_errors = []
+        stop_reasons = []
+        total_usage = {
+            'input_tokens': 0, 'output_tokens': 0,
+            'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0,
+        }
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(batches))) as ex:
+            future_to_idx = {ex.submit(_call_one_batch, b, i): i for i, b in enumerate(batches)}
+            for f in as_completed(future_to_idx):
+                parsed_b, usage_b, stop_reason_b, err = f.result()
+                if err:
+                    batch_errors.append(err)
+                    continue
+                if stop_reason_b:
+                    stop_reasons.append(stop_reason_b)
+                for k in total_usage:
+                    total_usage[k] += usage_b.get(k, 0)
+                all_preds.extend(parsed_b.get('predictions') or [])
+
+        if not all_preds and batch_errors:
             return jsonify({
-                'error': f'Anthropic API returned {api_resp.status_code}',
-                'detail': api_resp.text[:500]
+                'error': 'All prediction batches failed',
+                'detail': '; '.join(batch_errors)[:1000],
             }), 502
 
-        body = api_resp.json()
-        # Extract the tool_use block — input is already a parsed dict.
-        parsed = None
-        for block in body.get('content', []):
-            if block.get('type') == 'tool_use' and block.get('name') == 'submit_predictions':
-                parsed = block.get('input') or {}
-                break
-        if parsed is None:
-            return jsonify({
-                'error': 'Model did not call the predictions tool',
-                'raw_response': json.dumps(body.get('content', []))[:2000]
-            }), 502
-
-        # ── Validate + enrich each prediction with full open-order metadata ──
-        # so the frontend can render image, brand, qty, value etc. without extra lookups.
+        # ── Validate + enrich predictions ──
         by_style = {s['style']: s for s in analyzable}
-        preds_in = parsed.get('predictions') or []
         enriched = []
         invalid = []
         seen_styles = set()
-        for p in preds_in:
+        for p in all_preds:
             style = (p.get('style') or '').upper().strip()
+            # Defensive: strip any accidental size suffix (e.g. "ROCHYD166SLD-M" → "ROCHYD166SLD")
+            if style not in by_style and '-' in style:
+                style = style.split('-')[0]
             if style not in by_style:
                 invalid.append(style)
                 continue
             if style in seen_styles:
-                continue  # de-dupe — model occasionally repeats a row
+                continue
             seen_styles.add(style)
             order = by_style[style]
             enriched.append({
@@ -6578,7 +6678,6 @@ def ai_open_order_predictions():
                 'confidence':         p.get('confidence') or 'low',
                 'rationale':          p.get('rationale') or '',
                 'referenced_sellers': p.get('referenced_sellers') or [],
-                # Open-order metadata
                 'brand_abbr':         order.get('brand_abbr', ''),
                 'brand_full':         order.get('brand_full', ''),
                 'color':              order.get('color', ''),
@@ -6587,21 +6686,22 @@ def ai_open_order_predictions():
                 'total_qty':          order['total_qty'],
                 'total_value':        order['total_value'],
                 'pos':                order['pos'],
-                # Ship-date / season the AI was told to match against
                 'ship_date':          order.get('ship_date_str', 'no_date'),
                 'ship_season':        order.get('ship_season', 'unknown'),
             })
 
-        # Note any styles the AI silently skipped despite the "never skip" instruction
         missing = [s['style'] for s in analyzable if s['style'] not in seen_styles]
 
-        # Bucket counts for the UI summary
         counts = {'likely_best': 0, 'likely_okay': 0, 'likely_worst': 0}
         for e in enriched:
             counts[e['verdict']] = counts.get(e['verdict'], 0) + 1
 
-        usage = body.get('usage', {})
-        cost = _ai_estimate_cost(usage.get('input_tokens', 0), usage.get('output_tokens', 0))
+        usage = total_usage
+        # Cost calc — cache reads cost 0.1x normal input rate
+        regular_in = usage.get('input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+        cache_in   = usage.get('cache_read_input_tokens', 0)
+        cost = _ai_estimate_cost(regular_in, usage.get('output_tokens', 0)) + \
+               (cache_in / 1_000_000) * AI_OPUS_INPUT_PER_MTOK * 0.1
 
         return jsonify({
             'predictions': enriched,
@@ -6612,12 +6712,19 @@ def ai_open_order_predictions():
             'skipped_no_metadata': [s['style'] for s in skipped],
             'invalid_styles_returned': invalid,
             'missing_from_response': missing,
+            # Batching diagnostics — surfaced for debug + UI status messaging
+            'batches_total':       len(batches),
+            'batches_succeeded':   len(batches) - len(batch_errors),
+            'batches_failed':      len(batch_errors),
+            'batch_errors':        batch_errors,
+            'stop_reasons':        list(set(stop_reasons)),
             'context': {
                 'customer': customer,
                 'season': season,
                 'sheets_used': [s['name'] for s in sheets],
                 'open_orders_analyzed': len(enriched),
                 'total_open_styles': len(styles),
+                'batch_size': BATCH_SIZE,
             }
         })
 
