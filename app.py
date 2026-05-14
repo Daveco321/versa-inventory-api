@@ -6717,6 +6717,31 @@ def ai_open_order_predictions():
         cost = _ai_estimate_cost(regular_in, usage.get('output_tokens', 0)) + \
                (cache_in / 1_000_000) * AI_OPUS_INPUT_PER_MTOK * 0.1
 
+        # ── Pre-warm image cache for these styles in the background ──
+        # By the time the user reads the predictions and clicks "Export to Excel",
+        # we want every image already in _img_cache. Without this, the first export
+        # fetches images one-by-one and can take 30-90s. With pre-warming kicked off
+        # right after the AI call returns, the cache is usually populated by the
+        # time the export button is clicked → export becomes near-instant.
+        try:
+            prewarm_items = [
+                {
+                    'sku':        e['style'],
+                    'brand_abbr': e.get('brand_abbr', ''),
+                    'brand':      e.get('brand_abbr', ''),
+                }
+                for e in enriched
+            ]
+            def _prewarm():
+                try:
+                    download_images_for_items(prewarm_items, S3_PHOTOS_URL, use_cache=True)
+                    print(f"  [prewarm] cached images for {len(prewarm_items)} prediction styles", flush=True)
+                except Exception as pwe:
+                    print(f"  [prewarm] failed: {pwe}", flush=True)
+            threading.Thread(target=_prewarm, daemon=True).start()
+        except Exception as e:
+            print(f"  [prewarm] kickoff failed: {e}", flush=True)
+
         return jsonify({
             'predictions': enriched,
             'counts': counts,
@@ -6784,7 +6809,18 @@ def export_predictions():
 
         # Image fetch — uses the same cached downloader as catalog exports. We feed it
         # a list of "item-like" dicts (only sku is required for the cache key).
-        items_for_img = [{'sku': p.get('style', '')} for p in preds]
+        # Build "item-like" dicts for the image fetcher. brand_abbr is REQUIRED here —
+        # without it the resolver can't use the brand-folder fallback path (where most
+        # shirt images actually live in S3) and falls through to placeholder. We pass
+        # both forms of brand because the resolver checks both keys.
+        items_for_img = [
+            {
+                'sku':        p.get('style', ''),
+                'brand_abbr': p.get('brand_abbr', '') or p.get('brand', ''),
+                'brand':      p.get('brand_abbr', '') or p.get('brand', ''),
+            }
+            for p in preds
+        ]
         all_imgs = download_images_for_items(items_for_img, S3_PHOTOS_URL, use_cache=True)
         # Build a style → image-bytes map so we can look up by style in each brand sheet.
         # download_images_for_items returns {original_index: image_data}, so reverse it
@@ -6886,11 +6922,12 @@ def export_predictions():
         ws_sum.write(total_row, 6, grand['value'], fmt_total_money)
 
         # Per-brand sheets — image in column A, then the data columns.
-        # IMAGE_COL_WIDTH and IMAGE_ROW_HEIGHT are tuned to match the catalog export
-        # so the embedded thumbnails are visually consistent across all exports.
-        IMAGE_COL_WIDTH = 22   # column A width in Excel "characters"
-        IMAGE_ROW_HEIGHT = 90  # row height in points
-        IMAGE_PIXEL_HEIGHT = 110  # target pixel height for embedded images
+        # IMAGE_COL_WIDTH and IMAGE_ROW_HEIGHT MATCH the catalog export exactly so the
+        # embedded thumbnails are visually consistent. download_images_for_items returns
+        # image dicts already pre-scaled for a 150x150 catalog cell — we use the same
+        # helper (_padded_image_opts) that the catalog uses so the result is identical.
+        IMAGE_COL_WIDTH = COL_WIDTH_UNITS   # 22 chars — same as catalog
+        IMAGE_ROW_HEIGHT = 112.5             # points — same as catalog set_default_row
 
         headers = ['Image', 'Style', 'Color', 'Fabric', 'Fit', 'Ship Date',
                    'Ship Season', 'Verdict', 'Confidence', 'Rationale',
@@ -6923,27 +6960,43 @@ def export_predictions():
                 ws.set_row(r_idx, IMAGE_ROW_HEIGHT)
                 style = (p.get('style') or '').upper()
 
-                # Column A: embedded image. We use the same pipeline as the catalog
-                # export — image bytes come from download_images_for_items, BytesIO
-                # wraps them for xlsxwriter, and the scale is tuned to fit inside the
-                # 110px target row height.
+                # Column A: image. Two failure modes possible:
+                #   1) img_data is None — image fetch failed or didn't run → "No Image" cell
+                #   2) img_data exists but insert_image throws (rare — usually means corrupted
+                #      bytes or missing required keys in the dict). We log the actual exception
+                #      and write a short error tag in the cell so the rest of the sheet still
+                #      builds successfully.
+                # Defensive: build the insert-options dict ourselves rather than relying on
+                # _padded_image_opts, which assumes every expected key is present. Open-order
+                # styles that hit the brand-folder fallback path sometimes return image dicts
+                # with partial keys.
                 img_data = img_by_style.get(style)
-                if img_data:
+                if img_data and img_data.get('image_data'):
                     try:
-                        img_io = BytesIO(img_data.get('bytes') if isinstance(img_data, dict) else img_data)
-                        img_w = (img_data.get('width', 0) if isinstance(img_data, dict) else 0)
-                        img_h = (img_data.get('height', 0) if isinstance(img_data, dict) else 0)
-                        scale = IMAGE_PIXEL_HEIGHT / img_h if img_h else 0.25
-                        ws.insert_image(r_idx, 0, f'{style}.jpg', {
-                            'image_data': img_io,
-                            'x_scale': scale, 'y_scale': scale,
-                            'x_offset': 4, 'y_offset': 4,
-                            'object_position': 1,  # move & size with cells
-                        })
+                        bio = img_data['image_data']
+                        if hasattr(bio, 'seek'):
+                            bio.seek(0)
+                        ratio = (TARGET_W - _IMG_CELL_PAD) / TARGET_W
+                        insert_opts = {
+                            'image_data': bio,
+                            'x_scale':  (img_data.get('x_scale') or 1) * ratio,
+                            'y_scale':  (img_data.get('y_scale') or 1) * ratio,
+                            'x_offset': (img_data.get('x_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'y_offset': (img_data.get('y_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'object_position': 1,
+                            'url': img_data.get('url', '') or '',
+                        }
+                        ws.insert_image(r_idx, 0, 'img.png', insert_opts)
                     except Exception as e:
-                        ws.write(r_idx, 0, '(image error)', fmt_text)
+                        # Log full exception for server diagnostics
+                        import traceback as _tb
+                        print(f"  [export-predictions] image insert failed for {style}: "
+                              f"{type(e).__name__}: {e}", flush=True)
+                        _tb.print_exc()
+                        # Short readable tag in the cell — concise so the row still fits
+                        ws.write(r_idx, 0, f'err: {type(e).__name__}', fmt_text)
                 else:
-                    ws.write(r_idx, 0, '', fmt_text)
+                    ws.write(r_idx, 0, 'No Image', fmt_text)
 
                 ws.write(r_idx, 1, style, fmt_text)
                 ws.write(r_idx, 2, p.get('color', '') or '', fmt_text)
