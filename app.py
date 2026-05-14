@@ -5221,6 +5221,20 @@ def _ai_season_from_date(dt):
     if 3 <= m <= 5: return 'spring'
     return 'summer'
 
+def _ai_floor_season_from_ship_date(dt):
+    """Bucket a SHIP DATE into the season the goods will actually be on the floor.
+
+    Why this isn't just _ai_season_from_date: goods leaving the dock on 8/12
+    aren't actually selling on 8/12. Between shipping out, transit, DC receiving,
+    QA, and store distribution, real time-on-floor lags the ship date by ~3 weeks.
+    So a ship date of 8/12 should be classified as FALL (not late summer) because
+    the goods will be selling in early September. We add 21 days then bucket.
+    """
+    if not dt:
+        return 'unknown'
+    from datetime import timedelta
+    return _ai_season_from_date(dt + timedelta(days=21))
+
 def _ai_parse_order_ship_date(order):
     """Pull the start ship date from an open-order row. Open-orders-api returns
     startDate as an ISO string ('2026-03-15') or similar. Returns datetime or None."""
@@ -6044,7 +6058,7 @@ def _aggregate_orders_by_style(ross_orders):
     for r in by_style.values():
         r['pos'] = sorted(r['pos'])
         r['customer_variants'] = sorted(r['customer_variants'])
-        r['ship_season'] = _ai_season_from_date(r['earliest_ship']) if r['earliest_ship'] else 'unknown'
+        r['ship_season'] = _ai_floor_season_from_ship_date(r['earliest_ship']) if r['earliest_ship'] else 'unknown'
         r['ship_date_str'] = r['earliest_ship'].strftime('%Y-%m-%d') if r['earliest_ship'] else 'no_date'
     return list(by_style.values())
 
@@ -6728,6 +6742,245 @@ def ai_open_order_predictions():
             }
         })
 
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT PREDICTIONS TO EXCEL  (with embedded images in column A, one sheet per brand)
+# Reuses the same image pipeline as the catalog export so images appear identically.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/export-predictions', methods=['POST', 'OPTIONS'])
+def export_predictions():
+    """Build an xlsx workbook from a prediction-result payload.
+
+    Request body:
+      predictions: [...]   the enriched predictions list (passed back from /ai-open-order-predictions)
+      filename:    str     base filename (without extension or date)
+
+    Layout:
+      • Summary sheet first (totals by brand)
+      • One sheet per brand, sorted alphabetically
+      • Column A holds the embedded image, sized to match catalog exports
+      • Subsequent columns: Style, Color, Fabric, Fit, Ship Date, Ship Season,
+        Verdict, Confidence, Rationale (wide), Referenced Sellers, Qty, Value, POs
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json() or {}
+        preds = req.get('predictions') or []
+        fname = req.get('filename', 'Ross-Open-Order-Predictions')
+        if not preds:
+            return jsonify({'error': 'No predictions in request body'}), 400
+
+        # Group predictions by brand (use brand_full where available, fall back to abbr).
+        by_brand = {}
+        for p in preds:
+            brand = (p.get('brand_full') or p.get('brand_abbr') or 'Unknown').strip() or 'Unknown'
+            by_brand.setdefault(brand, []).append(p)
+        brands_sorted = sorted(by_brand.keys())
+
+        # Image fetch — uses the same cached downloader as catalog exports. We feed it
+        # a list of "item-like" dicts (only sku is required for the cache key).
+        items_for_img = [{'sku': p.get('style', '')} for p in preds]
+        all_imgs = download_images_for_items(items_for_img, S3_PHOTOS_URL, use_cache=True)
+        # Build a style → image-bytes map so we can look up by style in each brand sheet.
+        # download_images_for_items returns {original_index: image_data}, so reverse it
+        # to a style-keyed dict for sheet-by-sheet lookup.
+        img_by_style = {}
+        for idx, img_data in all_imgs.items():
+            if idx < len(preds):
+                style = (preds[idx].get('style') or '').upper()
+                if style and style not in img_by_style:
+                    img_by_style[style] = img_data
+
+        # Build the workbook.
+        buf = BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb.set_properties({'title': 'Versa Open Order Predictions',
+                           'author': 'Versa Inventory System'})
+
+        # Reusable cell formats. Defined once on the workbook (xlsxwriter constraint —
+        # formats are workbook-level objects shared across sheets).
+        fmt_header = wb.add_format({
+            'bold': True, 'bg_color': '#1f2937', 'font_color': 'white',
+            'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_size': 11,
+        })
+        fmt_text = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10})
+        fmt_text_wrap = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10, 'text_wrap': True
+        })
+        fmt_num = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10,
+            'num_format': '#,##0', 'align': 'right'
+        })
+        fmt_money = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10,
+            'num_format': '$#,##0.00', 'align': 'right'
+        })
+        # Verdict-colored cells — green/yellow/red tints to match the on-screen pills
+        fmt_best = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+            'bg_color': '#dcfce7', 'font_color': '#166534', 'align': 'center'
+        })
+        fmt_okay = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+            'bg_color': '#fef9c3', 'font_color': '#854d0e', 'align': 'center'
+        })
+        fmt_worst = wb.add_format({
+            'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+            'bg_color': '#fee2e2', 'font_color': '#991b1b', 'align': 'center'
+        })
+        verdict_fmt_map = {
+            'likely_best': (fmt_best,  'Likely Best'),
+            'likely_okay': (fmt_okay,  'Likely Okay'),
+            'likely_worst':(fmt_worst, 'Likely Worst'),
+        }
+
+        # Summary sheet — totals by brand.
+        ws_sum = wb.add_worksheet('Summary')
+        sum_headers = ['Brand', 'Total Styles', 'Likely Best', 'Likely Okay',
+                       'Likely Worst', 'Total Open Qty', 'Total Open Value (USD)']
+        for c, h in enumerate(sum_headers):
+            ws_sum.write(0, c, h, fmt_header)
+        ws_sum.set_row(0, 22)
+        col_widths_sum = [28, 13, 13, 13, 13, 18, 22]
+        for c, w in enumerate(col_widths_sum):
+            ws_sum.set_column(c, c, w)
+        grand = {'styles': 0, 'best': 0, 'okay': 0, 'worst': 0, 'qty': 0, 'value': 0.0}
+        for r, brand in enumerate(brands_sorted, start=1):
+            bps = by_brand[brand]
+            best = sum(1 for p in bps if p.get('verdict') == 'likely_best')
+            okay = sum(1 for p in bps if p.get('verdict') == 'likely_okay')
+            worst = sum(1 for p in bps if p.get('verdict') == 'likely_worst')
+            qty = sum(int(p.get('total_qty', 0) or 0) for p in bps)
+            value = sum(float(p.get('total_value', 0) or 0) for p in bps)
+            ws_sum.write(r, 0, brand, fmt_text)
+            ws_sum.write(r, 1, len(bps), fmt_num)
+            ws_sum.write(r, 2, best, fmt_num)
+            ws_sum.write(r, 3, okay, fmt_num)
+            ws_sum.write(r, 4, worst, fmt_num)
+            ws_sum.write(r, 5, qty, fmt_num)
+            ws_sum.write(r, 6, value, fmt_money)
+            grand['styles'] += len(bps); grand['best'] += best
+            grand['okay'] += okay;       grand['worst'] += worst
+            grand['qty'] += qty;         grand['value'] += value
+        # Bold TOTAL row at the bottom
+        fmt_total_text = wb.add_format({'bold': True, 'valign': 'vcenter',
+                                        'border': 1, 'font_size': 10, 'bg_color': '#f3f4f6'})
+        fmt_total_num = wb.add_format({'bold': True, 'valign': 'vcenter',
+                                       'border': 1, 'font_size': 10, 'num_format': '#,##0',
+                                       'align': 'right', 'bg_color': '#f3f4f6'})
+        fmt_total_money = wb.add_format({'bold': True, 'valign': 'vcenter',
+                                         'border': 1, 'font_size': 10, 'num_format': '$#,##0.00',
+                                         'align': 'right', 'bg_color': '#f3f4f6'})
+        total_row = len(brands_sorted) + 1
+        ws_sum.write(total_row, 0, 'TOTAL', fmt_total_text)
+        ws_sum.write(total_row, 1, grand['styles'], fmt_total_num)
+        ws_sum.write(total_row, 2, grand['best'], fmt_total_num)
+        ws_sum.write(total_row, 3, grand['okay'], fmt_total_num)
+        ws_sum.write(total_row, 4, grand['worst'], fmt_total_num)
+        ws_sum.write(total_row, 5, grand['qty'], fmt_total_num)
+        ws_sum.write(total_row, 6, grand['value'], fmt_total_money)
+
+        # Per-brand sheets — image in column A, then the data columns.
+        # IMAGE_COL_WIDTH and IMAGE_ROW_HEIGHT are tuned to match the catalog export
+        # so the embedded thumbnails are visually consistent across all exports.
+        IMAGE_COL_WIDTH = 22   # column A width in Excel "characters"
+        IMAGE_ROW_HEIGHT = 90  # row height in points
+        IMAGE_PIXEL_HEIGHT = 110  # target pixel height for embedded images
+
+        headers = ['Image', 'Style', 'Color', 'Fabric', 'Fit', 'Ship Date',
+                   'Ship Season', 'Verdict', 'Confidence', 'Rationale',
+                   'Referenced Sellers', 'Open Qty', 'Open Value (USD)', 'PO Numbers']
+        col_widths = [IMAGE_COL_WIDTH, 16, 20, 18, 16, 12, 13, 14, 12,
+                      70, 32, 11, 16, 28]
+
+        verdict_sort_rank = {'likely_best': 0, 'likely_okay': 1, 'likely_worst': 2}
+        confidence_sort_rank = {'high': 0, 'medium': 1, 'low': 2}
+
+        for brand in brands_sorted:
+            # Sanitize the sheet name — Excel forbids \ / ? * [ ] : and caps at 31 chars.
+            safe = re.sub(r'[\\/*?\[\]:]', '', brand)[:31] or 'Brand'
+            ws = wb.add_worksheet(safe)
+
+            for c, h in enumerate(headers):
+                ws.write(0, c, h, fmt_header)
+            ws.set_row(0, 22)
+            for c, w in enumerate(col_widths):
+                ws.set_column(c, c, w)
+
+            # Sort within the brand: verdict (best→worst), confidence (high→low), value desc
+            bps = sorted(by_brand[brand], key=lambda p: (
+                verdict_sort_rank.get(p.get('verdict'), 3),
+                confidence_sort_rank.get(p.get('confidence'), 3),
+                -(p.get('total_value') or 0),
+            ))
+
+            for r_idx, p in enumerate(bps, start=1):
+                ws.set_row(r_idx, IMAGE_ROW_HEIGHT)
+                style = (p.get('style') or '').upper()
+
+                # Column A: embedded image. We use the same pipeline as the catalog
+                # export — image bytes come from download_images_for_items, BytesIO
+                # wraps them for xlsxwriter, and the scale is tuned to fit inside the
+                # 110px target row height.
+                img_data = img_by_style.get(style)
+                if img_data:
+                    try:
+                        img_io = BytesIO(img_data.get('bytes') if isinstance(img_data, dict) else img_data)
+                        img_w = (img_data.get('width', 0) if isinstance(img_data, dict) else 0)
+                        img_h = (img_data.get('height', 0) if isinstance(img_data, dict) else 0)
+                        scale = IMAGE_PIXEL_HEIGHT / img_h if img_h else 0.25
+                        ws.insert_image(r_idx, 0, f'{style}.jpg', {
+                            'image_data': img_io,
+                            'x_scale': scale, 'y_scale': scale,
+                            'x_offset': 4, 'y_offset': 4,
+                            'object_position': 1,  # move & size with cells
+                        })
+                    except Exception as e:
+                        ws.write(r_idx, 0, '(image error)', fmt_text)
+                else:
+                    ws.write(r_idx, 0, '', fmt_text)
+
+                ws.write(r_idx, 1, style, fmt_text)
+                ws.write(r_idx, 2, p.get('color', '') or '', fmt_text)
+                ws.write(r_idx, 3, p.get('fabric', '') or '', fmt_text)
+                ws.write(r_idx, 4, p.get('fit', '') or '', fmt_text)
+                ws.write(r_idx, 5, p.get('ship_date', '') or '', fmt_text)
+                ws.write(r_idx, 6, (p.get('ship_season', '') or '').title(), fmt_text)
+                # Verdict cell uses the colored format matching its bucket
+                v = p.get('verdict', 'likely_okay')
+                vfmt, vlabel = verdict_fmt_map.get(v, (fmt_okay, v))
+                ws.write(r_idx, 7, vlabel, vfmt)
+                ws.write(r_idx, 8, (p.get('confidence', '') or '').upper(), fmt_text)
+                # Rationale — wide column with text wrap so it's actually readable
+                ws.write(r_idx, 9, p.get('rationale', '') or '', fmt_text_wrap)
+                ws.write(r_idx, 10, ', '.join(p.get('referenced_sellers', []) or []), fmt_text)
+                try:
+                    ws.write(r_idx, 11, int(p.get('total_qty', 0) or 0), fmt_num)
+                except (ValueError, TypeError):
+                    ws.write(r_idx, 11, 0, fmt_num)
+                try:
+                    ws.write(r_idx, 12, float(p.get('total_value', 0) or 0), fmt_money)
+                except (ValueError, TypeError):
+                    ws.write(r_idx, 12, 0.0, fmt_money)
+                ws.write(r_idx, 13, ', '.join(p.get('pos', []) or []), fmt_text)
+
+            # Freeze the header row so it stays visible while scrolling
+            ws.freeze_panes(1, 0)
+
+        wb.close()
+        buf.seek(0)
+        ts = datetime.utcnow().strftime('%Y-%m-%d')
+        return send_file(
+            buf,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f"{fname}_{ts}.xlsx"
+        )
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
