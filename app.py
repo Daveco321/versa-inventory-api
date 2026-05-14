@@ -6075,8 +6075,14 @@ def _aggregate_orders_by_style(ross_orders):
             'earliest_ship': None,
             'latest_ship': None,
         })
-        if o.get('po'):
-            rec['pos'].add(str(o['po']))
+        # The open-orders API returns the PO identifier under several different keys
+        # depending on the upstream feed — the frontend already handles this with a
+        # multi-key fallback (poOf). Mirror that here so the export doesn't end up
+        # with blank PO columns whenever the API happens to use 'poNumber' instead of 'po'.
+        po_val = (o.get('po') or o.get('poNumber') or o.get('customerPO')
+                  or o.get('orderNo') or o.get('ctrlNo') or '')
+        if po_val:
+            rec['pos'].add(str(po_val).strip())
         if o.get('customer'):
             rec['customer_variants'].add(str(o['customer']))
         rec['total_qty']   += open_qty + pick_qty
