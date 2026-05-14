@@ -5152,6 +5152,162 @@ def _ai_season_from_sheet(sheet_name):
         if 6 <= month <= 8: return 'summer'
     return 'unknown'
 
+def _ai_date_from_sheet(sheet_name):
+    """Best-effort parse of a sheet name into an actual date.
+    Sheet names look like:
+      '9.08'      → month/day, assume current selling-cycle year (Sep+ = prior year,
+                    Jan-Aug = current year — matches how the recap reports are dated)
+      '2.25.26'   → month.day.year (2-digit year)
+      'Fall 2025' → no specific date; use mid-season midpoint (Oct 15)
+      'Spring 26' → similar; use mid-season midpoint (Apr 15)
+    Returns a datetime object on success, None if unparseable. The dates are used
+    for ordering selling windows and matching ship dates to seasons — they don't
+    have to be perfectly accurate, just consistent.
+    """
+    if not sheet_name:
+        return None
+    s = sheet_name.strip().lower()
+
+    # Explicit season-name forms — "Fall 2025", "Spring 26", "Summer", etc.
+    season_match = re.match(r'(fall|winter|spring|summer)\s*(\d{2,4})?', s)
+    if season_match:
+        season = season_match.group(1)
+        year_str = season_match.group(2)
+        if year_str:
+            year = int(year_str)
+            if year < 100: year += 2000
+        else:
+            year = datetime.utcnow().year
+        # Midpoint of each season — gives the AI a reasonable date to compare ship dates against
+        mid = {'spring': (4, 15), 'summer': (7, 15), 'fall': (10, 15), 'winter': (1, 15)}[season]
+        # 'winter X' typically refers to the winter that spans Dec X-1 → Feb X
+        if season == 'winter':
+            return datetime(year, mid[0], mid[1])
+        return datetime(year, mid[0], mid[1])
+
+    # Numeric date forms — "9.08", "2.25.26", "11.10"
+    m = re.match(r'^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$', s)
+    if not m:
+        return None
+    month = int(m.group(1))
+    day = int(m.group(2))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    if m.group(3):
+        year = int(m.group(3))
+        if year < 100: year += 2000
+    else:
+        # No year given. Heuristic: months 9-12 belong to the *prior* selling year,
+        # months 1-8 belong to the *current* selling year. This matches how the
+        # Ross recap sheets are dated (Sep-Dec 2025 sheets are dated 9.xx-12.xx;
+        # Jan-Aug 2026 sheets are dated 1.xx-8.xx — they're all part of one cycle).
+        # The selling cycle is anchored on the upcoming year unless we're past Aug.
+        now = datetime.utcnow()
+        anchor_year = now.year if now.month <= 6 else now.year + 1
+        year = anchor_year - 1 if month >= 9 else anchor_year
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+def _ai_season_from_date(dt):
+    """Bucket a date into one of fall/winter/spring/summer. Northern-hemisphere retail
+    season convention: Sep-Nov = Fall, Dec-Feb = Winter, Mar-May = Spring, Jun-Aug = Summer."""
+    if not dt:
+        return 'unknown'
+    m = dt.month
+    if 9 <= m <= 11: return 'fall'
+    if m == 12 or m <= 2: return 'winter'
+    if 3 <= m <= 5: return 'spring'
+    return 'summer'
+
+def _ai_parse_order_ship_date(order):
+    """Pull the start ship date from an open-order row. Open-orders-api returns
+    startDate as an ISO string ('2026-03-15') or similar. Returns datetime or None."""
+    raw = order.get('startDate') or order.get('start_date') or order.get('shipDate')
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Try a few common formats
+    for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ',
+                '%m/%d/%Y', '%m/%d/%y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s[:len(fmt)+2], fmt)   # +2 for buffer on T-suffixed forms
+        except ValueError:
+            continue
+    # Fallback: best-effort regex on YYYY-MM-DD pattern
+    m = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2})', s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+def _ai_build_sku_windows(sheets_with_dates):
+    """Convert per-sheet selling labels into per-SKU time windows.
+
+    Input:  list of {name, date (datetime), season, rows: [...]} in chronological order
+    Output: dict mapping each SKU → list of windows, each:
+              { start_date, end_date (or None=open-ended), label, season, sheet_name }
+
+    Model (matches what the user described):
+      Every appearance of a SKU defines the START of a window with that label.
+      The window stays open until the NEXT sheet that mentions the same SKU,
+      at which point a new window opens with whatever label that next sheet gave.
+      The last window per SKU extends from its sheet date until now (open-ended).
+      Before the first appearance, the SKU has no window (unknown — not assumed).
+    """
+    # Sort sheets by parsed date (chronological, oldest first). Sheets without a
+    # parseable date go to the end and are treated as open-ended at the tail.
+    dated   = sorted([s for s in sheets_with_dates if s.get('date')], key=lambda s: s['date'])
+    undated = [s for s in sheets_with_dates if not s.get('date')]
+    ordered = dated + undated
+
+    # First pass: collect every appearance per SKU, preserving order
+    by_sku = {}
+    for sh in ordered:
+        for r in sh['rows']:
+            sku = (r.get('sku') or '').upper()
+            if not sku or r.get('label') not in ('best', 'okay', 'worst'):
+                continue
+            by_sku.setdefault(sku, []).append({
+                'sheet_name': sh['name'],
+                'date': sh.get('date'),
+                'season': sh.get('season') or _ai_season_from_sheet(sh['name']),
+                'label': r['label'],
+            })
+
+    # Second pass: stitch consecutive appearances into windows.
+    # Window i runs from appearance[i].date until appearance[i+1].date, with label[i].
+    # The last appearance's window is open-ended (end_date=None).
+    windows_by_sku = {}
+    for sku, appearances in by_sku.items():
+        ws = []
+        for i, a in enumerate(appearances):
+            end = appearances[i + 1]['date'] if i + 1 < len(appearances) else None
+            ws.append({
+                'start_date': a['date'],
+                'end_date': end,
+                'label': a['label'],
+                'season': a['season'],
+                'sheet_name': a['sheet_name'],
+            })
+        windows_by_sku[sku] = ws
+    return windows_by_sku
+
+def _ai_format_window(w):
+    """Render one window as a compact string for the AI prompt."""
+    def _fmt(d):
+        return d.strftime('%Y-%m-%d') if d else 'open'
+    start = _fmt(w['start_date'])
+    end = _fmt(w['end_date'])
+    return f"{start}→{end} [{w['label'].upper()}, {w['season']}]"
+
 def _ai_build_inventory_context(ats_source='all', target_brands=None):
     """Build a compact text block listing current inventory styles with their
     color descriptions. The AI picks recommendations from this list — it can ONLY
@@ -5265,7 +5421,10 @@ def _ai_build_selling_context(customer, season_filter=None, sheet_filter=None):
     only includes sheets matching that season. If sheet_filter is supplied, only
     that specific sheet. Otherwise, all sheets.
 
-    Returns: { 'sheets': [{name, season, rows: [{sku, label, brand, type, description}]}] }
+    Each sheet entry now includes a parsed `date` (datetime or None) so downstream
+    consumers can build SKU time-windows for season-aware prediction.
+
+    Returns: list of {name, season, date, rows: [{sku, label, brand, type, description}]}
     """
     key = customer.lower()
     if key not in _selling_cache:
@@ -5278,7 +5437,12 @@ def _ai_build_selling_context(customer, season_filter=None, sheet_filter=None):
             continue
         if season_filter and season_filter != 'all' and season != season_filter:
             continue
-        sheets_out.append({'name': sh['name'], 'season': season, 'rows': sh['rows']})
+        sheets_out.append({
+            'name': sh['name'],
+            'season': season,
+            'date': _ai_date_from_sheet(sh['name']),   # datetime or None
+            'rows': sh['rows'],
+        })
     return sheets_out
 
 def _ai_estimate_tokens(selling_sheets, inventory_styles):
@@ -5732,7 +5896,13 @@ def _ross_open_orders(orders):
 def _aggregate_orders_by_style(ross_orders):
     """Many POs can hit the same base style. Aggregate into one row per style
     so the AI sees one prediction target per style rather than 17 line items
-    for the same SKU. Sums qty + dollar value; collects POs and customers."""
+    for the same SKU. Sums qty + dollar value; collects POs and customers.
+
+    Ship-date handling: an open order has a startDate (when it ships out) and a
+    cancelDate (when the retailer will refuse late shipments). For each style we
+    track the EARLIEST startDate across all its POs — that's when the first goods
+    will land at the retailer. Used downstream by the AI to match the right
+    historical selling season."""
     by_style = {}
     for o in ross_orders:
         style = str(o.get('style', '') or o.get('baseStyle', '') or '').upper().split('-')[0]
@@ -5754,12 +5924,15 @@ def _aggregate_orders_by_style(ross_orders):
             pick_val = float(o.get('pickValue') or 0)
         except (ValueError, TypeError):
             pick_val = 0
+        ship_dt = _ai_parse_order_ship_date(o)   # datetime or None
         rec = by_style.setdefault(style, {
             'style': style,
             'pos': set(),
             'customer_variants': set(),
             'total_qty': 0,
             'total_value': 0.0,
+            'earliest_ship': None,
+            'latest_ship': None,
         })
         if o.get('po'):
             rec['pos'].add(str(o['po']))
@@ -5767,10 +5940,17 @@ def _aggregate_orders_by_style(ross_orders):
             rec['customer_variants'].add(str(o['customer']))
         rec['total_qty']   += open_qty + pick_qty
         rec['total_value'] += open_val + pick_val
-    # Serialize sets to sorted lists for the prompt
+        if ship_dt:
+            if rec['earliest_ship'] is None or ship_dt < rec['earliest_ship']:
+                rec['earliest_ship'] = ship_dt
+            if rec['latest_ship'] is None or ship_dt > rec['latest_ship']:
+                rec['latest_ship'] = ship_dt
+    # Serialize sets to sorted lists, attach derived season info for the prompt
     for r in by_style.values():
         r['pos'] = sorted(r['pos'])
         r['customer_variants'] = sorted(r['customer_variants'])
+        r['ship_season'] = _ai_season_from_date(r['earliest_ship']) if r['earliest_ship'] else 'unknown'
+        r['ship_date_str'] = r['earliest_ship'].strftime('%Y-%m-%d') if r['earliest_ship'] else 'no_date'
     return list(by_style.values())
 
 def _enrich_open_orders_with_inventory(open_styles):
@@ -5958,14 +6138,38 @@ def ai_open_order_predictions():
             )
         recurrence_block = '\n'.join(recurrence_lines) if len(recurrence_lines) > 1 else ''
 
-        # Open-orders block: the AI must produce a verdict for EVERY entry here.
+        # ── SKU SELLING WINDOWS ──
+        # The user's selling-window model: a label on sheet X applies from sheet X's date
+        # until the next sheet that mentions that SKU. This is the AI's primary input
+        # for season-aware prediction — for any ship date we can ask "what label was
+        # in effect for this SKU/family during the same season last year?"
+        sku_windows = _ai_build_sku_windows(sheets)
+        window_lines = ['## SKU SELLING WINDOWS  (each label is in effect FROM its date until the NEXT report mentions the SKU)',
+                        '## Format: SKU | brand | window_1 → window_2 → … (last window is open-ended)']
+        # Sort by total appearances desc — same as recurrence — so the model reads strongest signals first
+        windowed_sorted = sorted(sku_windows.items(), key=lambda kv: -len(kv[1]))
+        for sku, ws in windowed_sorted:
+            if len(ws) < 1:
+                continue
+            brand = sku_track.get(sku, {}).get('brand', '')
+            window_strs = ' → '.join(_ai_format_window(w) for w in ws)
+            window_lines.append(f"  {sku} | {brand} | {window_strs}")
+        windows_block = '\n'.join(window_lines) if len(window_lines) > 2 else ''
+
+        # ── Open-orders block ──
+        # Each row now includes the EARLIEST ship date + the season it ships into,
+        # so the AI can match historical windows to the order's ship timing.
         open_lines = ['## ROSS OPEN ORDERS (must produce exactly one verdict per row, no skipping)',
-                      '## Fields: style | brand | color | fabric | fit | total_qty | total_value_USD | PO#s']
+                      '## Fields: style | brand | color | fabric | fit | qty | value | SHIP_DATE | SHIP_SEASON | POs',
+                      '## SHIP_SEASON is the season the goods will land on the floor — match historical windows from this season heavily.',
+                      '## SHIP_SEASON = "unknown" means no ship date was provided; use full history without season weighting for that style.']
         for s in analyzable:
             open_lines.append(
                 f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','')} | "
                 f"{s.get('fabric','')} | {s.get('fit','')} | "
                 f"qty:{s['total_qty']} | ${s['total_value']:.0f} | "
+                f"SHIP:{s.get('ship_date_str','no_date')} | "
+                f"SEASON:{s.get('ship_season','unknown')} | "
                 f"PO:{','.join(s['pos'][:4])}{'+more' if len(s['pos']) > 4 else ''}"
             )
         open_block = '\n'.join(open_lines)
@@ -5973,46 +6177,78 @@ def ai_open_order_predictions():
         system_prompt = (
             "You are an elite senior apparel buyer with 20 years of experience reading retail "
             "selling data. Today's job is FORECASTING — not recommending.\n\n"
-            "You will be given (1) Ross's historical selling recap data and (2) the list of styles "
-            "Ross currently has on open order. For EVERY open-order style, predict whether it will "
-            "likely sell BEST, OKAY, or WORST when it hits the floor.\n\n"
+            "You will be given (1) Ross's historical selling recap data, (2) per-SKU selling "
+            "WINDOWS that show when each label was in effect over time, and (3) the list of styles "
+            "Ross has on open order with their SHIP DATE and SHIP SEASON. For EVERY open-order "
+            "style, predict whether it will likely sell BEST, OKAY, or WORST when it hits the floor.\n\n"
+            "CORE MENTAL MODEL — read carefully:\n"
+            "• A label on a recap sheet (BEST/OKAY/WORST) applies to a TIME WINDOW, not a moment. "
+            "  The window starts on the sheet's date and ENDS when the next report mentions that SKU.\n"
+            "• A SKU labeled BEST on Nov 10 and WORST on Dec 22 was a BEST seller from Nov 10 to "
+            "  Dec 22, then became a WORST seller starting Dec 22. Both windows are real — neither "
+            "  invalidates the other.\n"
+            "• Selling is SEASONAL. A style that won during Fall windows is much more likely to win "
+            "  in next year's Fall than in next year's Spring. A style that won in Spring is much "
+            "  more likely to win in next year's Spring than in Fall.\n"
+            "• Each open order ships at a specific time (SHIP_DATE / SHIP_SEASON). The goods will be "
+            "  on the retailer's floor during the SHIP SEASON. Therefore the BEST evidence for that "
+            "  order's likely performance comes from HISTORICAL WINDOWS THAT FALL IN THE SAME SEASON.\n\n"
             "Hard rules:\n"
             "1. Produce exactly one verdict per open-order style. Never skip a row. Never invent rows.\n"
-            "2. Every verdict needs a rationale that names a specific pattern in the selling data "
-            "(color family, fabric type, fit, brand, or print style) and cites the supporting evidence.\n"
+            "2. Every verdict needs a rationale that NAMES THE SEASON-MATCHING REASONING. If the ship "
+            "season is Fall, explain what you saw in Fall windows of the historical data, not just "
+            "overall history.\n"
             "3. Every verdict needs `referenced_sellers` — 1 to 4 SKUs from the historical selling "
-            "data that justify your call. If a style has NO supporting evidence either way in the "
-            "selling data, that's an honest 'likely_okay' with confidence:'low' and a rationale "
-            "explaining the lack of signal — don't bluff a Best or Worst call.\n"
-            "4. Calibrate confidence honestly. 'high' = 2+ matching patterns or 3+ consistent "
-            "sellers. 'medium' = single solid pattern. 'low' = weak or absent signal.\n"
-            "5. You are PREDICTING SELLING, not recommending action. Do not suggest cancellations, "
-            "reductions, or replacements. Just forecast.\n"
+            "data that justify your call. Prefer SKUs whose WINNING WINDOW season matches the open "
+            "order's ship season.\n"
+            "4. Weight evidence with this hierarchy (most important first):\n"
+            "   a. Same SKU in the windows table — if the open-order style itself has a history, "
+            "      its most recent same-season window is the strongest single signal.\n"
+            "   b. Same-season pattern matches — other SKUs whose winning/losing windows fall in "
+            "      the same season as the open order's ship season AND whose color/fabric/fit "
+            "      profile is similar.\n"
+            "   c. Cross-season pattern matches — same color/fabric/fit family that won/lost in a "
+            "      different season. Use as secondary context only.\n"
+            "5. If SHIP_SEASON is 'unknown' for a style, that means no ship date was provided. Use "
+            "   the full history without season weighting and lower confidence by one level.\n"
+            "6. Calibrate confidence honestly. 'high' = same-season evidence from 2+ matching "
+            "   patterns or same-SKU history. 'medium' = some same-season evidence OR strong "
+            "   cross-season patterns. 'low' = thin or absent same-season evidence.\n"
+            "7. You are PREDICTING SELLING, not recommending action. Do not suggest cancellations, "
+            "   reductions, or replacements. Just forecast.\n"
         )
 
         user_prompt = (
             f"# CUSTOMER: {customer}\n"
-            f"# TASK: Predict selling performance for {len(analyzable)} open-order styles\n\n"
+            f"# TASK: Predict selling performance for {len(analyzable)} open-order styles "
+            f"using SEASON-AWARE reasoning from time-windowed selling history.\n\n"
             f"## HISTORICAL SELLING DATA (chronological)\n"
             f"{selling_block}\n\n"
             + (f"{recurrence_block}\n\n" if recurrence_block else "")
+            + (f"{windows_block}\n\n" if windows_block else "")
             + f"{open_block}\n\n"
-            + "## REASONING METHOD (apply in order):\n"
-            + "1. Identify the dominant patterns in the selling data: which colors/grounds/fabrics/"
-            + "fits/brands consistently won, and which consistently flopped. Recurrence is the "
-            + "strongest signal — same SKU labeled BEST multiple times beats a one-off BEST.\n"
-            + "2. For each open-order style, map its attributes onto those patterns. A style whose "
-            + "color/fabric/fit echoes the winning patterns gets likely_best. A style echoing the "
-            + "losing patterns gets likely_worst. A style with mixed signals OR no clear match in "
-            + "either direction is likely_okay.\n"
-            + "3. Distinguish coincidence from pattern. ONE matching seller is not a pattern. "
-            + "If a winning seller's attribute matches the open-order style only on one dimension "
-            + "(e.g. both have navy ground but different fabrics and fits), the signal is weaker "
-            + "than a multi-dimension match.\n"
-            + "4. Cross-reference. Don't predict 'likely_best' on a white solid because one white "
-            + "solid won if two other white solids flopped in the same data.\n"
-            + "5. Brand specificity matters. A pattern that won in DKNY does not automatically "
-            + "transfer to Chaps. Note when patterns are brand-specific vs cross-brand.\n\n"
+            + "## REASONING METHOD (apply in order, every time):\n"
+            + "1. For each open-order style, FIRST identify its SHIP_SEASON from the order row. "
+            + "This is the season the goods will be on Ross's floor. ALL season-matching logic "
+            + "centers on this date.\n"
+            + "2. Check if the open-order style appears in the SKU SELLING WINDOWS table. If yes, "
+            + "look at its most recent same-season window. That is your strongest evidence. "
+            + "(Example: open order ships Oct 15 → Fall season → look for that SKU's history in "
+            + "any prior Fall window.)\n"
+            + "3. If the style isn't in the windows table, find OTHER SKUs whose winning or losing "
+            + "windows fall in the SAME SEASON as the ship season AND whose color/fabric/fit "
+            + "profile is similar to the open-order style. These are your primary pattern signals.\n"
+            + "4. Distinguish coincidence from pattern. ONE matching seller is not a pattern. A "
+            + "pattern needs ≥2 same-season matches OR same-SKU multi-window history.\n"
+            + "5. Use cross-season patterns (same color/fabric won in a different season) as "
+            + "SECONDARY context only — never as the primary basis for a 'high' confidence verdict.\n"
+            + "6. Cross-reference negatives. Don't predict likely_best on a navy plaid because one "
+            + "navy plaid won in Fall if two other navy plaids LOST in Fall the same year.\n"
+            + "7. Brand specificity matters. A pattern that won in DKNY does not automatically "
+            + "transfer to Chaps. Same-brand evidence > cross-brand evidence.\n"
+            + "8. For styles with SHIP_SEASON='unknown' (no ship date provided), use the full "
+            + "history without season weighting — and lower confidence by one level since you "
+            + "can't time-match.\n\n"
             + "## OUTPUT FORMAT\n"
             + "Respond as STRICT JSON only — no markdown, no fences, no prose outside the JSON. "
             + "Exact shape:\n"
@@ -6022,7 +6258,7 @@ def ai_open_order_predictions():
             + '      "style": "<base style from the OPEN ORDERS list, verbatim>",\n'
             + '      "verdict": "likely_best" | "likely_okay" | "likely_worst",\n'
             + '      "confidence": "high" | "medium" | "low",\n'
-            + '      "rationale": "<2-4 sentences naming the pattern + evidence>",\n'
+            + '      "rationale": "<2-4 sentences. MUST mention the ship season and what same-season historical evidence drove the call.>",\n'
             + '      "referenced_sellers": ["<SKU>", "<SKU>"]\n'
             + "    }\n"
             + "  ]\n"
@@ -6112,6 +6348,9 @@ def ai_open_order_predictions():
                 'total_qty':          order['total_qty'],
                 'total_value':        order['total_value'],
                 'pos':                order['pos'],
+                # Ship-date / season the AI was told to match against
+                'ship_date':          order.get('ship_date_str', 'no_date'),
+                'ship_season':        order.get('ship_season', 'unknown'),
             })
 
         # Note any styles the AI silently skipped despite the "never skip" instruction
