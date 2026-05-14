@@ -5157,11 +5157,19 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None):
     color descriptions. The AI picks recommendations from this list — it can ONLY
     recommend styles you actually have inventory for, so this is the source of truth.
 
-    ats_source: 'all' = any style with inventory or incoming; 'warehouse_only' =
-                styles with on-hand warehouse stock (excludes incoming-only).
+    ats_source semantics:
+      'warehouse_only' = styles with on-hand warehouse stock only (no incoming).
+      'all'            = styles with warehouse OR incoming (current-pipeline view).
+      'all_styles_ever'= everything currently in stock/incoming PLUS every style that
+                         exists in the style_overrides database (your full color
+                         catalog, including discontinued styles with no current stock).
+                         This is the option to use when you want the AI to consider
+                         re-introducing old styles, not just shuffling current stock.
     target_brands: optional list of brand abbreviations to limit to; default = all.
 
     Returns a list of dicts (one per style) — the caller serializes for the prompt.
+    Styles with no current stock get total_warehouse=0, incoming=0 and an
+    `in_current_pipeline: False` flag so the AI can prefer pipeline styles when ties.
     """
     with _inv_lock:
         items_snap = list(_inventory['items'])
@@ -5183,14 +5191,20 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None):
         inc = it.get('incoming', 0)
         if ats_source == 'warehouse_only' and wh <= 0:
             continue
+        # 'all' and 'all_styles_ever' both include anything in the live inventory
+        # feed, even if wh+inc == 0 (e.g. a fully-committed style still tells the
+        # AI that this style exists and was being made). 'all_styles_ever' adds
+        # overrides-only styles on top of that — handled below.
         if ats_source == 'all' and (wh + inc) <= 0:
             continue
 
         # Color/description from style override if present, else from raw item
-        ov = overrides_snap.get(base, {})
-        color = ov.get('color') or it.get('color') or ''
-        fabric = ov.get('fabric') or it.get('fabrication') or ''
-        fit = ov.get('fit') or it.get('fit') or ''
+        ov = overrides_snap.get(base) or {}
+        if not isinstance(ov, dict):
+            ov = {}
+        color  = ov.get('color')   or it.get('color')        or ''
+        fabric = ov.get('fabric')  or it.get('fabrication')  or ''
+        fit    = ov.get('fit')     or it.get('fit')          or ''
 
         # Keep the highest-stock variant per base style (most representative)
         prev = by_style.get(base)
@@ -5206,7 +5220,44 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None):
             'total_warehouse': wh,
             'incoming': inc,
             'total_ats': it.get('total_ats', 0),
+            'in_current_pipeline': True,
         }
+
+    # 'all_styles_ever' — augment with every style that exists in the overrides
+    # database but isn't already in the live inventory feed. These represent
+    # historical/discontinued styles whose color/fabric/fit metadata is still
+    # available — the AI can recommend re-introducing them based on selling patterns.
+    if ats_source == 'all_styles_ever':
+        for base, ov in overrides_snap.items():
+            base_up = (base or '').upper()
+            if not base_up or base_up in by_style:
+                continue
+            if not isinstance(ov, dict):
+                continue
+            # Brand abbr isn't stored on overrides, so derive it from SKU positions 2-4.
+            # If the override has an explicit brand field (some entries do), prefer that.
+            brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
+            if target_brands and brand_abbr and brand_abbr not in target_brands:
+                continue
+            color  = ov.get('color')  or ''
+            fabric = ov.get('fabric') or ''
+            fit    = ov.get('fit')    or ''
+            # Skip overrides that have nothing useful for the AI to reason from.
+            if not (color or fabric or fit):
+                continue
+            by_style[base_up] = {
+                'style': base_up,
+                'brand_abbr': brand_abbr,
+                'brand_full': brand_abbr,  # we don't have full names for overrides-only
+                'color': color,
+                'fabric': fabric,
+                'fit': fit,
+                'total_warehouse': 0,
+                'incoming': 0,
+                'total_ats': 0,
+                'in_current_pipeline': False,
+            }
+
     return list(by_style.values())
 
 def _ai_build_selling_context(customer, season_filter=None, sheet_filter=None):
@@ -5272,14 +5323,14 @@ def ai_suggestions_estimate():
 
         sheets = _ai_build_selling_context(customer, season, sheet_filter)
         inv    = _ai_build_inventory_context(ats_source, target_brands)
-        # Cap inventory list to top 800 styles by total ATS to keep tokens bounded.
-        # Otherwise a full inventory (~3000+ styles) would blow up cost on every click.
-        inv = sorted(inv, key=lambda s: -(s.get('total_ats',0)))[:800]
+        # Same sort + cap as the live endpoint so the estimate matches reality.
+        inv.sort(key=lambda s: (-(s.get('total_ats',0)), 0 if s.get('in_current_pipeline') else 1))
+        inv = inv[:1500]
 
         in_toks = _ai_estimate_tokens(sheets, inv)
-        # Output budget: scales with rec count; drop suggestions are roughly half-sized.
-        out_per_rec = 220
-        out_toks = rec_count * out_per_rec + (rec_count * 100 if mode == 'both' else 0) + 300
+        # Output budget: scales with rec count; longer rationales now → 320 toks per rec.
+        out_per_rec = 320
+        out_toks = rec_count * out_per_rec + (rec_count * 200 if mode == 'both' else 0) + 500
         cost = _ai_estimate_cost(in_toks, out_toks)
         return jsonify({
             'input_tokens_est':  in_toks,
@@ -5333,12 +5384,19 @@ def ai_suggestions():
         if not sheets:
             return jsonify({'error': 'No selling data matched the season/sheet filter'}), 404
         inv = _ai_build_inventory_context(ats_source, target_brands)
-        inv = sorted(inv, key=lambda s: -(s.get('total_ats',0)))[:800]
+        # Cap to keep token cost bounded. With 'all_styles_ever' we can have several
+        # thousand styles in the override DB — sort by current ATS then by whether the
+        # style is in the current pipeline, so live stock surfaces first but discontinued
+        # styles still get fair representation. Cap raised to 1500 from 800.
+        inv.sort(key=lambda s: (-(s.get('total_ats',0)), 0 if s.get('in_current_pipeline') else 1))
+        inv = inv[:1500]
         if not inv:
             return jsonify({'error': 'No inventory styles match the filters'}), 404
 
         # ── Serialize for the prompt ──
-        # Selling data: compact "SKU | LABEL | brand | description" lines grouped by sheet
+        # Selling data: compact "SKU | LABEL | brand | description" lines grouped by sheet.
+        # Sheets are presented in their original order (which is chronological in the source)
+        # so the model can read trajectories: a style going Worst→Okay→Best vs Best→Worst.
         selling_lines = []
         for sh in sheets:
             selling_lines.append(f"\n## Sheet: {sh['name']}  (season: {sh['season']})")
@@ -5349,65 +5407,173 @@ def ai_suggestions():
                 )
         selling_block = '\n'.join(selling_lines)
 
-        inv_lines = ['## Available inventory (style | brand | color | fabric | fit | WH stock | incoming)']
+        # Build a recurrence index so the model gets aggregate signal alongside per-sheet rows.
+        # "BEST x3, WORST x0" is much sharper than reading the same SKU labeled BEST in three
+        # separate sheets and having to count it yourself.
+        from collections import defaultdict
+        sku_track = defaultdict(lambda: {'best':0, 'okay':0, 'worst':0, 'desc':'', 'brand':''})
+        for sh in sheets:
+            for r in sh['rows']:
+                sku = (r.get('sku') or '').upper()
+                if not sku:
+                    continue
+                lbl = r.get('label')
+                if lbl in ('best','okay','worst'):
+                    sku_track[sku][lbl] += 1
+                if r.get('description') and not sku_track[sku]['desc']:
+                    sku_track[sku]['desc'] = r['description'][:100]
+                if r.get('brand') and not sku_track[sku]['brand']:
+                    sku_track[sku]['brand'] = r['brand']
+        # Sort: most-appearances first; tie-break: more Best is higher signal than more Worst
+        ranked = sorted(sku_track.items(),
+                        key=lambda kv: (-(kv[1]['best']+kv[1]['okay']+kv[1]['worst']),
+                                        -(kv[1]['best'] - kv[1]['worst'])))
+        recurrence_lines = ['## RECURRENCE TABLE (same SKU across multiple sheets — strong patterns)']
+        for sku, t in ranked:
+            appearances = t['best']+t['okay']+t['worst']
+            if appearances < 2:
+                continue  # only show SKUs that appeared in 2+ sheets
+            recurrence_lines.append(
+                f"  {sku} | {t['brand']} | BEST×{t['best']} OKAY×{t['okay']} WORST×{t['worst']} | {t['desc']}"
+            )
+        # If everything appeared exactly once, omit the section so we don't waste tokens
+        recurrence_block = '\n'.join(recurrence_lines) if len(recurrence_lines) > 1 else ''
+
+        # Inventory: include the pipeline flag so the AI knows which styles are
+        # currently being made vs. which are historical/discontinued candidates for revival.
+        inv_lines = ['## ELIGIBLE STYLES (style | brand | color | fabric | fit | WH | INC | pipeline)',
+                     '## Note: pipeline=YES means currently in stock or on order; pipeline=NO means historical style with no current stock (only present if "All styles ever" was selected).']
         for s in inv:
+            pl = 'YES' if s.get('in_current_pipeline') else 'NO'
             inv_lines.append(
                 f"  {s['style']} | {s['brand_abbr']} | {s.get('color','')} | "
                 f"{s.get('fabric','')} | {s.get('fit','')} | "
-                f"WH:{s['total_warehouse']} | INC:{s['incoming']}"
+                f"WH:{s['total_warehouse']} | INC:{s['incoming']} | pipeline:{pl}"
             )
         inv_block = '\n'.join(inv_lines)
 
         # ── Build the prompt ──
-        strength_labels = "Strong (high conviction, large quantity), Medium (solid, moderate quantity), Trial (worth testing, small quantity)"
+        strength_labels_add = (
+            "Strong = high conviction, justified by 2+ winning patterns; book in large quantity. "
+            "Medium = solid signal but with some uncertainty; book in moderate quantity. "
+            "Trial = experimental pick, weaker signal but worth testing; book in small quantity."
+        )
+        strength_labels_drop = (
+            "Cut = clear consistent loser, cancel/cut entirely. "
+            "Reduce = mixed signals or single-sheet loser; cut quantity meaningfully but don't fully drop. "
+            "Watch = borderline; flag for review but don't necessarily cut yet."
+        )
+
+        # ── Drop semantics ──
+        # Drops are most actionable on INCOMING styles (you can still cancel/swap production).
+        # We tell the model this explicitly so it stops recommending dropping warehouse stock
+        # (which is already made and can't be unmade).
         if mode == 'add_only':
-            mode_instr = f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}."
+            mode_instr = (
+                f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}.\n"
+                f"Return an empty 'drop' array."
+            )
         elif mode == 'drop_only':
-            mode_instr = f"Recommend exactly {rec_count} styles to DROP or de-emphasize based on poor selling performance."
+            mode_instr = (
+                f"Recommend exactly {rec_count} styles to DROP or REDUCE.\n"
+                f"IMPORTANT: drops are only actionable on styles still on incoming production order "
+                f"(INC > 0) — you cannot 'drop' finished warehouse stock since it's already made. "
+                f"Restrict drop recommendations to styles with INC > 0.\n"
+                f"Return an empty 'add' array."
+            )
         else:
-            mode_instr = f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}, AND {rec_count} styles to DROP from current bookings based on poor selling."
+            mode_instr = (
+                f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}, "
+                f"AND exactly {rec_count} styles to DROP/REDUCE.\n"
+                f"IMPORTANT: drops are only actionable on styles still on incoming production order "
+                f"(INC > 0) — you cannot 'drop' finished warehouse stock. Restrict drop recommendations "
+                f"to styles with INC > 0."
+            )
 
         system_prompt = (
-            "You are a senior buyer and merchandiser for Versa (a private-label apparel manufacturer). "
-            "Your job: analyze historical selling data from a retailer (best/okay/worst sellers per date) and "
-            "recommend which styles from current inventory should be booked for an upcoming season. "
-            "You can only recommend styles that appear in the AVAILABLE INVENTORY list — never invent SKUs. "
-            "Reason from patterns: what colors, fabrics, fits, and price-point families won at this retailer; "
-            "what consistently flopped; what changed across the seasons in the data."
+            "You are an elite senior apparel buyer and merchandiser working at a private-label "
+            "manufacturer that sells to major US retailers. You have 20 years of experience reading "
+            "selling data and translating it into next-season production bets.\n\n"
+            "You are RIGOROUS. You don't reason from one data point. You distinguish coincidence from "
+            "pattern. You separate 'color won' from 'style won' from 'brand won' — three different "
+            "explanations for the same selling result that imply three different next bets.\n\n"
+            "Hard rules you NEVER break:\n"
+            "1. You ONLY recommend styles that appear verbatim in the ELIGIBLE STYLES list provided. "
+            "Never invent a style code. If you can't find a style in the list that fits, return fewer "
+            "recommendations rather than hallucinating one.\n"
+            "2. Every recommendation MUST include a `rationale` of 2-4 sentences that names a specific "
+            "pattern AND points to specific evidence. Generic rationales like 'this color sold well' "
+            "are not acceptable — say WHICH selling SKUs, in WHICH sheets, and WHY the pattern projects "
+            "onto your pick.\n"
+            "3. Every recommendation MUST include `referenced_sellers` — 1 to 4 actual SKUs from the "
+            "selling data that justify it. If you can't cite at least one, drop the recommendation.\n"
+            "4. Strength levels must be calibrated honestly. A 'Strong' rec needs 2+ supporting "
+            "patterns or 3+ consistent sellers. A pick supported by one BEST seller is at most Medium. "
+            "Don't inflate.\n"
         )
 
         user_prompt = (
             f"# CUSTOMER: {customer}\n"
-            f"# BOOKING FOR: {target_season.upper()} season\n"
+            f"# BOOKING FOR: {target_season.upper()} {datetime.utcnow().year + (1 if datetime.utcnow().month >= 7 else 0)}\n"
             f"# MODE: {mode}\n"
-            f"# Strength levels you may use: {strength_labels}\n\n"
-            f"## HISTORICAL SELLING DATA\n"
+            f"# Strength levels (ADD): {strength_labels_add}\n"
+            f"# Strength levels (DROP): {strength_labels_drop}\n\n"
+            f"## HISTORICAL SELLING DATA (chronological)\n"
             f"{selling_block}\n\n"
-            f"{inv_block}\n\n"
-            f"## TASK\n"
-            f"{mode_instr}\n\n"
-            f"Reasoning approach:\n"
-            f"- Group sellers by pattern (e.g. 'navy ground fancies in DKNY consistently won', "
-            f"'white solids in Eddie Bauer consistently flopped').\n"
-            f"- Map those patterns onto the AVAILABLE INVENTORY list to pick specific styles.\n"
-            f"- Prefer styles whose color/fabric/fit echoes the winning patterns AND avoid those echoing losers.\n"
-            f"- For SEASON FIT: heavier fabrics and darker grounds skew Fall/Winter; lighter/brighter skews Spring/Summer.\n"
-            f"- Cite 1-3 specific selling SKUs that justify each recommendation in 'referenced_sellers'.\n\n"
-            f"Respond as STRICT JSON with this exact shape — no markdown, no prose outside the JSON:\n"
-            f"{{\n"
-            f"  \"add\": [\n"
-            f"    {{\n"
-            f"      \"style\": \"<base SKU from inventory list>\",\n"
-            f"      \"brand\": \"<brand abbr>\",\n"
-            f"      \"recommended_color\": \"<color/print description>\",\n"
-            f"      \"strength\": \"Strong\" | \"Medium\" | \"Trial\",\n"
-            f"      \"rationale\": \"<1-2 sentences why>\",\n"
-            f"      \"referenced_sellers\": [\"<SKU>\", \"<SKU>\"]\n"
-            f"    }}\n"
-            f"  ],\n"
-            f"  \"drop\": [ /* same shape; strength can be 'Cut', 'Reduce', or 'Watch' for drops */ ]\n"
-            f"}}\n"
-            f"If a section doesn't apply for this mode, return it as an empty array."
+            f"{recurrence_block}\n\n" if recurrence_block else f"## HISTORICAL SELLING DATA (chronological)\n{selling_block}\n\n"
+        )
+        # The conditional above is gnarly; rebuild cleanly:
+        user_prompt = (
+            f"# CUSTOMER: {customer}\n"
+            f"# BOOKING FOR: {target_season.upper()} {datetime.utcnow().year + (1 if datetime.utcnow().month >= 7 else 0)}\n"
+            f"# MODE: {mode}\n"
+            f"# Strength levels (ADD): {strength_labels_add}\n"
+            f"# Strength levels (DROP): {strength_labels_drop}\n\n"
+            f"## HISTORICAL SELLING DATA (chronological)\n"
+            f"{selling_block}\n\n"
+            + (f"{recurrence_block}\n\n" if recurrence_block else "")
+            + f"{inv_block}\n\n"
+            + f"## TASK\n"
+            + f"{mode_instr}\n\n"
+            + "## REASONING METHOD (apply explicitly, in order):\n"
+            + "1. **Identify PATTERNS, not points.** A pattern needs at least 2 supporting data points. "
+            + "Look at the recurrence table first: same SKU labeled BEST in multiple sheets is the "
+            + "strongest signal. Single-sheet BESTs are weaker.\n"
+            + "2. **Isolate the WINNING ATTRIBUTE.** When a style sold well, was it the color, the "
+            + "ground, the print, the fabric weight, the fit, or the brand? Be specific. E.g. "
+            + "'multiple DKNY navy-ground fancies won' is sharper than 'DKNY won'.\n"
+            + "3. **Check for LOSERS that match your would-be ADDs.** If you're about to recommend a "
+            + "white solid because one white solid won, but two other white solids lost, that's a "
+            + "negative signal — downgrade or drop the pick.\n"
+            + "4. **Apply SEASON FIT for the target booking season.** Target is "
+            + f"{target_season.upper()}. Fall/Winter favors heavier weights, deeper grounds (navy, "
+            + "wine, hunter, charcoal), warmer prints. Spring/Summer favors lighter weights, brighter "
+            + "grounds (white, sky, sage, coral), fresher prints. A navy that won in Spring still "
+            + "translates to Fall, but a coral that won in Spring does NOT translate to Fall.\n"
+            + "5. **Prefer pipeline styles (pipeline:YES) over revival styles (pipeline:NO) when "
+            + "patterns are roughly equal.** A revival pick should require a noticeably stronger "
+            + "supporting pattern than a pipeline pick, because there's a manufacturing setup cost.\n"
+            + "6. **Diversify.** Don't recommend 10 white solids. Spread across brands and "
+            + "color/fabric families that the data supports.\n"
+            + "7. **Be honest about uncertainty.** If the data doesn't support a confident pick, use "
+            + "Trial. If the data is too sparse for a confident answer, return fewer recs.\n\n"
+            + "## OUTPUT FORMAT\n"
+            + "Respond as STRICT JSON only — no markdown, no fences, no prose outside the JSON. "
+            + "Exact shape:\n"
+            + "{\n"
+            + '  "add": [\n'
+            + "    {\n"
+            + '      "style": "<base style code, must appear verbatim in ELIGIBLE STYLES>",\n'
+            + '      "brand": "<brand abbreviation>",\n'
+            + '      "recommended_color": "<color or print description>",\n'
+            + '      "strength": "Strong" | "Medium" | "Trial",\n'
+            + '      "rationale": "<2-4 sentences naming the pattern and the supporting evidence>",\n'
+            + '      "referenced_sellers": ["<SKU>", "<SKU>"]\n'
+            + "    }\n"
+            + "  ],\n"
+            + '  "drop": [ /* same shape; strength is "Cut" | "Reduce" | "Watch" */ ]\n'
+            + "}\n"
+            + "Sections that don't apply for this mode get an empty array. NO other keys, NO commentary."
         )
 
         # ── Call Claude Opus ──
@@ -5420,7 +5586,7 @@ def ai_suggestions():
             },
             json={
                 'model': AI_OPUS_MODEL,
-                'max_tokens': 8000,
+                'max_tokens': 12000,   # longer rationales + recurrence-table reasoning needs headroom
                 'system': system_prompt,
                 'messages': [{'role': 'user', 'content': user_prompt}],
             },
@@ -5510,6 +5676,470 @@ def ai_suggestions():
                 'target_season': target_season,
                 'sheets_used': [s['name'] for s in sheets],
                 'inventory_styles_offered': len(inv),
+            }
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI OPEN-ORDER PREDICTIONS  (Phase 2b — separate function from Add/Drop)
+# Reads Ross's actual open orders from the open-orders-api service, then asks
+# Opus to predict — for each open style — whether it will likely sell Best /
+# Okay / Worst at Ross based on the historical selling-recap data.
+# This is a forecasting tool, not a recommendation tool: every open order gets
+# a verdict + reasoning. Nothing is suggested for "drop" — that's deliberate
+# (you wanted predictions, not action items).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# URL of the separate open-orders service. Matches what the frontend uses.
+OPEN_ORDERS_API_URL = os.environ.get('OPEN_ORDERS_API_URL',
+                                     'https://open-orders-api.onrender.com')
+
+def _fetch_open_orders():
+    """Hit the open-orders-api /api/orders endpoint and return the raw list.
+    Returns [] on any error so the caller can surface a clean message."""
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", timeout=30)
+        if resp.status_code != 200:
+            print(f"[OpenOrders] /api/orders returned {resp.status_code}", flush=True)
+            return []
+        return resp.json().get('orders', []) or []
+    except Exception as e:
+        print(f"[OpenOrders] fetch failed: {e}", flush=True)
+        return []
+
+def _ross_open_orders(orders):
+    """Filter the raw orders list to Ross-only entries.
+    Ross can show up under several customer values: 'ROSS', 'ROSS STORES', 'RO'
+    (the 2-char code), or 'RM' (Ross with size UPC). We match all of them.
+    We also fall back to checking the style prefix in case the customer field
+    is blank but the style code's first 2 chars are RO/RM."""
+    ROSS_CUSTOMERS = {'ROSS', 'ROSS STORES', 'RO', 'RM', 'ROSS (WITH SIZE UPC)'}
+    ROSS_PREFIXES  = {'RO', 'RM'}
+    out = []
+    for o in orders:
+        cust = str(o.get('customer', '') or '').upper().strip()
+        style = str(o.get('style', '') or o.get('baseStyle', '') or '').upper().strip()
+        base = style.split('-')[0] if style else ''
+        prefix = base[:2] if len(base) >= 2 else ''
+        if cust in ROSS_CUSTOMERS or prefix in ROSS_PREFIXES:
+            out.append(o)
+    return out
+
+def _aggregate_orders_by_style(ross_orders):
+    """Many POs can hit the same base style. Aggregate into one row per style
+    so the AI sees one prediction target per style rather than 17 line items
+    for the same SKU. Sums qty + dollar value; collects POs and customers."""
+    by_style = {}
+    for o in ross_orders:
+        style = str(o.get('style', '') or o.get('baseStyle', '') or '').upper().split('-')[0]
+        if not style:
+            continue
+        try:
+            open_qty = int(o.get('openQty') or 0)
+        except (ValueError, TypeError):
+            open_qty = 0
+        try:
+            pick_qty = int(o.get('pickQty') or 0)
+        except (ValueError, TypeError):
+            pick_qty = 0
+        try:
+            open_val = float(o.get('openValue') or 0)
+        except (ValueError, TypeError):
+            open_val = 0
+        try:
+            pick_val = float(o.get('pickValue') or 0)
+        except (ValueError, TypeError):
+            pick_val = 0
+        rec = by_style.setdefault(style, {
+            'style': style,
+            'pos': set(),
+            'customer_variants': set(),
+            'total_qty': 0,
+            'total_value': 0.0,
+        })
+        if o.get('po'):
+            rec['pos'].add(str(o['po']))
+        if o.get('customer'):
+            rec['customer_variants'].add(str(o['customer']))
+        rec['total_qty']   += open_qty + pick_qty
+        rec['total_value'] += open_val + pick_val
+    # Serialize sets to sorted lists for the prompt
+    for r in by_style.values():
+        r['pos'] = sorted(r['pos'])
+        r['customer_variants'] = sorted(r['customer_variants'])
+    return list(by_style.values())
+
+def _enrich_open_orders_with_inventory(open_styles):
+    """For each open-order style, look up color/fabric/fit from the style overrides
+    DB and current inventory feed. The AI needs that metadata to apply the
+    selling-pattern logic — without color/fabric info it can't reason about why
+    a style will or won't sell."""
+    with _inv_lock:
+        items_snap = list(_inventory['items'])
+    with _overrides_lock:
+        overrides_snap = dict(_style_overrides)
+
+    inv_by_style = {}
+    for it in items_snap:
+        base = (it.get('sku') or '').split('-')[0].upper()
+        if base and base not in inv_by_style:
+            inv_by_style[base] = it
+
+    for s in open_styles:
+        base = s['style']
+        inv = inv_by_style.get(base, {})
+        ov = overrides_snap.get(base) or {}
+        if not isinstance(ov, dict):
+            ov = {}
+        s['brand_abbr'] = (inv.get('brand_abbr') or inv.get('brand') or '').upper()
+        s['brand_full'] = inv.get('brand_full', s['brand_abbr'])
+        s['color']  = ov.get('color')  or inv.get('color')        or ''
+        s['fabric'] = ov.get('fabric') or inv.get('fabrication')  or ''
+        s['fit']    = ov.get('fit')    or inv.get('fit')          or ''
+    return open_styles
+
+@app.route('/ai-open-order-predictions/preview', methods=['GET', 'POST', 'OPTIONS'])
+def ai_open_order_predictions_preview():
+    """Returns the list of Ross open-order styles WITHOUT calling the AI.
+    Used to populate the cost estimate and let the UI show 'will analyze N styles'
+    before the user clicks the expensive Generate button."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    try:
+        raw = _fetch_open_orders()
+        ross = _ross_open_orders(raw)
+        styles = _aggregate_orders_by_style(ross)
+        styles = _enrich_open_orders_with_inventory(styles)
+        # Filter out styles with no useful metadata — they'd be unhelpful for the AI
+        # AND inflate cost. Still surface a count so the user knows.
+        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
+        # Token estimate (rough): ~80 chars per style row in the prompt, plus
+        # the selling-data block (variable). We compute a generous in/out so the
+        # UI shows a high-water mark.
+        return jsonify({
+            'total_open_orders': len(ross),
+            'unique_styles': len(styles),
+            'analyzable_styles': len(analyzable),
+            'skipped_no_metadata': len(styles) - len(analyzable),
+            'sample': [{'style': s['style'], 'brand': s['brand_abbr'],
+                        'color': s['color'], 'qty': s['total_qty'],
+                        'value': round(s['total_value'], 2),
+                        'pos': s['pos'][:3]} for s in analyzable[:5]],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/ai-open-order-predictions/estimate', methods=['POST', 'OPTIONS'])
+def ai_open_order_predictions_estimate():
+    """Cost estimate for the open-order prediction call."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not configured'}), 500
+    try:
+        req = request.get_json(silent=True) or {}
+        customer       = req.get('customer', 'Ross')
+        season         = (req.get('season') or 'all').lower()
+        sheet_filter   = req.get('sheet') or None
+
+        sheets = _ai_build_selling_context(customer, season, sheet_filter)
+        raw = _fetch_open_orders()
+        ross = _ross_open_orders(raw)
+        styles = _aggregate_orders_by_style(ross)
+        styles = _enrich_open_orders_with_inventory(styles)
+        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
+
+        # Char-count heuristic same as the recommendations estimate.
+        selling_chars = sum(
+            len(r.get('sku','')) + len(r.get('description','')) + 20
+            for sh in sheets for r in sh['rows']
+        ) + 300
+        open_chars = sum(len(s.get('color','')) + len(s.get('fabric','')) + 40 for s in analyzable)
+        in_toks = (selling_chars + open_chars + 2000) // 4   # +2000 for system+instructions
+        # Output: ~150 tokens per style (verdict + 2-3 sentence reason + refs)
+        out_toks = max(500, len(analyzable) * 150)
+        cost = _ai_estimate_cost(in_toks, out_toks)
+
+        return jsonify({
+            'input_tokens_est': in_toks,
+            'output_tokens_est': out_toks,
+            'cost_usd_est': round(cost, 3),
+            'analyzable_styles': len(analyzable),
+            'unique_open_styles': len(styles),
+            'skipped_no_metadata': len(styles) - len(analyzable),
+            'selling_sheets': len(sheets),
+            'sheets_included': [s['name'] for s in sheets],
+            'model': AI_OPUS_MODEL,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/ai-open-order-predictions', methods=['POST', 'OPTIONS'])
+def ai_open_order_predictions():
+    """Predict selling performance for every Ross open-order style.
+
+    Request body:
+      customer:  'Ross' (str) — which customer's selling data to read against
+      season:    'fall'|'winter'|'spring'|'summer'|'all' — historical filter
+      sheet:     optional specific sheet name override
+
+    Returns: { predictions: [...], skipped: [...], cost_usd, usage, ... }
+    Each prediction: { style, brand, color, qty, value, pos: [...],
+                       verdict: 'likely_best'|'likely_okay'|'likely_worst',
+                       confidence: 'high'|'medium'|'low',
+                       rationale, referenced_sellers }
+    """
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not configured on server'}), 500
+    try:
+        req = request.get_json(silent=True) or {}
+        customer     = req.get('customer', 'Ross')
+        season       = (req.get('season') or 'all').lower()
+        sheet_filter = req.get('sheet') or None
+
+        sheets = _ai_build_selling_context(customer, season, sheet_filter)
+        if not sheets:
+            return jsonify({'error': 'No selling data matched the season/sheet filter'}), 404
+
+        raw = _fetch_open_orders()
+        if not raw:
+            return jsonify({'error': 'Could not fetch open orders from open-orders-api '
+                           '(service may be down or starting up)'}), 503
+        ross = _ross_open_orders(raw)
+        styles = _aggregate_orders_by_style(ross)
+        styles = _enrich_open_orders_with_inventory(styles)
+        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
+        skipped    = [s for s in styles if not (s.get('color') or s.get('fabric'))]
+        if not analyzable:
+            return jsonify({'error': f'Found {len(ross)} Ross open orders but none have '
+                           f'color/fabric metadata for the AI to reason from.'}), 404
+
+        # ── Serialize selling data + recurrence table (same structure as Add/Drop endpoint) ──
+        from collections import defaultdict
+        selling_lines = []
+        for sh in sheets:
+            selling_lines.append(f"\n## Sheet: {sh['name']}  (season: {sh['season']})")
+            for r in sh['rows']:
+                lbl = (r.get('label') or 'unknown').upper()
+                selling_lines.append(
+                    f"  [{lbl}] {r.get('sku','')} | {r.get('brand','')} | {r.get('description','')[:120]}"
+                )
+        selling_block = '\n'.join(selling_lines)
+
+        sku_track = defaultdict(lambda: {'best':0, 'okay':0, 'worst':0, 'desc':'', 'brand':''})
+        for sh in sheets:
+            for r in sh['rows']:
+                sku = (r.get('sku') or '').upper()
+                if not sku:
+                    continue
+                lbl = r.get('label')
+                if lbl in ('best','okay','worst'):
+                    sku_track[sku][lbl] += 1
+                if r.get('description') and not sku_track[sku]['desc']:
+                    sku_track[sku]['desc'] = r['description'][:100]
+                if r.get('brand') and not sku_track[sku]['brand']:
+                    sku_track[sku]['brand'] = r['brand']
+        ranked = sorted(sku_track.items(),
+                        key=lambda kv: (-(kv[1]['best']+kv[1]['okay']+kv[1]['worst']),
+                                        -(kv[1]['best'] - kv[1]['worst'])))
+        recurrence_lines = ['## RECURRENCE TABLE (same SKU across multiple sheets)']
+        for sku, t in ranked:
+            appearances = t['best']+t['okay']+t['worst']
+            if appearances < 2:
+                continue
+            recurrence_lines.append(
+                f"  {sku} | {t['brand']} | BEST×{t['best']} OKAY×{t['okay']} WORST×{t['worst']} | {t['desc']}"
+            )
+        recurrence_block = '\n'.join(recurrence_lines) if len(recurrence_lines) > 1 else ''
+
+        # Open-orders block: the AI must produce a verdict for EVERY entry here.
+        open_lines = ['## ROSS OPEN ORDERS (must produce exactly one verdict per row, no skipping)',
+                      '## Fields: style | brand | color | fabric | fit | total_qty | total_value_USD | PO#s']
+        for s in analyzable:
+            open_lines.append(
+                f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','')} | "
+                f"{s.get('fabric','')} | {s.get('fit','')} | "
+                f"qty:{s['total_qty']} | ${s['total_value']:.0f} | "
+                f"PO:{','.join(s['pos'][:4])}{'+more' if len(s['pos']) > 4 else ''}"
+            )
+        open_block = '\n'.join(open_lines)
+
+        system_prompt = (
+            "You are an elite senior apparel buyer with 20 years of experience reading retail "
+            "selling data. Today's job is FORECASTING — not recommending.\n\n"
+            "You will be given (1) Ross's historical selling recap data and (2) the list of styles "
+            "Ross currently has on open order. For EVERY open-order style, predict whether it will "
+            "likely sell BEST, OKAY, or WORST when it hits the floor.\n\n"
+            "Hard rules:\n"
+            "1. Produce exactly one verdict per open-order style. Never skip a row. Never invent rows.\n"
+            "2. Every verdict needs a rationale that names a specific pattern in the selling data "
+            "(color family, fabric type, fit, brand, or print style) and cites the supporting evidence.\n"
+            "3. Every verdict needs `referenced_sellers` — 1 to 4 SKUs from the historical selling "
+            "data that justify your call. If a style has NO supporting evidence either way in the "
+            "selling data, that's an honest 'likely_okay' with confidence:'low' and a rationale "
+            "explaining the lack of signal — don't bluff a Best or Worst call.\n"
+            "4. Calibrate confidence honestly. 'high' = 2+ matching patterns or 3+ consistent "
+            "sellers. 'medium' = single solid pattern. 'low' = weak or absent signal.\n"
+            "5. You are PREDICTING SELLING, not recommending action. Do not suggest cancellations, "
+            "reductions, or replacements. Just forecast.\n"
+        )
+
+        user_prompt = (
+            f"# CUSTOMER: {customer}\n"
+            f"# TASK: Predict selling performance for {len(analyzable)} open-order styles\n\n"
+            f"## HISTORICAL SELLING DATA (chronological)\n"
+            f"{selling_block}\n\n"
+            + (f"{recurrence_block}\n\n" if recurrence_block else "")
+            + f"{open_block}\n\n"
+            + "## REASONING METHOD (apply in order):\n"
+            + "1. Identify the dominant patterns in the selling data: which colors/grounds/fabrics/"
+            + "fits/brands consistently won, and which consistently flopped. Recurrence is the "
+            + "strongest signal — same SKU labeled BEST multiple times beats a one-off BEST.\n"
+            + "2. For each open-order style, map its attributes onto those patterns. A style whose "
+            + "color/fabric/fit echoes the winning patterns gets likely_best. A style echoing the "
+            + "losing patterns gets likely_worst. A style with mixed signals OR no clear match in "
+            + "either direction is likely_okay.\n"
+            + "3. Distinguish coincidence from pattern. ONE matching seller is not a pattern. "
+            + "If a winning seller's attribute matches the open-order style only on one dimension "
+            + "(e.g. both have navy ground but different fabrics and fits), the signal is weaker "
+            + "than a multi-dimension match.\n"
+            + "4. Cross-reference. Don't predict 'likely_best' on a white solid because one white "
+            + "solid won if two other white solids flopped in the same data.\n"
+            + "5. Brand specificity matters. A pattern that won in DKNY does not automatically "
+            + "transfer to Chaps. Note when patterns are brand-specific vs cross-brand.\n\n"
+            + "## OUTPUT FORMAT\n"
+            + "Respond as STRICT JSON only — no markdown, no fences, no prose outside the JSON. "
+            + "Exact shape:\n"
+            + "{\n"
+            + '  "predictions": [\n'
+            + "    {\n"
+            + '      "style": "<base style from the OPEN ORDERS list, verbatim>",\n'
+            + '      "verdict": "likely_best" | "likely_okay" | "likely_worst",\n'
+            + '      "confidence": "high" | "medium" | "low",\n'
+            + '      "rationale": "<2-4 sentences naming the pattern + evidence>",\n'
+            + '      "referenced_sellers": ["<SKU>", "<SKU>"]\n'
+            + "    }\n"
+            + "  ]\n"
+            + "}\n"
+            + f"You MUST return exactly {len(analyzable)} entries — one per open-order style. "
+            + "NO other keys, NO commentary outside the JSON."
+        )
+
+        # ── Call Claude Opus ──
+        api_resp = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': AI_OPUS_MODEL,
+                'max_tokens': 16000,
+                'system': system_prompt,
+                'messages': [{'role': 'user', 'content': user_prompt}],
+            },
+            timeout=240
+        )
+        if api_resp.status_code != 200:
+            return jsonify({
+                'error': f'Anthropic API returned {api_resp.status_code}',
+                'detail': api_resp.text[:500]
+            }), 502
+
+        body = api_resp.json()
+        text_out = ''
+        for block in body.get('content', []):
+            if block.get('type') == 'text':
+                text_out += block.get('text', '')
+
+        # Parse JSON
+        cleaned = text_out.strip()
+        if cleaned.startswith('```'):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if not m:
+                return jsonify({
+                    'error': 'Model returned unparseable JSON',
+                    'raw_response': text_out[:2000]
+                }), 502
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                return jsonify({
+                    'error': 'Model returned unparseable JSON',
+                    'raw_response': text_out[:2000]
+                }), 502
+
+        # ── Validate + enrich each prediction with full open-order metadata ──
+        # so the frontend can render image, brand, qty, value etc. without extra lookups.
+        by_style = {s['style']: s for s in analyzable}
+        preds_in = parsed.get('predictions') or []
+        enriched = []
+        invalid = []
+        seen_styles = set()
+        for p in preds_in:
+            style = (p.get('style') or '').upper().strip()
+            if style not in by_style:
+                invalid.append(style)
+                continue
+            if style in seen_styles:
+                continue  # de-dupe — model occasionally repeats a row
+            seen_styles.add(style)
+            order = by_style[style]
+            enriched.append({
+                'style':              style,
+                'verdict':            p.get('verdict') or 'likely_okay',
+                'confidence':         p.get('confidence') or 'low',
+                'rationale':          p.get('rationale') or '',
+                'referenced_sellers': p.get('referenced_sellers') or [],
+                # Open-order metadata
+                'brand_abbr':         order.get('brand_abbr', ''),
+                'brand_full':         order.get('brand_full', ''),
+                'color':              order.get('color', ''),
+                'fabric':             order.get('fabric', ''),
+                'fit':                order.get('fit', ''),
+                'total_qty':          order['total_qty'],
+                'total_value':        order['total_value'],
+                'pos':                order['pos'],
+            })
+
+        # Note any styles the AI silently skipped despite the "never skip" instruction
+        missing = [s['style'] for s in analyzable if s['style'] not in seen_styles]
+
+        # Bucket counts for the UI summary
+        counts = {'likely_best': 0, 'likely_okay': 0, 'likely_worst': 0}
+        for e in enriched:
+            counts[e['verdict']] = counts.get(e['verdict'], 0) + 1
+
+        usage = body.get('usage', {})
+        cost = _ai_estimate_cost(usage.get('input_tokens', 0), usage.get('output_tokens', 0))
+
+        return jsonify({
+            'predictions': enriched,
+            'counts': counts,
+            'usage': usage,
+            'cost_usd': round(cost, 4),
+            'model': AI_OPUS_MODEL,
+            'skipped_no_metadata': [s['style'] for s in skipped],
+            'invalid_styles_returned': invalid,
+            'missing_from_response': missing,
+            'context': {
+                'customer': customer,
+                'season': season,
+                'sheets_used': [s['name'] for s in sheets],
+                'open_orders_analyzed': len(enriched),
+                'total_open_styles': len(styles),
             }
         })
 
