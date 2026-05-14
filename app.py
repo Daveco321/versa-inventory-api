@@ -5308,7 +5308,8 @@ def _ai_format_window(w):
     end = _fmt(w['end_date'])
     return f"{start}→{end} [{w['label'].upper()}, {w['season']}]"
 
-def _ai_build_inventory_context(ats_source='all', target_brands=None):
+def _ai_build_inventory_context(ats_source='all', target_brands=None,
+                                ats_only=False, ats_min=0, ats_scope='both'):
     """Build a compact text block listing current inventory styles with their
     color descriptions. The AI picks recommendations from this list — it can ONLY
     recommend styles you actually have inventory for, so this is the source of truth.
@@ -5414,7 +5415,31 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None):
                 'in_current_pipeline': False,
             }
 
-    return list(by_style.values())
+    out = list(by_style.values())
+
+    # ── ATS availability filter (post-process) ──
+    # Triggered by the "ATS available only" toggle in the UI. We filter on a
+    # per-scope basis so the user can say e.g. "only styles with at least 500
+    # units in the warehouse" vs "at least 100 units of either WH or incoming".
+    # When ats_only=False, we don't filter at all — the previous behavior.
+    if ats_only:
+        threshold = max(0, int(ats_min or 0))
+        def _passes(s):
+            wh  = int(s.get('total_warehouse', 0) or 0)
+            inc = int(s.get('incoming', 0) or 0)
+            ats = int(s.get('total_ats', 0) or 0)
+            if ats_scope == 'warehouse':
+                # Use total_ats as the gating signal so over-allocated styles
+                # (where committed > stock → ats negative) are correctly excluded.
+                # Combined with wh > 0 to make sure we're not picking up overseas-only.
+                return wh > 0 and ats >= threshold
+            if ats_scope == 'overseas':
+                return inc >= threshold
+            # 'both' = combined available (WH + incoming, net of deductions = total_ats)
+            return ats >= threshold
+        out = [s for s in out if _passes(s)]
+
+    return out
 
 def _ai_build_selling_context(customer, season_filter=None, sheet_filter=None):
     """Build selling-data context for the prompt. If season_filter is supplied,
@@ -5482,11 +5507,15 @@ def ai_suggestions_estimate():
         sheet_filter   = req.get('sheet') or None
         target_brands  = req.get('brands') or None
         ats_source     = req.get('ats_source', 'all')
+        ats_only       = bool(req.get('ats_only', False))
+        ats_min        = int(req.get('ats_min', 0) or 0)
+        ats_scope      = req.get('ats_scope', 'both')
         rec_count      = int(req.get('count', 10))
         mode           = req.get('mode', 'add_only')  # add_only | drop_only | both
 
         sheets = _ai_build_selling_context(customer, season, sheet_filter)
-        inv    = _ai_build_inventory_context(ats_source, target_brands)
+        inv    = _ai_build_inventory_context(ats_source, target_brands,
+                                              ats_only=ats_only, ats_min=ats_min, ats_scope=ats_scope)
         # Same sort + cap as the live endpoint so the estimate matches reality.
         inv.sort(key=lambda s: (-(s.get('total_ats',0)), 0 if s.get('in_current_pipeline') else 1))
         inv = inv[:1500]
@@ -5539,6 +5568,9 @@ def ai_suggestions():
         sheet_filter   = req.get('sheet') or None
         target_brands  = req.get('brands') or None
         ats_source     = req.get('ats_source', 'all')
+        ats_only       = bool(req.get('ats_only', False))
+        ats_min        = int(req.get('ats_min', 0) or 0)
+        ats_scope      = req.get('ats_scope', 'both')
         rec_count      = max(1, min(50, int(req.get('count', 10))))   # clamp 1..50
         mode           = req.get('mode', 'add_only')
         target_season  = (req.get('target_season') or season or 'fall').lower()
@@ -5547,7 +5579,8 @@ def ai_suggestions():
         sheets = _ai_build_selling_context(customer, season, sheet_filter)
         if not sheets:
             return jsonify({'error': 'No selling data matched the season/sheet filter'}), 404
-        inv = _ai_build_inventory_context(ats_source, target_brands)
+        inv = _ai_build_inventory_context(ats_source, target_brands,
+                                          ats_only=ats_only, ats_min=ats_min, ats_scope=ats_scope)
         # Cap to keep token cost bounded. With 'all_styles_ever' we can have several
         # thousand styles in the override DB — sort by current ATS then by whether the
         # style is in the current pipeline, so live stock surfaces first but discontinued
@@ -5555,7 +5588,8 @@ def ai_suggestions():
         inv.sort(key=lambda s: (-(s.get('total_ats',0)), 0 if s.get('in_current_pipeline') else 1))
         inv = inv[:1500]
         if not inv:
-            return jsonify({'error': 'No inventory styles match the filters'}), 404
+            return jsonify({'error': 'No inventory styles match the filters. '
+                            'Try widening the ATS minimum or switching scope.'}), 404
 
         # ── Serialize for the prompt ──
         # Selling data: compact "SKU | LABEL | brand | description" lines grouped by sheet.
@@ -5658,39 +5692,45 @@ def ai_suggestions():
             "You are an elite senior apparel buyer and merchandiser working at a private-label "
             "manufacturer that sells to major US retailers. You have 20 years of experience reading "
             "selling data and translating it into next-season production bets.\n\n"
-            "You are RIGOROUS. You don't reason from one data point. You distinguish coincidence from "
-            "pattern. You separate 'color won' from 'style won' from 'brand won' — three different "
-            "explanations for the same selling result that imply three different next bets.\n\n"
+            "You are RIGOROUS. You don't reason from one data point. You distinguish coincidence "
+            "from pattern. You separate 'color won' from 'fabric won' from 'print style won' from "
+            "'fit won' from 'brand won' — five different explanations for the same selling result "
+            "that imply five different next bets.\n\n"
+            "Your most valuable skill is CROSS-BRAND PATTERN TRANSFER. When you see a pattern win "
+            "in one brand, your job is to ask: 'is this pattern brand-specific (works because of "
+            "the brand's cachet/customer base) or is it attribute-driven (works because the print, "
+            "color, fit, or fabric is genuinely on-trend)?' The latter type of pattern transfers — "
+            "a geometric print that won under Nautica likely has legs under Jones New York or "
+            "Eddie Bauer because the print itself, not the badge, drove the sale. This is the "
+            "main way you generate non-obvious recommendations.\n\n"
             "Hard rules you NEVER break:\n"
-            "1. You ONLY recommend styles that appear verbatim in the ELIGIBLE STYLES list provided. "
-            "Never invent a style code. If you can't find a style in the list that fits, return fewer "
-            "recommendations rather than hallucinating one.\n"
-            "2. Every recommendation MUST include a `rationale` of 2-4 sentences that names a specific "
-            "pattern AND points to specific evidence. Generic rationales like 'this color sold well' "
-            "are not acceptable — say WHICH selling SKUs, in WHICH sheets, and WHY the pattern projects "
-            "onto your pick.\n"
-            "3. Every recommendation MUST include `referenced_sellers` — 1 to 4 actual SKUs from the "
-            "selling data that justify it. If you can't cite at least one, drop the recommendation.\n"
-            "4. Strength levels must be calibrated honestly. A 'Strong' rec needs 2+ supporting "
-            "patterns or 3+ consistent sellers. A pick supported by one BEST seller is at most Medium. "
-            "Don't inflate.\n"
+            "1. You ONLY recommend styles that appear verbatim in the ELIGIBLE STYLES list. Never "
+            "   invent a style code.\n"
+            "2. You MUST return the exact count requested. If you can't find that many high-"
+            "   conviction picks, fill the remainder with HONEST Trial-strength picks and say so "
+            "   in the rationale ('Trial because the pattern signal is thin, but XYZ suggests it's "
+            "   worth a small bet'). Never undershoot the count.\n"
+            "3. Every recommendation MUST include a `rationale` of 2-4 sentences that names a "
+            "   specific pattern AND cites the evidence. Say WHICH selling SKUs and WHY the "
+            "   pattern projects onto your pick. If you're doing cross-brand transfer, name BOTH "
+            "   the source brand (where the pattern won) and your reasoning for the transfer.\n"
+            "4. Every recommendation MUST include `referenced_sellers` — 1 to 4 actual SKUs from "
+            "   the selling data that justify it. If you can't cite at least one, drop that pick "
+            "   and find another (but still hit the count).\n"
+            "5. DIVERSITY IS MANDATORY. No more than 2 picks from the same color family (e.g. at "
+            "   most 2 white solids in the whole 'add' list). No more than 3 picks from the same "
+            "   brand. Spread your bets across brands, color families, fabrics, and fits.\n"
+            "6. Strength levels must be calibrated honestly. 'Strong' = 2+ supporting patterns or "
+            "   3+ consistent sellers AND attribute-level (not just brand-level) signal. 'Medium' "
+            "   = one solid pattern. 'Trial' = thin signal but worth testing. Don't inflate.\n"
         )
 
         user_prompt = (
             f"# CUSTOMER: {customer}\n"
             f"# BOOKING FOR: {target_season.upper()} {datetime.utcnow().year + (1 if datetime.utcnow().month >= 7 else 0)}\n"
             f"# MODE: {mode}\n"
-            f"# Strength levels (ADD): {strength_labels_add}\n"
-            f"# Strength levels (DROP): {strength_labels_drop}\n\n"
-            f"## HISTORICAL SELLING DATA (chronological)\n"
-            f"{selling_block}\n\n"
-            f"{recurrence_block}\n\n" if recurrence_block else f"## HISTORICAL SELLING DATA (chronological)\n{selling_block}\n\n"
-        )
-        # The conditional above is gnarly; rebuild cleanly:
-        user_prompt = (
-            f"# CUSTOMER: {customer}\n"
-            f"# BOOKING FOR: {target_season.upper()} {datetime.utcnow().year + (1 if datetime.utcnow().month >= 7 else 0)}\n"
-            f"# MODE: {mode}\n"
+            f"# REQUESTED COUNT: {rec_count} {'add' if mode != 'drop_only' else 'drop'}"
+            + (f" AND {rec_count} drop" if mode == 'both' else "") + " recommendation(s) — return EXACTLY this count.\n"
             f"# Strength levels (ADD): {strength_labels_add}\n"
             f"# Strength levels (DROP): {strength_labels_drop}\n\n"
             f"## HISTORICAL SELLING DATA (chronological)\n"
@@ -5700,27 +5740,41 @@ def ai_suggestions():
             + f"## TASK\n"
             + f"{mode_instr}\n\n"
             + "## REASONING METHOD (apply explicitly, in order):\n"
-            + "1. **Identify PATTERNS, not points.** A pattern needs at least 2 supporting data points. "
-            + "Look at the recurrence table first: same SKU labeled BEST in multiple sheets is the "
-            + "strongest signal. Single-sheet BESTs are weaker.\n"
-            + "2. **Isolate the WINNING ATTRIBUTE.** When a style sold well, was it the color, the "
-            + "ground, the print, the fabric weight, the fit, or the brand? Be specific. E.g. "
-            + "'multiple DKNY navy-ground fancies won' is sharper than 'DKNY won'.\n"
-            + "3. **Check for LOSERS that match your would-be ADDs.** If you're about to recommend a "
-            + "white solid because one white solid won, but two other white solids lost, that's a "
-            + "negative signal — downgrade or drop the pick.\n"
-            + "4. **Apply SEASON FIT for the target booking season.** Target is "
-            + f"{target_season.upper()}. Fall/Winter favors heavier weights, deeper grounds (navy, "
-            + "wine, hunter, charcoal), warmer prints. Spring/Summer favors lighter weights, brighter "
-            + "grounds (white, sky, sage, coral), fresher prints. A navy that won in Spring still "
-            + "translates to Fall, but a coral that won in Spring does NOT translate to Fall.\n"
-            + "5. **Prefer pipeline styles (pipeline:YES) over revival styles (pipeline:NO) when "
-            + "patterns are roughly equal.** A revival pick should require a noticeably stronger "
-            + "supporting pattern than a pipeline pick, because there's a manufacturing setup cost.\n"
-            + "6. **Diversify.** Don't recommend 10 white solids. Spread across brands and "
-            + "color/fabric families that the data supports.\n"
-            + "7. **Be honest about uncertainty.** If the data doesn't support a confident pick, use "
-            + "Trial. If the data is too sparse for a confident answer, return fewer recs.\n\n"
+            + "1. **Identify PATTERNS at the ATTRIBUTE level, not the SKU level.** When a style "
+            + "wins, ask: was it the COLOR (e.g. navy ground), the PRINT TYPE (e.g. small geometric "
+            + "check, gingham, stripe), the FABRIC (e.g. yarn-dye dobby, tc stretch, jersey knit), "
+            + "the FIT (e.g. slim long-sleeve), or the BRAND? Most patterns mix several of these. "
+            + "Tag each winning pattern with its dominant attribute(s).\n"
+            + "2. **Classify each pattern as TRANSFERABLE or BRAND-SPECIFIC.** Attribute-level "
+            + "patterns (a print style, a fabric weight, a fit silhouette) generally TRANSFER "
+            + "across brands. Brand-cachet patterns (a specific brand's customer loyalty for solid "
+            + "colors, for example) DON'T transfer. Examples:\n"
+            + "   • 'Small navy gingham checks win across all brands tested' → TRANSFERABLE\n"
+            + "   • 'White solids in DKNY specifically' → BRAND-SPECIFIC (DKNY's brand pulls customers)\n"
+            + "   • 'Geometric prints in Nautica' → likely TRANSFERABLE if the pattern is the draw\n"
+            + "3. **CROSS-BRAND TRANSFER IS A PRIMARY TOOL.** When you have a transferable winning "
+            + "pattern (geometric print, navy ground, slim fit, yarn-dye, etc.) and you find styles "
+            + "in OTHER brands with the same attribute profile, those are some of your strongest "
+            + "picks. Make at least 30% of your recommendations cross-brand transfers — meaning "
+            + "the rationale should explicitly say 'this pattern won in Brand X, transferring to "
+            + "this Brand Y style because [reason transfer is justified].'\n"
+            + "4. **Check for LOSERS that share the same attributes as your would-be ADDs.** If a "
+            + "white solid won in one brand but white solids lost in two others, that's a "
+            + "negative-transfer signal — that pattern is brand-specific, not transferable.\n"
+            + "5. **Apply SEASON FIT for the target booking season.** Target is "
+            + f"{target_season.upper()}. Fall/Winter favors heavier fabrics, deeper grounds "
+            + "(navy, wine, hunter, charcoal), warmer prints. Spring/Summer favors lighter "
+            + "weights, brighter grounds (white, sky, sage, coral), fresher prints. A navy that "
+            + "won in Spring still translates to Fall, but a coral that won in Spring does NOT "
+            + "translate to Fall.\n"
+            + "6. **Prefer pipeline styles (pipeline:YES) over revival styles (pipeline:NO) when "
+            + "patterns are roughly equal.** Revivals require noticeably stronger patterns because "
+            + "of manufacturing setup cost.\n"
+            + "7. **HIT THE COUNT WITH DIVERSITY.** You MUST return exactly the requested count. "
+            + "No more than 2 picks from the same color family in 'add'. No more than 3 picks "
+            + "from the same brand. If your strong-pattern shortlist runs out, fill with "
+            + "honest Trial-strength cross-brand transfers — the diversity rule overrides the "
+            + "conviction rule when those two conflict.\n\n"
             + "## OUTPUT FORMAT\n"
             + "Respond as STRICT JSON only — no markdown, no fences, no prose outside the JSON. "
             + "Exact shape:\n"
@@ -5956,30 +6010,131 @@ def _aggregate_orders_by_style(ross_orders):
 def _enrich_open_orders_with_inventory(open_styles):
     """For each open-order style, look up color/fabric/fit from the style overrides
     DB and current inventory feed. The AI needs that metadata to apply the
-    selling-pattern logic — without color/fabric info it can't reason about why
-    a style will or won't sell."""
+    selling-pattern logic.
+
+    Lookup chain for each style:
+      1. Live inventoryData (current stock feed) — direct base-style key
+      2. Live inventoryData — any size-variant match (size suffix stripped both sides)
+      3. style_overrides DB — direct lookup
+      4. style_overrides DB — case-insensitive scan as fallback
+      5. SKU-derived signals — brand abbr from positions 2-4, fit code via
+         _py_extract_fit_code, fabric code from positions 4-6, category via
+         _py_get_item_category. ALL styles will get at least these, since they're
+         derived purely from the SKU string.
+
+    The result: NO style is ever skipped for "missing color/fabric data". Worst
+    case the AI gets a style with empty color but a derived fit/fabric/category
+    from the SKU code, which is still enough to apply pattern logic.
+    """
     with _inv_lock:
         items_snap = list(_inventory['items'])
     with _overrides_lock:
         overrides_snap = dict(_style_overrides)
 
+    # Build inventoryData lookups: direct + size-stripped + case-folded
     inv_by_style = {}
     for it in items_snap:
         base = (it.get('sku') or '').split('-')[0].upper()
         if base and base not in inv_by_style:
             inv_by_style[base] = it
+    # Case-insensitive override map so a style code with unexpected casing still hits
+    overrides_ci = { (k or '').upper(): v for k, v in overrides_snap.items() if isinstance(v, dict) }
+
+    # SKU brand-code → full brand abbr map. Mirrors the frontend SKU_BRAND_CODE_MAP
+    # so e.g. 'DK' → 'DKNY', 'CH' → 'CHAPS', 'GB' → 'BEENE'. Without this we'd just
+    # show the 2-char code which is uninformative.
+    sku_brand_code_map = {
+        'NA': 'NAUTICA', 'DK': 'DKNY', 'EB': 'EB', 'RB': 'REEBOK', 'VC': 'VINCE',
+        'BE': 'BEN', 'US': 'USPA', 'CH': 'CHAPS', 'LB': 'LUCKY', 'JN': 'JNY',
+        'GB': 'BEENE', 'NM': 'NICOLE', 'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN',
+        'VD': 'VD', 'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
+        'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE',
+    }
 
     for s in open_styles:
-        base = s['style']
-        inv = inv_by_style.get(base, {})
-        ov = overrides_snap.get(base) or {}
+        base = (s['style'] or '').upper()
+        if not base:
+            continue
+
+        # 1. Direct inventory hit
+        inv = inv_by_style.get(base, {}) or {}
+        # 2. Override DB (direct + case-insensitive fallback)
+        ov = overrides_snap.get(base) or overrides_ci.get(base) or {}
         if not isinstance(ov, dict):
             ov = {}
-        s['brand_abbr'] = (inv.get('brand_abbr') or inv.get('brand') or '').upper()
-        s['brand_full'] = inv.get('brand_full', s['brand_abbr'])
-        s['color']  = ov.get('color')  or inv.get('color')        or ''
-        s['fabric'] = ov.get('fabric') or inv.get('fabrication')  or ''
-        s['fit']    = ov.get('fit')    or inv.get('fit')          or ''
+
+        # Brand: prefer live inventory, then override 'brand', then SKU-derived
+        brand_abbr = (inv.get('brand_abbr') or inv.get('brand') or ov.get('brand') or '').upper()
+        if not brand_abbr and len(base) >= 4:
+            # Brand code lives at positions 2-3 of the base SKU (after the 2-char customer code).
+            # Example: TJDKTS006 → customer=TJ, brand=DK → DKNY
+            brand_code = base[2:4]
+            brand_abbr = sku_brand_code_map.get(brand_code, brand_code)
+        s['brand_abbr'] = brand_abbr
+        s['brand_full'] = inv.get('brand_full', '') or BRAND_FULL_NAMES.get(brand_abbr, brand_abbr)
+
+        # Color/fabric/fit: prefer override (cleanest data), then live inventory,
+        # then SKU-derived for fit/fabric (color can't be derived from SKU codes).
+        s['color']  = (ov.get('color')  or inv.get('color')        or '').strip()
+        s['fabric'] = (ov.get('fabric') or inv.get('fabrication')  or '').strip()
+        s['fit']    = (ov.get('fit')    or inv.get('fit')          or '').strip()
+
+        # Fallback fit: extract from SKU positions per _py_extract_fit_code rules.
+        # Example: ROCHYD166SLD → fit code 'SL' (slim sleeve / long sleeve marker).
+        if not s['fit']:
+            try:
+                fit_code = _py_extract_fit_code(s['style'])
+                if fit_code:
+                    # Friendly labels for the common fit codes — gives the AI
+                    # something readable rather than just a 2-letter abbrev.
+                    fit_friendly = {
+                        'SL': 'Slim/Long Sleeve', 'RF': 'Regular Fit',
+                        'TF': 'Trim Fit', 'MF': 'Modern Fit',
+                        'BT': 'Big & Tall', 'BB': 'Big & Tall', 'TT': 'Tall',
+                        'SS': 'Short Sleeve', 'SR': 'Short Sleeve Regular',
+                        'SB': 'Short Sleeve B&T', 'ST': 'Short Sleeve Tall',
+                    }
+                    s['fit'] = fit_friendly.get(fit_code, fit_code)
+            except Exception:
+                pass
+
+        # Fallback fabric: derive from SKU positions 4-6 (fabric code). These codes
+        # are documented in _PY_SPORTSWEAR_FABRICS and _PY_YM_FABRIC_CODES — they tell
+        # us whether it's a polo (PH/PJ/PO/PW), tee (TH), heather (HE), woven dress
+        # shirt, etc. Better than empty.
+        if not s['fabric'] and len(base) >= 6:
+            fab_code = base[4:6]
+            fab_friendly = {
+                'PH': 'Pique (Polo)', 'PJ': 'Pique Jersey', 'PL': 'Pique LS',
+                'PO': 'Pique Open', 'PW': 'Pique Woven', 'TH': 'Tee Heather',
+                'HE': 'Heather', 'KN': 'Knit', 'WT': 'Woven Tee',
+                'SD': 'Soft Dobby', 'SF': 'Soft Fabric',
+                'YD': 'Yarn Dye', 'PT': 'Print/Pattern', 'TS': 'TC Stretch',
+                'PK': 'Polyester Knit', 'FT': 'Flax Stretch',
+                'BC': 'Carpenter Bottom', 'BR': 'Ripstop Bottom',
+                'BH': 'Heavy Bottom', 'BA': 'Pinstripe Bottom',
+            }
+            if fab_code in fab_friendly:
+                s['fabric'] = fab_friendly[fab_code]
+            elif fab_code:
+                s['fabric'] = fab_code   # at minimum, expose the code
+
+        # Category — derived from SKU position rules; tells AI if it's pants/
+        # sportswear/short-sleeve/long-sleeve/young men/big&tall. Always available.
+        try:
+            s['category'] = _py_get_item_category(s['style'], brand_abbr) or ''
+        except Exception:
+            s['category'] = ''
+
+        # Source flag — tells the AI (and the UI) how much real metadata we had
+        # vs how much was inferred from the SKU code. Useful for confidence.
+        if ov.get('color') or inv.get('color'):
+            s['_metadata_source'] = 'override' if ov.get('color') else 'inventory'
+        elif s['fabric'] or s['fit']:
+            s['_metadata_source'] = 'sku_derived'
+        else:
+            s['_metadata_source'] = 'minimal'
+
     return open_styles
 
 @app.route('/ai-open-order-predictions/preview', methods=['GET', 'POST', 'OPTIONS'])
@@ -5996,7 +6151,10 @@ def ai_open_order_predictions_preview():
         styles = _enrich_open_orders_with_inventory(styles)
         # Filter out styles with no useful metadata — they'd be unhelpful for the AI
         # AND inflate cost. Still surface a count so the user knows.
-        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
+        # No filtering — every style gets analyzed. The enricher always fills in at least
+        # category/fit/fabric from SKU codes, so the AI always has something to reason from.
+        analyzable = styles
+        skipped_no_metadata_list = []
         # Token estimate (rough): ~80 chars per style row in the prompt, plus
         # the selling-data block (variable). We compute a generous in/out so the
         # UI shows a high-water mark.
@@ -6031,7 +6189,10 @@ def ai_open_order_predictions_estimate():
         ross = _ross_open_orders(raw)
         styles = _aggregate_orders_by_style(ross)
         styles = _enrich_open_orders_with_inventory(styles)
-        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
+        # No filtering — every style gets analyzed. The enricher always fills in at least
+        # category/fit/fabric from SKU codes, so the AI always has something to reason from.
+        analyzable = styles
+        skipped_no_metadata_list = []
 
         # Char-count heuristic same as the recommendations estimate.
         selling_chars = sum(
@@ -6094,11 +6255,14 @@ def ai_open_order_predictions():
         ross = _ross_open_orders(raw)
         styles = _aggregate_orders_by_style(ross)
         styles = _enrich_open_orders_with_inventory(styles)
-        analyzable = [s for s in styles if s.get('color') or s.get('fabric')]
-        skipped    = [s for s in styles if not (s.get('color') or s.get('fabric'))]
+        # No filtering — every style gets analyzed. The enricher always fills in at least
+        # category/fit/fabric from SKU codes, so the AI always has something to reason from.
+        analyzable = styles
+        skipped_no_metadata_list = []
+        skipped = []  # kept as empty list for backward-compat response shape
         if not analyzable:
-            return jsonify({'error': f'Found {len(ross)} Ross open orders but none have '
-                           f'color/fabric metadata for the AI to reason from.'}), 404
+            return jsonify({'error': f'Found {len(ross)} Ross open orders but none had '
+                           f'parseable style codes.'}), 404
 
         # ── Serialize selling data + recurrence table (same structure as Add/Drop endpoint) ──
         from collections import defaultdict
@@ -6160,16 +6324,23 @@ def ai_open_order_predictions():
         # Each row now includes the EARLIEST ship date + the season it ships into,
         # so the AI can match historical windows to the order's ship timing.
         open_lines = ['## ROSS OPEN ORDERS (must produce exactly one verdict per row, no skipping)',
-                      '## Fields: style | brand | color | fabric | fit | qty | value | SHIP_DATE | SHIP_SEASON | POs',
+                      '## Fields: style | brand | color | fabric | fit | category | qty | value | SHIP_DATE | SHIP_SEASON | DATA_SOURCE | POs',
                       '## SHIP_SEASON is the season the goods will land on the floor — match historical windows from this season heavily.',
-                      '## SHIP_SEASON = "unknown" means no ship date was provided; use full history without season weighting for that style.']
+                      '## SHIP_SEASON = "unknown" means no ship date was provided; use full history without season weighting for that style.',
+                      '## DATA_SOURCE tells you how much real metadata we have:',
+                      '##   "override"      = clean color/fabric from our style database (most reliable)',
+                      '##   "inventory"     = pulled from current inventory feed (still good)',
+                      '##   "sku_derived"   = no color stored, but fit/fabric inferred from SKU position codes (lower confidence)',
+                      '##   "minimal"       = only the SKU itself + derived brand/category (lowest confidence — predict from category + brand patterns)']
         for s in analyzable:
             open_lines.append(
-                f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','')} | "
-                f"{s.get('fabric','')} | {s.get('fit','')} | "
+                f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','') or '(no color stored)'} | "
+                f"{s.get('fabric','') or '(no fabric)'} | {s.get('fit','') or '(no fit)'} | "
+                f"{s.get('category','')} | "
                 f"qty:{s['total_qty']} | ${s['total_value']:.0f} | "
                 f"SHIP:{s.get('ship_date_str','no_date')} | "
                 f"SEASON:{s.get('ship_season','unknown')} | "
+                f"SRC:{s.get('_metadata_source','minimal')} | "
                 f"PO:{','.join(s['pos'][:4])}{'+more' if len(s['pos']) > 4 else ''}"
             )
         open_block = '\n'.join(open_lines)
@@ -6211,10 +6382,19 @@ def ai_open_order_predictions():
             "      different season. Use as secondary context only.\n"
             "5. If SHIP_SEASON is 'unknown' for a style, that means no ship date was provided. Use "
             "   the full history without season weighting and lower confidence by one level.\n"
-            "6. Calibrate confidence honestly. 'high' = same-season evidence from 2+ matching "
-            "   patterns or same-SKU history. 'medium' = some same-season evidence OR strong "
-            "   cross-season patterns. 'low' = thin or absent same-season evidence.\n"
-            "7. You are PREDICTING SELLING, not recommending action. Do not suggest cancellations, "
+            "6. DATA_SOURCE affects how you reason, NOT whether you predict. Every style gets a "
+            "   verdict, even DATA_SOURCE='minimal' ones. For minimal/sku_derived styles:\n"
+            "   • Use BRAND + CATEGORY + FIT patterns from the historical data (e.g. 'DKNY slim-fit "
+            "     long-sleeve fancies in Fall windows consistently won').\n"
+            "   • The SKU code itself encodes information — first 2 chars = customer, chars 2-4 = "
+            "     brand, chars 4-6 = fabric code (yarn dye=YD, pique=PH, dobby=SD, etc.).\n"
+            "   • Lower confidence by one level relative to the same call made with full color "
+            "     data — 'minimal' rarely earns 'high' confidence.\n"
+            "7. Calibrate confidence honestly. 'high' = rich metadata + same-season evidence from "
+            "   2+ matching patterns or same-SKU history. 'medium' = some same-season evidence OR "
+            "   strong cross-season patterns. 'low' = thin or absent same-season evidence, or "
+            "   minimal metadata.\n"
+            "8. You are PREDICTING SELLING, not recommending action. Do not suggest cancellations, "
             "   reductions, or replacements. Just forecast.\n"
         )
 
