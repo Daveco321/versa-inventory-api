@@ -5119,6 +5119,405 @@ def refresh_selling_data_endpoint(customer):
     return jsonify({'ok': False, 'error': 'Refresh failed (see server logs)'}), 502
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI BOOKING SUGGESTIONS  (Phase 2)
+# Takes selling data for one customer/season + inventory color descriptions
+# and asks Claude Opus to recommend styles to add/drop for the upcoming season.
+# Returns structured recommendations the frontend can render as image tiles.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY = (os.environ.get('ANTHROPIC_API_KEY')
+                     or os.environ.get('CLAUDE_API_KEY', ''))
+# Pricing for cost-estimate display. Pulled from anthropic.com/pricing for Opus.
+# These are per-million-token rates and may drift — used only for the UI estimate,
+# not for billing. Override via env if Anthropic raises prices.
+AI_OPUS_INPUT_PER_MTOK  = float(os.environ.get('AI_OPUS_INPUT_PER_MTOK',  15.0))
+AI_OPUS_OUTPUT_PER_MTOK = float(os.environ.get('AI_OPUS_OUTPUT_PER_MTOK', 75.0))
+AI_OPUS_MODEL = os.environ.get('AI_OPUS_MODEL', 'claude-opus-4-5')
+
+def _ai_season_from_sheet(sheet_name):
+    """Same auto-mapping as the frontend's _sellingInferSeason. Kept here so the
+    backend can pre-filter sheets by season if the request asks for it."""
+    s = (sheet_name or '').lower()
+    if 'fall'   in s: return 'fall'
+    if 'winter' in s: return 'winter'
+    if 'spring' in s: return 'spring'
+    if 'summer' in s: return 'summer'
+    m = re.match(r'^(\d{1,2})[.\-/](\d{1,2})', s)
+    if m:
+        month = int(m.group(1))
+        if 9 <= month <= 11: return 'fall'
+        if month == 12 or month <= 2: return 'winter'
+        if 3 <= month <= 5: return 'spring'
+        if 6 <= month <= 8: return 'summer'
+    return 'unknown'
+
+def _ai_build_inventory_context(ats_source='all', target_brands=None):
+    """Build a compact text block listing current inventory styles with their
+    color descriptions. The AI picks recommendations from this list — it can ONLY
+    recommend styles you actually have inventory for, so this is the source of truth.
+
+    ats_source: 'all' = any style with inventory or incoming; 'warehouse_only' =
+                styles with on-hand warehouse stock (excludes incoming-only).
+    target_brands: optional list of brand abbreviations to limit to; default = all.
+
+    Returns a list of dicts (one per style) — the caller serializes for the prompt.
+    """
+    with _inv_lock:
+        items_snap = list(_inventory['items'])
+    with _overrides_lock:
+        overrides_snap = dict(_style_overrides)
+
+    # Dedupe by base style (one row per style, regardless of size variants)
+    by_style = {}
+    for it in items_snap:
+        sku = it.get('sku', '')
+        base = sku.split('-')[0].upper()
+        if not base:
+            continue
+        brand_abbr = (it.get('brand_abbr') or it.get('brand') or '').upper()
+        if target_brands and brand_abbr not in target_brands:
+            continue
+
+        wh = (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0))
+        inc = it.get('incoming', 0)
+        if ats_source == 'warehouse_only' and wh <= 0:
+            continue
+        if ats_source == 'all' and (wh + inc) <= 0:
+            continue
+
+        # Color/description from style override if present, else from raw item
+        ov = overrides_snap.get(base, {})
+        color = ov.get('color') or it.get('color') or ''
+        fabric = ov.get('fabric') or it.get('fabrication') or ''
+        fit = ov.get('fit') or it.get('fit') or ''
+
+        # Keep the highest-stock variant per base style (most representative)
+        prev = by_style.get(base)
+        if prev and (prev['total_warehouse'] + prev['incoming']) > (wh + inc):
+            continue
+        by_style[base] = {
+            'style': base,
+            'brand_abbr': brand_abbr,
+            'brand_full': it.get('brand_full', brand_abbr),
+            'color': color,
+            'fabric': fabric,
+            'fit': fit,
+            'total_warehouse': wh,
+            'incoming': inc,
+            'total_ats': it.get('total_ats', 0),
+        }
+    return list(by_style.values())
+
+def _ai_build_selling_context(customer, season_filter=None, sheet_filter=None):
+    """Build selling-data context for the prompt. If season_filter is supplied,
+    only includes sheets matching that season. If sheet_filter is supplied, only
+    that specific sheet. Otherwise, all sheets.
+
+    Returns: { 'sheets': [{name, season, rows: [{sku, label, brand, type, description}]}] }
+    """
+    key = customer.lower()
+    if key not in _selling_cache:
+        refresh_selling_data(customer)
+    data = _selling_cache.get(key, {})
+    sheets_out = []
+    for sh in data.get('sheets', []):
+        season = _ai_season_from_sheet(sh['name'])
+        if sheet_filter and sh['name'] != sheet_filter:
+            continue
+        if season_filter and season_filter != 'all' and season != season_filter:
+            continue
+        sheets_out.append({'name': sh['name'], 'season': season, 'rows': sh['rows']})
+    return sheets_out
+
+def _ai_estimate_tokens(selling_sheets, inventory_styles):
+    """Cheap token-count heuristic for the cost estimate UI. We use ~4 chars/token
+    as a rule of thumb. Doesn't need to be exact — it's a budgeting aid."""
+    # Rough char counts of what we'll serialize into the prompt
+    selling_chars = sum(
+        len(r.get('sku','')) + len(r.get('description','')) + len(r.get('label','')) + 20
+        for sh in selling_sheets for r in sh['rows']
+    ) + 200
+    inv_chars = sum(
+        len(s['style']) + len(s.get('color','')) + len(s.get('fabric','')) + len(s.get('fit','')) + 30
+        for s in inventory_styles
+    ) + 800  # system prompt + instructions
+    input_tokens = (selling_chars + inv_chars) // 4
+    # Output: assume 200 tokens per recommendation + 300 overhead
+    return input_tokens
+
+def _ai_estimate_cost(input_tokens, output_tokens):
+    """Convert token counts to USD estimate using the configured Opus rates."""
+    return (input_tokens  / 1_000_000) * AI_OPUS_INPUT_PER_MTOK + \
+           (output_tokens / 1_000_000) * AI_OPUS_OUTPUT_PER_MTOK
+
+@app.route('/ai-suggestions/estimate', methods=['POST', 'OPTIONS'])
+def ai_suggestions_estimate():
+    """Pre-call cost estimate. Same inputs as /ai-suggestions but doesn't call
+    the model — just returns the projected token + dollar cost so the UI can
+    show '~$0.62' before the user commits."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not configured on server'}), 500
+    try:
+        req = request.get_json(silent=True) or {}
+        customer       = req.get('customer', 'Ross')
+        season         = (req.get('season') or 'all').lower()
+        sheet_filter   = req.get('sheet') or None
+        target_brands  = req.get('brands') or None
+        ats_source     = req.get('ats_source', 'all')
+        rec_count      = int(req.get('count', 10))
+        mode           = req.get('mode', 'add_only')  # add_only | drop_only | both
+
+        sheets = _ai_build_selling_context(customer, season, sheet_filter)
+        inv    = _ai_build_inventory_context(ats_source, target_brands)
+        # Cap inventory list to top 800 styles by total ATS to keep tokens bounded.
+        # Otherwise a full inventory (~3000+ styles) would blow up cost on every click.
+        inv = sorted(inv, key=lambda s: -(s.get('total_ats',0)))[:800]
+
+        in_toks = _ai_estimate_tokens(sheets, inv)
+        # Output budget: scales with rec count; drop suggestions are roughly half-sized.
+        out_per_rec = 220
+        out_toks = rec_count * out_per_rec + (rec_count * 100 if mode == 'both' else 0) + 300
+        cost = _ai_estimate_cost(in_toks, out_toks)
+        return jsonify({
+            'input_tokens_est':  in_toks,
+            'output_tokens_est': out_toks,
+            'cost_usd_est': round(cost, 3),
+            'selling_rows': sum(len(s['rows']) for s in sheets),
+            'inventory_styles': len(inv),
+            'sheets_included': [s['name'] for s in sheets],
+            'model': AI_OPUS_MODEL,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/ai-suggestions', methods=['POST', 'OPTIONS'])
+def ai_suggestions():
+    """Generate booking recommendations from selling data using Claude Opus.
+
+    Request body:
+      customer:    'Ross' (str)
+      season:      'fall'|'winter'|'spring'|'summer'|'all' — which sheets to feed in
+      sheet:       optional specific sheet name (overrides season)
+      brands:      optional list of brand abbreviations to restrict recs to
+      ats_source:  'all' | 'warehouse_only' — which inventory styles are eligible
+      count:       number of recommendations to return (per direction)
+      mode:        'add_only' | 'drop_only' | 'both'
+      target_season: 'fall'|'winter'|'spring'|'summer' — the season being booked FOR
+                     (this is the recommendation target, season above is the historical filter)
+
+    Returns: { recommendations: { add: [...], drop: [...] }, usage: {...}, cost_usd: 0.XX }
+    Each rec: { style, brand, recommended_color, strength, rationale,
+                referenced_sellers: ['SKU1','SKU2'] }
+    """
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not configured on server. '
+                       'Add it under Render → Environment.'}), 500
+    try:
+        req = request.get_json(silent=True) or {}
+        customer       = req.get('customer', 'Ross')
+        season         = (req.get('season') or 'all').lower()
+        sheet_filter   = req.get('sheet') or None
+        target_brands  = req.get('brands') or None
+        ats_source     = req.get('ats_source', 'all')
+        rec_count      = max(1, min(50, int(req.get('count', 10))))   # clamp 1..50
+        mode           = req.get('mode', 'add_only')
+        target_season  = (req.get('target_season') or season or 'fall').lower()
+
+        # ── Gather context ──
+        sheets = _ai_build_selling_context(customer, season, sheet_filter)
+        if not sheets:
+            return jsonify({'error': 'No selling data matched the season/sheet filter'}), 404
+        inv = _ai_build_inventory_context(ats_source, target_brands)
+        inv = sorted(inv, key=lambda s: -(s.get('total_ats',0)))[:800]
+        if not inv:
+            return jsonify({'error': 'No inventory styles match the filters'}), 404
+
+        # ── Serialize for the prompt ──
+        # Selling data: compact "SKU | LABEL | brand | description" lines grouped by sheet
+        selling_lines = []
+        for sh in sheets:
+            selling_lines.append(f"\n## Sheet: {sh['name']}  (season: {sh['season']})")
+            for r in sh['rows']:
+                lbl = (r.get('label') or 'unknown').upper()
+                selling_lines.append(
+                    f"  [{lbl}] {r.get('sku','')} | {r.get('brand','')} | {r.get('description','')[:120]}"
+                )
+        selling_block = '\n'.join(selling_lines)
+
+        inv_lines = ['## Available inventory (style | brand | color | fabric | fit | WH stock | incoming)']
+        for s in inv:
+            inv_lines.append(
+                f"  {s['style']} | {s['brand_abbr']} | {s.get('color','')} | "
+                f"{s.get('fabric','')} | {s.get('fit','')} | "
+                f"WH:{s['total_warehouse']} | INC:{s['incoming']}"
+            )
+        inv_block = '\n'.join(inv_lines)
+
+        # ── Build the prompt ──
+        strength_labels = "Strong (high conviction, large quantity), Medium (solid, moderate quantity), Trial (worth testing, small quantity)"
+        if mode == 'add_only':
+            mode_instr = f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}."
+        elif mode == 'drop_only':
+            mode_instr = f"Recommend exactly {rec_count} styles to DROP or de-emphasize based on poor selling performance."
+        else:
+            mode_instr = f"Recommend exactly {rec_count} styles to ADD/BOOK for {target_season.upper()} {customer}, AND {rec_count} styles to DROP from current bookings based on poor selling."
+
+        system_prompt = (
+            "You are a senior buyer and merchandiser for Versa (a private-label apparel manufacturer). "
+            "Your job: analyze historical selling data from a retailer (best/okay/worst sellers per date) and "
+            "recommend which styles from current inventory should be booked for an upcoming season. "
+            "You can only recommend styles that appear in the AVAILABLE INVENTORY list — never invent SKUs. "
+            "Reason from patterns: what colors, fabrics, fits, and price-point families won at this retailer; "
+            "what consistently flopped; what changed across the seasons in the data."
+        )
+
+        user_prompt = (
+            f"# CUSTOMER: {customer}\n"
+            f"# BOOKING FOR: {target_season.upper()} season\n"
+            f"# MODE: {mode}\n"
+            f"# Strength levels you may use: {strength_labels}\n\n"
+            f"## HISTORICAL SELLING DATA\n"
+            f"{selling_block}\n\n"
+            f"{inv_block}\n\n"
+            f"## TASK\n"
+            f"{mode_instr}\n\n"
+            f"Reasoning approach:\n"
+            f"- Group sellers by pattern (e.g. 'navy ground fancies in DKNY consistently won', "
+            f"'white solids in Eddie Bauer consistently flopped').\n"
+            f"- Map those patterns onto the AVAILABLE INVENTORY list to pick specific styles.\n"
+            f"- Prefer styles whose color/fabric/fit echoes the winning patterns AND avoid those echoing losers.\n"
+            f"- For SEASON FIT: heavier fabrics and darker grounds skew Fall/Winter; lighter/brighter skews Spring/Summer.\n"
+            f"- Cite 1-3 specific selling SKUs that justify each recommendation in 'referenced_sellers'.\n\n"
+            f"Respond as STRICT JSON with this exact shape — no markdown, no prose outside the JSON:\n"
+            f"{{\n"
+            f"  \"add\": [\n"
+            f"    {{\n"
+            f"      \"style\": \"<base SKU from inventory list>\",\n"
+            f"      \"brand\": \"<brand abbr>\",\n"
+            f"      \"recommended_color\": \"<color/print description>\",\n"
+            f"      \"strength\": \"Strong\" | \"Medium\" | \"Trial\",\n"
+            f"      \"rationale\": \"<1-2 sentences why>\",\n"
+            f"      \"referenced_sellers\": [\"<SKU>\", \"<SKU>\"]\n"
+            f"    }}\n"
+            f"  ],\n"
+            f"  \"drop\": [ /* same shape; strength can be 'Cut', 'Reduce', or 'Watch' for drops */ ]\n"
+            f"}}\n"
+            f"If a section doesn't apply for this mode, return it as an empty array."
+        )
+
+        # ── Call Claude Opus ──
+        api_resp = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': AI_OPUS_MODEL,
+                'max_tokens': 8000,
+                'system': system_prompt,
+                'messages': [{'role': 'user', 'content': user_prompt}],
+            },
+            timeout=180
+        )
+        if api_resp.status_code != 200:
+            return jsonify({
+                'error': f'Anthropic API returned {api_resp.status_code}',
+                'detail': api_resp.text[:500]
+            }), 502
+
+        body = api_resp.json()
+        # Extract the assistant's text block
+        text_out = ''
+        for block in body.get('content', []):
+            if block.get('type') == 'text':
+                text_out += block.get('text', '')
+
+        # ── Parse JSON out of the response ──
+        # Be defensive: model may wrap in ```json fences despite instructions.
+        cleaned = text_out.strip()
+        if cleaned.startswith('```'):
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as je:
+            # Last-resort: try to grab the first {...} blob
+            m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    return jsonify({
+                        'error': 'Model returned unparseable JSON',
+                        'raw_response': text_out[:2000]
+                    }), 502
+            else:
+                return jsonify({
+                    'error': 'Model returned unparseable JSON',
+                    'raw_response': text_out[:2000]
+                }), 502
+
+        # ── Validate: every recommended style must exist in the inventory list ──
+        # The model sometimes hallucinates SKUs even with the instruction not to.
+        # We drop any rec whose style isn't in the eligible list and warn the UI.
+        valid_styles = {s['style']: s for s in inv}
+        def _filter(recs):
+            kept = []
+            dropped = []
+            for r in (recs or []):
+                style = (r.get('style') or '').upper().strip()
+                if style in valid_styles:
+                    # Enrich with the inventory data so the frontend can render image+ATS
+                    inv_data = valid_styles[style]
+                    r['style'] = style
+                    r['_inventory'] = {
+                        'brand_abbr': inv_data['brand_abbr'],
+                        'brand_full': inv_data['brand_full'],
+                        'color': inv_data.get('color',''),
+                        'total_warehouse': inv_data['total_warehouse'],
+                        'incoming': inv_data['incoming'],
+                        'total_ats': inv_data['total_ats'],
+                    }
+                    kept.append(r)
+                else:
+                    dropped.append(style)
+            return kept, dropped
+
+        add_recs, add_dropped = _filter(parsed.get('add', []))
+        drop_recs, drop_dropped = _filter(parsed.get('drop', []))
+
+        usage = body.get('usage', {})
+        in_t  = usage.get('input_tokens', 0)
+        out_t = usage.get('output_tokens', 0)
+        cost  = _ai_estimate_cost(in_t, out_t)
+
+        return jsonify({
+            'recommendations': {'add': add_recs, 'drop': drop_recs},
+            'usage': {'input_tokens': in_t, 'output_tokens': out_t},
+            'cost_usd': round(cost, 4),
+            'model': AI_OPUS_MODEL,
+            'invalid_styles_dropped': add_dropped + drop_dropped,
+            'context': {
+                'customer': customer,
+                'season': season,
+                'target_season': target_season,
+                'sheets_used': [s['name'] for s in sheets],
+                'inventory_styles_offered': len(inv),
+            }
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
