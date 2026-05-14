@@ -5804,9 +5804,65 @@ def ai_suggestions():
             },
             json={
                 'model': AI_OPUS_MODEL,
-                'max_tokens': 12000,   # longer rationales + recurrence-table reasoning needs headroom
+                'max_tokens': 16000,
                 'system': system_prompt,
                 'messages': [{'role': 'user', 'content': user_prompt}],
+                # ── Tool use forces structured output ──
+                # Instead of "please return JSON" (which is fragile — model can wrap
+                # in code fences, add prose, embed JS comments from our prompt example),
+                # we define a tool with a strict JSON schema and force the model to
+                # call it. The model's response then comes back as a tool_use block
+                # with `input` already parsed into a dict — no string parsing required.
+                'tools': [{
+                    'name': 'submit_recommendations',
+                    'description': 'Submit booking add and drop recommendations.',
+                    'input_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'add': {
+                                'type': 'array',
+                                'description': 'Styles to add/book for next season.',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'style': {'type': 'string', 'description': 'Base style code from ELIGIBLE STYLES list, verbatim'},
+                                        'brand': {'type': 'string'},
+                                        'recommended_color': {'type': 'string'},
+                                        'strength': {'type': 'string', 'enum': ['Strong', 'Medium', 'Trial']},
+                                        'rationale': {'type': 'string', 'description': '2-4 sentences naming the pattern and evidence'},
+                                        'referenced_sellers': {
+                                            'type': 'array',
+                                            'items': {'type': 'string'},
+                                            'description': '1-4 SKUs from selling data that justify this pick'
+                                        }
+                                    },
+                                    'required': ['style', 'brand', 'recommended_color', 'strength', 'rationale', 'referenced_sellers']
+                                }
+                            },
+                            'drop': {
+                                'type': 'array',
+                                'description': 'Styles to drop/reduce from current bookings.',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'style': {'type': 'string'},
+                                        'brand': {'type': 'string'},
+                                        'recommended_color': {'type': 'string'},
+                                        'strength': {'type': 'string', 'enum': ['Cut', 'Reduce', 'Watch']},
+                                        'rationale': {'type': 'string'},
+                                        'referenced_sellers': {
+                                            'type': 'array',
+                                            'items': {'type': 'string'}
+                                        }
+                                    },
+                                    'required': ['style', 'brand', 'recommended_color', 'strength', 'rationale', 'referenced_sellers']
+                                }
+                            }
+                        },
+                        'required': ['add', 'drop']
+                    }
+                }],
+                'tool_choice': {'type': 'tool', 'name': 'submit_recommendations'},
             },
             timeout=180
         )
@@ -5817,36 +5873,21 @@ def ai_suggestions():
             }), 502
 
         body = api_resp.json()
-        # Extract the assistant's text block
-        text_out = ''
+        # ── Extract the tool_use block ──
+        # With tool_choice forcing our tool, the model's response is a single
+        # tool_use content block whose `input` is the already-parsed JSON dict.
+        # No string parsing, no fence stripping, no JSON decode errors.
+        parsed = None
         for block in body.get('content', []):
-            if block.get('type') == 'text':
-                text_out += block.get('text', '')
-
-        # ── Parse JSON out of the response ──
-        # Be defensive: model may wrap in ```json fences despite instructions.
-        cleaned = text_out.strip()
-        if cleaned.startswith('```'):
-            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError as je:
-            # Last-resort: try to grab the first {...} blob
-            m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                except Exception:
-                    return jsonify({
-                        'error': 'Model returned unparseable JSON',
-                        'raw_response': text_out[:2000]
-                    }), 502
-            else:
-                return jsonify({
-                    'error': 'Model returned unparseable JSON',
-                    'raw_response': text_out[:2000]
-                }), 502
+            if block.get('type') == 'tool_use' and block.get('name') == 'submit_recommendations':
+                parsed = block.get('input') or {}
+                break
+        if parsed is None:
+            # Diagnostic fallback: include the raw content so we can see what came back.
+            return jsonify({
+                'error': 'Model did not call the recommendations tool',
+                'raw_response': json.dumps(body.get('content', []))[:2000]
+            }), 502
 
         # ── Validate: every recommended style must exist in the inventory list ──
         # The model sometimes hallucinates SKUs even with the instruction not to.
@@ -6460,6 +6501,39 @@ def ai_open_order_predictions():
                 'max_tokens': 16000,
                 'system': system_prompt,
                 'messages': [{'role': 'user', 'content': user_prompt}],
+                # Tool use for forced structured output — same pattern as /ai-suggestions.
+                # Without this the model can wrap JSON in fences, add prose, or embed
+                # comments from our prompt example, all of which break str→JSON parsing.
+                'tools': [{
+                    'name': 'submit_predictions',
+                    'description': 'Submit selling predictions for every open-order style.',
+                    'input_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'predictions': {
+                                'type': 'array',
+                                'description': 'One prediction per open-order style — must include every style with no skipping.',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'style': {'type': 'string', 'description': 'Base style code from OPEN ORDERS list, verbatim'},
+                                        'verdict': {'type': 'string', 'enum': ['likely_best', 'likely_okay', 'likely_worst']},
+                                        'confidence': {'type': 'string', 'enum': ['high', 'medium', 'low']},
+                                        'rationale': {'type': 'string', 'description': '2-4 sentences naming the ship season and same-season historical evidence'},
+                                        'referenced_sellers': {
+                                            'type': 'array',
+                                            'items': {'type': 'string'},
+                                            'description': '1-4 SKUs from selling data that justify the prediction'
+                                        }
+                                    },
+                                    'required': ['style', 'verdict', 'confidence', 'rationale', 'referenced_sellers']
+                                }
+                            }
+                        },
+                        'required': ['predictions']
+                    }
+                }],
+                'tool_choice': {'type': 'tool', 'name': 'submit_predictions'},
             },
             timeout=240
         )
@@ -6470,32 +6544,17 @@ def ai_open_order_predictions():
             }), 502
 
         body = api_resp.json()
-        text_out = ''
+        # Extract the tool_use block — input is already a parsed dict.
+        parsed = None
         for block in body.get('content', []):
-            if block.get('type') == 'text':
-                text_out += block.get('text', '')
-
-        # Parse JSON
-        cleaned = text_out.strip()
-        if cleaned.startswith('```'):
-            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-            if not m:
-                return jsonify({
-                    'error': 'Model returned unparseable JSON',
-                    'raw_response': text_out[:2000]
-                }), 502
-            try:
-                parsed = json.loads(m.group(0))
-            except Exception:
-                return jsonify({
-                    'error': 'Model returned unparseable JSON',
-                    'raw_response': text_out[:2000]
-                }), 502
+            if block.get('type') == 'tool_use' and block.get('name') == 'submit_predictions':
+                parsed = block.get('input') or {}
+                break
+        if parsed is None:
+            return jsonify({
+                'error': 'Model did not call the predictions tool',
+                'raw_response': json.dumps(body.get('content', []))[:2000]
+            }), 502
 
         # ── Validate + enrich each prediction with full open-order metadata ──
         # so the frontend can render image, brand, qty, value etc. without extra lookups.
