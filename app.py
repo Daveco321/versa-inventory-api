@@ -5709,12 +5709,30 @@ def ai_suggestions():
             return jsonify({'error': 'No selling data matched the season/sheet filter'}), 404
         inv = _ai_build_inventory_context(ats_source, target_brands,
                                           ats_only=ats_only, ats_min=ats_min, ats_scope=ats_scope)
-        # Cap to keep token cost bounded. With 'all_styles_ever' we can have several
-        # thousand styles in the override DB — sort by current ATS then by whether the
-        # style is in the current pipeline, so live stock surfaces first but discontinued
-        # styles still get fair representation. Cap raised to 1500 from 800.
-        inv.sort(key=lambda s: (-(s.get('total_ats',0)), 0 if s.get('in_current_pipeline') else 1))
-        inv = inv[:1500]
+        # ── Smart cap with revival quota ──
+        # The earlier behavior was "sort by ATS desc, take first 1500". That meant if
+        # 'all_styles_ever' was selected and you had 1500+ pipeline styles in current
+        # stock, NO revival styles ever reached the model — defeating the point of the
+        # source option. Fix: split the cap so revivals (in_current_pipeline=False) get
+        # a reserved share. Default split: 70% pipeline / 30% revival. Within each
+        # bucket, sort by ATS desc. Both lists are then concatenated.
+        TOTAL_CAP = 3000
+        if ats_source == 'all_styles_ever':
+            REVIVAL_SHARE = 0.30  # 30% of slots reserved for revival styles
+        else:
+            REVIVAL_SHARE = 0.0
+        revival_slots = int(TOTAL_CAP * REVIVAL_SHARE)
+        pipeline_slots = TOTAL_CAP - revival_slots
+        pipeline_styles = [s for s in inv if s.get('in_current_pipeline')]
+        revival_styles  = [s for s in inv if not s.get('in_current_pipeline')]
+        pipeline_styles.sort(key=lambda s: -(s.get('total_ats', 0)))
+        revival_styles.sort(key=lambda s: (s.get('style') or ''))   # alpha for stability
+        # If one bucket has fewer than its share, the other absorbs the slack.
+        if len(pipeline_styles) < pipeline_slots:
+            revival_slots = min(TOTAL_CAP - len(pipeline_styles), len(revival_styles))
+        elif len(revival_styles) < revival_slots:
+            pipeline_slots = min(TOTAL_CAP - len(revival_styles), len(pipeline_styles))
+        inv = pipeline_styles[:pipeline_slots] + revival_styles[:revival_slots]
         if not inv:
             return jsonify({'error': 'No inventory styles match the filters. '
                             'Try widening the ATS minimum or switching scope.'}), 404
@@ -5932,16 +5950,35 @@ def ai_suggestions():
 
             def _one_brand_call(brand_abbr, want_count):
                 """Build inventory filtered to brand_abbr only, then run a recommend call.
-                Returns (parsed_dict, usage, error_str_or_None)."""
+                Returns (parsed_dict, usage, error_str_or_None).
+
+                CRITICAL CHANGES from earlier version:
+                  1. We rebuild the inventory list FRESH for this single brand instead of
+                     slicing from the shared `inv` list. Why: the shared `inv` was capped
+                     at 1500 with a "sort by ATS desc, pipeline first" key. Geoffrey Beene
+                     revival styles (ATS=0) would lose every cap slot to NAUTICA / DKNY
+                     pipeline styles, even when the user explicitly asked for GB. Building
+                     fresh per-brand gives each brand its full eligibility list.
+                  2. We use a much higher per-brand cap (1500) since one brand has at most
+                     a few hundred styles total. Revivals now make it through.
+                """
                 try:
-                    brand_inv = [s for s in inv if (s.get('brand_abbr') or '').upper() == brand_abbr.upper()]
+                    # Fresh inventory build scoped to this brand only — bypasses the
+                    # global cap entirely so revivals aren't squeezed out.
+                    brand_inv = _ai_build_inventory_context(
+                        ats_source, [brand_abbr],
+                        ats_only=ats_only, ats_min=ats_min, ats_scope=ats_scope
+                    )
                     if not brand_inv:
                         return (None, {}, f"No eligible styles for brand {brand_abbr}")
-                    # Cap at 500 per brand — plenty for any single brand's search
-                    brand_inv = brand_inv[:500]
-                    # Build a brand-specific inv block. Selling data + reasoning prompt are
-                    # the same across brands; only the eligible-styles list differs, so we
-                    # reuse them.
+                    # Sort: pipeline (current stock) first, then revivals — but DON'T cap
+                    # aggressively. The model needs to see the revival styles to recommend them.
+                    brand_inv.sort(key=lambda s: (
+                        0 if s.get('in_current_pipeline') else 1,
+                        -(s.get('total_ats', 0))
+                    ))
+                    brand_inv = brand_inv[:1500]   # generous per-brand cap
+                    # Eligible-styles block: only this brand's styles
                     brand_inv_lines = ['## ELIGIBLE STYLES (only recommend from this list, verbatim style codes)']
                     brand_inv_lines.append(f"## Brand: {brand_abbr}  ({len(brand_inv)} styles)")
                     for s in brand_inv:
@@ -5952,17 +5989,79 @@ def ai_suggestions():
                             f"ATS:{s.get('total_ats',0)} pipeline:{('YES' if s.get('in_current_pipeline') else 'NO')}"
                         )
                     brand_inv_block = '\n'.join(brand_inv_lines)
-                    # Replace the inv_block section in user_prompt for this brand
-                    brand_user_prompt = user_prompt.replace(
-                        inv_block, brand_inv_block
-                    ).replace(
-                        f"# REQUESTED COUNT: {rec_count} ",
-                        f"# REQUESTED COUNT: {want_count} "
+                    # Reconstruct the entire user prompt with want_count embedded.
+                    # Selling block, recurrence block, mode_instr, and the reasoning
+                    # method are all unchanged across brands — only count + eligible
+                    # styles differ. Note the diversity rule is RELAXED here ("no more
+                    # than 3 from same brand") since EVERY pick is from one brand by
+                    # definition; we tell the model explicitly.
+                    booking_year = datetime.utcnow().year + (1 if datetime.utcnow().month >= 7 else 0)
+                    brand_user_prompt = (
+                        f"# CUSTOMER: {customer}\n"
+                        f"# BOOKING FOR: {target_season.upper()} {booking_year}\n"
+                        f"# MODE: {mode}\n"
+                        f"# BRAND FOCUS: {brand_abbr} (this entire call is scoped to ONE brand)\n"
+                        f"# REQUESTED COUNT: EXACTLY {want_count} {'add' if mode != 'drop_only' else 'drop'}"
+                        + (f" AND EXACTLY {want_count} drop" if mode == 'both' else "")
+                        + f" recommendation(s) for {brand_abbr} — return EXACTLY {want_count}, no more, no less.\n"
+                        f"# Strength levels (ADD): {strength_labels_add}\n"
+                        f"# Strength levels (DROP): {strength_labels_drop}\n\n"
+                        f"## HISTORICAL SELLING DATA (chronological)\n"
+                        f"{selling_block}\n\n"
+                        + (f"{recurrence_block}\n\n" if recurrence_block else "")
+                        + f"{brand_inv_block}\n\n"
+                        + f"## TASK\n"
+                        + f"Generate exactly {want_count} {brand_abbr} recommendation(s). "
+                        + "All picks come from the ELIGIBLE STYLES list above (which is "
+                        + f"already scoped to {brand_abbr} only — DO NOT recommend any other brand).\n\n"
+                        + "## REASONING METHOD (apply explicitly, in order):\n"
+                        + "1. **Identify PATTERNS at the ATTRIBUTE level** — color, print type, "
+                        + "fabric, fit. Tag each winning pattern with its dominant attribute(s).\n"
+                        + "2. **Cross-brand transfer is GOLD**: when a non-" + brand_abbr + " "
+                        + "style won with a transferable attribute (a print style, fabric weight, "
+                        + "or fit silhouette), look for a " + brand_abbr + " style with the same "
+                        + "attribute profile. The rationale MUST say 'this pattern won in Brand X, "
+                        + f"transferring to {brand_abbr} because [reason].'\n"
+                        + "3. **Check for LOSERS that share the same attributes as your would-be "
+                        + "ADDs**. If a white solid won in one brand but white solids lost in two "
+                        + "others, that's a negative-transfer signal.\n"
+                        + f"4. **Apply SEASON FIT for {target_season.upper()}**. Fall/Winter "
+                        + "favors heavier fabrics + deeper grounds. Spring/Summer favors lighter "
+                        + "weights + brighter grounds.\n"
+                        + "5. **Prefer pipeline styles (pipeline:YES) over revivals (pipeline:NO) "
+                        + "when patterns are roughly equal.**\n"
+                        + f"6. **HIT THE COUNT — EXACTLY {want_count}.** This call is scoped to one "
+                        + f"brand. The diversity rule (max 3 per brand) does NOT apply here, since "
+                        + f"every pick is {brand_abbr} by design. Spread across COLOR/FABRIC/FIT "
+                        + "diversity instead — no more than 2 picks from the same color family. "
+                        + "If your high-conviction shortlist runs out, fill with honest "
+                        + f"Trial-strength picks. NEVER undershoot {want_count}.\n\n"
+                        + "## OUTPUT FORMAT\n"
+                        + "Use the submit_recommendations tool. EXACTLY "
+                        + f"{want_count} entries in 'add'" + (f" and EXACTLY {want_count} in 'drop'"
+                          if mode == 'both' else " (or in 'drop' if mode is drop_only)") + ". "
+                        + "Each pick MUST be from the ELIGIBLE STYLES list verbatim."
+                    )
+                    # Per-brand system prompt — strip the "max 3 from same brand" rule
+                    # since by definition this call is single-brand, and STRONGLY re-emphasize
+                    # the exact count.
+                    brand_system_prompt = (
+                        system_prompt
+                        + f"\n\n## THIS SPECIFIC CALL\n"
+                        + f"You are working on ONE brand: {brand_abbr}. "
+                        + f"You MUST return EXACTLY {want_count} 'add' recommendations"
+                        + (f" AND EXACTLY {want_count} 'drop' recommendations" if mode == 'both' else "")
+                        + ". The 'max 3 from same brand' diversity rule from the general "
+                        + "rules above DOES NOT apply on this call — every pick will be "
+                        + f"{brand_abbr}. Focus diversity on COLOR/FABRIC/FIT instead "
+                        + "(max 2 from same color family). If you can't find enough strong-"
+                        + f"conviction picks, fill the remainder with Trial-strength bets — but "
+                        + f"NEVER return fewer than {want_count} items."
                     )
                     resp = _anthropic_post_with_retry({
                             'model': AI_OPUS_MODEL,
                             'max_tokens': 16000,
-                            'system': system_prompt,
+                            'system': brand_system_prompt,
                             'messages': [{'role': 'user', 'content': brand_user_prompt}],
                             'tools': [{
                                 'name': 'submit_recommendations',
@@ -6029,18 +6128,73 @@ def ai_suggestions():
                     all_add.extend(parsed_b.get('add', []))
                     all_drop.extend(parsed_b.get('drop', []))
 
-            # Filter + enrich the combined results (same logic as the single-call path)
+            # Filter + enrich the combined results.
+            #
+            # Validation logic: a returned style is VALID if it exists either:
+            #   (a) in the global `inv` list (current capped eligibility set), OR
+            #   (b) in the full overrides DB AND the live inventory feed
+            #
+            # The (b) fallback handles the "AI suggested ROGBSA019SLS during a DKNY call"
+            # case — that style is real, it just wasn't in DKNY's specific eligible list.
+            # We recover it by looking up the global catalog and enriching from there,
+            # so the user sees the AI's actual suggestion instead of a "skipped" warning.
             valid_styles = {s['style']: s for s in inv}
+            # Pre-build the full-catalog fallback. Done once outside the filter loop.
+            with _inv_lock:
+                _full_inv_snap = list(_inventory['items'])
+            with _overrides_lock:
+                _full_overrides_snap = dict(_style_overrides)
+            full_catalog = {}
+            # Live inventory entries
+            for it in _full_inv_snap:
+                base = (it.get('sku', '') or '').split('-')[0].upper()
+                if base and base not in full_catalog:
+                    full_catalog[base] = {
+                        'style': base,
+                        'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
+                        'brand_full': it.get('brand_full', ''),
+                        'color': it.get('color', ''),
+                        'fabric': it.get('fabrication', ''),
+                        'fit': it.get('fit', ''),
+                        'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
+                        'incoming': it.get('incoming', 0),
+                        'total_ats': it.get('total_ats', 0),
+                        'in_current_pipeline': True,
+                    }
+            # Overrides DB entries (revival styles)
+            for base, ov in _full_overrides_snap.items():
+                base_up = (base or '').upper()
+                if not base_up or base_up in full_catalog or not isinstance(ov, dict):
+                    continue
+                brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
+                full_catalog[base_up] = {
+                    'style': base_up,
+                    'brand_abbr': brand_abbr,
+                    'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
+                    'color': ov.get('color', ''),
+                    'fabric': ov.get('fabric', ''),
+                    'fit': ov.get('fit', ''),
+                    'total_warehouse': 0,
+                    'incoming': 0,
+                    'total_ats': 0,
+                    'in_current_pipeline': False,
+                }
+
             def _filter_brand(recs):
                 kept, dropped = [], []
                 for r in (recs or []):
                     style = (r.get('style') or '').upper().strip()
-                    if style in valid_styles:
-                        inv_data = valid_styles[style]
+                    # Try the capped inv first (typical case)
+                    inv_data = valid_styles.get(style)
+                    # Fallback: full catalog lookup. Recovers cross-brand suggestions
+                    # AND revival styles that didn't make the global cap.
+                    if not inv_data:
+                        inv_data = full_catalog.get(style)
+                    if inv_data:
                         r['style'] = style
                         r['_inventory'] = {
                             'brand_abbr':       inv_data['brand_abbr'],
-                            'brand_full':       inv_data['brand_full'],
+                            'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
                             'color':            inv_data.get('color',''),
                             'total_warehouse':  inv_data.get('total_warehouse', 0),
                             'incoming':         inv_data.get('incoming', 0),
@@ -6049,6 +6203,7 @@ def ai_suggestions():
                         }
                         kept.append(r)
                     else:
+                        # Truly hallucinated — not a real style anywhere in our catalog
                         dropped.append(style)
                 return kept, dropped
             add_recs, add_dropped = _filter_brand(all_add)
@@ -6161,32 +6316,70 @@ def ai_suggestions():
 
         # ── Validate: every recommended style must exist in the eligible inventory list ──
         # The model sometimes hallucinates SKUs even with the instruction not to.
-        # We drop any rec whose style isn't in the eligible list we provided. Styles in the
-        # list but flagged in_current_pipeline:False (revival picks from all_styles_ever)
-        # are KEPT — they have valid override data and the frontend handles them as
-        # "Not in current inventory" cards.
+        # Validation logic: a returned style is VALID if it exists either:
+        #   (a) in the global `inv` list (current capped eligibility set), OR
+        #   (b) in the full overrides DB AND the live inventory feed
+        # The (b) fallback recovers styles that the AI knew about but weren't in our
+        # capped eligible list (e.g. revival styles that didn't fit the 3000 cap).
         valid_styles = {s['style']: s for s in inv}
+        # Pre-build the full-catalog fallback. Same logic as the per-brand branch.
+        with _inv_lock:
+            _full_inv_snap = list(_inventory['items'])
+        with _overrides_lock:
+            _full_overrides_snap = dict(_style_overrides)
+        full_catalog = {}
+        for it in _full_inv_snap:
+            base = (it.get('sku', '') or '').split('-')[0].upper()
+            if base and base not in full_catalog:
+                full_catalog[base] = {
+                    'style': base,
+                    'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
+                    'brand_full': it.get('brand_full', ''),
+                    'color': it.get('color', ''),
+                    'fabric': it.get('fabrication', ''),
+                    'fit': it.get('fit', ''),
+                    'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
+                    'incoming': it.get('incoming', 0),
+                    'total_ats': it.get('total_ats', 0),
+                    'in_current_pipeline': True,
+                }
+        for base, ov in _full_overrides_snap.items():
+            base_up = (base or '').upper()
+            if not base_up or base_up in full_catalog or not isinstance(ov, dict):
+                continue
+            brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
+            full_catalog[base_up] = {
+                'style': base_up,
+                'brand_abbr': brand_abbr,
+                'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
+                'color': ov.get('color', ''),
+                'fabric': ov.get('fabric', ''),
+                'fit': ov.get('fit', ''),
+                'total_warehouse': 0,
+                'incoming': 0,
+                'total_ats': 0,
+                'in_current_pipeline': False,
+            }
         def _filter(recs):
             kept = []
             dropped = []
             for r in (recs or []):
                 style = (r.get('style') or '').upper().strip()
-                if style in valid_styles:
-                    inv_data = valid_styles[style]
+                inv_data = valid_styles.get(style) or full_catalog.get(style)
+                if inv_data:
                     r['style'] = style
                     r['_inventory'] = {
                         'brand_abbr':       inv_data['brand_abbr'],
-                        'brand_full':       inv_data['brand_full'],
+                        'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
                         'color':            inv_data.get('color',''),
                         'total_warehouse':  inv_data.get('total_warehouse', 0),
                         'incoming':         inv_data.get('incoming', 0),
                         'total_ats':        inv_data.get('total_ats', 0),
-                        # Pipeline flag tells frontend whether this is a live-stock style
-                        # or a revival pick (override-only, not currently produced).
                         'in_current_pipeline': inv_data.get('in_current_pipeline', True),
                     }
                     kept.append(r)
                 else:
+                    # Truly hallucinated — not in any catalog
                     dropped.append(style)
             return kept, dropped
 
