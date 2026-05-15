@@ -5168,6 +5168,201 @@ AI_OPUS_INPUT_PER_MTOK  = float(os.environ.get('AI_OPUS_INPUT_PER_MTOK',  15.0))
 AI_OPUS_OUTPUT_PER_MTOK = float(os.environ.get('AI_OPUS_OUTPUT_PER_MTOK', 75.0))
 AI_OPUS_MODEL = os.environ.get('AI_OPUS_MODEL', 'claude-opus-4-5')
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SKU code maps — module level so they're shared across resolvers.
+# Brand abbreviation lives at positions 2-3 of the base SKU (after the 2-char
+# customer code). Example: RONASU371SLP → customer=RO, brand=NA → NAUTICA.
+# These mirror the frontend's BRAND_IMAGE_PREFIX (reversed).
+# ─────────────────────────────────────────────────────────────────────────────
+SKU_BRAND_CODE_MAP = {
+    'NA': 'NAUTICA', 'DK': 'DKNY', 'EB': 'EB', 'RB': 'REEBOK', 'VC': 'VINCE',
+    'BE': 'BEN', 'US': 'USPA', 'CH': 'CHAPS', 'LB': 'LUCKY', 'JN': 'JNY',
+    'GB': 'BEENE', 'NM': 'NICOLE', 'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN',
+    'VD': 'VD', 'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
+    'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE',
+}
+
+# Friendly fit-code labels (from positions 9-10 of base SKU, e.g. "SL" → Slim/Long)
+SKU_FIT_FRIENDLY = {
+    'SL': 'Slim/Long Sleeve', 'RF': 'Regular Fit',
+    'TF': 'Trim Fit', 'MF': 'Modern Fit',
+    'BT': 'Big & Tall', 'BB': 'Big & Tall', 'TT': 'Tall',
+    'SS': 'Short Sleeve', 'SR': 'Short Sleeve Regular',
+    'SB': 'Short Sleeve B&T', 'ST': 'Short Sleeve Tall',
+}
+
+# Friendly fabric-code labels (from positions 4-5 of base SKU)
+SKU_FABRIC_FRIENDLY = {
+    'PH': 'Pique (Polo)', 'PJ': 'Pique Jersey', 'PL': 'Pique LS',
+    'PO': 'Pique Open', 'PW': 'Pique Woven', 'TH': 'Tee Heather',
+    'HE': 'Heather', 'KN': 'Knit', 'WT': 'Woven Tee',
+    'SD': 'Soft Dobby', 'SF': 'Soft Fabric',
+    'YD': 'Yarn Dye', 'PT': 'Print/Pattern', 'TS': 'TC Stretch',
+    'PK': 'Polyester Knit', 'FT': 'Flax Stretch',
+    'BC': 'Carpenter Bottom', 'BR': 'Ripstop Bottom',
+    'BH': 'Heavy Bottom', 'BA': 'Pinstripe Bottom',
+    'SU': 'Suiting',
+}
+
+def _synthesize_style_from_sku(sku):
+    """Build a synthetic style metadata dict from SKU code parsing alone.
+    Used as the last-resort fallback in _resolve_style_metadata so we NEVER
+    drop a model recommendation — every suggestion gets shown, just with
+    whatever fidelity we can derive from the code structure.
+
+    SKU structure: [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]
+    Example: RONASU371SLP → RO|NA|SU|371|SL|P → Ross Nautica Suiting #371 Slim Long-sleeve Polo-collar
+    """
+    sku_up = (sku or '').upper().split('-')[0]
+    brand_code = sku_up[2:4] if len(sku_up) >= 4 else ''
+    brand_abbr = SKU_BRAND_CODE_MAP.get(brand_code, brand_code)
+    fab_code = sku_up[4:6] if len(sku_up) >= 6 else ''
+    fab_label = SKU_FABRIC_FRIENDLY.get(fab_code, fab_code)
+    fit = ''
+    try:
+        fit_code = _py_extract_fit_code(sku_up)
+        if fit_code:
+            fit = SKU_FIT_FRIENDLY.get(fit_code, fit_code)
+    except Exception:
+        pass
+    return {
+        'style': sku_up,
+        'brand_abbr': brand_abbr,
+        'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
+        'color': '',          # can't derive color from SKU code; UI will show blank
+        'fabric': fab_label,
+        'fit': fit,
+        'total_warehouse': 0,
+        'incoming': 0,
+        'total_ats': 0,
+        'in_current_pipeline': False,
+        '_synthesized': True,   # flag the UI uses to tag this as "new style suggestion"
+    }
+
+def _build_full_catalog_index():
+    """Snapshot the live inventory + overrides DB into a unified catalog dict.
+    Also builds a secondary 'design' index — keyed by the style code WITHOUT the
+    2-char customer prefix — so cross-customer suggestions match too.
+
+    Example: if overrides DB has 'NASU371SLP' (no customer prefix), and the AI
+    suggests 'RONASU371SLP' (Ross), we find it under the design index by
+    stripping the customer code: 'RONASU371SLP'[2:] = 'NASU371SLP' → match.
+
+    Returns (full_catalog, design_index). Both are dicts of catalog entry dicts.
+    """
+    with _inv_lock:
+        items_snap = list(_inventory['items'])
+    with _overrides_lock:
+        overrides_snap = dict(_style_overrides)
+
+    full_catalog = {}
+    # Live inventory entries (highest fidelity)
+    for it in items_snap:
+        base = (it.get('sku', '') or '').split('-')[0].upper()
+        if base and base not in full_catalog:
+            full_catalog[base] = {
+                'style': base,
+                'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
+                'brand_full': it.get('brand_full', ''),
+                'color': it.get('color', ''),
+                'fabric': it.get('fabrication', ''),
+                'fit': it.get('fit', ''),
+                'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
+                'incoming': it.get('incoming', 0),
+                'total_ats': it.get('total_ats', 0),
+                'in_current_pipeline': True,
+            }
+    # Overrides DB entries (color/fabric/fit descriptions, may be revival styles)
+    for base, ov in overrides_snap.items():
+        base_up = (base or '').upper()
+        if not base_up or base_up in full_catalog or not isinstance(ov, dict):
+            continue
+        brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
+        full_catalog[base_up] = {
+            'style': base_up,
+            'brand_abbr': brand_abbr,
+            'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
+            'color': ov.get('color', ''),
+            'fabric': ov.get('fabric', ''),
+            'fit': ov.get('fit', ''),
+            'total_warehouse': 0,
+            'incoming': 0,
+            'total_ats': 0,
+            'in_current_pipeline': False,
+        }
+
+    # Build the design index — strip the 2-char customer prefix. This lets us
+    # match cross-customer suggestions: an override stored as 'NASU371SLP' will
+    # match an AI suggestion of 'RONASU371SLP' (Ross prefix) or 'TJNASU371SLP'
+    # (TJ prefix), since they share the same design code.
+    design_index = {}
+    for style_key, entry in full_catalog.items():
+        if len(style_key) >= 4:
+            design = style_key[2:]   # strip customer prefix
+            if design and design not in design_index:
+                design_index[design] = entry
+            # Also try the full key as a "design" (in case the override IS keyed
+            # without a customer prefix in the first place — e.g. 'NASU371SLP')
+            if style_key not in design_index:
+                design_index[style_key] = entry
+    return full_catalog, design_index
+
+def _resolve_style_metadata(style, eligible_styles, full_catalog, design_index):
+    """Progressive lookup chain. NEVER returns None — at minimum, synthesizes
+    metadata from the SKU code itself. Returns (metadata_dict, source_label).
+
+    source_label tells you which tier the match came from:
+      'exact'         — found in eligible_styles (the AI's intended pool)
+      'inventory'     — found in live inventory feed
+      'inventory_base'— matched after stripping size suffix
+      'design'        — fuzzy-matched by stripping customer prefix
+      'synthesized'   — no match anywhere; metadata derived from SKU code only
+
+    The 'synthesized' tier means the AI proposed a new style combo that doesn't
+    exist as an exact catalog key. We still show it — the user can decide if it's
+    a useful new bet. Synthesized entries are flagged so the UI can label them.
+    """
+    s = (style or '').upper().strip()
+    if not s:
+        return (_synthesize_style_from_sku(''), 'synthesized')
+
+    # Tier 1: Exact match in the eligible list (the AI's intended pool)
+    if s in eligible_styles:
+        return (eligible_styles[s], 'exact')
+
+    # Tier 2: Exact match in full catalog (live inventory + overrides)
+    if s in full_catalog:
+        return (full_catalog[s], 'inventory')
+
+    # Tier 3: Strip size suffix and retry (e.g. "RONASU371SLP-M" → "RONASU371SLP")
+    base = s.split('-')[0]
+    if base in eligible_styles:
+        return (eligible_styles[base], 'exact')
+    if base in full_catalog:
+        return (full_catalog[base], 'inventory_base')
+
+    # Tier 4: Design-code fuzzy match. Strip the customer prefix and check the
+    # design index. This catches the common case where the overrides DB stores
+    # color descriptions under a brand-only key (e.g. 'NASU371SLP') but the AI
+    # is suggesting a customer-prefixed code (e.g. 'RONASU371SLP').
+    if len(base) >= 4:
+        design = base[2:]
+        if design in design_index:
+            # Found by design — but the AI's suggested style code is what we
+            # want to display (it's the customer-prefixed version), so we copy
+            # the metadata from the design match and override the style code.
+            entry = dict(design_index[design])
+            entry['style'] = base
+            # Update brand from the AI's SKU code in case it suggests a brand
+            # variant — but the brand code is positions 2-4 of the AI's suggestion.
+            sku_brand_code = base[2:4]
+            entry['brand_abbr'] = SKU_BRAND_CODE_MAP.get(sku_brand_code, sku_brand_code)
+            entry['brand_full'] = BRAND_FULL_NAMES.get(entry['brand_abbr'], entry['brand_abbr'])
+            return (entry, 'design')
+
+    # Tier 5: Synthesize from SKU code. Last resort — never fails.
+    return (_synthesize_style_from_sku(s), 'synthesized')
+
 def _anthropic_post_with_retry(payload, *, timeout=180, max_retries=4):
     """POST to Anthropic's /v1/messages with retry-on-transient-error.
 
@@ -6128,93 +6323,57 @@ def ai_suggestions():
                     all_add.extend(parsed_b.get('add', []))
                     all_drop.extend(parsed_b.get('drop', []))
 
-            # Filter + enrich the combined results.
+            # ── Validate + enrich ──
+            # We NEVER drop a recommendation. The resolver's lookup chain (eligible
+            # → full catalog → design fuzzy match → SKU-derived synthesis) guarantees
+            # every style code gets metadata. Styles the AI proposed that don't exist
+            # anywhere as exact keys are still shown — flagged as 'synthesized' so the
+            # frontend can label them "new style suggestion".
             #
-            # Validation logic: a returned style is VALID if it exists either:
-            #   (a) in the global `inv` list (current capped eligibility set), OR
-            #   (b) in the full overrides DB AND the live inventory feed
-            #
-            # The (b) fallback handles the "AI suggested ROGBSA019SLS during a DKNY call"
-            # case — that style is real, it just wasn't in DKNY's specific eligible list.
-            # We recover it by looking up the global catalog and enriching from there,
-            # so the user sees the AI's actual suggestion instead of a "skipped" warning.
-            valid_styles = {s['style']: s for s in inv}
-            # Pre-build the full-catalog fallback. Done once outside the filter loop.
-            with _inv_lock:
-                _full_inv_snap = list(_inventory['items'])
-            with _overrides_lock:
-                _full_overrides_snap = dict(_style_overrides)
-            full_catalog = {}
-            # Live inventory entries
-            for it in _full_inv_snap:
-                base = (it.get('sku', '') or '').split('-')[0].upper()
-                if base and base not in full_catalog:
-                    full_catalog[base] = {
-                        'style': base,
-                        'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
-                        'brand_full': it.get('brand_full', ''),
-                        'color': it.get('color', ''),
-                        'fabric': it.get('fabrication', ''),
-                        'fit': it.get('fit', ''),
-                        'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
-                        'incoming': it.get('incoming', 0),
-                        'total_ats': it.get('total_ats', 0),
-                        'in_current_pipeline': True,
-                    }
-            # Overrides DB entries (revival styles)
-            for base, ov in _full_overrides_snap.items():
-                base_up = (base or '').upper()
-                if not base_up or base_up in full_catalog or not isinstance(ov, dict):
-                    continue
-                brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
-                full_catalog[base_up] = {
-                    'style': base_up,
-                    'brand_abbr': brand_abbr,
-                    'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
-                    'color': ov.get('color', ''),
-                    'fabric': ov.get('fabric', ''),
-                    'fit': ov.get('fit', ''),
-                    'total_warehouse': 0,
-                    'incoming': 0,
-                    'total_ats': 0,
-                    'in_current_pipeline': False,
-                }
-
+            # This fixes the symptom where asking for 10 picks returned 6 + "4 skipped"
+            # — the model was returning 10, our validator was dropping 4 that didn't
+            # match exactly, leaving the user shortchanged. Now all 10 surface.
+            eligible_styles = {s['style']: s for s in inv}
+            full_catalog, design_index = _build_full_catalog_index()
             def _filter_brand(recs):
-                kept, dropped = [], []
+                kept, synthesized = [], []
                 for r in (recs or []):
                     style = (r.get('style') or '').upper().strip()
-                    # Try the capped inv first (typical case)
-                    inv_data = valid_styles.get(style)
-                    # Fallback: full catalog lookup. Recovers cross-brand suggestions
-                    # AND revival styles that didn't make the global cap.
-                    if not inv_data:
-                        inv_data = full_catalog.get(style)
-                    if inv_data:
-                        r['style'] = style
-                        r['_inventory'] = {
-                            'brand_abbr':       inv_data['brand_abbr'],
-                            'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
-                            'color':            inv_data.get('color',''),
-                            'total_warehouse':  inv_data.get('total_warehouse', 0),
-                            'incoming':         inv_data.get('incoming', 0),
-                            'total_ats':        inv_data.get('total_ats', 0),
-                            'in_current_pipeline': inv_data.get('in_current_pipeline', True),
-                        }
-                        kept.append(r)
-                    else:
-                        # Truly hallucinated — not a real style anywhere in our catalog
-                        dropped.append(style)
-                return kept, dropped
-            add_recs, add_dropped = _filter_brand(all_add)
-            drop_recs, drop_dropped = _filter_brand(all_drop)
+                    if not style:
+                        continue
+                    inv_data, source = _resolve_style_metadata(
+                        style, eligible_styles, full_catalog, design_index)
+                    r['style'] = inv_data['style']
+                    r['_inventory'] = {
+                        'brand_abbr':       inv_data['brand_abbr'],
+                        'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
+                        'color':            inv_data.get('color',''),
+                        'fabric':           inv_data.get('fabric',''),
+                        'fit':              inv_data.get('fit',''),
+                        'total_warehouse':  inv_data.get('total_warehouse', 0),
+                        'incoming':         inv_data.get('incoming', 0),
+                        'total_ats':        inv_data.get('total_ats', 0),
+                        'in_current_pipeline': inv_data.get('in_current_pipeline', True),
+                        '_synthesized':     bool(inv_data.get('_synthesized', False)),
+                        '_lookup_source':   source,
+                    }
+                    kept.append(r)
+                    if source == 'synthesized':
+                        synthesized.append(style)
+                return kept, synthesized
+            add_recs, add_synthesized = _filter_brand(all_add)
+            drop_recs, drop_synthesized = _filter_brand(all_drop)
             cost = _ai_estimate_cost(total_in, total_out)
             return jsonify({
                 'recommendations': {'add': add_recs, 'drop': drop_recs},
                 'usage': {'input_tokens': total_in, 'output_tokens': total_out},
                 'cost_usd': round(cost, 4),
                 'model': AI_OPUS_MODEL,
-                'invalid_styles_dropped': add_dropped + drop_dropped,
+                # Renamed from invalid_styles_dropped — these are NOT dropped, they're
+                # shown but flagged as "new style suggestions" (style code didn't match
+                # any exact catalog entry, so metadata was derived from the SKU itself).
+                'invalid_styles_dropped': [],  # kept empty for frontend backward-compat
+                'synthesized_styles': add_synthesized + drop_synthesized,
                 'per_brand_mode': True,
                 'per_brand_counts': per_brand_counts,
                 'per_brand_errors': brand_errors,
@@ -6315,76 +6474,41 @@ def ai_suggestions():
             }), 502
 
         # ── Validate: every recommended style must exist in the eligible inventory list ──
-        # The model sometimes hallucinates SKUs even with the instruction not to.
-        # Validation logic: a returned style is VALID if it exists either:
-        #   (a) in the global `inv` list (current capped eligibility set), OR
-        #   (b) in the full overrides DB AND the live inventory feed
-        # The (b) fallback recovers styles that the AI knew about but weren't in our
-        # capped eligible list (e.g. revival styles that didn't fit the 3000 cap).
-        valid_styles = {s['style']: s for s in inv}
-        # Pre-build the full-catalog fallback. Same logic as the per-brand branch.
-        with _inv_lock:
-            _full_inv_snap = list(_inventory['items'])
-        with _overrides_lock:
-            _full_overrides_snap = dict(_style_overrides)
-        full_catalog = {}
-        for it in _full_inv_snap:
-            base = (it.get('sku', '') or '').split('-')[0].upper()
-            if base and base not in full_catalog:
-                full_catalog[base] = {
-                    'style': base,
-                    'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
-                    'brand_full': it.get('brand_full', ''),
-                    'color': it.get('color', ''),
-                    'fabric': it.get('fabrication', ''),
-                    'fit': it.get('fit', ''),
-                    'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
-                    'incoming': it.get('incoming', 0),
-                    'total_ats': it.get('total_ats', 0),
-                    'in_current_pipeline': True,
-                }
-        for base, ov in _full_overrides_snap.items():
-            base_up = (base or '').upper()
-            if not base_up or base_up in full_catalog or not isinstance(ov, dict):
-                continue
-            brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
-            full_catalog[base_up] = {
-                'style': base_up,
-                'brand_abbr': brand_abbr,
-                'brand_full': BRAND_FULL_NAMES.get(brand_abbr, brand_abbr),
-                'color': ov.get('color', ''),
-                'fabric': ov.get('fabric', ''),
-                'fit': ov.get('fit', ''),
-                'total_warehouse': 0,
-                'incoming': 0,
-                'total_ats': 0,
-                'in_current_pipeline': False,
-            }
+        # ── Validate + enrich (single-call path) ──
+        # Same NEVER-DROP guarantee as the per-brand path: every AI suggestion gets
+        # shown. Lookup chain progressively widens (eligible → full catalog → design
+        # fuzzy → SKU-derived). See _resolve_style_metadata for details.
+        eligible_styles = {s['style']: s for s in inv}
+        full_catalog, design_index = _build_full_catalog_index()
         def _filter(recs):
-            kept = []
-            dropped = []
+            kept, synthesized = [], []
             for r in (recs or []):
                 style = (r.get('style') or '').upper().strip()
-                inv_data = valid_styles.get(style) or full_catalog.get(style)
-                if inv_data:
-                    r['style'] = style
-                    r['_inventory'] = {
-                        'brand_abbr':       inv_data['brand_abbr'],
-                        'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
-                        'color':            inv_data.get('color',''),
-                        'total_warehouse':  inv_data.get('total_warehouse', 0),
-                        'incoming':         inv_data.get('incoming', 0),
-                        'total_ats':        inv_data.get('total_ats', 0),
-                        'in_current_pipeline': inv_data.get('in_current_pipeline', True),
-                    }
-                    kept.append(r)
-                else:
-                    # Truly hallucinated — not in any catalog
-                    dropped.append(style)
-            return kept, dropped
+                if not style:
+                    continue
+                inv_data, source = _resolve_style_metadata(
+                    style, eligible_styles, full_catalog, design_index)
+                r['style'] = inv_data['style']
+                r['_inventory'] = {
+                    'brand_abbr':       inv_data['brand_abbr'],
+                    'brand_full':       inv_data['brand_full'] or BRAND_FULL_NAMES.get(inv_data['brand_abbr'], inv_data['brand_abbr']),
+                    'color':            inv_data.get('color',''),
+                    'fabric':           inv_data.get('fabric',''),
+                    'fit':              inv_data.get('fit',''),
+                    'total_warehouse':  inv_data.get('total_warehouse', 0),
+                    'incoming':         inv_data.get('incoming', 0),
+                    'total_ats':        inv_data.get('total_ats', 0),
+                    'in_current_pipeline': inv_data.get('in_current_pipeline', True),
+                    '_synthesized':     bool(inv_data.get('_synthesized', False)),
+                    '_lookup_source':   source,
+                }
+                kept.append(r)
+                if source == 'synthesized':
+                    synthesized.append(style)
+            return kept, synthesized
 
-        add_recs, add_dropped = _filter(parsed.get('add', []))
-        drop_recs, drop_dropped = _filter(parsed.get('drop', []))
+        add_recs, add_synthesized = _filter(parsed.get('add', []))
+        drop_recs, drop_synthesized = _filter(parsed.get('drop', []))
 
         usage = body.get('usage', {})
         in_t  = usage.get('input_tokens', 0)
@@ -6396,7 +6520,12 @@ def ai_suggestions():
             'usage': {'input_tokens': in_t, 'output_tokens': out_t},
             'cost_usd': round(cost, 4),
             'model': AI_OPUS_MODEL,
-            'invalid_styles_dropped': add_dropped + drop_dropped,
+            # Empty for backward compatibility — nothing gets "dropped" anymore.
+            'invalid_styles_dropped': [],
+            # Synthesized styles: AI suggested codes that didn't match any catalog
+            # entry; metadata was derived from the SKU code structure. Still shown
+            # to the user — they decide if these new combinations are useful bets.
+            'synthesized_styles': add_synthesized + drop_synthesized,
             'context': {
                 'customer': customer,
                 'season': season,
