@@ -5620,6 +5620,17 @@ def ai_suggestions():
         rec_count      = max(1, min(50, int(req.get('count', 10))))   # clamp 1..50
         mode           = req.get('mode', 'add_only')
         target_season  = (req.get('target_season') or season or 'fall').lower()
+        # Per-brand counts: optional dict {brand_abbr: count}. When set, we fire one
+        # call per brand in parallel and concatenate the results. The top-level
+        # `count` field is IGNORED in this mode. Each brand sub-call uses the same
+        # prompt and inventory context, but with `brands=[abbr]` and `count=N`.
+        per_brand_counts = req.get('per_brand_counts') or {}
+        # Sanitize: positive ints only, cap each at 50
+        per_brand_counts = {
+            str(k).upper(): max(1, min(50, int(v)))
+            for k, v in per_brand_counts.items()
+            if v and int(v) > 0
+        }
 
         # ── Gather context ──
         sheets = _ai_build_selling_context(customer, season, sheet_filter)
@@ -5840,6 +5851,166 @@ def ai_suggestions():
             + "Sections that don't apply for this mode get an empty array. NO other keys, NO commentary."
         )
 
+        # ── Per-brand parallel branch ──
+        # When the user has specified per-brand counts, we run N parallel API calls
+        # (one per brand) and concatenate the results. This produces better quality
+        # than asking one call to balance a mix because each call has the full
+        # attention budget for its single brand. Costs the same in total tokens.
+        if per_brand_counts:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _one_brand_call(brand_abbr, want_count):
+                """Build inventory filtered to brand_abbr only, then run a recommend call.
+                Returns (parsed_dict, usage, error_str_or_None)."""
+                try:
+                    brand_inv = [s for s in inv if (s.get('brand_abbr') or '').upper() == brand_abbr.upper()]
+                    if not brand_inv:
+                        return (None, {}, f"No eligible styles for brand {brand_abbr}")
+                    # Cap at 500 per brand — plenty for any single brand's search
+                    brand_inv = brand_inv[:500]
+                    # Build a brand-specific inv block. Selling data + reasoning prompt are
+                    # the same across brands; only the eligible-styles list differs, so we
+                    # reuse them.
+                    brand_inv_lines = ['## ELIGIBLE STYLES (only recommend from this list, verbatim style codes)']
+                    brand_inv_lines.append(f"## Brand: {brand_abbr}  ({len(brand_inv)} styles)")
+                    for s in brand_inv:
+                        brand_inv_lines.append(
+                            f"  {s['style']} | {s.get('brand_abbr','')} | {s.get('color','') or '-'} | "
+                            f"{s.get('fabric','') or '-'} | {s.get('fit','') or '-'} | "
+                            f"WH:{s.get('total_warehouse',0)} INC:{s.get('incoming',0)} "
+                            f"ATS:{s.get('total_ats',0)} pipeline:{('YES' if s.get('in_current_pipeline') else 'NO')}"
+                        )
+                    brand_inv_block = '\n'.join(brand_inv_lines)
+                    # Replace the inv_block section in user_prompt for this brand
+                    brand_user_prompt = user_prompt.replace(
+                        inv_block, brand_inv_block
+                    ).replace(
+                        f"# REQUESTED COUNT: {rec_count} ",
+                        f"# REQUESTED COUNT: {want_count} "
+                    )
+                    resp = http_requests.post(
+                        'https://api.anthropic.com/v1/messages',
+                        headers={
+                            'x-api-key': ANTHROPIC_API_KEY,
+                            'anthropic-version': '2023-06-01',
+                            'content-type': 'application/json',
+                        },
+                        json={
+                            'model': AI_OPUS_MODEL,
+                            'max_tokens': 16000,
+                            'system': system_prompt,
+                            'messages': [{'role': 'user', 'content': brand_user_prompt}],
+                            'tools': [{
+                                'name': 'submit_recommendations',
+                                'description': 'Submit booking add and drop recommendations.',
+                                'input_schema': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'add': {'type': 'array', 'items': {'type': 'object',
+                                            'properties': {
+                                                'style': {'type': 'string'},
+                                                'brand': {'type': 'string'},
+                                                'recommended_color': {'type': 'string'},
+                                                'strength': {'type': 'string', 'enum': ['Strong','Medium','Trial']},
+                                                'rationale': {'type': 'string'},
+                                                'referenced_sellers': {'type':'array','items':{'type':'string'}}
+                                            },
+                                            'required': ['style','brand','recommended_color','strength','rationale','referenced_sellers']
+                                        }},
+                                        'drop': {'type': 'array', 'items': {'type': 'object',
+                                            'properties': {
+                                                'style': {'type': 'string'},
+                                                'brand': {'type': 'string'},
+                                                'recommended_color': {'type': 'string'},
+                                                'strength': {'type': 'string', 'enum': ['Cut','Reduce','Watch']},
+                                                'rationale': {'type': 'string'},
+                                                'referenced_sellers': {'type':'array','items':{'type':'string'}}
+                                            },
+                                            'required': ['style','brand','recommended_color','strength','rationale','referenced_sellers']
+                                        }},
+                                    },
+                                    'required': ['add', 'drop']
+                                }
+                            }],
+                            'tool_choice': {'type': 'tool', 'name': 'submit_recommendations'},
+                        },
+                        timeout=180
+                    )
+                    if resp.status_code != 200:
+                        return (None, {}, f"{brand_abbr}: HTTP {resp.status_code} — {resp.text[:200]}")
+                    body_b = resp.json()
+                    parsed_b = None
+                    for block in body_b.get('content', []):
+                        if block.get('type') == 'tool_use' and block.get('name') == 'submit_recommendations':
+                            parsed_b = block.get('input') or {}
+                            break
+                    if parsed_b is None:
+                        return (None, body_b.get('usage', {}), f"{brand_abbr}: model did not call tool")
+                    return (parsed_b, body_b.get('usage', {}), None)
+                except Exception as e:
+                    return (None, {}, f"{brand_abbr}: {type(e).__name__}: {str(e)[:200]}")
+
+            all_add = []
+            all_drop = []
+            brand_errors = []
+            total_in = 0
+            total_out = 0
+            with ThreadPoolExecutor(max_workers=min(8, len(per_brand_counts))) as ex:
+                futures = {ex.submit(_one_brand_call, b, c): b for b, c in per_brand_counts.items()}
+                for f in as_completed(futures):
+                    parsed_b, usage_b, err = f.result()
+                    if err:
+                        brand_errors.append(err)
+                        continue
+                    total_in  += usage_b.get('input_tokens', 0)
+                    total_out += usage_b.get('output_tokens', 0)
+                    all_add.extend(parsed_b.get('add', []))
+                    all_drop.extend(parsed_b.get('drop', []))
+
+            # Filter + enrich the combined results (same logic as the single-call path)
+            valid_styles = {s['style']: s for s in inv}
+            def _filter_brand(recs):
+                kept, dropped = [], []
+                for r in (recs or []):
+                    style = (r.get('style') or '').upper().strip()
+                    if style in valid_styles:
+                        inv_data = valid_styles[style]
+                        r['style'] = style
+                        r['_inventory'] = {
+                            'brand_abbr':       inv_data['brand_abbr'],
+                            'brand_full':       inv_data['brand_full'],
+                            'color':            inv_data.get('color',''),
+                            'total_warehouse':  inv_data.get('total_warehouse', 0),
+                            'incoming':         inv_data.get('incoming', 0),
+                            'total_ats':        inv_data.get('total_ats', 0),
+                            'in_current_pipeline': inv_data.get('in_current_pipeline', True),
+                        }
+                        kept.append(r)
+                    else:
+                        dropped.append(style)
+                return kept, dropped
+            add_recs, add_dropped = _filter_brand(all_add)
+            drop_recs, drop_dropped = _filter_brand(all_drop)
+            cost = _ai_estimate_cost(total_in, total_out)
+            return jsonify({
+                'recommendations': {'add': add_recs, 'drop': drop_recs},
+                'usage': {'input_tokens': total_in, 'output_tokens': total_out},
+                'cost_usd': round(cost, 4),
+                'model': AI_OPUS_MODEL,
+                'invalid_styles_dropped': add_dropped + drop_dropped,
+                'per_brand_mode': True,
+                'per_brand_counts': per_brand_counts,
+                'per_brand_errors': brand_errors,
+                'context': {
+                    'customer': customer,
+                    'season': season,
+                    'target_season': target_season,
+                    'sheets_used': [s['name'] for s in sheets],
+                    'inventory_styles_offered': len(inv),
+                    'brands_requested': list(per_brand_counts.keys()),
+                }
+            })
+
         # ── Call Claude Opus ──
         api_resp = http_requests.post(
             'https://api.anthropic.com/v1/messages',
@@ -5935,9 +6106,12 @@ def ai_suggestions():
                 'raw_response': json.dumps(body.get('content', []))[:2000]
             }), 502
 
-        # ── Validate: every recommended style must exist in the inventory list ──
+        # ── Validate: every recommended style must exist in the eligible inventory list ──
         # The model sometimes hallucinates SKUs even with the instruction not to.
-        # We drop any rec whose style isn't in the eligible list and warn the UI.
+        # We drop any rec whose style isn't in the eligible list we provided. Styles in the
+        # list but flagged in_current_pipeline:False (revival picks from all_styles_ever)
+        # are KEPT — they have valid override data and the frontend handles them as
+        # "Not in current inventory" cards.
         valid_styles = {s['style']: s for s in inv}
         def _filter(recs):
             kept = []
@@ -5945,16 +6119,18 @@ def ai_suggestions():
             for r in (recs or []):
                 style = (r.get('style') or '').upper().strip()
                 if style in valid_styles:
-                    # Enrich with the inventory data so the frontend can render image+ATS
                     inv_data = valid_styles[style]
                     r['style'] = style
                     r['_inventory'] = {
-                        'brand_abbr': inv_data['brand_abbr'],
-                        'brand_full': inv_data['brand_full'],
-                        'color': inv_data.get('color',''),
-                        'total_warehouse': inv_data['total_warehouse'],
-                        'incoming': inv_data['incoming'],
-                        'total_ats': inv_data['total_ats'],
+                        'brand_abbr':       inv_data['brand_abbr'],
+                        'brand_full':       inv_data['brand_full'],
+                        'color':            inv_data.get('color',''),
+                        'total_warehouse':  inv_data.get('total_warehouse', 0),
+                        'incoming':         inv_data.get('incoming', 0),
+                        'total_ats':        inv_data.get('total_ats', 0),
+                        # Pipeline flag tells frontend whether this is a live-stock style
+                        # or a revival pick (override-only, not currently produced).
+                        'in_current_pipeline': inv_data.get('in_current_pipeline', True),
                     }
                     kept.append(r)
                 else:
@@ -6816,6 +6992,322 @@ def ai_open_order_predictions():
 # EXPORT PREDICTIONS TO EXCEL  (with embedded images in column A, one sheet per brand)
 # Reuses the same image pipeline as the catalog export so images appear identically.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT AI SUGGESTIONS  (Add/Drop recommendations → Excel, one tab per brand)
+# Layout: one workbook, one Summary tab + one tab per brand. Within each brand
+# tab, Adds come first (with strength Strong/Medium/Trial), then Drops (Cut/
+# Reduce/Watch). Image in column A, same pattern as the catalog export.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/export-suggestions', methods=['POST', 'OPTIONS'])
+def export_suggestions():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json() or {}
+        recs = req.get('recommendations') or {}
+        fname = req.get('filename', 'AI-Booking-Suggestions')
+        adds = recs.get('add') or []
+        drops = recs.get('drop') or []
+        if not adds and not drops:
+            return jsonify({'error': 'No recommendations to export'}), 400
+
+        # Build a unified record list with direction tag so we can group by brand.
+        # Each record carries its origin direction so the brand tab can interleave them.
+        unified = []
+        for r in adds:
+            unified.append({**r, '_direction': 'add'})
+        for r in drops:
+            unified.append({**r, '_direction': 'drop'})
+
+        # Group by brand (canonical name). Recommendations from per-brand calls have
+        # _inventory.brand_full reliably set; legacy recs may use the top-level
+        # 'brand' field. Normalize both into one canonical key per brand.
+        by_brand = {}
+        for r in unified:
+            inv = r.get('_inventory') or {}
+            raw = inv.get('brand_full') or inv.get('brand_abbr') or r.get('brand') or 'Unknown'
+            brand = _normalize_brand(raw) or 'Unknown'
+            by_brand.setdefault(brand, []).append(r)
+        brands_sorted = sorted(by_brand.keys())
+
+        # Fetch images for every style across all brands
+        items_for_img = [
+            {
+                'sku':        r.get('style', ''),
+                'brand_abbr': (r.get('_inventory') or {}).get('brand_abbr', '') or r.get('brand', ''),
+                'brand':      (r.get('_inventory') or {}).get('brand_abbr', '') or r.get('brand', ''),
+            }
+            for r in unified
+        ]
+        all_imgs = download_images_for_items(items_for_img, S3_PHOTOS_URL, use_cache=True)
+        img_by_style = {}
+        for idx, data in all_imgs.items():
+            if idx < len(unified):
+                style = (unified[idx].get('style') or '').upper()
+                if style and style not in img_by_style:
+                    img_by_style[style] = data
+
+        # Build workbook
+        buf = BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb.set_properties({'title': 'AI Booking Suggestions',
+                           'author': 'Versa Inventory System'})
+
+        fmt_header = wb.add_format({'bold': True, 'bg_color': '#1f2937', 'font_color': 'white',
+                                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_size': 11})
+        fmt_text = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10})
+        fmt_text_wrap = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'text_wrap': True})
+        fmt_num = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10,
+                                 'num_format': '#,##0', 'align': 'right'})
+        # Direction-colored cells
+        fmt_add = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                 'bg_color': '#ede9fe', 'font_color': '#5b21b6', 'align': 'center'})
+        fmt_drop = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                  'bg_color': '#fee2e2', 'font_color': '#991b1b', 'align': 'center'})
+        fmt_strong = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                    'bg_color': '#dcfce7', 'font_color': '#166534', 'align': 'center'})
+        fmt_medium = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                    'bg_color': '#dbeafe', 'font_color': '#1e3a8a', 'align': 'center'})
+        fmt_trial = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                   'bg_color': '#fef3c7', 'font_color': '#92400e', 'align': 'center'})
+        strength_fmt = {'Strong': fmt_strong, 'Medium': fmt_medium, 'Trial': fmt_trial,
+                        'Cut': fmt_drop, 'Reduce': fmt_drop, 'Watch': fmt_trial}
+
+        # Summary sheet
+        ws_sum = wb.add_worksheet('Summary')
+        sum_h = ['Brand', 'Total', 'Adds', 'Drops', 'Strong Adds', 'Cut Drops']
+        for c, h in enumerate(sum_h):
+            ws_sum.write(0, c, h, fmt_header)
+        ws_sum.set_row(0, 22)
+        for c, w in enumerate([28, 10, 10, 10, 14, 14]):
+            ws_sum.set_column(c, c, w)
+        for r, brand in enumerate(brands_sorted, start=1):
+            recs_b = by_brand[brand]
+            a = [x for x in recs_b if x['_direction'] == 'add']
+            d = [x for x in recs_b if x['_direction'] == 'drop']
+            strong = sum(1 for x in a if x.get('strength') == 'Strong')
+            cut = sum(1 for x in d if x.get('strength') == 'Cut')
+            ws_sum.write(r, 0, brand, fmt_text)
+            ws_sum.write(r, 1, len(recs_b), fmt_num)
+            ws_sum.write(r, 2, len(a), fmt_num)
+            ws_sum.write(r, 3, len(d), fmt_num)
+            ws_sum.write(r, 4, strong, fmt_num)
+            ws_sum.write(r, 5, cut, fmt_num)
+
+        # Per-brand tabs
+        IMAGE_COL_WIDTH = COL_WIDTH_UNITS
+        IMAGE_ROW_HEIGHT = 112.5
+        headers = ['Image', 'Direction', 'Style', 'Color', 'Strength', 'Rationale',
+                   'Referenced Sellers', 'Total ATS', 'Warehouse', 'Incoming']
+        col_widths = [IMAGE_COL_WIDTH, 11, 16, 22, 12, 70, 32, 11, 11, 11]
+
+        for brand in brands_sorted:
+            safe = re.sub(r'[\\/*?\[\]:]', '', brand)[:31] or 'Brand'
+            ws = wb.add_worksheet(safe)
+            for c, h in enumerate(headers):
+                ws.write(0, c, h, fmt_header)
+            ws.set_row(0, 22)
+            for c, w in enumerate(col_widths):
+                ws.set_column(c, c, w)
+            # Sort: Adds first (Strong → Medium → Trial), then Drops (Cut → Reduce → Watch)
+            order_dir = {'add': 0, 'drop': 1}
+            order_str = {'Strong': 0, 'Medium': 1, 'Trial': 2, 'Cut': 0, 'Reduce': 1, 'Watch': 2}
+            recs_b = sorted(by_brand[brand], key=lambda r: (
+                order_dir.get(r['_direction'], 9),
+                order_str.get(r.get('strength'), 9),
+                r.get('style', '')
+            ))
+            for r_idx, rec in enumerate(recs_b, start=1):
+                ws.set_row(r_idx, IMAGE_ROW_HEIGHT)
+                style = (rec.get('style') or '').upper()
+                inv = rec.get('_inventory') or {}
+                img_data = img_by_style.get(style)
+                if img_data and img_data.get('image_data'):
+                    try:
+                        bio = img_data['image_data']
+                        if hasattr(bio, 'seek'): bio.seek(0)
+                        ratio = (TARGET_W - _IMG_CELL_PAD) / TARGET_W
+                        ws.insert_image(r_idx, 0, 'img.png', {
+                            'image_data': bio,
+                            'x_scale':  (img_data.get('x_scale') or 1) * ratio,
+                            'y_scale':  (img_data.get('y_scale') or 1) * ratio,
+                            'x_offset': (img_data.get('x_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'y_offset': (img_data.get('y_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'object_position': 1,
+                        })
+                    except Exception as e:
+                        ws.write(r_idx, 0, f'err: {type(e).__name__}', fmt_text)
+                else:
+                    ws.write(r_idx, 0, 'No Image', fmt_text)
+                direction = rec.get('_direction', 'add')
+                ws.write(r_idx, 1, '⬆ ADD' if direction == 'add' else '⬇ DROP',
+                         fmt_add if direction == 'add' else fmt_drop)
+                ws.write(r_idx, 2, style, fmt_text)
+                ws.write(r_idx, 3, rec.get('recommended_color', '') or inv.get('color', '') or '', fmt_text)
+                str_v = rec.get('strength', '')
+                ws.write(r_idx, 4, str_v, strength_fmt.get(str_v, fmt_text))
+                ws.write(r_idx, 5, rec.get('rationale', '') or '', fmt_text_wrap)
+                ws.write(r_idx, 6, ', '.join(rec.get('referenced_sellers', []) or []), fmt_text)
+                ws.write(r_idx, 7, int(inv.get('total_ats', 0) or 0), fmt_num)
+                ws.write(r_idx, 8, int(inv.get('total_warehouse', 0) or 0), fmt_num)
+                ws.write(r_idx, 9, int(inv.get('incoming', 0) or 0), fmt_num)
+            ws.freeze_panes(1, 0)
+
+        wb.close()
+        buf.seek(0)
+        ts = datetime.utcnow().strftime('%Y-%m-%d')
+        return send_file(
+            buf,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f"{fname}_{ts}.xlsx"
+        )
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT BOOKING PLAN  (the user's saved-to-plan items → Excel, one tab per brand)
+# Same brand-grouped layout as suggestions, but pulls from the plan items list
+# the frontend sends. Includes qty (which is user-set, ignoring ATS).
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/export-rec-plan', methods=['POST', 'OPTIONS'])
+def export_rec_plan():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json() or {}
+        items = req.get('items') or []
+        if not items:
+            return jsonify({'error': 'Plan is empty'}), 400
+
+        # Group by brand
+        by_brand = {}
+        for it in items:
+            raw = it.get('brand') or it.get('brand_abbr') or 'Unknown'
+            brand = _normalize_brand(raw) or 'Unknown'
+            by_brand.setdefault(brand, []).append(it)
+        brands_sorted = sorted(by_brand.keys())
+
+        # Image fetch
+        items_for_img = [
+            {
+                'sku':        it.get('style', ''),
+                'brand_abbr': it.get('brand_abbr', '') or it.get('brand', ''),
+                'brand':      it.get('brand_abbr', '') or it.get('brand', ''),
+            }
+            for it in items
+        ]
+        all_imgs = download_images_for_items(items_for_img, S3_PHOTOS_URL, use_cache=True)
+        img_by_style = {}
+        for idx, data in all_imgs.items():
+            if idx < len(items):
+                style = (items[idx].get('style') or '').upper()
+                if style and style not in img_by_style:
+                    img_by_style[style] = data
+
+        buf = BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb.set_properties({'title': 'Booking Plan', 'author': 'Versa Inventory System'})
+
+        fmt_header = wb.add_format({'bold': True, 'bg_color': '#1f2937', 'font_color': 'white',
+                                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_size': 11})
+        fmt_text = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10})
+        fmt_text_wrap = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'text_wrap': True})
+        fmt_num = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10,
+                                 'num_format': '#,##0', 'align': 'right'})
+        fmt_add = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                 'bg_color': '#ede9fe', 'font_color': '#5b21b6', 'align': 'center'})
+        fmt_drop = wb.add_format({'valign': 'vcenter', 'border': 1, 'font_size': 10, 'bold': True,
+                                  'bg_color': '#fee2e2', 'font_color': '#991b1b', 'align': 'center'})
+
+        # Summary
+        ws_sum = wb.add_worksheet('Summary')
+        sum_h = ['Brand', 'Styles', 'Add Qty', 'Drop Qty', 'Total Qty']
+        for c, h in enumerate(sum_h):
+            ws_sum.write(0, c, h, fmt_header)
+        ws_sum.set_row(0, 22)
+        for c, w in enumerate([28, 12, 12, 12, 12]):
+            ws_sum.set_column(c, c, w)
+        grand = {'styles': 0, 'add_qty': 0, 'drop_qty': 0}
+        for r, brand in enumerate(brands_sorted, start=1):
+            its = by_brand[brand]
+            adds = [x for x in its if x.get('direction') == 'add']
+            drops = [x for x in its if x.get('direction') == 'drop']
+            add_q = sum(int(x.get('qty', 0) or 0) for x in adds)
+            drop_q = sum(int(x.get('qty', 0) or 0) for x in drops)
+            ws_sum.write(r, 0, brand, fmt_text)
+            ws_sum.write(r, 1, len(its), fmt_num)
+            ws_sum.write(r, 2, add_q, fmt_num)
+            ws_sum.write(r, 3, drop_q, fmt_num)
+            ws_sum.write(r, 4, add_q + drop_q, fmt_num)
+            grand['styles'] += len(its); grand['add_qty'] += add_q; grand['drop_qty'] += drop_q
+
+        # Per-brand
+        IMAGE_COL_WIDTH = COL_WIDTH_UNITS
+        IMAGE_ROW_HEIGHT = 112.5
+        headers = ['Image', 'Direction', 'Style', 'Color', 'Strength', 'Qty', 'Rationale', 'Added']
+        col_widths = [IMAGE_COL_WIDTH, 11, 16, 22, 12, 10, 60, 18]
+        for brand in brands_sorted:
+            safe = re.sub(r'[\\/*?\[\]:]', '', brand)[:31] or 'Brand'
+            ws = wb.add_worksheet(safe)
+            for c, h in enumerate(headers):
+                ws.write(0, c, h, fmt_header)
+            ws.set_row(0, 22)
+            for c, w in enumerate(col_widths):
+                ws.set_column(c, c, w)
+            order_dir = {'add': 0, 'drop': 1}
+            its = sorted(by_brand[brand], key=lambda i: (
+                order_dir.get(i.get('direction', 'add'), 9),
+                i.get('style', '')
+            ))
+            for r_idx, it in enumerate(its, start=1):
+                ws.set_row(r_idx, IMAGE_ROW_HEIGHT)
+                style = (it.get('style') or '').upper()
+                img_data = img_by_style.get(style)
+                if img_data and img_data.get('image_data'):
+                    try:
+                        bio = img_data['image_data']
+                        if hasattr(bio, 'seek'): bio.seek(0)
+                        ratio = (TARGET_W - _IMG_CELL_PAD) / TARGET_W
+                        ws.insert_image(r_idx, 0, 'img.png', {
+                            'image_data': bio,
+                            'x_scale':  (img_data.get('x_scale') or 1) * ratio,
+                            'y_scale':  (img_data.get('y_scale') or 1) * ratio,
+                            'x_offset': (img_data.get('x_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'y_offset': (img_data.get('y_offset') or 0) * ratio + _IMG_CELL_PAD / 2,
+                            'object_position': 1,
+                        })
+                    except Exception as e:
+                        ws.write(r_idx, 0, f'err: {type(e).__name__}', fmt_text)
+                else:
+                    ws.write(r_idx, 0, 'No Image', fmt_text)
+                direction = it.get('direction', 'add')
+                ws.write(r_idx, 1, '⬆ ADD' if direction == 'add' else '⬇ DROP',
+                         fmt_add if direction == 'add' else fmt_drop)
+                ws.write(r_idx, 2, style, fmt_text)
+                ws.write(r_idx, 3, it.get('color', '') or '', fmt_text)
+                ws.write(r_idx, 4, it.get('strength', '') or '', fmt_text)
+                ws.write(r_idx, 5, int(it.get('qty', 0) or 0), fmt_num)
+                ws.write(r_idx, 6, it.get('rationale', '') or '', fmt_text_wrap)
+                ws.write(r_idx, 7, (it.get('added_at', '') or '')[:10], fmt_text)
+            ws.freeze_panes(1, 0)
+
+        wb.close()
+        buf.seek(0)
+        ts = datetime.utcnow().strftime('%Y-%m-%d')
+        return send_file(
+            buf,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f"Booking-Plan_{ts}.xlsx"
+        )
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
 @app.route('/export-predictions', methods=['POST', 'OPTIONS'])
 def export_predictions():
     """Build an xlsx workbook from a prediction-result payload.
