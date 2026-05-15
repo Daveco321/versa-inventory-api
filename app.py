@@ -4709,7 +4709,7 @@ def delete_saved_catalog(idx):
         return _cors_json({'error': str(e)}, 500)
 
 
-DROPBOX_RESYNC_INTERVAL = int(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600  # Default: 1 hour
+DROPBOX_RESYNC_INTERVAL = int(float(os.environ.get('DROPBOX_RESYNC_HOURS', 1)) * 3600)  # Default: 1 hour; supports fractions (e.g. 0.25 = 15 min, 0.5 = 30 min)
 
 _worker_initialized = False
 
