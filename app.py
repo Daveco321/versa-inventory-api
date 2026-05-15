@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import random
 import threading
 import concurrent.futures
 from datetime import datetime
@@ -5167,6 +5168,61 @@ AI_OPUS_INPUT_PER_MTOK  = float(os.environ.get('AI_OPUS_INPUT_PER_MTOK',  15.0))
 AI_OPUS_OUTPUT_PER_MTOK = float(os.environ.get('AI_OPUS_OUTPUT_PER_MTOK', 75.0))
 AI_OPUS_MODEL = os.environ.get('AI_OPUS_MODEL', 'claude-opus-4-5')
 
+def _anthropic_post_with_retry(payload, *, timeout=180, max_retries=4):
+    """POST to Anthropic's /v1/messages with retry-on-transient-error.
+
+    Anthropic returns HTTP 529 (overloaded) and 503 (service unavailable) when
+    their backend is over capacity. These typically clear in a few seconds.
+    Without retry, even one transient hiccup makes the entire user-facing
+    operation fail — and in per-brand parallel mode, ANY one of 5 parallel
+    calls hitting 529 throws the whole run.
+
+    Retry policy: exponential backoff with jitter — 2s, 4s, 8s, 16s. Stop after
+    `max_retries` total attempts. 529, 503, and 429 (rate limit) are retried;
+    everything else (400 bad request, 401 auth, 5xx other than the above) is
+    returned as-is so we don't mask real errors.
+    """
+    headers = {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+    }
+    RETRYABLE_STATUSES = {429, 503, 529}
+    last_resp = None
+    for attempt in range(max_retries):
+        try:
+            resp = http_requests.post(
+                'https://api.anthropic.com/v1/messages',
+                headers=headers, json=payload, timeout=timeout
+            )
+            if resp.status_code == 200 or resp.status_code not in RETRYABLE_STATUSES:
+                # Success, or a non-retryable error — return immediately
+                return resp
+            last_resp = resp
+            # Honor server's Retry-After header if present; otherwise exponential backoff
+            retry_after = resp.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    delay = min(float(retry_after), 30.0)
+                except (ValueError, TypeError):
+                    delay = (2 ** attempt) + random.random()
+            else:
+                delay = (2 ** attempt) + random.random()
+            print(f"  [anthropic] {resp.status_code} on attempt {attempt+1}/{max_retries} — "
+                  f"backing off {delay:.1f}s", flush=True)
+            time.sleep(delay)
+        except http_requests.exceptions.RequestException as e:
+            # Network-level error (timeout, connection reset, DNS) — also retry
+            print(f"  [anthropic] network error on attempt {attempt+1}/{max_retries}: {e} — retry",
+                  flush=True)
+            delay = (2 ** attempt) + random.random()
+            time.sleep(delay)
+    # Exhausted retries — return last response (or raise if we never got one)
+    if last_resp is None:
+        raise http_requests.exceptions.RequestException(
+            f"Anthropic API unreachable after {max_retries} attempts")
+    return last_resp
+
 def _ai_season_from_sheet(sheet_name):
     """Same auto-mapping as the frontend's _sellingInferSeason. Kept here so the
     backend can pre-filter sheets by season if the request asks for it."""
@@ -5356,24 +5412,29 @@ def _ai_format_window(w):
 
 def _ai_build_inventory_context(ats_source='all', target_brands=None,
                                 ats_only=False, ats_min=0, ats_scope='both'):
-    """Build a compact text block listing current inventory styles with their
-    color descriptions. The AI picks recommendations from this list — it can ONLY
-    recommend styles you actually have inventory for, so this is the source of truth.
+    """Build the inventory context for AI prompts.
 
-    ats_source semantics:
-      'warehouse_only' = styles with on-hand warehouse stock only (no incoming).
-      'all'            = styles with warehouse OR incoming (current-pipeline view).
-      'all_styles_ever'= everything currently in stock/incoming PLUS every style that
-                         exists in the style_overrides database (your full color
-                         catalog, including discontinued styles with no current stock).
-                         This is the option to use when you want the AI to consider
-                         re-introducing old styles, not just shuffling current stock.
-    target_brands: optional list of brand abbreviations to limit to; default = all.
-
-    Returns a list of dicts (one per style) — the caller serializes for the prompt.
-    Styles with no current stock get total_warehouse=0, incoming=0 and an
-    `in_current_pipeline: False` flag so the AI can prefer pipeline styles when ties.
+    ats_source: 'all' (default), 'warehouse_only', or 'all_styles_ever'
+    target_brands: optional list of brand identifiers. Accepts either abbreviations
+        (BEENE), full names (Geoffrey Beene), or any case variant — each is run
+        through _normalize_brand and resolved to a canonical full name, then
+        matched against the inventory item's normalized brand_full. This lets the
+        frontend send whatever it has (full name from the dropdown, abbr from
+        per-brand counts) without separate code paths.
     """
+    # Pre-compute the set of acceptable canonical brand names so the per-item check
+    # is a single dict lookup. Empty/None means "any brand".
+    target_brand_canonicals = None
+    if target_brands:
+        target_brand_canonicals = set()
+        for b in target_brands:
+            canon = _normalize_brand(b)
+            if canon:
+                target_brand_canonicals.add(canon)
+                # Also add the uppercase abbreviation form just in case some legacy
+                # entries store the abbr in brand_full
+                target_brand_canonicals.add(canon.upper())
+
     with _inv_lock:
         items_snap = list(_inventory['items'])
     with _overrides_lock:
@@ -5387,8 +5448,14 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
         if not base:
             continue
         brand_abbr = (it.get('brand_abbr') or it.get('brand') or '').upper()
-        if target_brands and brand_abbr not in target_brands:
-            continue
+        brand_full = it.get('brand_full', '') or BRAND_FULL_NAMES.get(brand_abbr, brand_abbr)
+        # Brand filter — normalize the item's brand and compare to the target set.
+        # The target set already contains canonical full names AND uppercase abbrs,
+        # so this catches any variant the frontend might send.
+        if target_brand_canonicals is not None:
+            item_canon = _normalize_brand(brand_full or brand_abbr)
+            if item_canon not in target_brand_canonicals and brand_abbr not in target_brand_canonicals:
+                continue
 
         wh = (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0))
         inc = it.get('incoming', 0)
@@ -5440,8 +5507,12 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
             # Brand abbr isn't stored on overrides, so derive it from SKU positions 2-4.
             # If the override has an explicit brand field (some entries do), prefer that.
             brand_abbr = (ov.get('brand') or '').upper() or (base_up[2:4] if len(base_up) >= 4 else '')
-            if target_brands and brand_abbr and brand_abbr not in target_brands:
-                continue
+            # Apply the normalized brand filter the same way as the live-inventory branch.
+            if target_brand_canonicals is not None:
+                brand_full_guess = BRAND_FULL_NAMES.get(brand_abbr, brand_abbr)
+                item_canon = _normalize_brand(brand_full_guess)
+                if item_canon not in target_brand_canonicals and brand_abbr not in target_brand_canonicals:
+                    continue
             color  = ov.get('color')  or ''
             fabric = ov.get('fabric') or ''
             fit    = ov.get('fit')    or ''
@@ -5888,14 +5959,7 @@ def ai_suggestions():
                         f"# REQUESTED COUNT: {rec_count} ",
                         f"# REQUESTED COUNT: {want_count} "
                     )
-                    resp = http_requests.post(
-                        'https://api.anthropic.com/v1/messages',
-                        headers={
-                            'x-api-key': ANTHROPIC_API_KEY,
-                            'anthropic-version': '2023-06-01',
-                            'content-type': 'application/json',
-                        },
-                        json={
+                    resp = _anthropic_post_with_retry({
                             'model': AI_OPUS_MODEL,
                             'max_tokens': 16000,
                             'system': system_prompt,
@@ -5933,9 +5997,7 @@ def ai_suggestions():
                                 }
                             }],
                             'tool_choice': {'type': 'tool', 'name': 'submit_recommendations'},
-                        },
-                        timeout=180
-                    )
+                        }, timeout=180)
                     if resp.status_code != 200:
                         return (None, {}, f"{brand_abbr}: HTTP {resp.status_code} — {resp.text[:200]}")
                     body_b = resp.json()
@@ -6011,15 +6073,8 @@ def ai_suggestions():
                 }
             })
 
-        # ── Call Claude Opus ──
-        api_resp = http_requests.post(
-            'https://api.anthropic.com/v1/messages',
-            headers={
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            json={
+        # ── Call Claude Opus (with auto-retry on transient 529/503/429) ──
+        api_resp = _anthropic_post_with_retry({
                 'model': AI_OPUS_MODEL,
                 'max_tokens': 16000,
                 'system': system_prompt,
@@ -6080,9 +6135,7 @@ def ai_suggestions():
                     }
                 }],
                 'tool_choice': {'type': 'tool', 'name': 'submit_recommendations'},
-            },
-            timeout=180
-        )
+            }, timeout=180)
         if api_resp.status_code != 200:
             return jsonify({
                 'error': f'Anthropic API returned {api_resp.status_code}',
@@ -6795,14 +6848,7 @@ def ai_open_order_predictions():
                  'text': open_block_batch + "\n\n" + reasoning_tail}
             ]
             try:
-                resp = http_requests.post(
-                    'https://api.anthropic.com/v1/messages',
-                    headers={
-                        'x-api-key': ANTHROPIC_API_KEY,
-                        'anthropic-version': '2023-06-01',
-                        'content-type': 'application/json',
-                    },
-                    json={
+                resp = _anthropic_post_with_retry({
                         'model': AI_OPUS_MODEL,
                         'max_tokens': 16000,
                         'system': [{'type': 'text', 'text': system_prompt,
@@ -6837,9 +6883,7 @@ def ai_open_order_predictions():
                             }
                         }],
                         'tool_choice': {'type': 'tool', 'name': 'submit_predictions'},
-                    },
-                    timeout=180
-                )
+                    }, timeout=180)
                 if resp.status_code != 200:
                     return (None, {}, '', f"Batch {batch_idx}: HTTP {resp.status_code} — {resp.text[:200]}")
                 body_b = resp.json()
