@@ -616,11 +616,12 @@ def load_allocation_from_s3():
         return []
 
 
-# Production data cache — loaded from Dropbox, refreshed hourly
+# Production data cache — loaded from Dropbox, refreshed every 10 min
+# (overridable via PRODUCTION_RESYNC_MINUTES env var; see production_resync_loop below)
 _production_data = []
 _production_last_sync = 0
 _production_lock = threading.Lock()
-_PRODUCTION_TTL = 3600  # 1 hour
+_PRODUCTION_TTL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 60)  # default 10 min
 
 
 def load_production_from_dropbox():
@@ -4774,6 +4775,31 @@ def hourly_resync():
 
 
 # ────────────────────────────────────────────────────────────────────────
+# STYLE LEDGER FAST-LANE — pulls production data every 10 min (configurable
+# via PRODUCTION_RESYNC_MINUTES env var). This runs INDEPENDENTLY of the
+# heavy hourly_resync above so we get fresh ledger data without thrashing
+# inventory, APO, or export regeneration on the same cadence.
+# ────────────────────────────────────────────────────────────────────────
+PRODUCTION_RESYNC_INTERVAL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 60)
+
+
+def production_resync_loop():
+    """Background loop: re-pull the Style Ledger from Dropbox every N minutes."""
+    print(f"  ⏰ Style Ledger fast-lane enabled (every {PRODUCTION_RESYNC_INTERVAL//60} min)")
+    while True:
+        try:
+            time.sleep(PRODUCTION_RESYNC_INTERVAL)
+            global _production_last_sync
+            # Reset timestamp to bypass the TTL cache and force a fresh pull
+            _production_last_sync = 0
+            load_production_from_dropbox()
+        except Exception as e:
+            print(f"  ⚠ Style Ledger fast-lane refresh failed: {e}")
+            # Brief back-off on persistent errors so we don't tight-loop
+            time.sleep(60)
+
+
+# ────────────────────────────────────────────────────────────────────────
 # DAILY FULL REGEN — clears ALL image caches and rebuilds every export
 # ────────────────────────────────────────────────────────────────────────
 # Set DAILY_REGEN_HOUR_UTC in env to change the trigger time (0–23, UTC).
@@ -4903,6 +4929,9 @@ def startup_sync():
 
     # Start daily full-regen scheduler (clears all caches + rebuilds at 11pm/configurable)
     threading.Thread(target=daily_regen_loop, daemon=True, name='daily-regen').start()
+
+    # Start Style Ledger fast-lane (10-min Dropbox pull, independent of hourly_resync)
+    threading.Thread(target=production_resync_loop, daemon=True, name='production-resync').start()
 
     # Start daily selling-data Dropbox sync + warm caches now (non-blocking)
     threading.Thread(target=daily_selling_sync_loop, daemon=True, name='selling-sync').start()
