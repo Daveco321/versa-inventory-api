@@ -2653,15 +2653,57 @@ def parse_inventory_excel(file_bytes):
 
         sku = str(_col_val(rd, 'SKU') or '').strip()
         brand = str(_col_val(rd, 'Brand') or '').strip().upper()
-        if not sku or sku == 'N/A' or not brand:
+        # ATS sheet is the source of truth: every row with a SKU appears in the
+        # catalog, no exceptions. Previously we dropped rows where Brand was
+        # blank — that silently hid SKUs like dashed-variant rows whenever
+        # David hadn't filled in the brand cell. If brand is missing, infer it
+        # from the SKU prefix (e.g. ROGB → BEENE) so the row still has a sensible
+        # bucket. If we still can't determine it, leave it as UNKNOWN rather
+        # than skipping.
+        if not sku or sku == 'N/A':
             continue
+        if not brand:
+            # SKU prefix conventions: first 2 chars = customer (RO=Ross, TJ=TJX, etc.),
+            # next 2 chars = brand abbreviation. We look up the brand portion in
+            # BRAND_FULL_NAMES which is keyed by the abbreviation; if found, use it.
+            sku_upper = sku.upper()
+            inferred = None
+            if len(sku_upper) >= 4:
+                prefix = sku_upper[2:4]
+                # Reverse-lookup: find any key in BRAND_FULL_NAMES whose value
+                # the prefix points to. Most brand abbrevs are 2 chars matching
+                # the SKU code (NA=NAUTICA, GB=BEENE, EB=EB).
+                _PREFIX_TO_BRAND = {
+                    'NA': 'NAUTICA', 'DK': 'DKNY', 'EB': 'EB', 'RB': 'REEBOK',
+                    'VC': 'VINCE', 'BE': 'BEN', 'US': 'USPA', 'CH': 'CHAPS',
+                    'LB': 'LUCKY', 'JN': 'JNY', 'GB': 'BEENE', 'NM': 'NICOLE',
+                    'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN', 'VD': 'VD',
+                    'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
+                    'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE'
+                }
+                inferred = _PREFIX_TO_BRAND.get(prefix)
+            brand = inferred or 'UNKNOWN'
 
         jtw = int(_col_val(rd, 'JTW') or 0)
         tr  = int(_col_val(rd, 'TR')  or 0)
         dcw = int(_col_val(rd, 'DCW') or 0)
         qa  = int(_col_val(rd, 'QA') or _col_val(rd, 'Q/A') or _col_val(rd, 'Quality') or 0)
-        committed = int(_col_val(rd, 'Committed') or 0)
-        allocated = int(_col_val(rd, 'Allocated') or 0)
+        # Tolerate header drift — "Committed", "Committed Units", "Committed Qty"
+        # all mean the same thing. Same for allocated.
+        committed = int(
+            _col_val(rd, 'Committed') or
+            _col_val(rd, 'Committed Units') or
+            _col_val(rd, 'Committed Qty') or
+            _col_val(rd, 'CommittedUnits') or
+            0
+        )
+        allocated = int(
+            _col_val(rd, 'Allocated') or
+            _col_val(rd, 'Allocated Units') or
+            _col_val(rd, 'Allocated Qty') or
+            _col_val(rd, 'AllocatedUnits') or
+            0
+        )
         incoming  = int(_col_val(rd, 'Incoming') or _col_val(rd, 'In Transit') or
                         _col_val(rd, 'InTransit') or _col_val(rd, 'In-Transit') or
                         _col_val(rd, 'On Order') or _col_val(rd, 'PO') or
@@ -5302,7 +5344,8 @@ def daily_selling_sync_loop():
     print(f"  ⏰ Daily selling-data sync armed "
           f"(target: {SELLING_REFRESH_HOUR_UTC:02d}:{SELLING_REFRESH_MIN_UTC:02d} UTC)",
           flush=True)
-    customers = ['Ross']  # extend list as more customer folders appear
+    customers = ['Ross']  # legacy best/okay/worst format
+    weekly_customers = ['Costco']  # new quantitative weekly format
     while True:
         try:
             now = datetime.utcnow()
@@ -5317,6 +5360,8 @@ def daily_selling_sync_loop():
                   f"{SELLING_REFRESH_MIN_UTC:02d} UTC trigger fired", flush=True)
             for c in customers:
                 refresh_selling_data(c)
+            for c in weekly_customers:
+                refresh_weekly_selling_data(c)
         except Exception as e:
             print(f"  ⚠ [SellingSync] Loop error: {e}", flush=True)
             time.sleep(3600)  # back off
@@ -5360,6 +5405,351 @@ def refresh_selling_data_endpoint(customer):
             'source_filename': data.get('source_filename'),
         })
     return jsonify({'ok': False, 'error': 'Refresh failed (see server logs)'}), 502
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEEKLY SELLING DATA (Costco-style)
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel system to the legacy Ross "best/okay/worst" labels — this one handles
+# fundamentally different data:
+#   • Multiple files per customer folder (one per week)
+#   • Filename encodes brand + snapshot date + week#
+#       e.g. Costco_EB_20260523_-_WK_3.xlsx
+#       e.g. Costco_DKNY_20260530_-_WK_4.xlsx
+#   • Each file has parent styles (e.g. CUEBWF26-10) broken into item-rows
+#     by size/color, with a TOTAL row per parent
+#   • Per-style + per-item quantitative metrics: $ sold, units, DPW, sell-through,
+#     inventory on hand, etc — for both "current week" and "lifetime"
+#
+# The viewer needs ALL weeks for trend analysis (W/W growth, season-to-date),
+# so we don't pick a single file like the legacy parser does — we parse the
+# whole folder and group by brand.
+
+import re as _re
+
+# Filename pattern: <Customer>_<Brand>_<YYYYMMDD>_-_WK_<N>.xlsx
+# Brand can contain underscores in unusual cases; we anchor on YYYYMMDD which is
+# always 8 digits, so anything before that (after the customer prefix) is brand.
+_WEEKLY_FILENAME_RE = _re.compile(
+    r'^(?P<customer>[^_]+)_(?P<brand>.+?)_(?P<date>\d{8})_-_WK_(?P<week>\d+)\.xlsx$',
+    _re.IGNORECASE
+)
+
+def _parse_weekly_filename(filename):
+    """Pull brand / date / week# out of a weekly-selling filename.
+    Returns dict or None if filename doesn't match the expected pattern."""
+    m = _WEEKLY_FILENAME_RE.match(filename or '')
+    if not m:
+        return None
+    try:
+        date_str = m.group('date')
+        snapshot_date = datetime.strptime(date_str, '%Y%m%d').date().isoformat()
+    except ValueError:
+        return None
+    return {
+        'customer': m.group('customer'),
+        'brand': m.group('brand').upper(),
+        'snapshot_date': snapshot_date,
+        'week': int(m.group('week')),
+    }
+
+
+def _parse_weekly_workbook(xlsx_bytes, file_meta):
+    """Parse a single weekly selling workbook into a JSON-friendly structure.
+
+    Returns: {
+      'snapshot_date', 'brand', 'week',
+      'styles': [
+        {'style': 'CUEBWF26-10', 'description': '...', 'brand': 'EB',
+         'items': [{item, description, ...metrics_current, ...metrics_lifetime}],
+         'totals_current': {...}, 'totals_lifetime': {...}}
+      ]
+    }
+
+    Layout (see /mnt/user-data/uploads/Costco_EB_20260523_-_WK_3.xlsx):
+      Row 1: snapshot date (col A), "Current Week" label (col G), "Lifetime Total" (col R)
+      Row 2: headers — cols G-Q = current week metrics, cols R-AB = lifetime metrics
+      Body rows: item rows + TOTAL summary rows
+        Parent style appears in col C on the first item row of each style block;
+        subsequent items in the same block leave col C blank (continuation).
+    """
+    import io as _io
+    import openpyxl as _openpyxl
+    wb = _openpyxl.load_workbook(_io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+    # Pick the first sheet that isn't named 'Data' (that's a pivot helper)
+    sheet_name = None
+    for n in wb.sheetnames:
+        if n.lower() != 'data':
+            sheet_name = n
+            break
+    if sheet_name is None:
+        sheet_name = wb.sheetnames[0]
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    # Column index mapping for the per-item metrics. Current-week cols start at G(6),
+    # lifetime cols start at R(17). Same 11 fields in each half.
+    def _metric_block(row, start_col):
+        # Safely pull each metric, defaulting to 0 for None/blank cells
+        def _num(idx):
+            v = row[idx] if idx < len(row) else None
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+        return {
+            'dollar_sales':    _num(start_col + 0),  # G or R
+            'unit_sales':      _num(start_col + 1),  # H or S
+            'avg_price':       _num(start_col + 2),  # I or T
+            'dpw':             _num(start_col + 3),  # J or U  (Dollars Per Warehouse Per Week)
+            'refund_dollars':  _num(start_col + 4),  # K or V
+            'inventory':       _num(start_col + 5),  # L or W
+            'on_order':        _num(start_col + 6),  # M or X
+            'in_transit':      _num(start_col + 7),  # N or Y
+            'qty_received':    _num(start_col + 8),  # O or Z
+            'nsi_units':       _num(start_col + 9),  # P or AA  (NSI = no-sale inventory)
+            'retail_value':    _num(start_col + 10), # Q or AB
+        }
+
+    styles = []
+    current_style = None
+    for row in rows[2:]:  # skip header rows
+        if not row:
+            continue
+        col_c = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else '')
+        col_a_item = (str(row[0]).strip() if len(row) > 0 and row[0] is not None else '')
+        col_d_item = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else '')
+
+        if not col_c and not col_a_item:
+            continue
+
+        is_total = col_c.upper().startswith('TOTAL')
+        # Skip the header row itself — col_c == "Style" is the literal column header
+        is_header = col_c.upper() in ('STYLE', 'BRAND', 'ITEM')
+        is_new_parent = bool(col_c) and not is_total and not is_header
+
+        if is_header:
+            continue
+
+        if is_new_parent:
+            # Begin a new style block
+            current_style = {
+                'style': col_c.upper(),
+                'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
+                'brand_label': str(row[4]).strip() if len(row) > 4 and row[4] else '',
+                'items': [],
+                'totals_current': None,
+                'totals_lifetime': None,
+            }
+            styles.append(current_style)
+            # First row of the block is also an item row — fall through to add it
+
+        if is_total:
+            if current_style is not None:
+                current_style['totals_current']  = _metric_block(row, 6)
+                current_style['totals_lifetime'] = _metric_block(row, 17)
+            continue
+
+        if current_style is None or not (col_a_item or col_d_item):
+            continue
+
+        # Add this item row
+        current_style['items'].append({
+            'item_code': col_a_item or col_d_item,
+            'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
+            'current':  _metric_block(row, 6),
+            'lifetime': _metric_block(row, 17),
+        })
+
+    # Compute derived metrics per style: sell-through %, weeks-of-cover, etc.
+    # Doing this server-side once so every viewer gets consistent numbers.
+    for s in styles:
+        tc = s.get('totals_current') or {}
+        tl = s.get('totals_lifetime') or {}
+        if tc:
+            # Sell-through (lifetime) = units sold / (units sold + inventory on hand)
+            sold_lt = tl.get('unit_sales', 0) or 0
+            inv_lt  = tl.get('inventory', 0) or 0
+            denom = sold_lt + inv_lt
+            s['sell_through_pct'] = (sold_lt / denom * 100) if denom > 0 else 0.0
+            # Weeks-of-cover @ current weekly rate: inv / current_week_units
+            wk_units = tc.get('unit_sales', 0) or 0
+            s['weeks_of_cover'] = (tc.get('inventory', 0) / wk_units) if wk_units > 0 else None
+
+    return {
+        'snapshot_date': file_meta['snapshot_date'],
+        'brand': file_meta['brand'],
+        'week': file_meta['week'],
+        'source_filename': file_meta.get('source_filename', ''),
+        'styles': styles,
+    }
+
+
+# Cache: customer -> {weeks: [...], by_brand: {...}, fetched_at}. Separate from
+# the Ross legacy cache because the data structure is fundamentally different.
+_weekly_selling_cache = {}
+_weekly_selling_last_synced = {}
+
+
+def _fetch_weekly_selling_from_dropbox(customer):
+    """List every .xlsx in the customer's selling folder, parse each one,
+    return aggregated data grouped by brand and ordered by snapshot date.
+    """
+    token = get_dropbox_token()
+    if not token:
+        print(f"[Weekly Selling] No Dropbox token, can't fetch {customer}", flush=True)
+        return None
+
+    folder_path = f"{DROPBOX_SELLING_BASE}/{customer}"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    try:
+        list_resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers,
+            json={'path': folder_path, 'recursive': False, 'limit': 500},
+            timeout=30
+        )
+        if list_resp.status_code != 200:
+            print(f"[Weekly Selling] list_folder({folder_path}) → {list_resp.status_code}: "
+                  f"{list_resp.text[:200]}", flush=True)
+            return None
+        entries = list_resp.json().get('entries', [])
+    except Exception as e:
+        print(f"[Weekly Selling] List failed for {customer}: {e}", flush=True)
+        return None
+
+    # Build list of (file_meta, file_entry) tuples for files that match our pattern.
+    parseable = []
+    for e in entries:
+        if e.get('.tag') != 'file':
+            continue
+        name = e.get('name', '')
+        if name.startswith('~$') or not name.lower().endswith('.xlsx'):
+            continue
+        meta = _parse_weekly_filename(name)
+        if meta is None:
+            continue
+        meta['source_filename'] = name
+        parseable.append((meta, e))
+
+    if not parseable:
+        print(f"[Weekly Selling] No matching files in {folder_path} "
+              "(expected Customer_Brand_YYYYMMDD_-_WK_N.xlsx)", flush=True)
+        return {'weeks': [], 'by_brand': {}}
+
+    # Download + parse each file. Order by snapshot date ASC so weeks
+    # appear chronologically downstream.
+    parseable.sort(key=lambda pe: pe[0]['snapshot_date'])
+    weeks = []
+    for meta, entry in parseable:
+        try:
+            dl_resp = http_requests.post(
+                'https://content.dropboxapi.com/2/files/download',
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Dropbox-API-Arg': json.dumps({'path': entry['path_display']})
+                },
+                timeout=60
+            )
+            if dl_resp.status_code != 200:
+                print(f"[Weekly Selling] Download {entry['name']} → {dl_resp.status_code}",
+                      flush=True)
+                continue
+            parsed = _parse_weekly_workbook(dl_resp.content, meta)
+            weeks.append(parsed)
+        except Exception as e:
+            print(f"[Weekly Selling] Parse error for {entry.get('name')}: {e}", flush=True)
+            continue
+
+    # Group by brand → ordered list of weeks per brand
+    by_brand = {}
+    for w in weeks:
+        brand = w['brand']
+        by_brand.setdefault(brand, []).append(w)
+
+    return {
+        'weeks': weeks,
+        'by_brand': by_brand,
+        'fetched_at': datetime.utcnow().isoformat() + 'Z',
+    }
+
+
+def refresh_weekly_selling_data(customer):
+    """Refresh one customer's weekly-selling cache."""
+    data = _fetch_weekly_selling_from_dropbox(customer)
+    if data is not None:
+        key = customer.lower()
+        _weekly_selling_cache[key] = data
+        _weekly_selling_last_synced[key] = int(time.time())
+        return True
+    return False
+
+
+@app.route('/selling-data-weekly/<customer>', methods=['GET', 'OPTIONS'])
+def get_weekly_selling_data(customer):
+    """Return all weekly selling data for a customer (e.g. Costco).
+    Grouped by brand, weeks ordered chronologically."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    key = (customer or '').lower()
+    if key not in _weekly_selling_cache:
+        refresh_weekly_selling_data(customer)
+    data = _weekly_selling_cache.get(key)
+    if not data:
+        return jsonify({'error': 'No weekly selling data available', 'customer': customer}), 404
+    return jsonify({
+        'customer': customer,
+        'fetched_at': data.get('fetched_at'),
+        'last_synced': _weekly_selling_last_synced.get(key),
+        'by_brand': data.get('by_brand', {}),
+        'brand_count': len(data.get('by_brand', {})),
+        'week_count': len(data.get('weeks', [])),
+    })
+
+
+@app.route('/selling-data-weekly/<customer>/refresh', methods=['POST', 'OPTIONS'])
+def refresh_weekly_selling_endpoint(customer):
+    """Force re-pull of all weekly files for this customer from Dropbox."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    ok = refresh_weekly_selling_data(customer)
+    if ok:
+        key = customer.lower()
+        d = _weekly_selling_cache.get(key, {})
+        return jsonify({
+            'ok': True,
+            'week_count': len(d.get('weeks', [])),
+            'brand_count': len(d.get('by_brand', {})),
+        })
+    return jsonify({'ok': False, 'error': 'Refresh failed'}), 502
+
+
+@app.route('/selling-data-customers', methods=['GET', 'OPTIONS'])
+def list_selling_customers():
+    """List all customer folders under /Selling Data — used by the frontend
+    to render a tile per customer without hardcoding the list."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    token = get_dropbox_token()
+    if not token:
+        return jsonify({'customers': []}), 200
+    try:
+        resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'path': DROPBOX_SELLING_BASE, 'recursive': False, 'limit': 200},
+            timeout=30
+        )
+        if resp.status_code != 200:
+            return jsonify({'customers': [], 'error': f'list_folder {resp.status_code}'}), 200
+        entries = resp.json().get('entries', [])
+        # Folders only — those represent customers
+        customers = sorted([e['name'] for e in entries if e.get('.tag') == 'folder'])
+        return jsonify({'customers': customers})
+    except Exception as e:
+        return jsonify({'customers': [], 'error': str(e)}), 200
 
 
 # ─────────────────────────────────────────────────────────────────────────────
