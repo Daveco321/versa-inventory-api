@@ -2639,32 +2639,86 @@ def parse_inventory_excel(file_bytes):
     header_row = next(rows_iter)
     headers = [str(cell.value or '').strip() for cell in header_row]
 
+    # ── POSITIONAL COLUMN INDEX MAP ────────────────────────────────────────
+    # Build a {header_name → column_index} map, taking the FIRST occurrence of
+    # each header name. This protects against a vulnerability in the prior
+    # dict-comprehension approach: if the ATS sheet has two columns named
+    # "Committed" (e.g. someone duplicated a column to the right of the table),
+    # `{headers[i]: row[i].value for i in ...}` silently keeps the LAST one,
+    # which can be empty/zero. Result: Committed reads as 0 even when the real
+    # ATS column has -7344. Allocated stays correct because there's only one
+    # "Allocated" header. That's exactly the asymmetry we observed.
+    #
+    # By indexing positionally to the first occurrence, we always read the real
+    # ATS column regardless of what else is to the right.
+    def _idx(*names):
+        """Return the first column index whose header (case-insensitive) matches
+        any of `names`, or None if no header matches."""
+        lower_names = [n.lower() for n in names]
+        for i, h in enumerate(headers):
+            if h.lower() in lower_names:
+                return i
+        return None
+
+    IDX_SKU       = _idx('SKU')
+    IDX_BRAND     = _idx('Brand')
+    IDX_CONTAINER = _idx('Container')
+    IDX_RECEIVE   = _idx('Receive Date', 'ReceiveDate')
+    IDX_LOT       = _idx('Lot Number', 'LotNumber')
+    IDX_JTW       = _idx('JTW')
+    IDX_TR        = _idx('TR')
+    IDX_DCW       = _idx('DCW')
+    IDX_QA        = _idx('QA', 'Q/A', 'Quality')
+    IDX_COMMITTED = _idx('Committed', 'Committed Units', 'Committed Qty')
+    IDX_ALLOCATED = _idx('Allocated', 'Allocated Units', 'Allocated Qty')
+    IDX_INCOMING  = _idx('Incoming', 'In Transit', 'InTransit', 'In-Transit',
+                         'On Order', 'PO', 'Incoming Qty')
+    IDX_TOTAL_ATS = _idx('Total ATS', 'Total_ATS', 'TotalATS')
+
+    def _cell(row, idx):
+        """Safely pull row[idx].value. Returns None if idx is out of range or None."""
+        if idx is None or idx >= len(row):
+            return None
+        return row[idx].value
+
+    def _int_at(row, idx):
+        """Read an integer value at column index — defaulting to 0 on missing or
+        non-numeric content. Does NOT use Python `or` (which would treat 0 as
+        falsy and fall through to a different column)."""
+        v = _cell(row, idx)
+        if v is None:
+            return 0
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return 0
+
+    def _str_at(row, idx):
+        v = _cell(row, idx)
+        return str(v).strip() if v is not None else ''
+
     items = []
     for row in rows_iter:
-        rd = {headers[i]: row[i].value for i in range(min(len(headers), len(row)))}
-
-        sku = str(_col_val(rd, 'SKU') or '').strip()
-        brand = str(_col_val(rd, 'Brand') or '').strip().upper()
+        sku = _str_at(row, IDX_SKU)
+        brand = _str_at(row, IDX_BRAND).upper()
         if not sku or sku == 'N/A' or not brand:
             continue
 
-        jtw = int(_col_val(rd, 'JTW') or 0)
-        tr  = int(_col_val(rd, 'TR')  or 0)
-        dcw = int(_col_val(rd, 'DCW') or 0)
-        qa  = int(_col_val(rd, 'QA') or _col_val(rd, 'Q/A') or _col_val(rd, 'Quality') or 0)
-        committed = int(_col_val(rd, 'Committed') or 0)
-        allocated = int(_col_val(rd, 'Allocated') or 0)
-        incoming  = int(_col_val(rd, 'Incoming') or _col_val(rd, 'In Transit') or
-                        _col_val(rd, 'InTransit') or _col_val(rd, 'In-Transit') or
-                        _col_val(rd, 'On Order') or _col_val(rd, 'PO') or
-                        _col_val(rd, 'Incoming Qty') or 0)
+        jtw       = _int_at(row, IDX_JTW)
+        tr        = _int_at(row, IDX_TR)
+        dcw       = _int_at(row, IDX_DCW)
+        qa        = _int_at(row, IDX_QA)
+        committed = _int_at(row, IDX_COMMITTED)
+        allocated = _int_at(row, IDX_ALLOCATED)
+        incoming  = _int_at(row, IDX_INCOMING)
+        total_ats = _int_at(row, IDX_TOTAL_ATS)
 
-        total_ats_raw = _col_val(rd, 'Total ATS') or _col_val(rd, 'Total_ATS') or _col_val(rd, 'TotalATS') or 0
-        total_ats = int(total_ats_raw)
-
-        container = str(_col_val(rd, 'Container') or '').strip()
-        receive_date = str(_col_val(rd, 'Receive Date') or _col_val(rd, 'ReceiveDate') or '').strip()
-        lot_number = str(_col_val(rd, 'Lot Number') or _col_val(rd, 'LotNumber') or '').strip()
+        container    = _str_at(row, IDX_CONTAINER)
+        receive_date = _str_at(row, IDX_RECEIVE)
+        lot_number   = _str_at(row, IDX_LOT)
 
         brand_full = BRAND_FULL_NAMES.get(brand, brand)
 
@@ -3091,6 +3145,75 @@ def inventory():
             "item_count": _inventory['item_count'],
             "inventory": list(_inventory['items']),
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIAGNOSTIC: shows backend state — source, freshness, specific SKU values.
+# Useful when frontend numbers disagree with the ATS sheet — proves whether
+# the backend is serving fresh/correct data or returning something stale.
+# Curl-friendly: curl https://your-backend/inventory/debug?skus=ROGBSA002SLS,BUGBSA001SLS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/inventory/debug', methods=['GET', 'OPTIONS'])
+def inventory_debug():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    skus_param = request.args.get('skus', '')
+    target_skus = [s.strip().upper() for s in skus_param.split(',') if s.strip()] if skus_param else []
+
+    with _inv_lock:
+        items = list(_inventory.get('items', []))
+        meta = {
+            'source': _inventory.get('source'),
+            'etag': _inventory.get('etag'),
+            'last_sync': _inventory.get('last_sync'),
+            'item_count': _inventory.get('item_count'),
+            'dropbox_inventory_path': DROPBOX_INVENTORY_PATH,
+            'has_dropbox_token': bool(get_dropbox_token() if DROPBOX_REFRESH_TOKEN or DROPBOX_PHOTOS_TOKEN else None),
+        }
+
+    # Sample some specific SKUs the user is checking
+    sku_details = {}
+    if target_skus:
+        for tgt in target_skus:
+            matches = [i for i in items if (i.get('sku') or '').strip().upper() == tgt]
+            if not matches:
+                sku_details[tgt] = {'found': False, 'note': 'Not in backend cache'}
+            else:
+                sku_details[tgt] = {
+                    'found': True,
+                    'rows': [{
+                        'sku': m.get('sku'),
+                        'brand': m.get('brand'),
+                        'committed': m.get('committed'),
+                        'allocated': m.get('allocated'),
+                        'jtw': m.get('jtw'),
+                        'tr': m.get('tr'),
+                        'dcw': m.get('dcw'),
+                        'qa': m.get('qa'),
+                        'incoming': m.get('incoming'),
+                        'total_ats': m.get('total_ats'),
+                    } for m in matches]
+                }
+
+    # Quick stats on the cached data
+    nonzero_committed = sum(1 for i in items if i.get('committed', 0) != 0)
+    nonzero_allocated = sum(1 for i in items if i.get('allocated', 0) != 0)
+    total_committed = sum(i.get('committed', 0) for i in items)
+    total_allocated = sum(i.get('allocated', 0) for i in items)
+
+    return jsonify({
+        'meta': meta,
+        'stats': {
+            'total_rows': len(items),
+            'rows_with_nonzero_committed': nonzero_committed,
+            'rows_with_nonzero_allocated': nonzero_allocated,
+            'sum_committed_all_rows': total_committed,
+            'sum_allocated_all_rows': total_allocated,
+        },
+        'sku_lookup': sku_details,
+        'hint': 'Pass ?skus=SKU1,SKU2 to inspect specific SKUs',
+    })
 
 
 @app.route('/exports', methods=['GET', 'OPTIONS'])
