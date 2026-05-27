@@ -2688,22 +2688,34 @@ def parse_inventory_excel(file_bytes):
         tr  = int(_col_val(rd, 'TR')  or 0)
         dcw = int(_col_val(rd, 'DCW') or 0)
         qa  = int(_col_val(rd, 'QA') or _col_val(rd, 'Q/A') or _col_val(rd, 'Quality') or 0)
-        # Tolerate header drift — "Committed", "Committed Units", "Committed Qty"
-        # all mean the same thing. Same for allocated.
-        committed = int(
-            _col_val(rd, 'Committed') or
-            _col_val(rd, 'Committed Units') or
-            _col_val(rd, 'Committed Qty') or
-            _col_val(rd, 'CommittedUnits') or
-            0
-        )
-        allocated = int(
-            _col_val(rd, 'Allocated') or
-            _col_val(rd, 'Allocated Units') or
-            _col_val(rd, 'Allocated Qty') or
-            _col_val(rd, 'AllocatedUnits') or
-            0
-        )
+
+        # Pick the first non-None value from a list of column-name candidates.
+        # Using Python `or` here would skip past zeros (since 0 is falsy) and
+        # accidentally fall through to fallback columns — that's a bug when a
+        # legitimate zero appears in the primary column. Explicit None check
+        # avoids it.
+        def _first_nonnull(*candidates):
+            for c in candidates:
+                v = _col_val(rd, c)
+                if v is not None:
+                    return v
+            return 0
+
+        # Read committed/allocated EXACTLY as the ATS sheet has them. No or-chain
+        # shenanigans. If the primary column matches by name, that's the value —
+        # even if it's zero.
+        committed_raw = _first_nonnull('Committed', 'Committed Units', 'Committed Qty', 'CommittedUnits')
+        allocated_raw = _first_nonnull('Allocated', 'Allocated Units', 'Allocated Qty', 'AllocatedUnits')
+
+        try:
+            committed = int(committed_raw or 0)
+        except (TypeError, ValueError):
+            committed = 0
+        try:
+            allocated = int(allocated_raw or 0)
+        except (TypeError, ValueError):
+            allocated = 0
+
         incoming  = int(_col_val(rd, 'Incoming') or _col_val(rd, 'In Transit') or
                         _col_val(rd, 'InTransit') or _col_val(rd, 'In-Transit') or
                         _col_val(rd, 'On Order') or _col_val(rd, 'PO') or
