@@ -688,31 +688,86 @@ def load_production_from_dropbox():
         ws = wb[wb.sheetnames[0]]
         results = []
         row_count = 0
-        for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+        # Read through column H. Columns of interest:
+        #   A=Production#, B=PO Name, C=Style, D=Units, E=Brand,
+        #   F=ETD, G=Estimated Arrival to Port, H=Shipment #
+        # When G is present, it OVERRIDES column F's ETD entirely:
+        #   - arrival = G + 10 days  (port-to-warehouse leg)
+        #   - etd     = G - 27 days  (factory ship-to-port lead time)
+        # When G is empty, fall back to column F ETD + the frontend's transit math
+        # (37 days for shirts, 55 for pants — applied frontend-side in loadProductionFromS3).
+        # Column H (Shipment #) is admin-only metadata for grouping physical shipments
+        # within the same Production#. Never appears in exports.
+        from datetime import timedelta as _td
+        for row in ws.iter_rows(min_row=2, max_col=8, values_only=True):
             row_count += 1
             style = str(row[2] or '').strip().upper()
             if not style:
                 continue
+
+            # ── Pull and normalize column G (Estimated Arrival to Port) ──
+            port_arrival_dt = None
+            if len(row) > 6 and row[6]:
+                if isinstance(row[6], datetime):
+                    port_arrival_dt = row[6]
+                else:
+                    try:
+                        port_arrival_dt = datetime.strptime(str(row[6])[:10], '%Y-%m-%d')
+                    except Exception:
+                        port_arrival_dt = None
+
+            # ── Compute etd + arrival ──
             etd = None
-            if row[5]:
+            arrival = None
+            if port_arrival_dt is not None:
+                # Column G wins: compute both dates from it. Ignore column F entirely.
+                etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
+                arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
+            elif row[5]:
+                # No port date — fall back to column F ETD. The arrival is left None here
+                # so the frontend can apply the legacy +37 / +55 transit rule based on
+                # whether the item is pants or shirts (info the backend doesn't have).
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
                 else:
                     try:
                         etd = str(row[5])
-                    except:
+                    except Exception:
                         etd = None
+
             try:
                 units = int(row[3] or 0)
             except (ValueError, TypeError):
                 units = 0
+
+            # ── Column H: Shipment # ──
+            shipment_no = ''
+            if len(row) > 7 and row[7] is not None:
+                # Could be numeric or text; preserve as string so leading zeros / mixed
+                # formats survive. Empty strings stay empty.
+                if isinstance(row[7], (int, float)):
+                    # Strip trailing .0 from numeric values that came in as float
+                    shipment_no = str(int(row[7])) if float(row[7]).is_integer() else str(row[7])
+                else:
+                    shipment_no = str(row[7]).strip()
+
             results.append({
                 'production': str(row[0] or '').strip(),
                 'poName': str(row[1] or '').strip(),
                 'style': style,
                 'units': units,
                 'brand': str(row[4] or '').strip(),
-                'etd': etd
+                'etd': etd,
+                # arrival is only set when David provided column G. None means
+                # "frontend, please apply your transit rule based on category".
+                'arrival': arrival,
+                # Flag for downstream debugging / display: is this date authoritative
+                # (from David's port column) or derived from legacy ETD + transit?
+                'port_dated': port_arrival_dt is not None,
+                # Shipment # — admin-only column H. Used to break a single Production#
+                # PO into physical shipments. Frontend surfaces this in a dedicated
+                # admin-only modal; deliberately excluded from all exports.
+                'shipmentNo': shipment_no
             })
         wb.close()
 
@@ -4149,8 +4204,13 @@ def load_apo_from_dropbox():
                 continue
             customer = cols[cust_idx] if len(cols) > cust_idx else ''
             style_raw = cols[style_idx] if len(cols) > style_idx else ''
-            # Strip size suffix (e.g. "ASU201SLS" or "TJNASU201SLS-2XL" → keep base)
-            style = style_raw.upper().split('-')[0].strip()
+            # Preserve full SKU (including any size suffix like "-M" or "-2XL").
+            # The frontend's smart routing engine requires exact 1:1 SKU matching for
+            # size-broken styles — stripping the suffix here would cause those rows to
+            # silently fall back to legacy FIFO since their APO demand could not be
+            # tracked at the dashed-row level. For non-dashed styles, this is a no-op
+            # (the SKU is already the base style).
+            style = style_raw.upper().strip()
             if not style:
                 continue
             qty = 0
@@ -4532,6 +4592,127 @@ def trigger_dropbox_photo_sync():
         prewarm_dropbox_cache()
     threading.Thread(target=_sync_and_warm, daemon=True).start()
     return jsonify({'status': 'sync_started', 'current_count': len(_dropbox_photo_index)})
+
+
+# ============================================
+# ADMIN — Force-refresh sync endpoints
+# ============================================
+# Each /admin/refresh/* endpoint clears the TTL marker for the corresponding data
+# source and triggers an immediate re-pull, returning the new freshness timestamp
+# so the frontend can confirm it actually ran. Used by the Admin Tools panel.
+#
+# These all do synchronous re-pulls (not background threads) so the API only
+# returns once the refresh is complete. Means the UI button can show "refreshing"
+# state cleanly and confirm success when the call returns. Each refresh is a few
+# seconds of Dropbox/S3 IO — not long enough to need async.
+
+@app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
+def admin_refresh_production():
+    """Force a fresh pull of the Style Ledger from Dropbox."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _production_last_sync
+    _production_last_sync = 0  # invalidate TTL cache
+    try:
+        load_production_from_dropbox()
+        return jsonify({
+            'status': 'ok',
+            'last_sync': _production_last_sync,
+            'row_count': len(_production_data)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/refresh/apo', methods=['POST', 'OPTIONS'])
+def admin_refresh_apo():
+    """Force a fresh pull of the APO allocations from Dropbox."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _apo_last_sync
+    _apo_last_sync = 0  # invalidate TTL cache
+    try:
+        load_apo_from_dropbox()
+        return jsonify({
+            'status': 'ok',
+            'last_sync': _apo_last_sync,
+            'row_count': len(_apo_data)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/refresh/inventory', methods=['POST', 'OPTIONS'])
+def admin_refresh_inventory():
+    """Force a fresh pull of inventory (ATS) from S3."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        sync_inventory()
+        with _inv_lock:
+            last_sync = _inventory['last_sync']
+            count = _inventory['item_count']
+        return jsonify({'status': 'ok', 'last_sync': last_sync, 'item_count': count})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/sync-status', methods=['GET', 'OPTIONS'])
+def admin_sync_status():
+    """Single endpoint returning the last-sync timestamp for every data source
+    the platform tracks. Used by the Admin Tools panel to show one unified view
+    of system freshness. Times are returned as ISO 8601 strings (or unix epoch
+    seconds for sources tracked that way), plus a derived "age in seconds" for
+    convenience."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    import time as _time
+    now = _time.time()
+
+    def _epoch_to_iso(epoch_seconds):
+        if not epoch_seconds:
+            return None
+        return datetime.utcfromtimestamp(epoch_seconds).isoformat() + 'Z'
+
+    def _iso_age(iso_str):
+        if not iso_str:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+            return int((datetime.now(dt.tzinfo) - dt).total_seconds())
+        except Exception:
+            return None
+
+    with _inv_lock:
+        inv_sync = _inventory.get('last_sync')
+        inv_count = _inventory.get('item_count', 0)
+
+    return jsonify({
+        'inventory': {
+            'last_sync_iso': inv_sync,
+            'age_seconds': _iso_age(inv_sync),
+            'row_count': inv_count,
+            'auto_interval_minutes': 60,  # hourly_resync
+        },
+        'production': {
+            'last_sync_iso': _epoch_to_iso(_production_last_sync) if _production_last_sync else None,
+            'age_seconds': int(now - _production_last_sync) if _production_last_sync else None,
+            'row_count': len(_production_data),
+            'auto_interval_minutes': PRODUCTION_RESYNC_INTERVAL // 60,
+        },
+        'apo': {
+            'last_sync_iso': _epoch_to_iso(_apo_last_sync) if _apo_last_sync else None,
+            'age_seconds': int(now - _apo_last_sync) if _apo_last_sync else None,
+            'row_count': len(_apo_data),
+            'auto_interval_minutes': 60,  # APO is part of hourly_resync
+        },
+        'dropbox_photos': {
+            'last_sync_iso': _epoch_to_iso(_dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
+            'age_seconds': int(now - _dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
+            'row_count': len(_dropbox_photo_index),
+            'auto_interval_minutes': int(DROPBOX_RESYNC_INTERVAL / 60),
+        }
+    })
 
 
 
