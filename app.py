@@ -695,7 +695,7 @@ def load_production_from_dropbox():
         #   - arrival = G + 10 days  (port-to-warehouse leg)
         #   - etd     = G - 27 days  (factory ship-to-port lead time)
         # When G is empty, fall back to column F ETD + the frontend's transit math
-        # (37 days for shirts, 55 for pants — applied frontend-side in loadProductionFromS3).
+        # (37 days for shirts, 55 for pants — applied frontend-side).
         # Column H (Shipment #) is admin-only metadata for grouping physical shipments
         # within the same Production#. Never appears in exports.
         from datetime import timedelta as _td
@@ -724,15 +724,12 @@ def load_production_from_dropbox():
                 etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
                 arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
             elif row[5]:
-                # No port date — fall back to column F ETD. The arrival is left None here
-                # so the frontend can apply the legacy +37 / +55 transit rule based on
-                # whether the item is pants or shirts (info the backend doesn't have).
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
                 else:
                     try:
                         etd = str(row[5])
-                    except Exception:
+                    except:
                         etd = None
 
             try:
@@ -743,10 +740,7 @@ def load_production_from_dropbox():
             # ── Column H: Shipment # ──
             shipment_no = ''
             if len(row) > 7 and row[7] is not None:
-                # Could be numeric or text; preserve as string so leading zeros / mixed
-                # formats survive. Empty strings stay empty.
                 if isinstance(row[7], (int, float)):
-                    # Strip trailing .0 from numeric values that came in as float
                     shipment_no = str(int(row[7])) if float(row[7]).is_integer() else str(row[7])
                 else:
                     shipment_no = str(row[7]).strip()
@@ -761,8 +755,6 @@ def load_production_from_dropbox():
                 # arrival is only set when David provided column G. None means
                 # "frontend, please apply your transit rule based on category".
                 'arrival': arrival,
-                # Flag for downstream debugging / display: is this date authoritative
-                # (from David's port column) or derived from legacy ETD + transit?
                 'port_dated': port_arrival_dt is not None,
                 # Shipment # — admin-only column H. Used to break a single Production#
                 # PO into physical shipments. Frontend surfaces this in a dedicated
@@ -2653,69 +2645,15 @@ def parse_inventory_excel(file_bytes):
 
         sku = str(_col_val(rd, 'SKU') or '').strip()
         brand = str(_col_val(rd, 'Brand') or '').strip().upper()
-        # ATS sheet is the source of truth: every row with a SKU appears in the
-        # catalog, no exceptions. Previously we dropped rows where Brand was
-        # blank — that silently hid SKUs like dashed-variant rows whenever
-        # David hadn't filled in the brand cell. If brand is missing, infer it
-        # from the SKU prefix (e.g. ROGB → BEENE) so the row still has a sensible
-        # bucket. If we still can't determine it, leave it as UNKNOWN rather
-        # than skipping.
-        if not sku or sku == 'N/A':
+        if not sku or sku == 'N/A' or not brand:
             continue
-        if not brand:
-            # SKU prefix conventions: first 2 chars = customer (RO=Ross, TJ=TJX, etc.),
-            # next 2 chars = brand abbreviation. We look up the brand portion in
-            # BRAND_FULL_NAMES which is keyed by the abbreviation; if found, use it.
-            sku_upper = sku.upper()
-            inferred = None
-            if len(sku_upper) >= 4:
-                prefix = sku_upper[2:4]
-                # Reverse-lookup: find any key in BRAND_FULL_NAMES whose value
-                # the prefix points to. Most brand abbrevs are 2 chars matching
-                # the SKU code (NA=NAUTICA, GB=BEENE, EB=EB).
-                _PREFIX_TO_BRAND = {
-                    'NA': 'NAUTICA', 'DK': 'DKNY', 'EB': 'EB', 'RB': 'REEBOK',
-                    'VC': 'VINCE', 'BE': 'BEN', 'US': 'USPA', 'CH': 'CHAPS',
-                    'LB': 'LUCKY', 'JN': 'JNY', 'GB': 'BEENE', 'NM': 'NICOLE',
-                    'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN', 'VD': 'VD',
-                    'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
-                    'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE'
-                }
-                inferred = _PREFIX_TO_BRAND.get(prefix)
-            brand = inferred or 'UNKNOWN'
 
         jtw = int(_col_val(rd, 'JTW') or 0)
         tr  = int(_col_val(rd, 'TR')  or 0)
         dcw = int(_col_val(rd, 'DCW') or 0)
         qa  = int(_col_val(rd, 'QA') or _col_val(rd, 'Q/A') or _col_val(rd, 'Quality') or 0)
-
-        # Pick the first non-None value from a list of column-name candidates.
-        # Using Python `or` here would skip past zeros (since 0 is falsy) and
-        # accidentally fall through to fallback columns — that's a bug when a
-        # legitimate zero appears in the primary column. Explicit None check
-        # avoids it.
-        def _first_nonnull(*candidates):
-            for c in candidates:
-                v = _col_val(rd, c)
-                if v is not None:
-                    return v
-            return 0
-
-        # Read committed/allocated EXACTLY as the ATS sheet has them. No or-chain
-        # shenanigans. If the primary column matches by name, that's the value —
-        # even if it's zero.
-        committed_raw = _first_nonnull('Committed', 'Committed Units', 'Committed Qty', 'CommittedUnits')
-        allocated_raw = _first_nonnull('Allocated', 'Allocated Units', 'Allocated Qty', 'AllocatedUnits')
-
-        try:
-            committed = int(committed_raw or 0)
-        except (TypeError, ValueError):
-            committed = 0
-        try:
-            allocated = int(allocated_raw or 0)
-        except (TypeError, ValueError):
-            allocated = 0
-
+        committed = int(_col_val(rd, 'Committed') or 0)
+        allocated = int(_col_val(rd, 'Allocated') or 0)
         incoming  = int(_col_val(rd, 'Incoming') or _col_val(rd, 'In Transit') or
                         _col_val(rd, 'InTransit') or _col_val(rd, 'In-Transit') or
                         _col_val(rd, 'On Order') or _col_val(rd, 'PO') or
@@ -4258,13 +4196,8 @@ def load_apo_from_dropbox():
                 continue
             customer = cols[cust_idx] if len(cols) > cust_idx else ''
             style_raw = cols[style_idx] if len(cols) > style_idx else ''
-            # Preserve full SKU (including any size suffix like "-M" or "-2XL").
-            # The frontend's smart routing engine requires exact 1:1 SKU matching for
-            # size-broken styles — stripping the suffix here would cause those rows to
-            # silently fall back to legacy FIFO since their APO demand could not be
-            # tracked at the dashed-row level. For non-dashed styles, this is a no-op
-            # (the SKU is already the base style).
-            style = style_raw.upper().strip()
+            # Strip size suffix (e.g. "ASU201SLS" or "TJNASU201SLS-2XL" → keep base)
+            style = style_raw.upper().split('-')[0].strip()
             if not style:
                 continue
             qty = 0
@@ -4652,13 +4585,7 @@ def trigger_dropbox_photo_sync():
 # ADMIN — Force-refresh sync endpoints
 # ============================================
 # Each /admin/refresh/* endpoint clears the TTL marker for the corresponding data
-# source and triggers an immediate re-pull, returning the new freshness timestamp
-# so the frontend can confirm it actually ran. Used by the Admin Tools panel.
-#
-# These all do synchronous re-pulls (not background threads) so the API only
-# returns once the refresh is complete. Means the UI button can show "refreshing"
-# state cleanly and confirm success when the call returns. Each refresh is a few
-# seconds of Dropbox/S3 IO — not long enough to need async.
+# source and triggers an immediate re-pull. Used by the Admin Tools panel.
 
 @app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
 def admin_refresh_production():
@@ -4666,7 +4593,7 @@ def admin_refresh_production():
     if request.method == 'OPTIONS':
         return '', 204
     global _production_last_sync
-    _production_last_sync = 0  # invalidate TTL cache
+    _production_last_sync = 0
     try:
         load_production_from_dropbox()
         return jsonify({
@@ -4684,7 +4611,7 @@ def admin_refresh_apo():
     if request.method == 'OPTIONS':
         return '', 204
     global _apo_last_sync
-    _apo_last_sync = 0  # invalidate TTL cache
+    _apo_last_sync = 0
     try:
         load_apo_from_dropbox()
         return jsonify({
@@ -4713,11 +4640,8 @@ def admin_refresh_inventory():
 
 @app.route('/admin/sync-status', methods=['GET', 'OPTIONS'])
 def admin_sync_status():
-    """Single endpoint returning the last-sync timestamp for every data source
-    the platform tracks. Used by the Admin Tools panel to show one unified view
-    of system freshness. Times are returned as ISO 8601 strings (or unix epoch
-    seconds for sources tracked that way), plus a derived "age in seconds" for
-    convenience."""
+    """Single endpoint returning the last-sync timestamp for every data source.
+    Used by the Admin Tools panel to show one unified view of system freshness."""
     if request.method == 'OPTIONS':
         return '', 204
     import time as _time
@@ -4746,7 +4670,7 @@ def admin_sync_status():
             'last_sync_iso': inv_sync,
             'age_seconds': _iso_age(inv_sync),
             'row_count': inv_count,
-            'auto_interval_minutes': 60,  # hourly_resync
+            'auto_interval_minutes': 60,
         },
         'production': {
             'last_sync_iso': _epoch_to_iso(_production_last_sync) if _production_last_sync else None,
@@ -4758,7 +4682,7 @@ def admin_sync_status():
             'last_sync_iso': _epoch_to_iso(_apo_last_sync) if _apo_last_sync else None,
             'age_seconds': int(now - _apo_last_sync) if _apo_last_sync else None,
             'row_count': len(_apo_data),
-            'auto_interval_minutes': 60,  # APO is part of hourly_resync
+            'auto_interval_minutes': 60,
         },
         'dropbox_photos': {
             'last_sync_iso': _epoch_to_iso(_dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
@@ -5422,34 +5346,22 @@ def refresh_selling_data_endpoint(customer):
 # ─────────────────────────────────────────────────────────────────────────────
 # WEEKLY SELLING DATA (Costco-style)
 # ─────────────────────────────────────────────────────────────────────────────
-# Parallel system to the legacy Ross "best/okay/worst" labels — this one handles
-# fundamentally different data:
+# Parallel system to the legacy Ross "best/okay/worst" labels. Costco files:
 #   • Multiple files per customer folder (one per week)
-#   • Filename encodes brand + snapshot date + week#
-#       e.g. Costco_EB_20260523_-_WK_3.xlsx
-#       e.g. Costco_DKNY_20260530_-_WK_4.xlsx
-#   • Each file has parent styles (e.g. CUEBWF26-10) broken into item-rows
-#     by size/color, with a TOTAL row per parent
-#   • Per-style + per-item quantitative metrics: $ sold, units, DPW, sell-through,
-#     inventory on hand, etc — for both "current week" and "lifetime"
-#
-# The viewer needs ALL weeks for trend analysis (W/W growth, season-to-date),
-# so we don't pick a single file like the legacy parser does — we parse the
-# whole folder and group by brand.
+#   • Filename: Costco_EB_20260523_-_WK_3.xlsx (Customer_Brand_YYYYMMDD_-_WK_N.xlsx)
+#   • Each file has parent styles broken into item-rows by size/color
+#   • Quantitative metrics: $ sold, units, DPW, sell-through, inventory, etc.
+#   • Current week + lifetime totals
 
 import re as _re
 
-# Filename pattern: <Customer>_<Brand>_<YYYYMMDD>_-_WK_<N>.xlsx
-# Brand can contain underscores in unusual cases; we anchor on YYYYMMDD which is
-# always 8 digits, so anything before that (after the customer prefix) is brand.
 _WEEKLY_FILENAME_RE = _re.compile(
     r'^(?P<customer>[^_]+)_(?P<brand>.+?)_(?P<date>\d{8})_-_WK_(?P<week>\d+)\.xlsx$',
     _re.IGNORECASE
 )
 
 def _parse_weekly_filename(filename):
-    """Pull brand / date / week# out of a weekly-selling filename.
-    Returns dict or None if filename doesn't match the expected pattern."""
+    """Pull brand / date / week# out of a weekly-selling filename."""
     m = _WEEKLY_FILENAME_RE.match(filename or '')
     if not m:
         return None
@@ -5467,28 +5379,10 @@ def _parse_weekly_filename(filename):
 
 
 def _parse_weekly_workbook(xlsx_bytes, file_meta):
-    """Parse a single weekly selling workbook into a JSON-friendly structure.
-
-    Returns: {
-      'snapshot_date', 'brand', 'week',
-      'styles': [
-        {'style': 'CUEBWF26-10', 'description': '...', 'brand': 'EB',
-         'items': [{item, description, ...metrics_current, ...metrics_lifetime}],
-         'totals_current': {...}, 'totals_lifetime': {...}}
-      ]
-    }
-
-    Layout (see /mnt/user-data/uploads/Costco_EB_20260523_-_WK_3.xlsx):
-      Row 1: snapshot date (col A), "Current Week" label (col G), "Lifetime Total" (col R)
-      Row 2: headers — cols G-Q = current week metrics, cols R-AB = lifetime metrics
-      Body rows: item rows + TOTAL summary rows
-        Parent style appears in col C on the first item row of each style block;
-        subsequent items in the same block leave col C blank (continuation).
-    """
+    """Parse a single weekly selling workbook into a JSON-friendly structure."""
     import io as _io
     import openpyxl as _openpyxl
     wb = _openpyxl.load_workbook(_io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
-    # Pick the first sheet that isn't named 'Data' (that's a pivot helper)
     sheet_name = None
     for n in wb.sheetnames:
         if n.lower() != 'data':
@@ -5500,10 +5394,7 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
 
-    # Column index mapping for the per-item metrics. Current-week cols start at G(6),
-    # lifetime cols start at R(17). Same 11 fields in each half.
     def _metric_block(row, start_col):
-        # Safely pull each metric, defaulting to 0 for None/blank cells
         def _num(idx):
             v = row[idx] if idx < len(row) else None
             try:
@@ -5511,22 +5402,22 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
             except (TypeError, ValueError):
                 return 0.0
         return {
-            'dollar_sales':    _num(start_col + 0),  # G or R
-            'unit_sales':      _num(start_col + 1),  # H or S
-            'avg_price':       _num(start_col + 2),  # I or T
-            'dpw':             _num(start_col + 3),  # J or U  (Dollars Per Warehouse Per Week)
-            'refund_dollars':  _num(start_col + 4),  # K or V
-            'inventory':       _num(start_col + 5),  # L or W
-            'on_order':        _num(start_col + 6),  # M or X
-            'in_transit':      _num(start_col + 7),  # N or Y
-            'qty_received':    _num(start_col + 8),  # O or Z
-            'nsi_units':       _num(start_col + 9),  # P or AA  (NSI = no-sale inventory)
-            'retail_value':    _num(start_col + 10), # Q or AB
+            'dollar_sales':    _num(start_col + 0),
+            'unit_sales':      _num(start_col + 1),
+            'avg_price':       _num(start_col + 2),
+            'dpw':             _num(start_col + 3),
+            'refund_dollars':  _num(start_col + 4),
+            'inventory':       _num(start_col + 5),
+            'on_order':        _num(start_col + 6),
+            'in_transit':      _num(start_col + 7),
+            'qty_received':    _num(start_col + 8),
+            'nsi_units':       _num(start_col + 9),
+            'retail_value':    _num(start_col + 10),
         }
 
     styles = []
     current_style = None
-    for row in rows[2:]:  # skip header rows
+    for row in rows[2:]:
         if not row:
             continue
         col_c = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else '')
@@ -5537,7 +5428,6 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
             continue
 
         is_total = col_c.upper().startswith('TOTAL')
-        # Skip the header row itself — col_c == "Style" is the literal column header
         is_header = col_c.upper() in ('STYLE', 'BRAND', 'ITEM')
         is_new_parent = bool(col_c) and not is_total and not is_header
 
@@ -5545,7 +5435,6 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
             continue
 
         if is_new_parent:
-            # Begin a new style block
             current_style = {
                 'style': col_c.upper(),
                 'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
@@ -5555,7 +5444,6 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
                 'totals_lifetime': None,
             }
             styles.append(current_style)
-            # First row of the block is also an item row — fall through to add it
 
         if is_total:
             if current_style is not None:
@@ -5566,7 +5454,6 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
         if current_style is None or not (col_a_item or col_d_item):
             continue
 
-        # Add this item row
         current_style['items'].append({
             'item_code': col_a_item or col_d_item,
             'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
@@ -5574,18 +5461,15 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
             'lifetime': _metric_block(row, 17),
         })
 
-    # Compute derived metrics per style: sell-through %, weeks-of-cover, etc.
-    # Doing this server-side once so every viewer gets consistent numbers.
+    # Compute derived metrics per style
     for s in styles:
         tc = s.get('totals_current') or {}
         tl = s.get('totals_lifetime') or {}
         if tc:
-            # Sell-through (lifetime) = units sold / (units sold + inventory on hand)
             sold_lt = tl.get('unit_sales', 0) or 0
             inv_lt  = tl.get('inventory', 0) or 0
             denom = sold_lt + inv_lt
             s['sell_through_pct'] = (sold_lt / denom * 100) if denom > 0 else 0.0
-            # Weeks-of-cover @ current weekly rate: inv / current_week_units
             wk_units = tc.get('unit_sales', 0) or 0
             s['weeks_of_cover'] = (tc.get('inventory', 0) / wk_units) if wk_units > 0 else None
 
@@ -5598,16 +5482,12 @@ def _parse_weekly_workbook(xlsx_bytes, file_meta):
     }
 
 
-# Cache: customer -> {weeks: [...], by_brand: {...}, fetched_at}. Separate from
-# the Ross legacy cache because the data structure is fundamentally different.
 _weekly_selling_cache = {}
 _weekly_selling_last_synced = {}
 
 
 def _fetch_weekly_selling_from_dropbox(customer):
-    """List every .xlsx in the customer's selling folder, parse each one,
-    return aggregated data grouped by brand and ordered by snapshot date.
-    """
+    """List every .xlsx in the customer's folder, parse each one, group by brand."""
     token = get_dropbox_token()
     if not token:
         print(f"[Weekly Selling] No Dropbox token, can't fetch {customer}", flush=True)
@@ -5632,7 +5512,6 @@ def _fetch_weekly_selling_from_dropbox(customer):
         print(f"[Weekly Selling] List failed for {customer}: {e}", flush=True)
         return None
 
-    # Build list of (file_meta, file_entry) tuples for files that match our pattern.
     parseable = []
     for e in entries:
         if e.get('.tag') != 'file':
@@ -5651,8 +5530,6 @@ def _fetch_weekly_selling_from_dropbox(customer):
               "(expected Customer_Brand_YYYYMMDD_-_WK_N.xlsx)", flush=True)
         return {'weeks': [], 'by_brand': {}}
 
-    # Download + parse each file. Order by snapshot date ASC so weeks
-    # appear chronologically downstream.
     parseable.sort(key=lambda pe: pe[0]['snapshot_date'])
     weeks = []
     for meta, entry in parseable:
@@ -5675,7 +5552,6 @@ def _fetch_weekly_selling_from_dropbox(customer):
             print(f"[Weekly Selling] Parse error for {entry.get('name')}: {e}", flush=True)
             continue
 
-    # Group by brand → ordered list of weeks per brand
     by_brand = {}
     for w in weeks:
         brand = w['brand']
@@ -5701,8 +5577,7 @@ def refresh_weekly_selling_data(customer):
 
 @app.route('/selling-data-weekly/<customer>', methods=['GET', 'OPTIONS'])
 def get_weekly_selling_data(customer):
-    """Return all weekly selling data for a customer (e.g. Costco).
-    Grouped by brand, weeks ordered chronologically."""
+    """Return all weekly selling data for a customer (e.g. Costco)."""
     if request.method == 'OPTIONS':
         return ('', 204)
     key = (customer or '').lower()
@@ -5740,8 +5615,7 @@ def refresh_weekly_selling_endpoint(customer):
 
 @app.route('/selling-data-customers', methods=['GET', 'OPTIONS'])
 def list_selling_customers():
-    """List all customer folders under /Selling Data — used by the frontend
-    to render a tile per customer without hardcoding the list."""
+    """List all customer folders under /Selling Data."""
     if request.method == 'OPTIONS':
         return ('', 204)
     token = get_dropbox_token()
@@ -5757,7 +5631,6 @@ def list_selling_customers():
         if resp.status_code != 200:
             return jsonify({'customers': [], 'error': f'list_folder {resp.status_code}'}), 200
         entries = resp.json().get('entries', [])
-        # Folders only — those represent customers
         customers = sorted([e['name'] for e in entries if e.get('.tag') == 'folder'])
         return jsonify({'customers': customers})
     except Exception as e:
