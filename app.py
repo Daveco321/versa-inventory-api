@@ -5522,22 +5522,83 @@ _WEEKLY_FILENAME_RE = _re.compile(
     _re.IGNORECASE
 )
 
+# Alternate pattern matching David's actual naming convention:
+#   "Costco Selling EB 5.23.xlsx"  →  customer=Costco, brand=EB, date=2026-05-23
+# Tokens: Customer Selling Brand M.D[.YYYY]
+# - Date can be M.D (year inferred) or M.D.YYYY
+# - "Selling" literal between customer and brand can also be other words; we
+#   ignore the middle and take the last non-date whitespace token as brand.
+_WEEKLY_FILENAME_RE_ALT = _re.compile(
+    r'^(?P<customer>[A-Za-z][A-Za-z0-9]*)\s+'
+    r'(?P<middle>.+?)\s+'
+    r'(?P<brand>[A-Za-z][A-Za-z0-9]*)\s+'
+    r'(?P<m>\d{1,2})\.(?P<d>\d{1,2})(?:\.(?P<y>\d{2,4}))?'
+    r'\.xlsx$',
+    _re.IGNORECASE
+)
+
 def _parse_weekly_filename(filename):
-    """Pull brand / date / week# out of a weekly-selling filename."""
-    m = _WEEKLY_FILENAME_RE.match(filename or '')
-    if not m:
-        return None
-    try:
-        date_str = m.group('date')
-        snapshot_date = datetime.strptime(date_str, '%Y%m%d').date().isoformat()
-    except ValueError:
-        return None
-    return {
-        'customer': m.group('customer'),
-        'brand': m.group('brand').upper(),
-        'snapshot_date': snapshot_date,
-        'week': int(m.group('week')),
-    }
+    """Pull brand / date / week# out of a weekly-selling filename.
+
+    Supports two naming conventions:
+      1. Strict:   Customer_Brand_YYYYMMDD_-_WK_N.xlsx
+      2. Loose:    Customer Selling Brand M.D[.YYYY].xlsx  (Costco's actual format)
+
+    For the loose format the week number is derived from the calendar week of
+    the parsed date. Year is inferred from the current year, or the previous
+    year if M.D falls in the future (which means it's actually last year's).
+    """
+    name = filename or ''
+
+    # Try strict format first
+    m = _WEEKLY_FILENAME_RE.match(name)
+    if m:
+        try:
+            date_str = m.group('date')
+            snapshot_date = datetime.strptime(date_str, '%Y%m%d').date().isoformat()
+        except ValueError:
+            return None
+        return {
+            'customer': m.group('customer'),
+            'brand': m.group('brand').upper(),
+            'snapshot_date': snapshot_date,
+            'week': int(m.group('week')),
+        }
+
+    # Fall back to loose format
+    m = _WEEKLY_FILENAME_RE_ALT.match(name)
+    if m:
+        try:
+            mo = int(m.group('m'))
+            day = int(m.group('d'))
+            year_raw = m.group('y')
+            if year_raw:
+                yr = int(year_raw)
+                if yr < 100:
+                    yr += 2000
+            else:
+                # Infer year: if the M.D is in the future relative to today,
+                # it's last year's data. Otherwise current year.
+                today = datetime.utcnow().date()
+                yr = today.year
+                try:
+                    candidate = datetime(yr, mo, day).date()
+                    if candidate > today:
+                        yr -= 1
+                except ValueError:
+                    pass
+            dt = datetime(yr, mo, day).date()
+            iso_week = dt.isocalendar()[1]
+            return {
+                'customer': m.group('customer'),
+                'brand': m.group('brand').upper(),
+                'snapshot_date': dt.isoformat(),
+                'week': iso_week,
+            }
+        except (ValueError, AttributeError):
+            return None
+
+    return None
 
 
 def _parse_weekly_workbook(xlsx_bytes, file_meta):
