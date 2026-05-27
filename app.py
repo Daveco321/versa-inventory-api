@@ -251,7 +251,75 @@ _inventory = {
     'last_sync': None,
     'item_count': 0,
     'source': None,  # 'dropbox' or 's3'
+    # Fingerprint of the last accepted sync — used by _sync_passes_sanity_check
+    # to reject partial-write reads. Tracks the count of rows with non-zero
+    # committed and the total absolute committed sum; both should stay roughly
+    # stable across syncs (David's ATS file represents real warehouse state
+    # that changes incrementally, not in 90% jumps).
+    'committed_nonzero_count': 0,
+    'committed_abs_sum': 0,
 }
+
+def _sync_passes_sanity_check(new_items):
+    """Reject a proposed inventory sync that looks like a partial-write read.
+
+    The "Hourly ATS" Dropbox file is being regenerated on a schedule. If the
+    backend fetches it WHILE the upstream process is mid-write, the file we
+    download may have its later columns (like Committed) only partially
+    populated. openpyxl reads those uncommitted cells as None → parsed as 0,
+    silently zeroing out the column for some rows.
+
+    Defense: each accepted sync stamps a fingerprint (count of non-zero
+    committed rows, total |committed|). Subsequent syncs are checked against
+    the last known good fingerprint. A sync that loses more than 30% of its
+    non-zero-committed rows or more than 40% of its total committed magnitude
+    compared to the previous good sync is rejected — we keep the prior data
+    rather than serve corrupted numbers.
+
+    Returns (accepted: bool, reason: str, fingerprint: dict).
+    """
+    new_nonzero = sum(1 for i in new_items if i.get('committed', 0) != 0)
+    new_abs_sum = sum(abs(i.get('committed', 0)) for i in new_items)
+    fingerprint = {
+        'committed_nonzero_count': new_nonzero,
+        'committed_abs_sum': new_abs_sum,
+        'row_count': len(new_items),
+    }
+
+    # First-ever sync — always accept, nothing to compare against
+    prev_nonzero = _inventory.get('committed_nonzero_count', 0)
+    prev_abs_sum = _inventory.get('committed_abs_sum', 0)
+    if prev_nonzero == 0 and prev_abs_sum == 0:
+        return True, 'first-sync (no baseline to compare)', fingerprint
+
+    # Row count must be in the same ballpark (10% tolerance) — catches the case
+    # where parsing got truncated and we only got half the rows
+    prev_rows = _inventory.get('item_count', 0)
+    if prev_rows > 0 and len(new_items) < prev_rows * 0.7:
+        return False, (
+            f'row count collapsed ({prev_rows} → {len(new_items)}) — '
+            f'likely a partial download or parse failure'
+        ), fingerprint
+
+    # Non-zero committed count shouldn't drop by more than 30%
+    if prev_nonzero > 0 and new_nonzero < prev_nonzero * 0.70:
+        return False, (
+            f'non-zero committed rows dropped sharply '
+            f'({prev_nonzero} → {new_nonzero}, '
+            f'{((prev_nonzero - new_nonzero) / prev_nonzero * 100):.1f}% loss) — '
+            f'likely a partial-write read from Dropbox'
+        ), fingerprint
+
+    # Absolute committed magnitude shouldn't drop by more than 40%
+    if prev_abs_sum > 0 and new_abs_sum < prev_abs_sum * 0.60:
+        return False, (
+            f'|committed| total dropped sharply '
+            f'({prev_abs_sum:,} → {new_abs_sum:,}, '
+            f'{((prev_abs_sum - new_abs_sum) / prev_abs_sum * 100):.1f}% loss) — '
+            f'likely a partial-write read from Dropbox'
+        ), fingerprint
+
+    return True, 'passed', fingerprint
 
 _img_lock = threading.Lock()
 _img_cache = {}  # base_style → image result (shared across all size variants)
@@ -688,13 +756,42 @@ def load_production_from_dropbox():
         ws = wb[wb.sheetnames[0]]
         results = []
         row_count = 0
-        for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+        # Read through column H. Columns of interest:
+        #   A=Production#, B=PO Name, C=Style, D=Units, E=Brand,
+        #   F=ETD, G=Estimated Arrival to Port, H=Shipment #
+        # When G is present, it OVERRIDES column F's ETD entirely:
+        #   - arrival = G + 10 days  (port-to-warehouse leg)
+        #   - etd     = G - 27 days  (factory ship-to-port lead time)
+        # When G is empty, fall back to column F ETD + the frontend's transit math
+        # (37 days for shirts, 55 for pants — applied frontend-side).
+        # Column H (Shipment #) is admin-only metadata for grouping physical shipments
+        # within the same Production#. Never appears in exports.
+        from datetime import timedelta as _td
+        for row in ws.iter_rows(min_row=2, max_col=8, values_only=True):
             row_count += 1
             style = str(row[2] or '').strip().upper()
             if not style:
                 continue
+
+            # ── Pull and normalize column G (Estimated Arrival to Port) ──
+            port_arrival_dt = None
+            if len(row) > 6 and row[6]:
+                if isinstance(row[6], datetime):
+                    port_arrival_dt = row[6]
+                else:
+                    try:
+                        port_arrival_dt = datetime.strptime(str(row[6])[:10], '%Y-%m-%d')
+                    except Exception:
+                        port_arrival_dt = None
+
+            # ── Compute etd + arrival ──
             etd = None
-            if row[5]:
+            arrival = None
+            if port_arrival_dt is not None:
+                # Column G wins: compute both dates from it. Ignore column F entirely.
+                etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
+                arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
+            elif row[5]:
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
                 else:
@@ -702,17 +799,35 @@ def load_production_from_dropbox():
                         etd = str(row[5])
                     except:
                         etd = None
+
             try:
                 units = int(row[3] or 0)
             except (ValueError, TypeError):
                 units = 0
+
+            # ── Column H: Shipment # ──
+            shipment_no = ''
+            if len(row) > 7 and row[7] is not None:
+                if isinstance(row[7], (int, float)):
+                    shipment_no = str(int(row[7])) if float(row[7]).is_integer() else str(row[7])
+                else:
+                    shipment_no = str(row[7]).strip()
+
             results.append({
                 'production': str(row[0] or '').strip(),
                 'poName': str(row[1] or '').strip(),
                 'style': style,
                 'units': units,
                 'brand': str(row[4] or '').strip(),
-                'etd': etd
+                'etd': etd,
+                # arrival is only set when David provided column G. None means
+                # "frontend, please apply your transit rule based on category".
+                'arrival': arrival,
+                'port_dated': port_arrival_dt is not None,
+                # Shipment # — admin-only column H. Used to break a single Production#
+                # PO into physical shipments. Frontend surfaces this in a dedicated
+                # admin-only modal; deliberately excluded from all exports.
+                'shipmentNo': shipment_no
             })
         wb.close()
 
@@ -2706,6 +2821,17 @@ def sync_from_dropbox():
             print("  ⚠ No valid rows parsed from Dropbox file")
             return False
 
+        # ── SANITY CHECK ────────────────────────────────────────────────
+        # If the parsed data looks materially worse than the previous accepted
+        # sync (probably a partial-write read of the still-being-regenerated
+        # Hourly ATS file), reject it and keep the previous good data.
+        accepted, reason, fingerprint = _sync_passes_sanity_check(items)
+        if not accepted:
+            print(f"  ⚠ Dropbox sync REJECTED — {reason}. Keeping previous good data.", flush=True)
+            return False
+        if reason != 'passed' and reason != 'first-sync (no baseline to compare)':
+            print(f"  ℹ Sanity check: {reason}", flush=True)
+
         brands = _group_by_brand(items)
 
         with _inv_lock:
@@ -2715,8 +2841,12 @@ def sync_from_dropbox():
             _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
             _inventory['item_count'] = len(items)
             _inventory['source'] = 'dropbox'
+            _inventory['committed_nonzero_count'] = fingerprint['committed_nonzero_count']
+            _inventory['committed_abs_sum'] = fingerprint['committed_abs_sum']
 
-        print(f"  ✓ Dropbox sync: {len(items)} items across {len(brands)} brands")
+        print(f"  ✓ Dropbox sync: {len(items)} items across {len(brands)} brands "
+              f"(non-zero committed: {fingerprint['committed_nonzero_count']}, "
+              f"|committed| sum: {fingerprint['committed_abs_sum']:,})", flush=True)
         return True
 
     except Exception as e:
@@ -2794,6 +2924,12 @@ def sync_inventory():
         print(f"  Failed to parse inventory: {e}")
         return False
 
+    # Sanity check — same defense applied to the S3 fallback path
+    accepted, reason, fingerprint = _sync_passes_sanity_check(items)
+    if not accepted:
+        print(f"  ⚠ S3 sync REJECTED — {reason}. Keeping previous good data.", flush=True)
+        return False
+
     brands = _group_by_brand(items)
 
     with _inv_lock:
@@ -2803,8 +2939,12 @@ def sync_inventory():
         _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
         _inventory['item_count'] = len(items)
         _inventory['source'] = 's3'
+        _inventory['committed_nonzero_count'] = fingerprint['committed_nonzero_count']
+        _inventory['committed_abs_sum'] = fingerprint['committed_abs_sum']
 
-    print(f"  Parsed {len(items)} items across {len(brands)} brands")
+    print(f"  Parsed {len(items)} items across {len(brands)} brands "
+          f"(non-zero committed: {fingerprint['committed_nonzero_count']}, "
+          f"|committed| sum: {fingerprint['committed_abs_sum']:,})", flush=True)
     return True
 
 
@@ -3044,6 +3184,75 @@ def inventory():
             "item_count": _inventory['item_count'],
             "inventory": list(_inventory['items']),
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIAGNOSTIC: shows backend state — source, freshness, specific SKU values.
+# Useful when frontend numbers disagree with the ATS sheet — proves whether
+# the backend is serving fresh/correct data or returning something stale.
+# Curl-friendly: curl https://your-backend/inventory/debug?skus=ROGBSA002SLS,BUGBSA001SLS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route('/inventory/debug', methods=['GET', 'OPTIONS'])
+def inventory_debug():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    skus_param = request.args.get('skus', '')
+    target_skus = [s.strip().upper() for s in skus_param.split(',') if s.strip()] if skus_param else []
+
+    with _inv_lock:
+        items = list(_inventory.get('items', []))
+        meta = {
+            'source': _inventory.get('source'),
+            'etag': _inventory.get('etag'),
+            'last_sync': _inventory.get('last_sync'),
+            'item_count': _inventory.get('item_count'),
+            'dropbox_inventory_path': DROPBOX_INVENTORY_PATH,
+            'has_dropbox_token': bool(get_dropbox_token() if DROPBOX_REFRESH_TOKEN or DROPBOX_PHOTOS_TOKEN else None),
+        }
+
+    # Sample some specific SKUs the user is checking
+    sku_details = {}
+    if target_skus:
+        for tgt in target_skus:
+            matches = [i for i in items if (i.get('sku') or '').strip().upper() == tgt]
+            if not matches:
+                sku_details[tgt] = {'found': False, 'note': 'Not in backend cache'}
+            else:
+                sku_details[tgt] = {
+                    'found': True,
+                    'rows': [{
+                        'sku': m.get('sku'),
+                        'brand': m.get('brand'),
+                        'committed': m.get('committed'),
+                        'allocated': m.get('allocated'),
+                        'jtw': m.get('jtw'),
+                        'tr': m.get('tr'),
+                        'dcw': m.get('dcw'),
+                        'qa': m.get('qa'),
+                        'incoming': m.get('incoming'),
+                        'total_ats': m.get('total_ats'),
+                    } for m in matches]
+                }
+
+    # Quick stats on the cached data
+    nonzero_committed = sum(1 for i in items if i.get('committed', 0) != 0)
+    nonzero_allocated = sum(1 for i in items if i.get('allocated', 0) != 0)
+    total_committed = sum(i.get('committed', 0) for i in items)
+    total_allocated = sum(i.get('allocated', 0) for i in items)
+
+    return jsonify({
+        'meta': meta,
+        'stats': {
+            'total_rows': len(items),
+            'rows_with_nonzero_committed': nonzero_committed,
+            'rows_with_nonzero_allocated': nonzero_allocated,
+            'sum_committed_all_rows': total_committed,
+            'sum_allocated_all_rows': total_allocated,
+        },
+        'sku_lookup': sku_details,
+        'hint': 'Pass ?skus=SKU1,SKU2 to inspect specific SKUs',
+    })
 
 
 @app.route('/exports', methods=['GET', 'OPTIONS'])
@@ -4534,6 +4743,118 @@ def trigger_dropbox_photo_sync():
     return jsonify({'status': 'sync_started', 'current_count': len(_dropbox_photo_index)})
 
 
+# ============================================
+# ADMIN — Force-refresh sync endpoints
+# ============================================
+# Each /admin/refresh/* endpoint clears the TTL marker for the corresponding data
+# source and triggers an immediate re-pull. Used by the Admin Tools panel.
+
+@app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
+def admin_refresh_production():
+    """Force a fresh pull of the Style Ledger from Dropbox."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _production_last_sync
+    _production_last_sync = 0
+    try:
+        load_production_from_dropbox()
+        return jsonify({
+            'status': 'ok',
+            'last_sync': _production_last_sync,
+            'row_count': len(_production_data)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/refresh/apo', methods=['POST', 'OPTIONS'])
+def admin_refresh_apo():
+    """Force a fresh pull of the APO allocations from Dropbox."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _apo_last_sync
+    _apo_last_sync = 0
+    try:
+        load_apo_from_dropbox()
+        return jsonify({
+            'status': 'ok',
+            'last_sync': _apo_last_sync,
+            'row_count': len(_apo_data)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/refresh/inventory', methods=['POST', 'OPTIONS'])
+def admin_refresh_inventory():
+    """Force a fresh pull of inventory (ATS) from S3."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        sync_inventory()
+        with _inv_lock:
+            last_sync = _inventory['last_sync']
+            count = _inventory['item_count']
+        return jsonify({'status': 'ok', 'last_sync': last_sync, 'item_count': count})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/sync-status', methods=['GET', 'OPTIONS'])
+def admin_sync_status():
+    """Single endpoint returning the last-sync timestamp for every data source.
+    Used by the Admin Tools panel to show one unified view of system freshness."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    import time as _time
+    now = _time.time()
+
+    def _epoch_to_iso(epoch_seconds):
+        if not epoch_seconds:
+            return None
+        return datetime.utcfromtimestamp(epoch_seconds).isoformat() + 'Z'
+
+    def _iso_age(iso_str):
+        if not iso_str:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+            return int((datetime.now(dt.tzinfo) - dt).total_seconds())
+        except Exception:
+            return None
+
+    with _inv_lock:
+        inv_sync = _inventory.get('last_sync')
+        inv_count = _inventory.get('item_count', 0)
+
+    return jsonify({
+        'inventory': {
+            'last_sync_iso': inv_sync,
+            'age_seconds': _iso_age(inv_sync),
+            'row_count': inv_count,
+            'auto_interval_minutes': 60,
+        },
+        'production': {
+            'last_sync_iso': _epoch_to_iso(_production_last_sync) if _production_last_sync else None,
+            'age_seconds': int(now - _production_last_sync) if _production_last_sync else None,
+            'row_count': len(_production_data),
+            'auto_interval_minutes': PRODUCTION_RESYNC_INTERVAL // 60,
+        },
+        'apo': {
+            'last_sync_iso': _epoch_to_iso(_apo_last_sync) if _apo_last_sync else None,
+            'age_seconds': int(now - _apo_last_sync) if _apo_last_sync else None,
+            'row_count': len(_apo_data),
+            'auto_interval_minutes': 60,
+        },
+        'dropbox_photos': {
+            'last_sync_iso': _epoch_to_iso(_dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
+            'age_seconds': int(now - _dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
+            'row_count': len(_dropbox_photo_index),
+            'auto_interval_minutes': int(DROPBOX_RESYNC_INTERVAL / 60),
+        }
+    })
+
+
 
 
 # ============================================
@@ -5121,7 +5442,8 @@ def daily_selling_sync_loop():
     print(f"  ⏰ Daily selling-data sync armed "
           f"(target: {SELLING_REFRESH_HOUR_UTC:02d}:{SELLING_REFRESH_MIN_UTC:02d} UTC)",
           flush=True)
-    customers = ['Ross']  # extend list as more customer folders appear
+    customers = ['Ross']  # legacy best/okay/worst format
+    weekly_customers = ['Costco']  # new quantitative weekly format
     while True:
         try:
             now = datetime.utcnow()
@@ -5136,6 +5458,8 @@ def daily_selling_sync_loop():
                   f"{SELLING_REFRESH_MIN_UTC:02d} UTC trigger fired", flush=True)
             for c in customers:
                 refresh_selling_data(c)
+            for c in weekly_customers:
+                refresh_weekly_selling_data(c)
         except Exception as e:
             print(f"  ⚠ [SellingSync] Loop error: {e}", flush=True)
             time.sleep(3600)  # back off
@@ -5179,6 +5503,300 @@ def refresh_selling_data_endpoint(customer):
             'source_filename': data.get('source_filename'),
         })
     return jsonify({'ok': False, 'error': 'Refresh failed (see server logs)'}), 502
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEEKLY SELLING DATA (Costco-style)
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel system to the legacy Ross "best/okay/worst" labels. Costco files:
+#   • Multiple files per customer folder (one per week)
+#   • Filename: Costco_EB_20260523_-_WK_3.xlsx (Customer_Brand_YYYYMMDD_-_WK_N.xlsx)
+#   • Each file has parent styles broken into item-rows by size/color
+#   • Quantitative metrics: $ sold, units, DPW, sell-through, inventory, etc.
+#   • Current week + lifetime totals
+
+import re as _re
+
+_WEEKLY_FILENAME_RE = _re.compile(
+    r'^(?P<customer>[^_]+)_(?P<brand>.+?)_(?P<date>\d{8})_-_WK_(?P<week>\d+)\.xlsx$',
+    _re.IGNORECASE
+)
+
+def _parse_weekly_filename(filename):
+    """Pull brand / date / week# out of a weekly-selling filename."""
+    m = _WEEKLY_FILENAME_RE.match(filename or '')
+    if not m:
+        return None
+    try:
+        date_str = m.group('date')
+        snapshot_date = datetime.strptime(date_str, '%Y%m%d').date().isoformat()
+    except ValueError:
+        return None
+    return {
+        'customer': m.group('customer'),
+        'brand': m.group('brand').upper(),
+        'snapshot_date': snapshot_date,
+        'week': int(m.group('week')),
+    }
+
+
+def _parse_weekly_workbook(xlsx_bytes, file_meta):
+    """Parse a single weekly selling workbook into a JSON-friendly structure."""
+    import io as _io
+    import openpyxl as _openpyxl
+    wb = _openpyxl.load_workbook(_io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+    sheet_name = None
+    for n in wb.sheetnames:
+        if n.lower() != 'data':
+            sheet_name = n
+            break
+    if sheet_name is None:
+        sheet_name = wb.sheetnames[0]
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    def _metric_block(row, start_col):
+        def _num(idx):
+            v = row[idx] if idx < len(row) else None
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+        return {
+            'dollar_sales':    _num(start_col + 0),
+            'unit_sales':      _num(start_col + 1),
+            'avg_price':       _num(start_col + 2),
+            'dpw':             _num(start_col + 3),
+            'refund_dollars':  _num(start_col + 4),
+            'inventory':       _num(start_col + 5),
+            'on_order':        _num(start_col + 6),
+            'in_transit':      _num(start_col + 7),
+            'qty_received':    _num(start_col + 8),
+            'nsi_units':       _num(start_col + 9),
+            'retail_value':    _num(start_col + 10),
+        }
+
+    styles = []
+    current_style = None
+    for row in rows[2:]:
+        if not row:
+            continue
+        col_c = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else '')
+        col_a_item = (str(row[0]).strip() if len(row) > 0 and row[0] is not None else '')
+        col_d_item = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else '')
+
+        if not col_c and not col_a_item:
+            continue
+
+        is_total = col_c.upper().startswith('TOTAL')
+        is_header = col_c.upper() in ('STYLE', 'BRAND', 'ITEM')
+        is_new_parent = bool(col_c) and not is_total and not is_header
+
+        if is_header:
+            continue
+
+        if is_new_parent:
+            current_style = {
+                'style': col_c.upper(),
+                'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
+                'brand_label': str(row[4]).strip() if len(row) > 4 and row[4] else '',
+                'items': [],
+                'totals_current': None,
+                'totals_lifetime': None,
+            }
+            styles.append(current_style)
+
+        if is_total:
+            if current_style is not None:
+                current_style['totals_current']  = _metric_block(row, 6)
+                current_style['totals_lifetime'] = _metric_block(row, 17)
+            continue
+
+        if current_style is None or not (col_a_item or col_d_item):
+            continue
+
+        current_style['items'].append({
+            'item_code': col_a_item or col_d_item,
+            'description': str(row[5]).strip() if len(row) > 5 and row[5] else '',
+            'current':  _metric_block(row, 6),
+            'lifetime': _metric_block(row, 17),
+        })
+
+    # Compute derived metrics per style
+    for s in styles:
+        tc = s.get('totals_current') or {}
+        tl = s.get('totals_lifetime') or {}
+        if tc:
+            sold_lt = tl.get('unit_sales', 0) or 0
+            inv_lt  = tl.get('inventory', 0) or 0
+            denom = sold_lt + inv_lt
+            s['sell_through_pct'] = (sold_lt / denom * 100) if denom > 0 else 0.0
+            wk_units = tc.get('unit_sales', 0) or 0
+            s['weeks_of_cover'] = (tc.get('inventory', 0) / wk_units) if wk_units > 0 else None
+
+    return {
+        'snapshot_date': file_meta['snapshot_date'],
+        'brand': file_meta['brand'],
+        'week': file_meta['week'],
+        'source_filename': file_meta.get('source_filename', ''),
+        'styles': styles,
+    }
+
+
+_weekly_selling_cache = {}
+_weekly_selling_last_synced = {}
+
+
+def _fetch_weekly_selling_from_dropbox(customer):
+    """List every .xlsx in the customer's folder, parse each one, group by brand."""
+    token = get_dropbox_token()
+    if not token:
+        print(f"[Weekly Selling] No Dropbox token, can't fetch {customer}", flush=True)
+        return None
+
+    folder_path = f"{DROPBOX_SELLING_BASE}/{customer}"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    try:
+        list_resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers=headers,
+            json={'path': folder_path, 'recursive': False, 'limit': 500},
+            timeout=30
+        )
+        if list_resp.status_code != 200:
+            print(f"[Weekly Selling] list_folder({folder_path}) → {list_resp.status_code}: "
+                  f"{list_resp.text[:200]}", flush=True)
+            return None
+        entries = list_resp.json().get('entries', [])
+    except Exception as e:
+        print(f"[Weekly Selling] List failed for {customer}: {e}", flush=True)
+        return None
+
+    parseable = []
+    for e in entries:
+        if e.get('.tag') != 'file':
+            continue
+        name = e.get('name', '')
+        if name.startswith('~$') or not name.lower().endswith('.xlsx'):
+            continue
+        meta = _parse_weekly_filename(name)
+        if meta is None:
+            continue
+        meta['source_filename'] = name
+        parseable.append((meta, e))
+
+    if not parseable:
+        print(f"[Weekly Selling] No matching files in {folder_path} "
+              "(expected Customer_Brand_YYYYMMDD_-_WK_N.xlsx)", flush=True)
+        return {'weeks': [], 'by_brand': {}}
+
+    parseable.sort(key=lambda pe: pe[0]['snapshot_date'])
+    weeks = []
+    for meta, entry in parseable:
+        try:
+            dl_resp = http_requests.post(
+                'https://content.dropboxapi.com/2/files/download',
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Dropbox-API-Arg': json.dumps({'path': entry['path_display']})
+                },
+                timeout=60
+            )
+            if dl_resp.status_code != 200:
+                print(f"[Weekly Selling] Download {entry['name']} → {dl_resp.status_code}",
+                      flush=True)
+                continue
+            parsed = _parse_weekly_workbook(dl_resp.content, meta)
+            weeks.append(parsed)
+        except Exception as e:
+            print(f"[Weekly Selling] Parse error for {entry.get('name')}: {e}", flush=True)
+            continue
+
+    by_brand = {}
+    for w in weeks:
+        brand = w['brand']
+        by_brand.setdefault(brand, []).append(w)
+
+    return {
+        'weeks': weeks,
+        'by_brand': by_brand,
+        'fetched_at': datetime.utcnow().isoformat() + 'Z',
+    }
+
+
+def refresh_weekly_selling_data(customer):
+    """Refresh one customer's weekly-selling cache."""
+    data = _fetch_weekly_selling_from_dropbox(customer)
+    if data is not None:
+        key = customer.lower()
+        _weekly_selling_cache[key] = data
+        _weekly_selling_last_synced[key] = int(time.time())
+        return True
+    return False
+
+
+@app.route('/selling-data-weekly/<customer>', methods=['GET', 'OPTIONS'])
+def get_weekly_selling_data(customer):
+    """Return all weekly selling data for a customer (e.g. Costco)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    key = (customer or '').lower()
+    if key not in _weekly_selling_cache:
+        refresh_weekly_selling_data(customer)
+    data = _weekly_selling_cache.get(key)
+    if not data:
+        return jsonify({'error': 'No weekly selling data available', 'customer': customer}), 404
+    return jsonify({
+        'customer': customer,
+        'fetched_at': data.get('fetched_at'),
+        'last_synced': _weekly_selling_last_synced.get(key),
+        'by_brand': data.get('by_brand', {}),
+        'brand_count': len(data.get('by_brand', {})),
+        'week_count': len(data.get('weeks', [])),
+    })
+
+
+@app.route('/selling-data-weekly/<customer>/refresh', methods=['POST', 'OPTIONS'])
+def refresh_weekly_selling_endpoint(customer):
+    """Force re-pull of all weekly files for this customer from Dropbox."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    ok = refresh_weekly_selling_data(customer)
+    if ok:
+        key = customer.lower()
+        d = _weekly_selling_cache.get(key, {})
+        return jsonify({
+            'ok': True,
+            'week_count': len(d.get('weeks', [])),
+            'brand_count': len(d.get('by_brand', {})),
+        })
+    return jsonify({'ok': False, 'error': 'Refresh failed'}), 502
+
+
+@app.route('/selling-data-customers', methods=['GET', 'OPTIONS'])
+def list_selling_customers():
+    """List all customer folders under /Selling Data."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    token = get_dropbox_token()
+    if not token:
+        return jsonify({'customers': []}), 200
+    try:
+        resp = http_requests.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'path': DROPBOX_SELLING_BASE, 'recursive': False, 'limit': 200},
+            timeout=30
+        )
+        if resp.status_code != 200:
+            return jsonify({'customers': [], 'error': f'list_folder {resp.status_code}'}), 200
+        entries = resp.json().get('entries', [])
+        customers = sorted([e['name'] for e in entries if e.get('.tag') == 'folder'])
+        return jsonify({'customers': customers})
+    except Exception as e:
+        return jsonify({'customers': [], 'error': str(e)}), 200
 
 
 # ─────────────────────────────────────────────────────────────────────────────
