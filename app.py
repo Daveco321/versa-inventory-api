@@ -787,6 +787,14 @@ def load_production_from_dropbox():
             # ── Compute etd + arrival ──
             etd = None
             arrival = None
+            # Track FOB-flagged production rows. When David puts "be ready",
+            # "FOB ...", or "FOB-AS READY" in the ETD column, it signals an FOB
+            # production batch with no firm ex-factory date. These should NOT
+            # participate in date-based feasibility — frontend treats them as
+            # date-less but keeps them in the supply pool for FIFO fallback.
+            fob_flag = False
+            fob_note = ''
+
             if port_arrival_dt is not None:
                 # Column G wins: compute both dates from it. Ignore column F entirely.
                 etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
@@ -795,10 +803,29 @@ def load_production_from_dropbox():
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
                 else:
-                    try:
-                        etd = str(row[5])
-                    except:
+                    raw_etd = str(row[5]).strip()
+                    raw_upper = raw_etd.upper()
+                    # FOB markers: ETD is a non-date string. Common variants:
+                    #   "be ready", "FOB", "FOB 6/10", "FOB-AS READY", "as ready"
+                    is_fob_marker = (
+                        'FOB' in raw_upper
+                        or 'BE READY' in raw_upper
+                        or raw_upper == 'AS READY'
+                        or raw_upper == 'READY'
+                        or raw_upper == 'TBD'
+                    )
+                    # Try to detect if it's at least a parseable date-ish string
+                    looks_like_date = bool(re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', raw_etd))
+                    if is_fob_marker or not looks_like_date:
+                        # No usable ETD — flag as FOB and leave dates blank
+                        fob_flag = True
+                        fob_note = raw_etd
                         etd = None
+                    else:
+                        try:
+                            etd = raw_etd
+                        except:
+                            etd = None
 
             try:
                 units = int(row[3] or 0)
@@ -824,6 +851,12 @@ def load_production_from_dropbox():
                 # "frontend, please apply your transit rule based on category".
                 'arrival': arrival,
                 'port_dated': port_arrival_dt is not None,
+                # FOB flag: ETD column had "be ready" / "FOB ..." instead of a
+                # real date. Frontend treats these as date-less (no feasibility
+                # filter) but keeps them in the supply pool. fob_note carries
+                # the raw text so the UI can display it.
+                'fob_flag': fob_flag,
+                'fob_note': fob_note,
                 # Shipment # — admin-only column H. Used to break a single Production#
                 # PO into physical shipments. Frontend surfaces this in a dedicated
                 # admin-only modal; deliberately excluded from all exports.
