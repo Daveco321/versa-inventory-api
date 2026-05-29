@@ -4358,8 +4358,13 @@ def load_apo_from_dropbox():
                 continue
             customer = cols[cust_idx] if len(cols) > cust_idx else ''
             style_raw = cols[style_idx] if len(cols) > style_idx else ''
-            # Strip size suffix (e.g. "ASU201SLS" or "TJNASU201SLS-2XL" → keep base)
-            style = style_raw.upper().split('-')[0].strip()
+            # PRESERVE FULL SKU (no suffix strip).
+            # Smart routing matches APO demand to inventory by exact SKU, so
+            # "TMDKPK001SLS-M" must stay as-is to land on the -M inventory pool.
+            # If the ledger has base-style APO rows like "ASU201SLS", they pass
+            # through unchanged and continue to match base-style inventory.
+            # Only whitespace is trimmed.
+            style = style_raw.upper().strip()
             if not style:
                 continue
             qty = 0
