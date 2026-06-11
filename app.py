@@ -1941,6 +1941,37 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
     return results
 
 
+# Factory lookup — the first 2 letters of a Production # identify the factory
+# producing the goods. Customer (catalog) exports show ONLY the prefix; admin
+# exports show the full factory name. Unknown prefixes fall back to the prefix
+# itself so new factories still show up before this map is updated.
+FACTORY_NAMES = {
+    'TF': 'Top Find',
+    'NB': 'Yuxiu',
+    'PC': 'Pinnacle',
+    'DP': 'David Peng',
+    'FR': 'Frank',
+    'NK': 'Najmul',
+}
+
+
+def _factory_label(production_ref, full_name=False):
+    """Derive the factory from a production reference number.
+
+    full_name=False → 2-letter prefix only (customer-facing).
+    full_name=True  → full factory name from FACTORY_NAMES (admin-facing).
+    """
+    ref = str(production_ref or '').strip()
+    if len(ref) < 2:
+        return ''
+    prefix = ref[:2].upper()
+    if not prefix.isalpha():
+        return ''
+    if full_name:
+        return FACTORY_NAMES.get(prefix, prefix)
+    return prefix
+
+
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
                      flow_mode=False):
@@ -1974,8 +2005,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             headers.extend(['Fit', 'Fabrication'])
             # 📋 Customer-facing overseas: PO Ref # column (from style ledger column A — the
             # production reference number) when at least one cart row maps to a specific delivery.
+            # Factory = 2-letter prefix of the production ref (customers never see full names).
             if flow_mode:
-                headers.append('PO Ref #')
+                headers.extend(['PO Ref #', 'Factory'])
             if is_order:
                 headers.append('Qty Selected')
             # Customer catalog overseas view: NO Incoming column — per-delivery rows
@@ -1994,18 +2026,20 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             if view_mode == 'all':
                 headers.extend(['Ex-Factory', 'Arrival'])
                 # 📋 Mixed-cart support: when customer has overseas items in cart with specific
-                # arrivals (flow_mode=true), include PO Ref #. Warehouse rows get blank cells.
+                # arrivals (flow_mode=true), include PO Ref # + Factory prefix.
+                # Warehouse rows get blank cells.
                 if flow_mode:
-                    headers.append('PO Ref #')
+                    headers.extend(['PO Ref #', 'Factory'])
     elif view_mode == 'incoming':
         # Admin overseas view: no warehouse columns, add dates
         headers = ['IMAGE', 'SKU', 'Brand']
         if has_color:
             headers.append('Color')
         headers.extend(['Fit', 'Fabrication'])
-        # Flow mode (admin only): add Production # and PO Name columns
+        # Flow mode (admin only): add Production #, PO Name and Factory columns.
+        # Admin sees the FULL factory name (mapped from the production # prefix).
         if flow_mode and not catalog_mode:
-            headers.extend(['Production #', 'PO Name'])
+            headers.extend(['Production #', 'PO Name', 'Factory'])
         if is_order:
             headers.append('Qty Selected')
         headers.extend(['Incoming', 'Committed', 'Allocated', 'Overseas ATS',
@@ -2033,7 +2067,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
     col_widths = {
         'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
-        'Production #': 16, 'PO Name': 30, 'PO Ref #': 22,
+        'Production #': 16, 'PO Name': 30, 'PO Ref #': 22, 'Factory': 14,
         'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
@@ -2047,7 +2081,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
 
 
 def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
-                view_mode='all', headers=None):
+                view_mode='all', headers=None, catalog_mode=False):
     """Write data rows using headers list to determine column layout."""
     if not headers:
         headers = []
@@ -2064,6 +2098,11 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Production #': lambda item: item.get('production', ''),
         'PO Name': lambda item: item.get('po_name', ''),
         'PO Ref #': lambda item: item.get('po_ref', ''),
+        # Factory derived from production ref prefix — admin gets full name,
+        # customers (catalog_mode) only ever see the 2-letter prefix.
+        'Factory': lambda item: _factory_label(
+            item.get('production') or item.get('po_ref'),
+            full_name=not catalog_mode),
         'Qty Selected': lambda item: item.get('quantity_ordered', 0),
         'JTW': lambda item: item.get('jtw', 0),
         'TR': lambda item: item.get('tr', 0),
@@ -2430,7 +2469,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
-                    view_mode=view_mode, headers=headers)
+                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode)
     print(f"  [build_brand_excel] Step 4: add size charts (prepack_defaults={type(prepack_defaults).__name__}, len={len(prepack_defaults) if prepack_defaults else 0})")
     try:
         _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
@@ -2457,7 +2496,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
                                          catalog_mode=catalog_mode, flow_mode=flow_mode)
         imgs = download_images_for_items(items, s3_base_url, use_cache=True)
         _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
-                    view_mode=view_mode, headers=headers)
+                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode)
         wb.close()
         print(f"  [build_brand_excel] Retry succeeded (no size charts)")
     return buf.getvalue()
@@ -2510,7 +2549,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             if gi in all_imgs:
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
-                        has_color=has_color, headers=headers)
+                        has_color=has_color, headers=headers, catalog_mode=catalog_mode)
         try:
             _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
         except Exception as e:
@@ -2530,7 +2569,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
             ws = wb.add_worksheet(safe)
             fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
-                                             catalog_mode=catalog_mode, view_mode=view_mode)
+                                             catalog_mode=catalog_mode, view_mode=view_mode,
+                                             flow_mode=flow_mode)
             start, count = offsets[bi]
             local_imgs = {}
             for li in range(count):
@@ -2538,7 +2578,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 if gi in all_imgs:
                     local_imgs[li] = all_imgs[gi]
             _write_rows(wb, ws, brand['items'], local_imgs, fmts,
-                        has_color=has_color, headers=headers)
+                        has_color=has_color, headers=headers, catalog_mode=catalog_mode)
         wb.close()
         print(f"  ✓ Multi-brand retry succeeded (no size charts)")
     return buf.getvalue()
@@ -3591,9 +3631,9 @@ def build_overseas_summary_excel(title, items, s3_base_url):
 
     # ── Headers ──
     headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
-               'Production', 'PO', 'Ex-Factory', 'Arrival',
+               'Production', 'Factory', 'PO', 'Ex-Factory', 'Arrival',
                'Produced', 'Deducted', 'Flow ATS']
-    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 22, 14, 14, 12, 12, 12]
+    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 14, 22, 14, 14, 12, 12, 12]
 
     ws.hide_gridlines(2)
     ws.freeze_panes(1, 0)
@@ -3666,13 +3706,15 @@ def build_overseas_summary_excel(title, items, s3_base_url):
         ws.write(row, 4, item.get('fit', ''), cf)
         ws.write(row, 5, item.get('fabrication', ''), cf)
         ws.write(row, 6, item.get('production', ''), cf)
-        ws.write(row, 7, item.get('po', ''), cf)
-        ws.write(row, 8, item.get('ex_factory', ''), cf)
-        ws.write(row, 9, item.get('arrival', ''), cf)
-        ws.write(row, 10, item.get('produced', 0), nf)
+        # Overseas Summary is admin-only — full factory name
+        ws.write(row, 7, _factory_label(item.get('production'), full_name=True), cf)
+        ws.write(row, 8, item.get('po', ''), cf)
+        ws.write(row, 9, item.get('ex_factory', ''), cf)
+        ws.write(row, 10, item.get('arrival', ''), cf)
+        ws.write(row, 11, item.get('produced', 0), nf)
         deducted = item.get('deducted', 0)
-        ws.write(row, 11, deducted, deducted_fmt if deducted else nf)
-        ws.write(row, 12, item.get('flow_ats', 0), ats_fmt)
+        ws.write(row, 12, deducted, deducted_fmt if deducted else nf)
+        ws.write(row, 13, item.get('flow_ats', 0), ats_fmt)
 
         row += 1
         data_row_idx += 1
