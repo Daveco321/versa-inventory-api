@@ -966,6 +966,10 @@ _PY_YM_FABRIC_CODES    = {
 # Sportswear Bottoms — subset of YM/Sportswear that ALSO belongs to the Dress Pants filter
 # (per "(BOTTOMS)" marker in spreadsheet: Carpenters, Ripstops, Heavy Weight, Pinstripe).
 _PY_SPORTSWEAR_BOTTOM_CODES = {'BC','BR','BH','BA'}
+# Brands whose dress pants use the P##X serial convention (position 7 = 'P',
+# positions 8-9 digits, position 10 a letter — e.g. "CUUSPPP01SLS", "PMGBDPP01SRS").
+# US Polo pioneered it; Geoffrey Beene followed. Mirrors frontend PANTS_SERIAL_BRANDS.
+_PY_PANTS_SERIAL_BRANDS = {'US', 'GB'}
 # Long-sleeve fit codes — mirrors frontend LONG_SLEEVE_FIT_CODES.
 # Used by _py_is_long_sleeve_shirt() so that YM-fabric items (VD shackets etc.) can match
 # 'long_sleeve' prepack rules on the basis of their fit code.
@@ -1024,11 +1028,12 @@ def _py_get_item_category(sku, brand_abbr):
     base = sku.split('-')[0].upper()
     # Brand code lives at positions 2-3 of the base SKU.
     sku_brand = base[2:4] if len(base) >= 4 else ''
-    # Pants: US POLO ONLY — uses P##X serial pattern (e.g. "CUUSPPP01SLS").
-    # Per business rule: other brands don't use P## convention; their pants are
-    # identified by fabric code — only "(BOTTOMS)" codes from Style Rules spreadsheet
-    # count as pants (BC/BR/BH/BA), handled by _py_is_pants() via _PY_SPORTSWEAR_BOTTOM_CODES.
-    if (sku_brand == 'US'
+    # Pants: P##X serial pattern, _PY_PANTS_SERIAL_BRANDS only (US Polo, Geoffrey
+    # Beene — e.g. "CUUSPPP01SLS", "PMGBDPP01SRS"). Per business rule: other brands
+    # don't use the P## convention; their pants are identified by fabric code — only
+    # "(BOTTOMS)" codes from Style Rules spreadsheet count as pants (BC/BR/BH/BA),
+    # handled by _py_is_pants() via _PY_SPORTSWEAR_BOTTOM_CODES.
+    if (sku_brand in _PY_PANTS_SERIAL_BRANDS
             and len(base) >= 10 and base[6] == 'P'
             and base[7].isdigit() and base[8].isdigit() and base[9].isalpha()):
         return 'pants'
@@ -2195,8 +2200,10 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
             # PRIORITY B: SKU-specific assignment on any prepack rule
             sku_matched = None
             for rule in prepack_defaults:
-                for s in (rule.get('skus') or []):
-                    su = s.upper().strip()
+                # 'sk', not 's' — 's' is the red subtitle cell format defined above;
+                # shadowing it made every "SIZE SCALE TO USE" row silently disappear.
+                for sk in (rule.get('skus') or []):
+                    su = sk.upper().strip()
                     if su and (su == sku or su == base or sku.startswith(su)):
                         sku_matched = rule
                         break
@@ -2350,6 +2357,12 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
     # ── Render each rule as a vertical block ──────────────────────────────
     r = start
 
+    # "Waist x Length" size-name detector (e.g. dress pants "32 x 30") — such
+    # packs pivot into the same compact two-dimensional grid as neck/sleeve
+    # shirts (waist across the top, length down the side). Rendered flat (one
+    # column per size) they get too wide to read or print past a few sizes.
+    x_re = re.compile(r'^\s*([\d.\-]+)\s*[xX×]\s*([\d.\-]+)\s*$')
+
     for rule in packs_to_render:
         sizes  = rule.get('sizes') or []
         # Ensure sizes is a list of [name, qty] pairs with numeric qty
@@ -2364,7 +2377,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
         inner  = rule.get('inner_qty', '—')  # free-text string
         if isinstance(inner, (int, float)):
             inner = str(inner)  # legacy numeric → string
-        label  = rule.get('label') or rule.get('category', '?')
+        label  = rule.get('label') or rule.get('category') or '?'
 
         worksheet.set_row(r, 20)
         inner_part = '{}, '.format(inner) if inner and inner != '—' else ''
@@ -2377,36 +2390,55 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
         ratios = _compute_ratios(sizes)
         is_neck_sleeve = any('/' in str(sz[0]) for sz in sizes if sz)
+        is_waist_length = (not is_neck_sleeve and
+                           all(x_re.match(str(sz[0])) for sz in sizes))
 
-        if is_neck_sleeve:
-            # Parse neck/sleeve — e.g. "15-15.5 / 32-33" — using ratios
-            neck_map   = {}   # neck -> {sleeve: ratio}
-            neck_order = []
-            slv_order  = []
+        if is_neck_sleeve or is_waist_length:
+            # Parse two-part sizes — "15-15.5 / 32-33" (neck/sleeve) or
+            # "32 x 30" (waist/length) — into columns (first part) and rows (second)
+            col_dim, row_dim = ('NECK', 'SLEEVE') if is_neck_sleeve else ('WAIST', 'LENGTH')
+            col_map   = {}   # first dim (neck / waist) -> {second dim: ratio}
+            col_order = []
+            row_order = []
             for (sz, _), (_, ratio) in zip(sizes, ratios):
-                parts = [p.strip() for p in sz.split('/')]
-                neck  = parts[0]
-                slv   = parts[1] if len(parts) > 1 else ''
-                if neck not in neck_map:
-                    neck_map[neck] = {}
-                    neck_order.append(neck)
-                neck_map[neck][slv] = ratio
-                if slv not in slv_order:
-                    slv_order.append(slv)
+                if is_neck_sleeve:
+                    parts = [p.strip() for p in sz.split('/')]
+                    cval  = parts[0]
+                    rval  = parts[1] if len(parts) > 1 else ''
+                else:
+                    m = x_re.match(str(sz))
+                    cval, rval = m.group(1), m.group(2)
+                if cval not in col_map:
+                    col_map[cval] = {}
+                    col_order.append(cval)
+                col_map[cval][rval] = ratio
+                if rval not in row_order:
+                    row_order.append(rval)
 
-            # Column header row: blank corner + neck sizes as columns
-            worksheet.set_row(r, 22)
+            # Dimension banner row: merged label over the size columns so the
+            # reader knows which number is which (e.g. WAIST across the top)
+            worksheet.set_row(r, 18)
             worksheet.write(r, 0, '', gh)
-            for ci, neck in enumerate(neck_order):
-                worksheet.write(r, 1 + ci, neck, gh)
+            if len(col_order) > 1:
+                worksheet.merge_range(r, 1, r, len(col_order), col_dim, gh)
+            else:
+                worksheet.write(r, 1, col_dim, gh)
             r += 1
 
-            # One data row per sleeve length
-            for slv in slv_order:
+            # Column header row: row-dimension label in the corner (e.g. LENGTH,
+            # sitting directly above the row values) + first-dim sizes as columns
+            worksheet.set_row(r, 22)
+            worksheet.write(r, 0, row_dim, gh)
+            for ci, cval in enumerate(col_order):
+                worksheet.write(r, 1 + ci, cval, gh)
+            r += 1
+
+            # One data row per second-dimension size (sleeve / length)
+            for rval in row_order:
                 worksheet.set_row(r, 22)
-                worksheet.write(r, 0, slv, gh)
-                for ci, neck in enumerate(neck_order):
-                    val = neck_map[neck].get(slv, '')
+                worksheet.write(r, 0, rval, gh)
+                for ci, cval in enumerate(col_order):
+                    val = col_map[cval].get(rval, '')
                     worksheet.write(r, 1 + ci, val if val != '' else '', gd)
                 r += 1
 
@@ -2443,7 +2475,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
         )
 
     buf = BytesIO()
-    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet(brand_name[:31])
     # Monkey-patch worksheet.write to catch string-as-format bugs
@@ -2488,7 +2520,7 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
         # Try again without size charts — rebuild from scratch
         print(f"  [build_brand_excel] Retrying WITHOUT size charts...")
         buf = BytesIO()
-        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
         ws = wb.add_worksheet(brand_name[:31])
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
@@ -2520,7 +2552,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     all_imgs = download_images_for_items(all_items, s3_base_url, use_cache=True)
 
     buf = BytesIO()
-    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
 
     for bi, brand in enumerate(brands_list):
@@ -2563,7 +2595,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         print(f"  ⚠ wb.close() failed in multi-brand: {e} — retrying WITHOUT size charts...")
         # Retry from scratch without size charts
         buf = BytesIO()
-        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
         for bi, brand in enumerate(brands_list):
             safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
@@ -3589,7 +3621,7 @@ def export_overseas_summary():
 def build_overseas_summary_excel(title, items, s3_base_url):
     """Build a formatted overseas summary Excel with images, date banners, brand separators."""
     buf = BytesIO()
-    wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     wb.set_properties({'title': f'Versa - {title}', 'author': 'Versa Inventory System'})
     ws = wb.add_worksheet('Overseas Summary')
 
@@ -8203,7 +8235,7 @@ def export_suggestions():
 
         # Build workbook
         buf = BytesIO()
-        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'AI Booking Suggestions',
                            'author': 'Versa Inventory System'})
 
@@ -8362,7 +8394,7 @@ def export_rec_plan():
                     img_by_style[style] = data
 
         buf = BytesIO()
-        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Booking Plan', 'author': 'Versa Inventory System'})
 
         fmt_header = wb.add_format({'bold': True, 'bg_color': '#1f2937', 'font_color': 'white',
@@ -8524,7 +8556,7 @@ def export_predictions():
 
         # Build the workbook.
         buf = BytesIO()
-        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Versa Open Order Predictions',
                            'author': 'Versa Inventory System'})
 
