@@ -353,6 +353,7 @@ _overrides_lock = threading.Lock()
 _style_overrides = {}
 _overrides_loaded = False       # True once S3 load completes — prevents race on fresh workers
 _overrides_last_saved = 0.0    # epoch timestamp of last POST save — used for version polling
+_prepack_last_saved = 0.0      # epoch timestamp of last prepack-rules save — exports staleness check
 _s3_overrides_etag = None      # ETag from S3 — used to detect cross-worker staleness
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
@@ -954,7 +955,7 @@ def get_base_style(sku):
 
 _PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
 _PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE'}
-_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST'}
+_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','WB'}  # mirrors frontend BT_FIT_CODES ('WB' was missing)
 # Young Men / Sportswear fabric codes — mirrors frontend YOUNG_MEN_FABRIC_CODES.
 # Per Style Rules spreadsheet ("YOUNG MEN / SPORTSWEAR" section), these 18 codes belong
 # to BOTH the Young Men category AND the Sportswear category.
@@ -975,20 +976,41 @@ _PY_PANTS_SERIAL_BRANDS = {'US', 'GB'}
 # 'long_sleeve' prepack rules on the basis of their fit code.
 _PY_LONG_SLEEVE_FIT_CODES = {'SL','RF','TF','MF','BT','BB','TT','WB','BR','DB'}
 
+# Full fit-code list — mirrors the frontend FIT_CODES table keys EXACTLY.
+# Do not trim: any code missing here used to fall through to the old 'RF'
+# default below, which made those items match "Regular Fit" (or VD S–XL)
+# prepack rules in export bottom grids that the product tiles never showed —
+# the "export shows a different prepack than the product" bug.
+_PY_ALL_FIT_CODES = {'BB','BR','BT','CE','CH','CR','DB','MF','RF','RR','SB',
+                     'SC','SE','SH','SF','SL','SR','SS','ST','TF','TT','WB'}
+
 def _py_extract_fit_code(sku):
-    """Extract 2-char fit code from base style — mirrors extractFitCode() in JS."""
-    base = sku.split('-')[0].upper().rstrip('V').rstrip('-')
+    """Extract 2-char fit code — mirrors extractFitCode() in the frontend EXACTLY.
+    Parity rules (index.html extractFitCode):
+      1. VD B&T special case: WB/BT at base positions 4-6 win first.
+      2. Base: 2nd & 3rd chars from the end (last char = collar). NO V-stripping —
+         stripping a trailing V shifts the window and misreads e.g. ...01DBV
+         (fit DB, collar V) as '1D'.
+      3. Dash parts: check EVERY dash-separated part (not just the last one)
+         against the full code list, e.g. LUCK-22-170-SL-V → SL.
+      4. NO 'RF' default: return the raw candidate. Unknown fit codes must match
+         no fit-restricted rule — same as the frontend — instead of silently
+         matching Regular Fit rules server-side."""
+    parts = sku.upper().split('-')
+    base = parts[0]
+    if len(base) >= 6 and base[2:4] == 'VD':
+        vd_fit = base[4:6]
+        if vd_fit in ('WB', 'BT'):
+            return vd_fit
     if len(base) >= 3:
         candidate = base[-3:-1]   # 2nd & 3rd from end (last char = collar)
-        known = {'SL','RF','BT','BB','TT','TF','MF','SS','SR','SB','ST',
-                 'SE','SH','CE','CH','CR','SF','SC','RR'}
-        if candidate in known:
+        if candidate in _PY_ALL_FIT_CODES:
             return candidate
-    # fallback: dash suffix e.g. NONAU175-SL
-    parts = sku.upper().split('-')
-    if len(parts) > 1 and parts[-1] in {'SL','RF','BT','TF','MF','SS','SR'}:
-        return parts[-1]
-    return 'RF'
+    for part in parts[1:]:
+        p = part.strip()
+        if p in _PY_ALL_FIT_CODES:
+            return p
+    return base[-3:-1] if len(base) >= 3 else ''
 
 def _py_is_short_sleeve(sku):
     """Short-sleeve check. An explicit fit code wins; the sportswear-collar fallback
@@ -1012,12 +1034,27 @@ def _py_is_young_men(sku):
         return base[4:6] in _PY_YM_FABRIC_CODES
     return False
 
+def _py_is_blazer(sku):
+    """Blazers — identified SOLELY by the B01-B99 serial at base positions 6-8,
+    mirroring frontend isBlazer() exactly (fabric/fit codes deliberately NOT
+    used; see the frontend comment about Bloomingdale private-label SKUs).
+    Without this, a 'blazers' prepack rule matched on product tiles but
+    silently matched NOTHING in any export."""
+    if not sku:
+        return False
+    base = sku.split('-')[0].upper()
+    serial = base[6:9]
+    return (len(serial) == 3 and serial[0] == 'B'
+            and serial[1].isdigit() and serial[2].isdigit())
+
 def _py_is_big_tall(sku):
     base = sku.split('-')[0].upper()
-    # Von Dutch special B&T prefixes: WBJ, BTC, BTS, WBK (after customer+brand code)
-    if len(base) >= 7 and base[2:4] == 'VD':
-        suffix = base[4:]
-        if suffix.startswith(('WBJ', 'BTC', 'BTS', 'WBK')):
+    # Von Dutch B&T: WB/BT at positions 4-5 (the fit slot on VD's shorter SKU
+    # format) with ANY collar letter after — mirrors frontend isBigAndTall()
+    # exactly (the old prefix whitelist WBJ/BTC/BTS/WBK missed other collars).
+    if len(base) >= 6 and base[2:4] == 'VD':
+        vd_fit = base[4:6]
+        if vd_fit in ('WB', 'BT'):
             return True
     if len(base) >= 11:
         return base[9:11] in _PY_BT_FIT_CODES
@@ -1099,6 +1136,8 @@ def _py_matches_category(sku, brand_abbr, category):
         return _py_is_sportswear(sku, brand_abbr)
     if category == 'pants':
         return _py_is_pants(sku, brand_abbr)
+    if category == 'blazers':
+        return _py_is_blazer(sku)
     if category == 'young_men':
         return _py_is_young_men(sku)
     if category == 'short_sleeve':
@@ -1107,6 +1146,22 @@ def _py_matches_category(sku, brand_abbr, category):
         return _py_is_long_sleeve_shirt(sku)
     # Non-overlapping categories fall through to the primary-category equality check
     return _py_get_item_category(sku, brand_abbr) == category
+
+def _fresh_prepack_defaults():
+    """Reload prepack rules from S3 and return a snapshot list.
+
+    Export paths must NOT trust this worker's in-memory copy: Render runs
+    multiple gunicorn workers with independent memory, so a rule save that
+    landed on another worker is invisible here until we re-read S3 (same
+    multi-worker pattern as GET /prepack-defaults). Falls back to whatever is
+    in memory if the S3 read fails — never blocks an export."""
+    try:
+        load_prepack_defaults_from_s3()
+    except Exception as e:
+        print(f"  ⚠ _fresh_prepack_defaults: S3 reload failed, using in-memory copy: {e}")
+    with _prepack_defaults_lock:
+        return list(_prepack_defaults)
+
 
 def _annotate_items_for_prepack(items):
     """Add _export_category, _export_fit, and _override_size_pack to raw inventory items (returns new list)."""
@@ -3071,6 +3126,11 @@ def generate_all_exports():
         date_str = datetime.utcnow().strftime('%Y-%m-%d')
         total = len(brands)
 
+        # Reload prepack rules from S3 ONCE per generation run — this worker's
+        # in-memory copy may be stale (rule saves can land on other gunicorn
+        # workers). One read covers every brand tab below.
+        pd_snap = _fresh_prepack_defaults()
+
         print(f"\n{'='*60}")
         print(f"  Generating exports for {total} brands...")
         print(f"  Image strategy: STYLE+OVERRIDES first → brand folder fallback")
@@ -3107,8 +3167,7 @@ def generate_all_exports():
 
             try:
                 annotated_items = _annotate_items_for_prepack(sorted_items)
-                with _prepack_defaults_lock:
-                    pd_snap = list(_prepack_defaults)
+                # pd_snap loaded fresh from S3 once at generation start
                 xl_bytes = build_brand_excel(name, annotated_items, S3_PHOTOS_URL,
                                              prepack_defaults=pd_snap)
 
@@ -3134,8 +3193,7 @@ def generate_all_exports():
         if brands_list_for_multi:
             print(f"\n  [ALL] Multi-tab ({len(brands_list_for_multi)} brands)...")
             try:
-                with _prepack_defaults_lock:
-                    pd_snap = list(_prepack_defaults)
+                # pd_snap loaded fresh from S3 once at generation start
                 multi_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL,
                                                       prepack_defaults=pd_snap)
                 with _export_lock:
@@ -3403,8 +3461,10 @@ def _exports_are_stale(generated_at_iso):
         gen_epoch = gen_dt.timestamp()
     except Exception:
         return True
-    # _overrides_last_saved is a plain epoch float; small grace to avoid races
-    return _overrides_last_saved > (gen_epoch + 1)
+    # _overrides_last_saved / _prepack_last_saved are plain epoch floats; small
+    # grace to avoid races. A prepack-rule save must invalidate cached exports
+    # too — their bottom size-scale grids are built from the rules.
+    return max(_overrides_last_saved, _prepack_last_saved) > (gen_epoch + 1)
 
 
 @app.route('/download/brand/<abbr>', methods=['GET'])
@@ -3429,8 +3489,7 @@ def download_brand(abbr):
             if brand:
                 sorted_items = sorted(brand['items'], key=lambda x: x.get('total_warehouse', 0), reverse=True)
                 annotated_items = _annotate_items_for_prepack(sorted_items)
-                with _prepack_defaults_lock:
-                    pd_snap = list(_prepack_defaults)
+                pd_snap = _fresh_prepack_defaults()
                 fresh_bytes = build_brand_excel(brand['name'], annotated_items, S3_PHOTOS_URL,
                                                 prepack_defaults=pd_snap)
                 # Update cache so next request is fast
@@ -3487,8 +3546,7 @@ def download_all():
                 annotated_items = _annotate_items_for_prepack(sorted_items)
                 brands_list_for_multi.append({'brand_name': brand['name'], 'items': annotated_items})
             if brands_list_for_multi:
-                with _prepack_defaults_lock:
-                    pd_snap = list(_prepack_defaults)
+                pd_snap = _fresh_prepack_defaults()
                 fresh_bytes = build_multi_brand_excel(brands_list_for_multi, S3_PHOTOS_URL,
                                                      prepack_defaults=pd_snap)
                 with _export_lock:
@@ -3551,8 +3609,7 @@ def download_multi_selected():
     # Annotate items with category/fit for prepack chart matching
     for b in brands_list:
         b['items'] = _annotate_items_for_prepack(b['items'])
-    with _prepack_defaults_lock:
-        pd_snap = list(_prepack_defaults)
+    pd_snap = _fresh_prepack_defaults()
 
     xl_bytes = build_multi_brand_excel(brands_list, S3_PHOTOS_URL, prepack_defaults=pd_snap)
     date_str = datetime.utcnow().strftime('%Y-%m-%d')
@@ -3770,7 +3827,12 @@ def export_single():
         is_order = req.get('is_order', False)
         catalog_mode = req.get('catalog_mode', False)
         flow_mode = req.get('flow_mode', False)
-        prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
+        # Explicit None check — an explicitly-empty client list means "no grids",
+        # while an OMITTED field means "server, use your own rules" (reloaded
+        # from S3 so a stale worker copy can't bake old grids into the export).
+        prepack_defaults = req.get('prepack_defaults')
+        if prepack_defaults is None:
+            prepack_defaults = _fresh_prepack_defaults()
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
@@ -3836,7 +3898,12 @@ def export_multi():
         view_mode = req.get('view_mode', 'all')
         # 📋 flow_mode enables PO Name column in catalog overseas exports
         flow_mode = req.get('flow_mode', False)
-        prepack_defaults = req.get('prepack_defaults') or _prepack_defaults or []
+        # Explicit None check — an explicitly-empty client list means "no grids",
+        # while an OMITTED field means "server, use your own rules" (reloaded
+        # from S3 so a stale worker copy can't bake old grids into the export).
+        prepack_defaults = req.get('prepack_defaults')
+        if prepack_defaults is None:
+            prepack_defaults = _fresh_prepack_defaults()
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
 
@@ -4134,7 +4201,13 @@ def save_prepack_defaults_route():
         if not isinstance(defaults, list):
             return jsonify({"error": "'defaults' must be an array"}), 400
         # SAFETY: refuse to save empty array if we already have rules
-        # (prevents accidental wipe from failed client load)
+        # (prevents accidental wipe from failed client load). Reload from S3
+        # first — a worker whose startup load failed would otherwise report
+        # count 0 and let the wipe through.
+        try:
+            load_prepack_defaults_from_s3()
+        except Exception:
+            pass
         with _prepack_defaults_lock:
             current_count = len(_prepack_defaults)
         if len(defaults) == 0 and current_count > 0:
@@ -4144,6 +4217,16 @@ def save_prepack_defaults_route():
             _prepack_defaults = defaults
         success = save_prepack_defaults_to_s3()
         if success:
+            # Rule edits change the export bottom grids — invalidate cached
+            # workbooks and kick off a background regeneration so instant
+            # downloads pick up the new rules without waiting for the next
+            # override save / inventory sync.
+            global _prepack_last_saved
+            _prepack_last_saved = time.time()
+            try:
+                trigger_background_generation()
+            except Exception as e:
+                print(f"  ⚠ prepack save: could not trigger export regen: {e}")
             return jsonify({"ok": True, "count": len(defaults)})
         return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
