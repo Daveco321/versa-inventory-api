@@ -4099,36 +4099,38 @@ def save_overrides():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
-@app.route('/overrides/extract-images', methods=['POST', 'OPTIONS'])
-def extract_override_images():
-    """Move embedded base64 override images out of the overrides JSON into the
-    S3 STYLE OVERRIDES folder (one JPEG per BASE style #), then strip them from
-    the JSON and save.
+# ── OVERRIDE IMAGE EXTRACTION (background job) ─────────────────────────
+# Moves embedded base64 override images out of the overrides JSON into the
+# S3 STYLE OVERRIDES folder (one JPEG per BASE style #), then strips them
+# from the JSON and saves. Automates the recurring 50MB-overrides fix.
+# Runs in a daemon thread: 300+ S3 uploads far exceed gunicorn's request
+# timeout, so POST returns immediately and progress is polled via
+# GET /overrides/extract-images/status.
+# Safety: full timestamped backup (images included) is written to S3 BEFORE
+# anything is stripped; an entry's image is only stripped if its upload
+# succeeded; the stripped JSON is saved once at the end. Idempotent.
+_extract_lock = threading.Lock()
+_extract_state = {'running': False, 'done': False, 'error': None,
+                  'total': 0, 'uploaded': 0, 'failed': [], 'stripped': 0,
+                  'backup': None, 'json_size_mb': None, 'started_at': None}
 
-    Why: the overrides blob balloons past ~50MB with embedded images and saves
-    start failing — this automates David's manual fix (export → strip images →
-    upload to S3 → re-import). Display is unaffected: the image chain checks
-    STYLE OVERRIDES right after the base64 override.
 
-    Safety: a full timestamped backup (images included) is written to S3 BEFORE
-    anything is stripped, and an entry's image is only stripped if its S3
-    upload succeeded. Idempotent — re-running is harmless.
-    """
-    if request.method == 'OPTIONS':
-        return '', 204
+def _run_override_image_extraction():
     global _style_overrides, _overrides_last_saved
+    import base64 as _b64
     try:
-        import base64 as _b64
         with _overrides_lock:
             snapshot = json.loads(json.dumps(_style_overrides))  # deep copy
         img_keys = [k for k, v in snapshot.items()
                     if isinstance(v, dict) and isinstance(v.get('image'), str)
                     and v['image'].startswith('data:image/')]
         if not img_keys:
-            return jsonify({"ok": True, "message": "No embedded images found — nothing to do",
-                            "uploaded": 0, "stripped": 0, "entries": len(snapshot)})
+            with _extract_lock:
+                _extract_state.update(running=False, done=True, error=None, total=0)
+            print("  Override image extraction: no embedded images found")
+            return
 
-        # Full backup FIRST — synchronous; abort if it fails
+        # Full backup FIRST — must succeed before anything is touched
         s3 = get_s3()
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         backup_key = f"inventory/overrides_backups/style_overrides_pre_image_extract_{ts}.json"
@@ -4141,6 +4143,9 @@ def extract_override_images():
         by_base = {}
         for k in img_keys:
             by_base.setdefault(get_base_style(k), []).append(k)
+        with _extract_lock:
+            _extract_state.update(total=len(by_base), backup=backup_key)
+
         uploaded, failed = [], []
         for base, keys in by_base.items():
             pick = sorted(keys, key=lambda kk: (0 if get_base_style(kk) == kk.upper().strip() else 1,
@@ -4164,6 +4169,8 @@ def extract_override_images():
                 uploaded.append(base)
             except Exception as e:
                 failed.append({"base": base, "error": str(e)})
+            with _extract_lock:
+                _extract_state.update(uploaded=len(uploaded), failed=list(failed))
 
         # Strip image fields ONLY where the S3 upload succeeded
         ok_bases = set(uploaded)
@@ -4179,8 +4186,10 @@ def extract_override_images():
             _style_overrides = snapshot
         _overrides_last_saved = time.time()
         if not save_overrides_to_s3():
-            return jsonify({"error": "Images uploaded but saving the stripped overrides JSON failed — "
-                                     "RE-RUN this endpoint. Full backup: " + backup_key}), 500
+            with _extract_lock:
+                _extract_state.update(running=False, done=True, stripped=0,
+                                      error="Images uploaded but saving the stripped JSON failed — re-run. Backup: " + backup_key)
+            return
 
         # New S3 images must show immediately: bust CloudFront + image cache,
         # regenerate cached exports (generator queues itself if busy).
@@ -4192,15 +4201,39 @@ def extract_override_images():
         trigger_background_generation()
 
         size_after = len(json.dumps(snapshot))
+        with _extract_lock:
+            _extract_state.update(running=False, done=True, error=None, stripped=stripped,
+                                  json_size_mb=round(size_after / 1024 / 1024, 2))
         print(f"  ✓ Override image extraction: {len(uploaded)} images → S3, {stripped} fields stripped, "
               f"JSON now {size_after/1024/1024:.1f}MB, backup {backup_key}")
-        return jsonify({"ok": True, "uploaded": len(uploaded), "stripped": stripped,
-                        "failed": failed, "entries": len(snapshot),
-                        "json_size_mb": round(size_after / 1024 / 1024, 2),
-                        "backup": backup_key})
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        traceback.print_exc()
+        with _extract_lock:
+            _extract_state.update(running=False, done=True, error=str(e))
+
+
+@app.route('/overrides/extract-images', methods=['POST', 'OPTIONS'])
+def extract_override_images():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _extract_lock:
+        if _extract_state['running']:
+            return jsonify({"ok": True, "already_running": True, **{k: v for k, v in _extract_state.items()}})
+        _extract_state.update(running=True, done=False, error=None, total=0, uploaded=0,
+                              failed=[], stripped=0, backup=None, json_size_mb=None,
+                              started_at=datetime.utcnow().isoformat() + 'Z')
+    threading.Thread(target=_run_override_image_extraction, daemon=True).start()
+    return jsonify({"ok": True, "started": True,
+                    "note": "Running in background — poll GET /overrides/extract-images/status"})
+
+
+@app.route('/overrides/extract-images/status', methods=['GET', 'OPTIONS'])
+def extract_override_images_status():
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _extract_lock:
+        return jsonify({k: v for k, v in _extract_state.items()})
 
 
 @app.route('/overrides/backups', methods=['GET', 'OPTIONS'])
