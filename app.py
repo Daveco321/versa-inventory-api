@@ -354,6 +354,7 @@ _style_overrides = {}
 _overrides_loaded = False       # True once S3 load completes — prevents race on fresh workers
 _overrides_last_saved = 0.0    # epoch timestamp of last POST save — used for version polling
 _prepack_last_saved = 0.0      # epoch timestamp of last prepack-rules save — exports staleness check
+_regen_queued = False          # a regen request arrived while one was running — rerun at end
 _s3_overrides_etag = None      # ETag from S3 — used to detect cross-worker staleness
 _manual_alloc_lock = threading.Lock()
 _manual_allocations = []  # list of dicts: {id, sku, customer, po, qty, type, date, notes}
@@ -1017,16 +1018,15 @@ def _py_is_short_sleeve(sku):
     only kicks in when the fit code itself is ambiguous (not recognized as either
     short or long sleeve). This way a long-sleeve polo (e.g. fit RF + Z collar) is
     correctly identified as long sleeve, not force-tagged short by the collar code."""
-    base = sku.split('-')[0].upper()
     fit = _py_extract_fit_code(sku)
     if fit in {'SS','SR','SB','ST'}:
         return True
-    # Explicit long-sleeve fit code overrides the sportswear-collar fallback below
-    if fit in _PY_LONG_SLEEVE_FIT_CODES:
-        return False
-    # Fit code is unrecognized — fall back to sportswear collar codes (polo-style
-    # items default to short sleeve when no clearer signal is available).
-    return len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS
+    # PARITY: the frontend has NO collar-based short-sleeve fallback for
+    # unrecognized fit codes — an unknown fit is simply not short sleeve.
+    # (The old fallback here was unreachable while _py_extract_fit_code
+    # defaulted to 'RF'; with raw codes returned it would have created a
+    # server-only 'short_sleeve' match the tiles never show.)
+    return False
 
 def _py_is_young_men(sku):
     base = sku.split('-')[0].upper()
@@ -3109,11 +3109,23 @@ def sync_inventory():
 
 
 def generate_all_exports():
+    global _regen_queued
     with _export_lock:
         if _exports['generating']:
+            # A run is already in flight. Queue a follow-up instead of dropping
+            # the request — rules/overrides saved MID-RUN would otherwise never
+            # be baked into the cached workbooks, yet get stamped "fresh".
+            _regen_queued = True
             return
         _exports['generating'] = True
         _exports['progress'] = 'starting...'
+
+    # Everything this run reads (inventory, overrides, prepack rules) is
+    # snapshotted near the start, so every export it writes must be stamped
+    # with the RUN-START time — not its completion time. Stamping completion
+    # time made brands finished AFTER a mid-run save look newer than the save,
+    # defeating the _exports_are_stale check.
+    run_started_iso = datetime.utcnow().isoformat() + 'Z'
 
     try:
         with _inv_lock:
@@ -3174,7 +3186,7 @@ def generate_all_exports():
                 with _export_lock:
                     _exports['brands'][abbr] = {
                         'bytes': xl_bytes,
-                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'generated_at': run_started_iso,
                         'name': name,
                         'items_count': len(sorted_items),
                         'size_bytes': len(xl_bytes),
@@ -3199,7 +3211,7 @@ def generate_all_exports():
                 with _export_lock:
                     _exports['all_brands'] = {
                         'bytes': multi_bytes,
-                        'generated_at': datetime.utcnow().isoformat() + 'Z',
+                        'generated_at': run_started_iso,
                         'brands_count': len(brands_list_for_multi),
                         'items_count': sum(len(b['items']) for b in brands_list_for_multi),
                         'size_bytes': len(multi_bytes),
@@ -3209,7 +3221,6 @@ def generate_all_exports():
                 print(f"    Failed: {e}")
 
         with _export_lock:
-            _exports['generating'] = False
             _exports['progress'] = 'done'
             _exports['last_generated'] = datetime.utcnow().isoformat() + 'Z'
 
@@ -3222,8 +3233,20 @@ def generate_all_exports():
     except Exception as e:
         print(f"  Export generation error: {e}")
         with _export_lock:
-            _exports['generating'] = False
             _exports['progress'] = f'error: {e}'
+    finally:
+        # ALWAYS release the flag — the old code leaked generating=True on the
+        # empty-inventory early return, permanently blocking every future regen
+        # on that worker. Then honor any regen queued while we were running.
+        rerun = False
+        with _export_lock:
+            _exports['generating'] = False
+            if _regen_queued:
+                _regen_queued = False
+                rerun = True
+        if rerun:
+            print("  Data changed mid-run — regenerating exports with fresh snapshot")
+            trigger_background_generation()
 
 
 def trigger_background_generation():
@@ -3501,11 +3524,10 @@ def download_brand(abbr):
                         'items_count': len(sorted_items),
                         'size_bytes': len(fresh_bytes),
                     }
-                # Trigger full background regen so other brands (and All_Brands) catch up
-                with _export_lock:
-                    already_generating = _exports['generating']
-                if not already_generating:
-                    trigger_background_generation()
+                # Trigger full background regen so other brands (and All_Brands)
+                # catch up. Unconditional: if a run is in flight, the generator
+                # queues a follow-up instead of dropping the request.
+                trigger_background_generation()
                 return send_file(
                     BytesIO(fresh_bytes),
                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -3557,10 +3579,8 @@ def download_all():
                         'items_count': sum(len(b['items']) for b in brands_list_for_multi),
                         'size_bytes': len(fresh_bytes),
                     }
-                with _export_lock:
-                    already_generating = _exports['generating']
-                if not already_generating:
-                    trigger_background_generation()
+                # Unconditional — the generator queues a follow-up if busy
+                trigger_background_generation()
                 return send_file(
                     BytesIO(fresh_bytes),
                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -3827,11 +3847,14 @@ def export_single():
         is_order = req.get('is_order', False)
         catalog_mode = req.get('catalog_mode', False)
         flow_mode = req.get('flow_mode', False)
-        # Explicit None check — an explicitly-empty client list means "no grids",
-        # while an OMITTED field means "server, use your own rules" (reloaded
-        # from S3 so a stale worker copy can't bake old grids into the export).
+        # Omitted, null, or EMPTY client rules all mean "server, use your own"
+        # (reloaded from S3 so a stale worker copy can't bake old grids in).
+        # The frontend can legitimately send [] during its first seconds of
+        # load, before /prepack-defaults resolves — substituting server rules
+        # there matches the old behavior and avoids silently exporting the
+        # hardcoded fallback grids.
         prepack_defaults = req.get('prepack_defaults')
-        if prepack_defaults is None:
+        if not prepack_defaults:
             prepack_defaults = _fresh_prepack_defaults()
         if not data:
             return jsonify({"error": "Empty data"}), 400
@@ -3898,11 +3921,14 @@ def export_multi():
         view_mode = req.get('view_mode', 'all')
         # 📋 flow_mode enables PO Name column in catalog overseas exports
         flow_mode = req.get('flow_mode', False)
-        # Explicit None check — an explicitly-empty client list means "no grids",
-        # while an OMITTED field means "server, use your own rules" (reloaded
-        # from S3 so a stale worker copy can't bake old grids into the export).
+        # Omitted, null, or EMPTY client rules all mean "server, use your own"
+        # (reloaded from S3 so a stale worker copy can't bake old grids in).
+        # The frontend can legitimately send [] during its first seconds of
+        # load, before /prepack-defaults resolves — substituting server rules
+        # there matches the old behavior and avoids silently exporting the
+        # hardcoded fallback grids.
         prepack_defaults = req.get('prepack_defaults')
-        if prepack_defaults is None:
+        if not prepack_defaults:
             prepack_defaults = _fresh_prepack_defaults()
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
@@ -4061,15 +4087,117 @@ def save_overrides():
             # which were built with old images. Without this, downloads stay stale
             # until the next /sync or /regenerate.
             if changed_styles:
-                with _export_lock:
-                    already_generating = _exports['generating']
-                if not already_generating:
-                    print(f"  Override change → triggering background export regeneration ({len(changed_styles)} styles)")
-                    trigger_background_generation()
+                print(f"  Override change → triggering background export regeneration ({len(changed_styles)} styles)")
+                # Unconditional — the generator queues a follow-up if a run is in flight
+                trigger_background_generation()
 
             return jsonify({"success": True, "count": len(merged), "invalidated": len(changed_styles)})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route('/overrides/extract-images', methods=['POST', 'OPTIONS'])
+def extract_override_images():
+    """Move embedded base64 override images out of the overrides JSON into the
+    S3 STYLE OVERRIDES folder (one JPEG per BASE style #), then strip them from
+    the JSON and save.
+
+    Why: the overrides blob balloons past ~50MB with embedded images and saves
+    start failing — this automates David's manual fix (export → strip images →
+    upload to S3 → re-import). Display is unaffected: the image chain checks
+    STYLE OVERRIDES right after the base64 override.
+
+    Safety: a full timestamped backup (images included) is written to S3 BEFORE
+    anything is stripped, and an entry's image is only stripped if its S3
+    upload succeeded. Idempotent — re-running is harmless.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _style_overrides, _overrides_last_saved
+    try:
+        import base64 as _b64
+        with _overrides_lock:
+            snapshot = json.loads(json.dumps(_style_overrides))  # deep copy
+        img_keys = [k for k, v in snapshot.items()
+                    if isinstance(v, dict) and isinstance(v.get('image'), str)
+                    and v['image'].startswith('data:image/')]
+        if not img_keys:
+            return jsonify({"ok": True, "message": "No embedded images found — nothing to do",
+                            "uploaded": 0, "stripped": 0, "entries": len(snapshot)})
+
+        # Full backup FIRST — synchronous; abort if it fails
+        s3 = get_s3()
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        backup_key = f"inventory/overrides_backups/style_overrides_pre_image_extract_{ts}.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=backup_key,
+                      Body=json.dumps(snapshot), ContentType='application/json')
+
+        # Group by BASE style — the S3 lookup is per base. Prefer the exact
+        # base key's image, else the largest payload (observed dupes across
+        # size-suffixed keys are byte-identical anyway).
+        by_base = {}
+        for k in img_keys:
+            by_base.setdefault(get_base_style(k), []).append(k)
+        uploaded, failed = [], []
+        for base, keys in by_base.items():
+            pick = sorted(keys, key=lambda kk: (0 if get_base_style(kk) == kk.upper().strip() else 1,
+                                                -len(snapshot[kk]['image'])))[0]
+            try:
+                raw = _b64.b64decode(snapshot[pick]['image'].split(',', 1)[1])
+                with PilImage.open(BytesIO(raw)) as im:
+                    im = ImageOps.exif_transpose(im)
+                    if im.mode in ('RGBA', 'LA', 'P'):
+                        rgba = im.convert('RGBA')
+                        bg = PilImage.new('RGB', rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.split()[-1])
+                        im = bg
+                    elif im.mode != 'RGB':
+                        im = im.convert('RGB')
+                    out = BytesIO()
+                    im.save(out, format='JPEG', quality=90)
+                s3.put_object(Bucket=S3_BUCKET,
+                              Key=f"ALL INVENTORY Photos/STYLE OVERRIDES/{base}.jpg",
+                              Body=out.getvalue(), ContentType='image/jpeg')
+                uploaded.append(base)
+            except Exception as e:
+                failed.append({"base": base, "error": str(e)})
+
+        # Strip image fields ONLY where the S3 upload succeeded
+        ok_bases = set(uploaded)
+        stripped = 0
+        for k in img_keys:
+            if get_base_style(k) in ok_bases:
+                snapshot[k].pop('image', None)
+                stripped += 1
+                if not snapshot[k]:
+                    snapshot.pop(k, None)
+
+        with _overrides_lock:
+            _style_overrides = snapshot
+        _overrides_last_saved = time.time()
+        if not save_overrides_to_s3():
+            return jsonify({"error": "Images uploaded but saving the stripped overrides JSON failed — "
+                                     "RE-RUN this endpoint. Full backup: " + backup_key}), 500
+
+        # New S3 images must show immediately: bust CloudFront + image cache,
+        # regenerate cached exports (generator queues itself if busy).
+        paths = [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{b}.jpg" for b in uploaded]
+        threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+        with _img_lock:
+            for b in uploaded:
+                _img_cache.pop(b, None)
+        trigger_background_generation()
+
+        size_after = len(json.dumps(snapshot))
+        print(f"  ✓ Override image extraction: {len(uploaded)} images → S3, {stripped} fields stripped, "
+              f"JSON now {size_after/1024/1024:.1f}MB, backup {backup_key}")
+        return jsonify({"ok": True, "uploaded": len(uploaded), "stripped": stripped,
+                        "failed": failed, "entries": len(snapshot),
+                        "json_size_mb": round(size_after / 1024 / 1024, 2),
+                        "backup": backup_key})
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -6124,6 +6252,11 @@ def _synthesize_style_from_sku(sku):
     fit = ''
     try:
         fit_code = _py_extract_fit_code(sku_up)
+        # Display default: unknown/junk codes (raw serial fragments like '37')
+        # read as Regular Fit here, preserving this feed's old behavior from
+        # when _py_extract_fit_code itself defaulted to 'RF'.
+        if fit_code and fit_code not in _PY_ALL_FIT_CODES:
+            fit_code = 'RF'
         if fit_code:
             fit = SKU_FIT_FRIENDLY.get(fit_code, fit_code)
     except Exception:
@@ -7633,6 +7766,10 @@ def _enrich_open_orders_with_inventory(open_styles):
         if not s['fit']:
             try:
                 fit_code = _py_extract_fit_code(s['style'])
+                # Display default: junk codes read as 'RF' (old behavior) rather
+                # than feeding a raw serial fragment into the AI prompt/UI.
+                if fit_code and fit_code not in _PY_ALL_FIT_CODES:
+                    fit_code = 'RF'
                 if fit_code:
                     # Friendly labels for the common fit codes — gives the AI
                     # something readable rather than just a 2-letter abbrev.
