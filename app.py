@@ -765,7 +765,7 @@ def load_production_from_dropbox():
         #   - arrival = G + 10 days  (port-to-warehouse leg)
         #   - etd     = G - 27 days  (factory ship-to-port lead time)
         # When G is empty, fall back to column F ETD + the frontend's transit math
-        # (37 days for shirts, 55 for pants — applied frontend-side).
+        # (45 days for shirts since Jul 2026 — was 37 — 55 for pants; applied frontend-side).
         # Column H (Shipment #) is admin-only metadata for grouping physical shipments
         # within the same Production#. Never appears in exports.
         from datetime import timedelta as _td
