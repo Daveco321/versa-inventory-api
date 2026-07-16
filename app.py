@@ -4236,6 +4236,78 @@ def extract_override_images_status():
         return jsonify({k: v for k, v in _extract_state.items()})
 
 
+# ── CONFIRM PRE-PO: saved check history (S3-backed snapshots) ───────────
+# A saved check is a SNAPSHOT of a Confirm Pre-PO run (verdict, per-line
+# pulls, ship plan) plus the inputs needed to re-run it live. List GET
+# strips the heavy payloads; the item GET returns the full record.
+S3_CPP_CHECKS_KEY = os.environ.get('S3_CPP_CHECKS_KEY', 'inventory/cpp_check_history.json')
+_cpp_checks_lock = threading.Lock()
+
+
+def _load_cpp_checks():
+    """Always read from S3 — saves can land on any worker."""
+    try:
+        s3 = get_s3()
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_CPP_CHECKS_KEY)
+        data = json.loads(resp['Body'].read())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_cpp_checks(checks):
+    s3 = get_s3()
+    s3.put_object(Bucket=S3_BUCKET, Key=S3_CPP_CHECKS_KEY,
+                  Body=json.dumps(checks), ContentType='application/json')
+
+
+@app.route('/cpp-checks', methods=['GET', 'POST', 'OPTIONS'])
+def cpp_checks():
+    if request.method == 'OPTIONS':
+        return '', 204
+    if request.method == 'GET':
+        checks = _load_cpp_checks()
+        slim = [{k: v for k, v in c.items() if k not in ('snapshot', 'inputs')} for c in checks]
+        return jsonify({"checks": slim})
+    try:
+        req = request.get_json()
+        check = (req or {}).get('check')
+        if not isinstance(check, dict) or not check.get('id'):
+            return jsonify({"error": "Missing 'check' object with an 'id'"}), 400
+        if len(json.dumps(check)) > 3_000_000:
+            return jsonify({"error": "Check too large to save (over 3MB) — too many lines"}), 400
+        with _cpp_checks_lock:
+            checks = _load_cpp_checks()
+            checks = [c for c in checks if c.get('id') != check['id']]
+            checks.insert(0, check)
+            checks = checks[:50]  # keep the most recent 50
+            _save_cpp_checks(checks)
+        return jsonify({"ok": True, "count": len(checks)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/cpp-checks/<check_id>', methods=['GET', 'DELETE', 'OPTIONS'])
+def cpp_check_item(check_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+    if request.method == 'GET':
+        for c in _load_cpp_checks():
+            if c.get('id') == check_id:
+                return jsonify({"check": c})
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with _cpp_checks_lock:
+            checks = _load_cpp_checks()
+            kept = [c for c in checks if c.get('id') != check_id]
+            if len(kept) == len(checks):
+                return jsonify({"error": "Not found"}), 404
+            _save_cpp_checks(kept)
+        return jsonify({"ok": True, "count": len(kept)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/overrides/backups', methods=['GET', 'OPTIONS'])
 def list_overrides_backups():
     """List available override backup files in S3, newest first."""
