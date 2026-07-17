@@ -2097,7 +2097,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             headers.append('Color')
         headers.extend(['Fit', 'Fabrication'])
         # Flow mode (admin only): add Production #, PO Name and Factory columns.
-        # Admin sees the FULL factory name (mapped from the production # prefix).
+        # Factory shows the 2-letter prefix, same as customer exports.
         if flow_mode and not catalog_mode:
             headers.extend(['Production #', 'PO Name', 'Factory'])
         if is_order:
