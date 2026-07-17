@@ -2002,9 +2002,9 @@ def download_images_for_items(items, s3_base_url, use_cache=True):
 
 
 # Factory lookup — the first 2 letters of a Production # identify the factory
-# producing the goods. Customer (catalog) exports show ONLY the prefix; admin
-# exports show the full factory name. Unknown prefixes fall back to the prefix
-# itself so new factories still show up before this map is updated.
+# producing the goods. ALL exports (admin and customer alike) show only the
+# 2-letter prefix; the full-name map below is kept as an internal reference
+# for what each prefix means.
 FACTORY_NAMES = {
     'TF': 'Top Find',
     'NB': 'Yuxiu',
@@ -2018,8 +2018,8 @@ FACTORY_NAMES = {
 def _factory_label(production_ref, full_name=False):
     """Derive the factory from a production reference number.
 
-    full_name=False → 2-letter prefix only (customer-facing).
-    full_name=True  → full factory name from FACTORY_NAMES (admin-facing).
+    full_name=False → 2-letter prefix only (used by ALL exports since Jul 2026).
+    full_name=True  → full factory name from FACTORY_NAMES (internal use only).
     """
     ref = str(production_ref or '').strip()
     if len(ref) < 2:
@@ -2158,11 +2158,10 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Production #': lambda item: item.get('production', ''),
         'PO Name': lambda item: item.get('po_name', ''),
         'PO Ref #': lambda item: item.get('po_ref', ''),
-        # Factory derived from production ref prefix — admin gets full name,
-        # customers (catalog_mode) only ever see the 2-letter prefix.
+        # Factory derived from production ref prefix — 2-letter abbreviation
+        # only, for admin and customer (catalog_mode) exports alike.
         'Factory': lambda item: _factory_label(
-            item.get('production') or item.get('po_ref'),
-            full_name=not catalog_mode),
+            item.get('production') or item.get('po_ref')),
         'Qty Selected': lambda item: item.get('quantity_ordered', 0),
         'JTW': lambda item: item.get('jtw', 0),
         'TR': lambda item: item.get('tr', 0),
@@ -3815,8 +3814,8 @@ def build_overseas_summary_excel(title, items, s3_base_url):
         ws.write(row, 4, item.get('fit', ''), cf)
         ws.write(row, 5, item.get('fabrication', ''), cf)
         ws.write(row, 6, item.get('production', ''), cf)
-        # Overseas Summary is admin-only — full factory name
-        ws.write(row, 7, _factory_label(item.get('production'), full_name=True), cf)
+        # Factory abbreviation only (matches every other export)
+        ws.write(row, 7, _factory_label(item.get('production')), cf)
         ws.write(row, 8, item.get('po', ''), cf)
         ws.write(row, 9, item.get('ex_factory', ''), cf)
         ws.write(row, 10, item.get('arrival', ''), cf)
