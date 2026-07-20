@@ -47,7 +47,10 @@ CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
+        # Authorization is required by /factory-view, which authenticates the
+        # caller's Versa-Docs session. Without it here the browser's preflight
+        # never grants the header and the request is blocked before it is sent.
+        "allow_headers": ["Content-Type", "Authorization"]
     }
 })
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
