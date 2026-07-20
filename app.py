@@ -9317,6 +9317,13 @@ def factory_view():
             'allocated': int(item.get('allocated', 0) or 0),
         })
 
+    # ── Suppression overrides (S3-backed exemption list, same source as
+    # GET /suppression-overrides) — the frontend's arrival-suppression rule
+    # needs these so an exempted SKU stays visible, matching the office view. ──
+    load_suppression_overrides_from_s3()
+    with _suppression_overrides_lock:
+        suppression_overrides = list(_suppression_overrides)
+
     return jsonify({
         'factory': {'code': code, 'name': factory_name},
         'generated_at': datetime.utcnow().isoformat() + 'Z',
@@ -9327,6 +9334,7 @@ def factory_view():
         'apo': apo,
         'vw': vw,
         'inventory': inventory_rows,
+        'suppression_overrides': suppression_overrides,
         'orders_ok': orders_ok,
     })
 
