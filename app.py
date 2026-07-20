@@ -9110,6 +9110,45 @@ _all_open_orders_cache = {'data': None, 'fetched_at': 0}
 _all_open_orders_lock = threading.Lock()
 _ALL_OPEN_ORDERS_TTL = 600  # 10 minutes
 
+# FOB pickup customers (route by ETD, never US warehouse). The open-orders app
+# keeps the live admin-editable list at /api/fob-customers; this seed matches
+# its built-in default and is served when that fetch fails, so the factory view
+# always has a workable list. Proxied here so factory browsers only ever need
+# one reachable host (onrender.com is blocked in China).
+_FOB_CUSTOMERS_SEED = ['CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1']
+_fob_customers_cache = {'data': None, 'fetched_at': 0}
+_fob_customers_lock = threading.Lock()
+
+
+def _fetch_fob_customers():
+    """Live FOB customer codes from the open-orders service (10-min cache),
+    falling back to the seed list when unreachable."""
+    now = time.time()
+    with _fob_customers_lock:
+        if (_fob_customers_cache['data'] is not None
+                and now - _fob_customers_cache['fetched_at'] < _ALL_OPEN_ORDERS_TTL):
+            return list(_fob_customers_cache['data'])
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/fob-customers", timeout=10)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        # Response shape: {'fobCustomers': [...]} — null when the admin list
+        # was never saved, in which case the seed applies.
+        codes = data.get('fobCustomers')
+        if not isinstance(codes, list) or not codes:
+            raise RuntimeError('list unset upstream')
+        codes = [str(c).strip().upper() for c in codes if str(c).strip()]
+        with _fob_customers_lock:
+            _fob_customers_cache['data'] = codes
+            _fob_customers_cache['fetched_at'] = time.time()
+        return list(codes)
+    except Exception as e:
+        print(f"[FactoryView] fob-customers fetch failed ({e}) — using seed list", flush=True)
+        with _fob_customers_lock:
+            stale = _fob_customers_cache['data']
+            return list(stale) if stale else list(_FOB_CUSTOMERS_SEED)
+
 
 def _fetch_all_open_orders():
     """Fetch the full open-orders list from the open-orders-api service.
@@ -9335,6 +9374,7 @@ def factory_view():
         'vw': vw,
         'inventory': inventory_rows,
         'suppression_overrides': suppression_overrides,
+        'fob_customers': _fetch_fob_customers(),
         'orders_ok': orders_ok,
     })
 
