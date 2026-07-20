@@ -9085,6 +9085,397 @@ def export_predictions():
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTORY VIEW  (Open Order to PO)
+# Sanitized data bundle for the Versa-Docs "Open Order to PO" factory view.
+# Factory users (garment factories, some behind China's firewall) see which of
+# their production orders have open customer PO demand.
+# SECURITY RULE: factories must NEVER see dollar amounts. Every list in the
+# response is built field-by-field from an explicit whitelist — never copy an
+# upstream dict and delete keys, so a new upstream field can never flow
+# through. Col-H shipmentNo (admin-only) is likewise excluded, matching the
+# export rule elsewhere in this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Transit constants for the frontend's arrival math. When a ledger row has no
+# port-dated arrival (column G), the frontend computes arrival = ETD + transit:
+# 45 days for shirts (since Jul 2026 — was 37), 55 for pants. Served as data so
+# the factory view shares one source of truth with the office frontend.
+FACTORY_VIEW_TRANSIT = {'default_days': 45, 'pants_days': 55}
+
+# Module-level cache for the FULL open-orders list (all customers, unfiltered).
+# Deliberately separate from _fetch_open_orders() above — that one is uncached
+# and its callers Ross-filter it for the AI prediction endpoints. Do not merge.
+_all_open_orders_cache = {'data': None, 'fetched_at': 0, 'fail_until': 0}
+_all_open_orders_lock = threading.Lock()
+_ALL_OPEN_ORDERS_TTL = 600  # 10 minutes
+_UPSTREAM_FAIL_BACKOFF = 120  # after a failure, don't retry for 2 minutes
+
+# FOB pickup customers (route by ETD, never US warehouse). The open-orders app
+# keeps the live admin-editable list at /api/fob-customers; this seed matches
+# its built-in default and is served when that fetch fails, so the factory view
+# always has a workable list. Proxied here so factory browsers only ever need
+# one reachable host (onrender.com is blocked in China).
+_FOB_CUSTOMERS_SEED = ['CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1']
+_fob_customers_cache = {'data': None, 'fetched_at': 0}
+_fob_customers_lock = threading.Lock()
+
+
+def _fetch_fob_customers():
+    """Live FOB customer codes from the open-orders service (10-min cache),
+    falling back to the seed list when unreachable."""
+    now = time.time()
+    with _fob_customers_lock:
+        if (_fob_customers_cache['data'] is not None
+                and now - _fob_customers_cache['fetched_at'] < _ALL_OPEN_ORDERS_TTL):
+            return list(_fob_customers_cache['data'])
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/fob-customers", timeout=10)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        # Response shape: {'fobCustomers': [...]} — null when the admin list
+        # was never saved, in which case the seed applies.
+        codes = data.get('fobCustomers')
+        if not isinstance(codes, list) or not codes:
+            raise RuntimeError('list unset upstream')
+        codes = [str(c).strip().upper() for c in codes if str(c).strip()]
+        with _fob_customers_lock:
+            _fob_customers_cache['data'] = codes
+            _fob_customers_cache['fetched_at'] = time.time()
+        return list(codes)
+    except Exception as e:
+        print(f"[FactoryView] fob-customers fetch failed ({e}) — using seed list", flush=True)
+        with _fob_customers_lock:
+            stale = _fob_customers_cache['data']
+            return list(stale) if stale else list(_FOB_CUSTOMERS_SEED)
+
+
+def _fetch_all_open_orders():
+    """Fetch the full open-orders list from the open-orders-api service.
+
+    Returns (orders, ok):
+      orders — list of raw order dicts (same /api/orders response shape that
+               _fetch_open_orders parses)
+      ok     — True when the list is fresh (cache hit inside TTL, or a
+               successful fetch); False when the upstream fetch failed and we
+               are serving a stale cache (or nothing at all).
+    Cached module-level with a 10-minute TTL so factory-view polling doesn't
+    hammer the open-orders service."""
+    now = time.time()
+    with _all_open_orders_lock:
+        if (_all_open_orders_cache['data'] is not None
+                and now - _all_open_orders_cache['fetched_at'] < _ALL_OPEN_ORDERS_TTL):
+            return list(_all_open_orders_cache['data']), True
+        # After a failure, serve what we have without re-attempting for a
+        # while: with a single sync worker, retrying a dead upstream on every
+        # request would block the whole API for the timeout each time.
+        if now < _all_open_orders_cache['fail_until']:
+            stale = _all_open_orders_cache['data']
+            return (list(stale) if stale else []), False
+
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        orders = resp.json().get('orders', []) or []
+        # An empty list is a bad payload, not a real 'no open orders' state —
+        # don't cache it as fresh for the next 10 minutes.
+        if not orders:
+            raise RuntimeError('empty orders payload')
+        with _all_open_orders_lock:
+            _all_open_orders_cache['data'] = orders
+            _all_open_orders_cache['fetched_at'] = time.time()
+            _all_open_orders_cache['fail_until'] = 0
+        return list(orders), True
+    except Exception as e:
+        print(f"[FactoryView] open-orders fetch failed: {e}", flush=True)
+        with _all_open_orders_lock:
+            _all_open_orders_cache['fail_until'] = time.time() + _UPSTREAM_FAIL_BACKOFF
+            stale = _all_open_orders_cache['data']
+            return (list(stale) if stale else []), False
+
+
+# ── Caller identity (Versa-Docs Supabase session) ────────────────────────────
+# The factory a caller may see is derived from their OWN profile row, never
+# from the query string: a factory account is pinned to its prefix even if it
+# asks for another one. The user's access token is used for both calls, so no
+# service key lives here — RLS lets a signed-in user read their own profile.
+VERSA_DOCS_SUPABASE_URL = os.environ.get(
+    'VERSA_DOCS_SUPABASE_URL', 'https://api.versa-docs.com')
+VERSA_DOCS_SUPABASE_ANON = os.environ.get(
+    'VERSA_DOCS_SUPABASE_ANON', 'sb_publishable_zKJbBUqAFcqZzuaOhGWL0A_miIpnHio')
+_identity_cache = {}          # access_token -> (expires_at, profile dict)
+_identity_lock = threading.Lock()
+_IDENTITY_TTL = 300           # 5 minutes
+
+
+def _caller_identity(token):
+    """Resolve a Versa-Docs access token to {'role','factory_prefix'}.
+
+    Returns None when the token is missing/invalid/unverifiable. Cached
+    briefly so polling doesn't hit Supabase on every request."""
+    if not token:
+        return None
+    now = time.time()
+    with _identity_lock:
+        hit = _identity_cache.get(token)
+        if hit and hit[0] > now:
+            return hit[1]
+    hdr = {'apikey': VERSA_DOCS_SUPABASE_ANON, 'Authorization': f'Bearer {token}'}
+    try:
+        u = http_requests.get(f'{VERSA_DOCS_SUPABASE_URL}/auth/v1/user',
+                              headers=hdr, timeout=10)
+        if u.status_code != 200:
+            return None
+        uid = (u.json() or {}).get('id')
+        if not uid:
+            return None
+        p = http_requests.get(
+            f'{VERSA_DOCS_SUPABASE_URL}/rest/v1/profiles'
+            f'?select=role,factory_prefix&id=eq.{uid}',
+            headers=hdr, timeout=10)
+        if p.status_code != 200:
+            return None
+        rows = p.json() or []
+        if not rows:
+            return None
+        prof = {'role': (rows[0].get('role') or '').strip().lower(),
+                'factory_prefix': (rows[0].get('factory_prefix') or '').strip().upper()}
+        with _identity_lock:
+            _identity_cache[token] = (now + _IDENTITY_TTL, prof)
+            if len(_identity_cache) > 500:      # bound the cache
+                for k in [k for k, v in _identity_cache.items() if v[0] <= now]:
+                    _identity_cache.pop(k, None)
+        return prof
+    except Exception as e:
+        print(f"[FactoryView] identity check failed: {e}", flush=True)
+        return None
+
+
+@app.route('/factory-view', methods=['GET', 'OPTIONS'])
+def factory_view():
+    """Consumed by Versa-Docs 'Open Order to PO' factory view. Whitelisted —
+    no price/value fields may ever be added here.
+
+    GET /factory-view?factory=<CODE>   (Authorization: Bearer <supabase token>)
+      CODE — TF/NB/PC/DP/FR/NK (case-insensitive) for a single factory, or
+             ALL for office mode (every row, no external_supply masking).
+
+    AUTHORIZATION: the caller's Versa-Docs session decides what they get.
+    A 'factory' profile is FORCED to its own prefix regardless of the query
+    param; staff may request any factory or ALL. No valid session → 401.
+
+    Bundle: the factory's production ledger rows, masked external supply for
+    the same SKUs (routing engine needs the full supply picture per SKU),
+    matching open orders / APO / VW allocations, and summed warehouse
+    inventory. Explicitly forbidden: sales price, open/pick dollar value,
+    unit price, control #, warehouse code, order notes, shipment # —
+    no dollar amounts, no admin metadata, ever."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    # ── Who is asking? ──
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    ident = _caller_identity(token)
+    if not ident:
+        return jsonify({'error': 'Sign in to Versa Docs to view this data.'}), 401
+
+    requested = str(request.args.get('factory', '') or '').strip().upper()
+    valid_codes = sorted(FACTORY_NAMES.keys())
+
+    if ident['role'] == 'factory':
+        # Pinned to their own factory — the query param is ignored entirely.
+        code = ident['factory_prefix']
+        if code not in FACTORY_NAMES:
+            return jsonify({'error': 'Your account is not linked to a factory yet.'}), 403
+    elif ident['role'] == 'staff':
+        code = requested or 'ALL'
+        if code != 'ALL' and code not in FACTORY_NAMES:
+            return jsonify({
+                'error': f"Invalid factory code '{code}'. "
+                         f"Valid codes: {', '.join(valid_codes)} or ALL"
+            }), 400
+    else:
+        return jsonify({'error': 'Your account does not have access to this data.'}), 403
+
+    all_mode = (code == 'ALL')
+    factory_name = 'All factories' if all_mode else FACTORY_NAMES[code]
+
+    # ── Production ledger (Dropbox-backed cache, self-TTL'd) ──
+    ledger = load_production_from_dropbox()
+
+    productions = []
+    sku_set = set()
+    for row in ledger:
+        prod_ref = str(row.get('production', '') or '').strip()
+        if not all_mode and _factory_label(prod_ref) != code:
+            continue
+        style = str(row.get('style', '') or '').strip().upper()
+        if style:
+            sku_set.add(style)
+        # Field-by-field whitelist — never dict-copy the ledger row
+        # (shipmentNo / col H is admin-only and must not leak here).
+        productions.append({
+            'production': prod_ref,
+            'poName': row.get('poName', ''),
+            'style': style,
+            'units': row.get('units', 0),
+            'brand': row.get('brand', ''),
+            'etd': row.get('etd'),
+            'arrival': row.get('arrival'),
+            'port_dated': bool(row.get('port_dated')),
+            'fob_flag': bool(row.get('fob_flag')),
+            'fob_note': row.get('fob_note', ''),
+        })
+
+    # ── External supply (single-factory mode only) ──
+    # The routing engine needs the FULL supply per SKU to work out which open
+    # orders this factory's production actually covers. Rows from OTHER
+    # factories for the same SKUs are included but MASKED: a stable "EXT-n"
+    # ref (one per distinct external production #, stable within this
+    # response) replaces the production #, and poName / brand are omitted
+    # entirely — factories must not see each other's order details.
+    external_supply = []
+    if not all_mode:
+        ext_ref_map = {}  # real production # → masked "EXT-n" ref
+        for row in ledger:
+            prod_ref = str(row.get('production', '') or '').strip()
+            if _factory_label(prod_ref) == code:
+                continue
+            style = str(row.get('style', '') or '').strip().upper()
+            if not style or style not in sku_set:
+                continue
+            if prod_ref not in ext_ref_map:
+                ext_ref_map[prod_ref] = f"EXT-{len(ext_ref_map) + 1}"
+            external_supply.append({
+                'ref': ext_ref_map[prod_ref],
+                'style': style,
+                'units': row.get('units', 0),
+                'etd': row.get('etd'),
+                'arrival': row.get('arrival'),
+                'port_dated': bool(row.get('port_dated')),
+                'fob_flag': bool(row.get('fob_flag')),
+            })
+
+    # ── Open orders (exact-SKU uppercase match on the style field) ──
+    raw_orders, orders_ok = _fetch_all_open_orders()
+    orders = []
+    for o in raw_orders:
+        style = str(o.get('style', '') or '').strip().upper()
+        if style not in sku_set:
+            continue
+        try:
+            open_qty = int(o.get('openQty') or 0)
+        except (ValueError, TypeError):
+            open_qty = 0
+        try:
+            pick_qty = int(o.get('pickQty') or 0)
+        except (ValueError, TypeError):
+            pick_qty = 0
+        # WHITELIST — built field-by-field on purpose so a new upstream field
+        # can never flow through. The upstream rows also carry sales-price /
+        # open-value / pick-value dollar fields, the control #, warehouse
+        # code, and notes — none of those may EVER be added here.
+        orders.append({
+            'style': style,
+            'customer': o.get('customer', ''),
+            'customerFull': o.get('customerFull', ''),
+            'orderNo': o.get('orderNo', ''),
+            'startDate': o.get('startDate', ''),
+            'cancelDate': o.get('cancelDate', ''),
+            'openQty': open_qty,
+            'pickQty': pick_qty,
+            'isPipeline': bool(o.get('isPipeline')),
+        })
+
+    # ── APO allocations (in-memory cache, hourly Dropbox sync) ──
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    apo = []
+    for row in apo_rows:
+        style = str(row.get('style', '') or '').strip().upper()
+        if style not in sku_set:
+            continue
+        # 'po' is intentionally not served — the page never displays an APO's
+        # internal booking reference to a factory.
+        apo.append({
+            'style': style,
+            'customer': row.get('customer', ''),
+            'qty': row.get('qty', 0),
+        })
+
+    # ── VW allocations (S3 sheet + manual entries — same merge as /allocations) ──
+    try:
+        s3_alloc = load_allocation_from_s3()
+    except Exception as e:
+        print(f"[FactoryView] VW allocation load failed: {e}", flush=True)
+        s3_alloc = []
+    with _manual_alloc_lock:
+        manual_alloc = list(_manual_allocations)
+    vw = []
+    for row in s3_alloc + manual_alloc:
+        sku = str(row.get('sku', '') or '').strip().upper()
+        if sku not in sku_set:
+            continue
+        vw.append({
+            'sku': sku,
+            'customer': row.get('customer', ''),
+            'qty': row.get('qty', 0),
+        })
+
+    # ── Inventory (warehouse TOTAL only — per-warehouse breakdown withheld) ──
+    with _inv_lock:
+        inv_items = list(_inventory['items'])
+    inventory_rows = []
+    for item in inv_items:
+        sku = str(item.get('sku', '') or '').strip().upper()
+        if sku not in sku_set:
+            continue
+        try:
+            warehouse = (int(item.get('jtw', 0) or 0) + int(item.get('tr', 0) or 0)
+                         + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0))
+        except (ValueError, TypeError):
+            warehouse = 0
+        inventory_rows.append({
+            'sku': sku,
+            'warehouse': warehouse,
+            'incoming': int(item.get('incoming', 0) or 0),
+            'committed': int(item.get('committed', 0) or 0),
+            'allocated': int(item.get('allocated', 0) or 0),
+        })
+
+    # ── Suppression overrides (S3-backed exemption list, same source as
+    # GET /suppression-overrides) — the frontend's arrival-suppression rule
+    # needs these so an exempted SKU stays visible, matching the office view. ──
+    load_suppression_overrides_from_s3()
+    with _suppression_overrides_lock:
+        # Scoped to this factory's SKUs — the full list is a catalog-wide
+        # inventory of style codes and isn't a factory's business.
+        suppression_overrides = [s for s in _suppression_overrides
+                                 if str(s or '').strip().upper() in sku_set]
+
+    return jsonify({
+        'factory': {'code': code, 'name': factory_name},
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'transit': dict(FACTORY_VIEW_TRANSIT),
+        'productions': productions,
+        'external_supply': external_supply,
+        'orders': orders,
+        'apo': apo,
+        'vw': vw,
+        'inventory': inventory_rows,
+        'suppression_overrides': suppression_overrides,
+        'fob_customers': _fetch_fob_customers(),
+        'orders_ok': orders_ok,
+        # False during a cold start before the first inventory/ledger sync —
+        # the page warns instead of implying the factory has no work.
+        'inventory_ok': bool(inv_items),
+        'ledger_ok': bool(ledger),
+    })
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
