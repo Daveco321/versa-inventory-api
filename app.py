@@ -9479,6 +9479,516 @@ def factory_view():
     })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTORY REPORTS  (Excel builder for the Open Order to PO page)
+# The page computes the rows (it owns the routing engine); this builds the
+# workbook, embedding the same 150x150 product thumbnails the catalog exports
+# use. Same authorization rule as /factory-view: a factory account can only
+# ever export its own factory, whatever the payload claims.
+# NO price, value or margin field may ever be written here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Header + status vocabulary per report language. English falls through to the
+# key itself, so a missing translation degrades to English rather than blank.
+_FR_T = {
+    'zh': {
+        'Report': '报告', 'Summary': '汇总', 'Image': '图片', 'Production #': '生产单号',
+        'PO Name': '生产单名称', 'Factory': '工厂', 'Style': '款号', 'Brand': '品牌',
+        'Units in production': '生产件数', 'Ex-Factory': '出厂日期', 'Arrival': '到仓日期',
+        'Customer': '客户', 'Customer PO': '客户订单号', 'Units needed': '需求件数',
+        'Start': '起始日期', 'Cancel': '截止日期', 'Status': '状态', 'Issue': '问题说明',
+        'ON TIME': '准时', 'TIGHT': '紧张', 'LATE': '延误', 'SHORT': '短缺',
+        'SHORT + LATE': '短缺且延误', 'NO ORDER': '暂无订单', 'APO': '预留', 'HOLD': '保留',
+        'BULK': '期货订单', 'FOB PICKUP': 'FOB提货', 'ESTIMATE': '估算',
+        'Open Order to PO': '订单对应生产单', 'Generated': '生成时间',
+        'Productions': '生产订单', 'Style lines': '款式行', 'Units': '件数',
+        'Late lines': '延误款', 'Short lines': '短缺款', 'Tight lines': '紧张款',
+        'Report type': '报告类型', 'Language': '语言', 'Filters': '筛选条件',
+        'Slack (days)': '可延误天数', 'Cumulative units': '累计件数',
+        'days late': '天延误', 'units short': '件短缺', 'port-dated': '港口日期',
+        'Arrives after the cancel date': '在截止日期之后到仓',
+        'Arrives after the start date but before cancel': '在起始日之后、截止日之前到仓',
+        'Not enough units in production to cover this order': '生产数量不足以覆盖此订单',
+        'Short and arriving late': '数量短缺且到仓延误',
+        'No customer order linked yet': '暂无关联客户订单',
+        'Arrives in time': '按时到仓',
+        'Allocation booking (APO)': '预留分配 (APO)',
+        'Estimated allocation - not reconciled': '估算分配 — 未核对',
+        'All factories': '全部工厂', 'Problem styles only': '仅问题款式',
+        'Full line sheet': '完整款式表', 'By customer': '按客户',
+    },
+    'bn': {
+        'Report': 'রিপোর্ট', 'Summary': 'সারসংক্ষেপ', 'Image': 'ছবি', 'Production #': 'প্রোডাকশন #',
+        'PO Name': 'PO নাম', 'Factory': 'ফ্যাক্টরি', 'Style': 'স্টাইল', 'Brand': 'ব্র্যান্ড',
+        'Units in production': 'প্রোডাকশন ইউনিট', 'Ex-Factory': 'এক্স-ফ্যাক্টরি', 'Arrival': 'পৌঁছানোর তারিখ',
+        'Customer': 'কাস্টমার', 'Customer PO': 'কাস্টমার PO', 'Units needed': 'প্রয়োজনীয় ইউনিট',
+        'Start': 'শুরু', 'Cancel': 'ক্যানসেল', 'Status': 'স্ট্যাটাস', 'Issue': 'সমস্যা',
+        'ON TIME': 'সময়মতো', 'TIGHT': 'টাইট', 'LATE': 'লেট', 'SHORT': 'শর্ট',
+        'SHORT + LATE': 'শর্ট + লেট', 'NO ORDER': 'অর্ডার নেই', 'APO': 'APO', 'HOLD': 'হোল্ড',
+        'BULK': 'বাল্ক', 'FOB PICKUP': 'FOB পিকআপ', 'ESTIMATE': 'আনুমানিক',
+        'Open Order to PO': 'ওপেন অর্ডার → PO', 'Generated': 'তৈরি হয়েছে',
+        'Productions': 'প্রোডাকশন', 'Style lines': 'স্টাইল লাইন', 'Units': 'ইউনিট',
+        'Late lines': 'লেট লাইন', 'Short lines': 'শর্ট লাইন', 'Tight lines': 'টাইট লাইন',
+        'Report type': 'রিপোর্টের ধরন', 'Language': 'ভাষা', 'Filters': 'ফিল্টার',
+        'Slack (days)': 'অতিরিক্ত দিন', 'Cumulative units': 'ক্রমযোজিত ইউনিট',
+        'days late': 'দিন দেরি', 'units short': 'ইউনিট কম', 'port-dated': 'পোর্ট-তারিখ',
+        'Arrives after the cancel date': 'ক্যানসেল তারিখের পরে পৌঁছায়',
+        'Arrives after the start date but before cancel': 'শুরুর পরে কিন্তু ক্যানসেলের আগে পৌঁছায়',
+        'Not enough units in production to cover this order': 'এই অর্ডারের জন্য যথেষ্ট ইউনিট নেই',
+        'Short and arriving late': 'কম এবং দেরিতে পৌঁছাচ্ছে',
+        'No customer order linked yet': 'এখনও কোনো কাস্টমার অর্ডার নেই',
+        'Arrives in time': 'সময়মতো পৌঁছায়',
+        'Allocation booking (APO)': 'অ্যালোকেশন বুকিং (APO)',
+        'Estimated allocation - not reconciled': 'আনুমানিক বরাদ্দ — মিলানো হয়নি',
+        'All factories': 'সব ফ্যাক্টরি', 'Problem styles only': 'শুধু সমস্যার স্টাইল',
+        'Full line sheet': 'সম্পূর্ণ লাইন শিট', 'By customer': 'কাস্টমার অনুযায়ী',
+    },
+    'ko': {
+        'Report': '리포트', 'Summary': '요약', 'Image': '이미지', 'Production #': '생산 번호',
+        'PO Name': 'PO 이름', 'Factory': '공장', 'Style': '스타일', 'Brand': '브랜드',
+        'Units in production': '생산 수량', 'Ex-Factory': '출고일', 'Arrival': '도착일',
+        'Customer': '고객', 'Customer PO': '고객 PO', 'Units needed': '필요 수량',
+        'Start': '시작일', 'Cancel': '마감일', 'Status': '상태', 'Issue': '문제',
+        'ON TIME': '정상', 'TIGHT': '빠듯', 'LATE': '지연', 'SHORT': '부족',
+        'SHORT + LATE': '부족 + 지연', 'NO ORDER': '주문 없음', 'APO': 'APO', 'HOLD': '홀드',
+        'BULK': '벌크', 'FOB PICKUP': 'FOB 인수', 'ESTIMATE': '추정',
+        'Open Order to PO': '오픈 오더 → PO', 'Generated': '생성',
+        'Productions': '생산 오더', 'Style lines': '스타일 라인', 'Units': '수량',
+        'Late lines': '지연 라인', 'Short lines': '부족 라인', 'Tight lines': '빠듯한 라인',
+        'Report type': '리포트 유형', 'Language': '언어', 'Filters': '필터',
+        'Slack (days)': '여유 일수', 'Cumulative units': '누적 수량',
+        'days late': '일 지연', 'units short': '수량 부족', 'port-dated': '항구 일정',
+        'Arrives after the cancel date': '마감일 이후 도착',
+        'Arrives after the start date but before cancel': '시작일 이후, 마감일 이전 도착',
+        'Not enough units in production to cover this order': '이 주문을 채울 생산 수량 부족',
+        'Short and arriving late': '수량 부족 및 지연 도착',
+        'No customer order linked yet': '연결된 고객 주문 없음',
+        'Arrives in time': '기한 내 도착',
+        'Allocation booking (APO)': '할당 예약 (APO)',
+        'Estimated allocation - not reconciled': '추정 배분 — 대조되지 않음',
+        'All factories': '전체 공장', 'Problem styles only': '문제 스타일만',
+        'Full line sheet': '전체 라인시트', 'By customer': '고객별',
+    },
+    'vi': {
+        'Report': 'Báo cáo', 'Summary': 'Tổng hợp', 'Image': 'Hình', 'Production #': 'Số PO sản xuất',
+        'PO Name': 'Tên PO', 'Factory': 'Nhà máy', 'Style': 'Mã hàng', 'Brand': 'Thương hiệu',
+        'Units in production': 'SL sản xuất', 'Ex-Factory': 'Ngày xuất xưởng', 'Arrival': 'Ngày đến kho',
+        'Customer': 'Khách hàng', 'Customer PO': 'PO khách hàng', 'Units needed': 'SL cần',
+        'Start': 'Ngày bắt đầu', 'Cancel': 'Ngày hủy', 'Status': 'Trạng thái', 'Issue': 'Vấn đề',
+        'ON TIME': 'ĐÚNG HẠN', 'TIGHT': 'SÁT HẠN', 'LATE': 'TRỄ', 'SHORT': 'THIẾU',
+        'SHORT + LATE': 'THIẾU + TRỄ', 'NO ORDER': 'CHƯA CÓ ĐƠN', 'APO': 'APO', 'HOLD': 'GIỮ',
+        'BULK': 'BULK', 'FOB PICKUP': 'FOB nhận tại xưởng', 'ESTIMATE': 'Ước tính',
+        'Open Order to PO': 'Đơn hàng → PO', 'Generated': 'Tạo lúc',
+        'Productions': 'Đơn sản xuất', 'Style lines': 'Dòng mã hàng', 'Units': 'Số lượng',
+        'Late lines': 'Dòng trễ', 'Short lines': 'Dòng thiếu', 'Tight lines': 'Dòng sát hạn',
+        'Report type': 'Loại báo cáo', 'Language': 'Ngôn ngữ', 'Filters': 'Bộ lọc',
+        'Slack (days)': 'Số ngày dư', 'Cumulative units': 'SL lũy kế',
+        'days late': 'ngày trễ', 'units short': 'thiếu', 'port-dated': 'theo lịch cảng',
+        'Arrives after the cancel date': 'Đến sau ngày hủy',
+        'Arrives after the start date but before cancel': 'Đến sau ngày bắt đầu, trước ngày hủy',
+        'Not enough units in production to cover this order': 'Không đủ số lượng sản xuất cho đơn này',
+        'Short and arriving late': 'Thiếu và đến trễ',
+        'No customer order linked yet': 'Chưa có đơn khách hàng',
+        'Arrives in time': 'Đến đúng hạn',
+        'Allocation booking (APO)': 'Đặt chỗ phân bổ (APO)',
+        'Estimated allocation - not reconciled': 'Phân bổ ước tính — chưa đối chiếu',
+        'All factories': 'Tất cả nhà máy', 'Problem styles only': 'Chỉ mã có vấn đề',
+        'Full line sheet': 'Line sheet đầy đủ', 'By customer': 'Theo khách hàng',
+    },
+}
+
+
+def _frt(lang, s):
+    """Translate a report string; unknown language or key falls back to English."""
+    return _FR_T.get(lang, {}).get(s, s)
+
+
+_FR_STATUS_LABEL = {
+    'ok': 'ON TIME', 'confirm': 'TIGHT', 'late': 'LATE', 'short': 'SHORT',
+    'short_late': 'SHORT + LATE', 'none': 'NO ORDER', 'apo': 'APO', 'hold': 'HOLD',
+}
+_FR_STATUS_REASON = {
+    'late': 'Arrives after the cancel date',
+    'confirm': 'Arrives after the start date but before cancel',
+    'short': 'Not enough units in production to cover this order',
+    'short_late': 'Short and arriving late',
+    'none': 'No customer order linked yet',
+    'ok': 'Arrives in time',
+    'apo': 'Allocation booking (APO)',
+    'hold': 'Allocation booking (APO)',
+}
+# Severity drives sort order, tab colour and the summary counts.
+_FR_SEVERITY = {'short_late': 0, 'late': 1, 'short': 2, 'confirm': 3,
+                'ok': 4, 'apo': 5, 'hold': 5, 'none': 6}
+
+
+def _fr_sheet_name(raw, used):
+    """Excel sheet names: <=31 chars, no \\ / ? * [ ] :, unique within the book."""
+    safe = re.sub(r'[\\/*?\[\]:]', '-', str(raw or '')).strip() or 'Sheet'
+    safe = safe[:31]
+    if safe not in used:
+        used.add(safe)
+        return safe
+    for n in range(2, 200):
+        suffix = f'~{n}'
+        cand = safe[:31 - len(suffix)] + suffix
+        if cand not in used:
+            used.add(cand)
+            return cand
+    used.add(safe[:28] + '~xx')
+    return safe[:28] + '~xx'
+
+
+@app.route('/factory-report', methods=['POST', 'OPTIONS'])
+def factory_report():
+    """Excel report builder for the Versa-Docs Open Order to PO page.
+
+    POST body:
+      factory   - 'TF'.. or 'ALL' (ignored for factory accounts, which are
+                  pinned to their own prefix exactly like /factory-view)
+      lang      - en|zh|bn|ko|vi   (report language, independent of the UI)
+      title     - report title for the summary sheet
+      split     - 'none' | 'production' | 'customer'  (one tab per group)
+      images    - bool, embed product thumbnails
+      filters   - free-text description of the filters used, for the cover
+      rows      - [{production, poName, factoryCode, style, brand, units,
+                    etd, arrival, portDated, fob, customer, orderNo,
+                    unitsNeeded, start, cancel, status, days, gap,
+                    bulk, fobPickup, est}]
+
+    Whitelisted by construction: only the fields above are read, and none of
+    them carry price or value data."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    ident = _caller_identity(token)
+    if not ident:
+        return jsonify({'error': 'Sign in to Versa Docs to build a report.'}), 401
+
+    try:
+        req = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    rows = req.get('rows') or []
+    if not isinstance(rows, list) or not rows:
+        return jsonify({'error': 'No rows to export'}), 400
+    if len(rows) > 20000:
+        return jsonify({'error': 'Report too large — narrow the filters'}), 413
+
+    lang = str(req.get('lang') or 'en').lower()
+    if lang not in ('en', 'zh', 'bn', 'ko', 'vi'):
+        lang = 'en'
+    split = str(req.get('split') or 'none').lower()
+    if split not in ('none', 'production', 'customer'):
+        split = 'none'
+    want_images = bool(req.get('images', True))
+
+    # ── Scope enforcement (server-side, same rule as /factory-view) ──
+    requested = str(req.get('factory') or 'ALL').strip().upper()
+    if ident['role'] == 'factory':
+        code = ident['factory_prefix']
+        if code not in FACTORY_NAMES:
+            return jsonify({'error': 'Your account is not linked to a factory yet.'}), 403
+        # Never trust client-side filtering for another factory's rows.
+        rows = [r for r in rows
+                if str(r.get('factoryCode') or _factory_label(r.get('production'))).upper() == code]
+        if not rows:
+            return jsonify({'error': 'No rows for your factory'}), 400
+    elif ident['role'] == 'staff':
+        code = requested if (requested == 'ALL' or requested in FACTORY_NAMES) else 'ALL'
+    else:
+        return jsonify({'error': 'Your account does not have access to this data.'}), 403
+
+    T = lambda s: _frt(lang, s)
+    factory_name = T('All factories') if code == 'ALL' else FACTORY_NAMES.get(code, code)
+
+    # ── Images: one fetch per unique style, reused across every sheet ──
+    img_by_style = {}
+    if want_images:
+        try:
+            uniq = []
+            seen_styles = set()
+            for r in rows:
+                s = str(r.get('style') or '').upper()
+                if s and s not in seen_styles:
+                    seen_styles.add(s)
+                    # brand_abbr feeds the brand-folder fallback in the image
+                    # resolution chain (extract_image_code); the ledger's brand
+                    # column is already the abbreviation.
+                    b = str(r.get('brand') or '').strip()
+                    uniq.append({'sku': s, 'brand': b, 'brand_abbr': b})
+            if uniq:
+                fetched = download_images_for_items(uniq, S3_PHOTOS_URL, use_cache=True)
+                for i, item in enumerate(uniq):
+                    if i in fetched:
+                        img_by_style[item['sku']] = fetched[i]
+        except Exception as e:
+            print(f"[FactoryReport] image fetch failed: {e}", flush=True)
+
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
+
+    # CJK/Bengali need a font with the right coverage or Excel shows boxes.
+    base_font = {'zh': 'Microsoft YaHei', 'ko': 'Malgun Gothic',
+                 'bn': 'Nirmala UI', 'vi': 'Segoe UI'}.get(lang, 'Calibri')
+
+    f_title = wb.add_format({'bold': True, 'font_size': 18, 'font_name': base_font,
+                             'font_color': '#16181D'})
+    f_sub = wb.add_format({'font_size': 11, 'font_name': base_font, 'font_color': '#5B6068'})
+    f_kpi_n = wb.add_format({'bold': True, 'font_size': 20, 'font_name': base_font,
+                             'align': 'center', 'font_color': '#16181D'})
+    f_kpi_l = wb.add_format({'font_size': 9, 'font_name': base_font, 'align': 'center',
+                             'font_color': '#5B6068'})
+    f_hdr = wb.add_format({'bold': True, 'font_size': 10, 'font_name': base_font,
+                           'bg_color': '#16181D', 'font_color': '#FFFFFF',
+                           'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+                           'border': 1, 'border_color': '#16181D'})
+    f_cell = wb.add_format({'font_size': 10, 'font_name': base_font, 'valign': 'vcenter',
+                            'border': 1, 'border_color': '#E7E8EC', 'text_wrap': True})
+    f_num = wb.add_format({'font_size': 10, 'font_name': base_font, 'valign': 'vcenter',
+                           'border': 1, 'border_color': '#E7E8EC', 'num_format': '#,##0',
+                           'align': 'right'})
+    f_mono = wb.add_format({'font_size': 10, 'font_name': 'Consolas', 'valign': 'vcenter',
+                            'border': 1, 'border_color': '#E7E8EC'})
+    f_date = wb.add_format({'font_size': 10, 'font_name': base_font, 'valign': 'vcenter',
+                            'border': 1, 'border_color': '#E7E8EC', 'align': 'center'})
+    f_dateval = wb.add_format({'font_size': 10, 'font_name': base_font, 'valign': 'vcenter',
+                               'border': 1, 'border_color': '#E7E8EC', 'align': 'center',
+                               'num_format': 'yyyy-mm-dd'})
+    # Status colours mirror the web page and stay legible printed in mono.
+    _STATUS_FMT_SPEC = {
+        'late':       ('#FEF3F2', '#B42318'), 'short_late': ('#FEE4E2', '#912018'),
+        'short':      ('#FFF8E6', '#9A6700'), 'confirm':    ('#FFF6ED', '#B54708'),
+        'ok':         ('#EAF6EE', '#0A7D3C'), 'apo':        ('#EFF8FF', '#175CD3'),
+        'hold':       ('#EFF8FF', '#175CD3'), 'none':       ('#F7F8FA', '#5B6068'),
+    }
+    f_status = {k: wb.add_format({'font_size': 10, 'font_name': base_font, 'bold': True,
+                                  'align': 'center', 'valign': 'vcenter', 'border': 1,
+                                  'border_color': '#E7E8EC', 'bg_color': bg, 'font_color': fg})
+                for k, (bg, fg) in _STATUS_FMT_SPEC.items()}
+
+    # "Slack" is how many days this production can slip before the tightest
+    # customer PO on it misses its cancel date — the single most actionable
+    # number a factory can have. In tab-per-production mode the sheet is a
+    # cut-split ticket, so it also carries a running unit total.
+    per_production = (split == 'production')
+    HEADERS = ['Image', 'Production #', 'PO Name', 'Factory', 'Style', 'Brand',
+               'Units in production', 'Ex-Factory', 'Arrival', 'Slack (days)',
+               'Customer', 'Customer PO', 'Units needed']
+    WIDTHS = [COL_WIDTH_UNITS, 16, 26, 9, 18, 16, 13, 13, 13, 11, 22, 16, 12]
+    if per_production:
+        HEADERS += ['Cumulative units']
+        WIDTHS += [13]
+    HEADERS += ['Start', 'Cancel', 'Status', 'Issue']
+    WIDTHS += [12, 12, 15, 42]
+    if not want_images:
+        HEADERS = HEADERS[1:]
+        WIDTHS = WIDTHS[1:]
+    NUM_COLS = {'Units in production', 'Units needed', 'Cumulative units', 'Slack (days)'}
+    DATE_COLS = {'Ex-Factory', 'Arrival', 'Start', 'Cancel'}
+    MONO_COLS = {'Production #', 'Style', 'Customer PO'}
+
+    def _as_date(v):
+        """'YYYY-MM-DD' -> datetime so Excel sorts and filters it as a real
+        date. Anything else is written through as text."""
+        try:
+            return datetime.strptime(str(v)[:10], '%Y-%m-%d')
+        except Exception:
+            return None
+
+    def _issue_text(r):
+        st = r.get('status') or 'ok'
+        base = T(_FR_STATUS_REASON.get(st, ''))
+        bits = []
+        if st in ('late', 'short_late') and r.get('days'):
+            bits.append(f"{int(r['days'])} {T('days late')}")
+        if st in ('short', 'short_late') and r.get('gap'):
+            bits.append(f"{int(r['gap'])} {T('units short')}")
+        if r.get('fobPickup'):
+            bits.append(T('FOB PICKUP'))
+        if r.get('bulk'):
+            bits.append(T('BULK'))
+        if r.get('portDated'):
+            bits.append(T('port-dated'))
+        if r.get('est'):
+            bits.append(T('ESTIMATE'))
+        return base + (' · ' + ' · '.join(bits) if bits else '')
+
+    def _write_sheet(ws, sheet_rows):
+        for c, h in enumerate(HEADERS):
+            ws.write(0, c, T(h), f_hdr)
+        ws.set_row(0, 30)
+        for c, w in enumerate(WIDTHS):
+            ws.set_column(c, c, w)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, max(len(sheet_rows), 1), len(HEADERS) - 1)
+        # Print setup: landscape, one page wide, header row repeated.
+        ws.set_landscape()
+        ws.fit_to_pages(1, 0)
+        ws.repeat_rows(0)
+        ws.set_margins(0.3, 0.3, 0.4, 0.4)
+        ws.set_footer('&L' + str(T('Open Order to PO')) + ' · ' + str(factory_name) + '&R&P/&N')
+
+        running = 0
+        for i, r in enumerate(sheet_rows):
+            row = i + 1
+            if want_images:
+                ws.set_row(row, 112.5)
+            st = r.get('status') or 'ok'
+            # Cumulative units answers "if only part of the cut is finished by
+            # ex-factory, how far down this list can we ship?"
+            if per_production and st not in ('none',):
+                try:
+                    running += int(r.get('unitsNeeded') or 0)
+                except (TypeError, ValueError):
+                    pass
+            vals = {
+                'Production #': r.get('production') or '',
+                'PO Name': r.get('poName') or '',
+                'Factory': (r.get('factoryCode') or _factory_label(r.get('production')) or ''),
+                'Style': r.get('style') or '',
+                'Brand': r.get('brand') or '',
+                'Units in production': r.get('units') or 0,
+                'Ex-Factory': r.get('etd') or '',
+                'Arrival': r.get('arrival') or '',
+                'Slack (days)': r.get('slackDays') if r.get('slackDays') != '' else '',
+                'Customer': r.get('customer') or '',
+                'Customer PO': r.get('orderNo') or '',
+                'Units needed': r.get('unitsNeeded') or '',
+                'Cumulative units': running if per_production else '',
+                'Start': r.get('start') or '',
+                'Cancel': r.get('cancel') or '',
+                'Status': T(_FR_STATUS_LABEL.get(st, st)),
+                'Issue': _issue_text(r),
+            }
+            for c, h in enumerate(HEADERS):
+                if h == 'Image':
+                    continue
+                v = vals.get(h, '')
+                if h == 'Status':
+                    ws.write(row, c, v, f_status.get(st, f_cell))
+                elif h in DATE_COLS:
+                    d = _as_date(v)
+                    if d:
+                        ws.write_datetime(row, c, d, f_dateval)
+                    else:
+                        ws.write(row, c, v or '', f_date)
+                elif h in NUM_COLS:
+                    ws.write(row, c, v if v != '' else '', f_num)
+                elif h in MONO_COLS:
+                    ws.write(row, c, v, f_mono)
+                else:
+                    ws.write(row, c, v, f_cell)
+            if want_images:
+                img = img_by_style.get(str(r.get('style') or '').upper())
+                if img and img.get('image_data'):
+                    try:
+                        bio = img['image_data']
+                        if hasattr(bio, 'seek'):
+                            bio.seek(0)
+                        ws.insert_image(row, 0, 'img.png', _padded_image_opts(img))
+                    except Exception:
+                        ws.write(row, 0, '', f_cell)
+                else:
+                    ws.write(row, 0, '', f_cell)
+
+    # ── Summary / cover sheet ──
+    counts = {}
+    for r in rows:
+        st = r.get('status') or 'ok'
+        counts[st] = counts.get(st, 0) + 1
+    total_units = sum(int(r.get('units') or 0) for r in rows)
+    n_prod = len({r.get('production') for r in rows if r.get('production')})
+
+    ws_sum = wb.add_worksheet(_fr_sheet_name(T('Summary'), set()))
+    ws_sum.hide_gridlines(2)
+    ws_sum.set_column(0, 0, 3)
+    ws_sum.set_column(1, 6, 20)
+    ws_sum.write(1, 1, req.get('title') or T('Open Order to PO'), f_title)
+    ws_sum.write(2, 1, f"{T('Factory')}: {factory_name}", f_sub)
+    ws_sum.write(3, 1, f"{T('Generated')}: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC", f_sub)
+    if req.get('filters'):
+        ws_sum.write(4, 1, f"{T('Filters')}: {req.get('filters')}", f_sub)
+    kpis = [(T('Productions'), n_prod), (T('Style lines'), len(rows)), (T('Units'), total_units),
+            (T('Late lines'), counts.get('late', 0) + counts.get('short_late', 0)),
+            (T('Short lines'), counts.get('short', 0) + counts.get('short_late', 0)),
+            (T('Tight lines'), counts.get('confirm', 0))]
+    for i, (label, val) in enumerate(kpis):
+        ws_sum.write(6, 1 + i, val, f_kpi_n)
+        ws_sum.write(7, 1 + i, label, f_kpi_l)
+
+    # Legend — so anyone opening the file cold knows what the colours mean
+    # without being told, and so a mono printout is still readable.
+    f_leg = wb.add_format({'font_size': 10, 'font_name': base_font, 'font_color': '#5B6068'})
+    ws_sum.write(10, 1, T('Status'), wb.add_format({'bold': True, 'font_name': base_font,
+                                                    'font_size': 11}))
+    LEGEND = [('late', 'Arrives after the cancel date'),
+              ('short_late', 'Short and arriving late'),
+              ('short', 'Not enough units in production to cover this order'),
+              ('confirm', 'Arrives after the start date but before cancel'),
+              ('ok', 'Arrives in time'), ('none', 'No customer order linked yet')]
+    for i, (stk, desc) in enumerate(LEGEND):
+        ws_sum.write(11 + i, 1, T(_FR_STATUS_LABEL.get(stk, stk)), f_status.get(stk, f_cell))
+        ws_sum.write(11 + i, 2, T(desc), f_leg)
+    ws_sum.set_landscape()
+
+    # ── Data sheets ──
+    sev = lambda r: _FR_SEVERITY.get(r.get('status') or 'ok', 9)
+    used_names = {ws_sum.get_name()}
+    if split == 'none':
+        ws = wb.add_worksheet(_fr_sheet_name(T('Report'), used_names))
+        _write_sheet(ws, sorted(rows, key=lambda r: (sev(r), str(r.get('production') or ''),
+                                                     str(r.get('style') or ''))))
+    else:
+        key = (lambda r: r.get('production') or '-') if split == 'production' \
+            else (lambda r: r.get('customer') or '-')
+        groups = {}
+        for r in rows:
+            groups.setdefault(key(r), []).append(r)
+        # Worst groups first so the urgent tabs sit nearest the summary.
+        ordered = sorted(groups.items(),
+                         key=lambda kv: (min((sev(r) for r in kv[1]), default=9), str(kv[0])))
+        shown = ordered[:180]           # Excel tolerates more, humans do not
+        links = []
+        for name, grp in shown:
+            ws = wb.add_worksheet(_fr_sheet_name(name, used_names))
+            worst = min((sev(r) for r in grp), default=9)
+            ws.set_tab_color({0: '#B42318', 1: '#B42318', 2: '#9A6700',
+                              3: '#B54708', 4: '#0A7D3C'}.get(worst, '#98A2B3'))
+            # Tab-per-production doubles as a cut-split ticket: order by the
+            # customer deadline, so the top of the sheet ships first.
+            if per_production:
+                grp_sorted = sorted(grp, key=lambda r: (str(r.get('cancel') or '9999-12-31'),
+                                                        sev(r), str(r.get('style') or '')))
+            else:
+                grp_sorted = sorted(grp, key=lambda r: (sev(r), str(r.get('style') or '')))
+            _write_sheet(ws, grp_sorted)
+            links.append((ws.get_name(), name, len(grp), worst))
+        # Contents list on the cover, hyperlinked to each tab.
+        f_link = wb.add_format({'font_size': 10, 'font_name': base_font,
+                                'font_color': '#1D4ED8', 'underline': 1})
+        base_row = 12 + len(LEGEND)
+        ws_sum.write(base_row, 1, T('Report'), wb.add_format({'bold': True, 'font_name': base_font,
+                                                              'font_size': 11}))
+        for i, (sheet, label, n, worst) in enumerate(links):
+            rr = base_row + 1 + i
+            ws_sum.write_url(rr, 1, f"internal:'{sheet}'!A1", f_link, str(label))
+            ws_sum.write(rr, 2, n, f_leg)
+        if len(ordered) > len(shown):
+            ws_sum.write(base_row + 1 + len(links), 1,
+                         f"+{len(ordered) - len(shown)} more (narrow the filters)", f_leg)
+
+    wb.close()
+    buf.seek(0)
+    stamp = datetime.utcnow().strftime('%Y-%m-%d')
+    fname = f"open-order-to-po_{code}_{stamp}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
