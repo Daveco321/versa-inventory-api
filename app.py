@@ -9085,6 +9085,252 @@ def export_predictions():
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FACTORY VIEW  (Open Order to PO)
+# Sanitized data bundle for the Versa-Docs "Open Order to PO" factory view.
+# Factory users (garment factories, some behind China's firewall) see which of
+# their production orders have open customer PO demand.
+# SECURITY RULE: factories must NEVER see dollar amounts. Every list in the
+# response is built field-by-field from an explicit whitelist — never copy an
+# upstream dict and delete keys, so a new upstream field can never flow
+# through. Col-H shipmentNo (admin-only) is likewise excluded, matching the
+# export rule elsewhere in this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Transit constants for the frontend's arrival math. When a ledger row has no
+# port-dated arrival (column G), the frontend computes arrival = ETD + transit:
+# 45 days for shirts (since Jul 2026 — was 37), 55 for pants. Served as data so
+# the factory view shares one source of truth with the office frontend.
+FACTORY_VIEW_TRANSIT = {'default_days': 45, 'pants_days': 55}
+
+# Module-level cache for the FULL open-orders list (all customers, unfiltered).
+# Deliberately separate from _fetch_open_orders() above — that one is uncached
+# and its callers Ross-filter it for the AI prediction endpoints. Do not merge.
+_all_open_orders_cache = {'data': None, 'fetched_at': 0}
+_all_open_orders_lock = threading.Lock()
+_ALL_OPEN_ORDERS_TTL = 600  # 10 minutes
+
+
+def _fetch_all_open_orders():
+    """Fetch the full open-orders list from the open-orders-api service.
+
+    Returns (orders, ok):
+      orders — list of raw order dicts (same /api/orders response shape that
+               _fetch_open_orders parses)
+      ok     — True when the list is fresh (cache hit inside TTL, or a
+               successful fetch); False when the upstream fetch failed and we
+               are serving a stale cache (or nothing at all).
+    Cached module-level with a 10-minute TTL so factory-view polling doesn't
+    hammer the open-orders service."""
+    now = time.time()
+    with _all_open_orders_lock:
+        if (_all_open_orders_cache['data'] is not None
+                and now - _all_open_orders_cache['fetched_at'] < _ALL_OPEN_ORDERS_TTL):
+            return list(_all_open_orders_cache['data']), True
+
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        orders = resp.json().get('orders', []) or []
+        with _all_open_orders_lock:
+            _all_open_orders_cache['data'] = orders
+            _all_open_orders_cache['fetched_at'] = time.time()
+        return list(orders), True
+    except Exception as e:
+        print(f"[FactoryView] open-orders fetch failed: {e}", flush=True)
+        with _all_open_orders_lock:
+            stale = _all_open_orders_cache['data']
+            return (list(stale) if stale else []), False
+
+
+@app.route('/factory-view', methods=['GET', 'OPTIONS'])
+def factory_view():
+    """Consumed by Versa-Docs 'Open Order to PO' factory view. Whitelisted —
+    no price/value fields may ever be added here.
+
+    GET /factory-view?factory=<CODE>
+      CODE — TF/NB/PC/DP/FR/NK (case-insensitive) for a single factory, or
+             ALL for office mode (every row, no external_supply masking).
+
+    Bundle: the factory's production ledger rows, masked external supply for
+    the same SKUs (routing engine needs the full supply picture per SKU),
+    matching open orders / APO / VW allocations, and summed warehouse
+    inventory. Explicitly forbidden: sales price, open/pick dollar value,
+    unit price, control #, warehouse code, order notes, shipment # —
+    no dollar amounts, no admin metadata, ever."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    code = str(request.args.get('factory', '') or '').strip().upper()
+    valid_codes = sorted(FACTORY_NAMES.keys())
+    if code != 'ALL' and code not in FACTORY_NAMES:
+        return jsonify({
+            'error': f"Invalid factory code '{code}'. "
+                     f"Valid codes: {', '.join(valid_codes)} or ALL"
+        }), 400
+
+    all_mode = (code == 'ALL')
+    factory_name = 'All factories' if all_mode else FACTORY_NAMES[code]
+
+    # ── Production ledger (Dropbox-backed cache, self-TTL'd) ──
+    ledger = load_production_from_dropbox()
+
+    productions = []
+    sku_set = set()
+    for row in ledger:
+        prod_ref = str(row.get('production', '') or '').strip()
+        if not all_mode and _factory_label(prod_ref) != code:
+            continue
+        style = str(row.get('style', '') or '').strip().upper()
+        if style:
+            sku_set.add(style)
+        # Field-by-field whitelist — never dict-copy the ledger row
+        # (shipmentNo / col H is admin-only and must not leak here).
+        productions.append({
+            'production': prod_ref,
+            'poName': row.get('poName', ''),
+            'style': style,
+            'units': row.get('units', 0),
+            'brand': row.get('brand', ''),
+            'etd': row.get('etd'),
+            'arrival': row.get('arrival'),
+            'port_dated': bool(row.get('port_dated')),
+            'fob_flag': bool(row.get('fob_flag')),
+            'fob_note': row.get('fob_note', ''),
+        })
+
+    # ── External supply (single-factory mode only) ──
+    # The routing engine needs the FULL supply per SKU to work out which open
+    # orders this factory's production actually covers. Rows from OTHER
+    # factories for the same SKUs are included but MASKED: a stable "EXT-n"
+    # ref (one per distinct external production #, stable within this
+    # response) replaces the production #, and poName / brand are omitted
+    # entirely — factories must not see each other's order details.
+    external_supply = []
+    if not all_mode:
+        ext_ref_map = {}  # real production # → masked "EXT-n" ref
+        for row in ledger:
+            prod_ref = str(row.get('production', '') or '').strip()
+            if _factory_label(prod_ref) == code:
+                continue
+            style = str(row.get('style', '') or '').strip().upper()
+            if not style or style not in sku_set:
+                continue
+            if prod_ref not in ext_ref_map:
+                ext_ref_map[prod_ref] = f"EXT-{len(ext_ref_map) + 1}"
+            external_supply.append({
+                'ref': ext_ref_map[prod_ref],
+                'style': style,
+                'units': row.get('units', 0),
+                'etd': row.get('etd'),
+                'arrival': row.get('arrival'),
+                'port_dated': bool(row.get('port_dated')),
+                'fob_flag': bool(row.get('fob_flag')),
+            })
+
+    # ── Open orders (exact-SKU uppercase match on the style field) ──
+    raw_orders, orders_ok = _fetch_all_open_orders()
+    orders = []
+    for o in raw_orders:
+        style = str(o.get('style', '') or '').strip().upper()
+        if style not in sku_set:
+            continue
+        try:
+            open_qty = int(o.get('openQty') or 0)
+        except (ValueError, TypeError):
+            open_qty = 0
+        try:
+            pick_qty = int(o.get('pickQty') or 0)
+        except (ValueError, TypeError):
+            pick_qty = 0
+        # WHITELIST — built field-by-field on purpose so a new upstream field
+        # can never flow through. The upstream rows also carry sales-price /
+        # open-value / pick-value dollar fields, the control #, warehouse
+        # code, and notes — none of those may EVER be added here.
+        orders.append({
+            'style': style,
+            'customer': o.get('customer', ''),
+            'customerFull': o.get('customerFull', ''),
+            'orderNo': o.get('orderNo', ''),
+            'startDate': o.get('startDate', ''),
+            'cancelDate': o.get('cancelDate', ''),
+            'openQty': open_qty,
+            'pickQty': pick_qty,
+            'isPipeline': bool(o.get('isPipeline')),
+        })
+
+    # ── APO allocations (in-memory cache, hourly Dropbox sync) ──
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    apo = []
+    for row in apo_rows:
+        style = str(row.get('style', '') or '').strip().upper()
+        if style not in sku_set:
+            continue
+        entry = {
+            'style': style,
+            'customer': row.get('customer', ''),
+            'qty': row.get('qty', 0),
+        }
+        if row.get('po'):
+            entry['po'] = row.get('po')
+        apo.append(entry)
+
+    # ── VW allocations (S3 sheet + manual entries — same merge as /allocations) ──
+    try:
+        s3_alloc = load_allocation_from_s3()
+    except Exception as e:
+        print(f"[FactoryView] VW allocation load failed: {e}", flush=True)
+        s3_alloc = []
+    with _manual_alloc_lock:
+        manual_alloc = list(_manual_allocations)
+    vw = []
+    for row in s3_alloc + manual_alloc:
+        sku = str(row.get('sku', '') or '').strip().upper()
+        if sku not in sku_set:
+            continue
+        vw.append({
+            'sku': sku,
+            'customer': row.get('customer', ''),
+            'qty': row.get('qty', 0),
+        })
+
+    # ── Inventory (warehouse TOTAL only — per-warehouse breakdown withheld) ──
+    with _inv_lock:
+        inv_items = list(_inventory['items'])
+    inventory_rows = []
+    for item in inv_items:
+        sku = str(item.get('sku', '') or '').strip().upper()
+        if sku not in sku_set:
+            continue
+        try:
+            warehouse = (int(item.get('jtw', 0) or 0) + int(item.get('tr', 0) or 0)
+                         + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0))
+        except (ValueError, TypeError):
+            warehouse = 0
+        inventory_rows.append({
+            'sku': sku,
+            'warehouse': warehouse,
+            'incoming': int(item.get('incoming', 0) or 0),
+            'committed': int(item.get('committed', 0) or 0),
+            'allocated': int(item.get('allocated', 0) or 0),
+        })
+
+    return jsonify({
+        'factory': {'code': code, 'name': factory_name},
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'transit': dict(FACTORY_VIEW_TRANSIT),
+        'productions': productions,
+        'external_supply': external_supply,
+        'orders': orders,
+        'apo': apo,
+        'vw': vw,
+        'inventory': inventory_rows,
+        'orders_ok': orders_ok,
+    })
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
