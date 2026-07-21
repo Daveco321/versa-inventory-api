@@ -793,6 +793,11 @@ def load_production_from_dropbox():
             # ── Compute etd + arrival ──
             etd = None
             arrival = None
+            # etd_raw: column F exactly as the ledger states it, kept even when
+            # column G overrides the working dates. ONLY /factory-view reads
+            # it — the Open Order to PO factory page shows the true ledger
+            # ex-factory date, never the G-27 backdate (David, Jul 21 2026).
+            etd_raw = None
             # Track FOB-flagged production rows. When David puts "be ready",
             # "FOB ...", or "FOB-AS READY" in the ETD column, it signals an FOB
             # production batch with no firm ex-factory date. These should NOT
@@ -802,9 +807,17 @@ def load_production_from_dropbox():
             fob_note = ''
 
             if port_arrival_dt is not None:
-                # Column G wins: compute both dates from it. Ignore column F entirely.
+                # Column G wins for the WORKING dates: compute both from it.
                 etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
                 arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
+                # Still capture the real column-F ETD when it parses as a date.
+                if row[5] is not None:
+                    if isinstance(row[5], datetime):
+                        etd_raw = row[5].strftime('%Y-%m-%d')
+                    else:
+                        _f = str(row[5]).strip()
+                        if re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', _f):
+                            etd_raw = _f
             elif row[5]:
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
@@ -832,6 +845,8 @@ def load_production_from_dropbox():
                             etd = raw_etd
                         except:
                             etd = None
+                # Without a column-G override, the working ETD IS the raw one.
+                etd_raw = etd
 
             try:
                 units = int(row[3] or 0)
@@ -853,6 +868,9 @@ def load_production_from_dropbox():
                 'units': units,
                 'brand': str(row[4] or '').strip(),
                 'etd': etd,
+                # The ledger's own column-F date, untouched by the column-G
+                # backdate. Only /factory-view consumes it (see etd_raw above).
+                'etd_raw': etd_raw,
                 # arrival is only set when David provided column G. None means
                 # "frontend, please apply your transit rule based on category".
                 'arrival': arrival,
@@ -9101,11 +9119,11 @@ def export_predictions():
 # export rule elsewhere in this file.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Transit constants for the frontend's arrival math. When a ledger row has no
-# port-dated arrival (column G), the frontend computes arrival = ETD + transit:
-# 45 days for shirts (since Jul 2026 — was 37), 55 for pants. Served as data so
-# the factory view shares one source of truth with the office frontend.
-FACTORY_VIEW_TRANSIT = {'default_days': 45, 'pants_days': 55}
+# Transit constants for the factory page's arrival math. THIS PAGE ONLY
+# (David, Jul 21 2026): sail time is a flat ETD + 35 days — no pants split —
+# and a port-dated row keeps its ATD + 10 arrival. The office platforms keep
+# their own 45/55 rule; nothing here feeds them.
+FACTORY_VIEW_TRANSIT = {'default_days': 35, 'pants_days': 35}
 
 # Module-level cache for the FULL open-orders list (all customers, unfiltered).
 # Deliberately separate from _fetch_open_orders() above — that one is uncached
@@ -9321,13 +9339,16 @@ def factory_view():
             sku_set.add(style)
         # Field-by-field whitelist — never dict-copy the ledger row
         # (shipmentNo / col H is admin-only and must not leak here).
+        # ETD is the RAW ledger date (etd_raw): factories see what the ledger
+        # says, never the G-27 backdate. Port-dated rows may therefore carry
+        # arrival without etd when column F was blank.
         productions.append({
             'production': prod_ref,
             'poName': row.get('poName', ''),
             'style': style,
             'units': row.get('units', 0),
             'brand': row.get('brand', ''),
-            'etd': row.get('etd'),
+            'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
             'arrival': row.get('arrival'),
             'port_dated': bool(row.get('port_dated')),
             'fob_flag': bool(row.get('fob_flag')),
@@ -9357,7 +9378,7 @@ def factory_view():
                 'ref': ext_ref_map[prod_ref],
                 'style': style,
                 'units': row.get('units', 0),
-                'etd': row.get('etd'),
+                'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
                 'arrival': row.get('arrival'),
                 'port_dated': bool(row.get('port_dated')),
                 'fob_flag': bool(row.get('fob_flag')),
