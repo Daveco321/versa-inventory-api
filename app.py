@@ -9504,7 +9504,7 @@ _FR_T = {
         'Productions': '生产订单', 'Style lines': '款式行', 'Units': '件数',
         'Late lines': '延误款', 'Short lines': '短缺款', 'Tight lines': '紧张款',
         'Report type': '报告类型', 'Language': '语言', 'Filters': '筛选条件',
-        'Slack (days)': '可延误天数', 'Cumulative units': '累计件数',
+        'Slack (days)': '可延误天数', 'Cumulative units': '累计件数', 'Ship by': '最迟出厂日',
         'days late': '天延误', 'units short': '件短缺', 'port-dated': '港口日期',
         'Arrives after the cancel date': '在截止日期之后到仓',
         'Arrives after the start date but before cancel': '在起始日之后、截止日之前到仓',
@@ -9530,7 +9530,7 @@ _FR_T = {
         'Productions': 'প্রোডাকশন', 'Style lines': 'স্টাইল লাইন', 'Units': 'ইউনিট',
         'Late lines': 'লেট লাইন', 'Short lines': 'শর্ট লাইন', 'Tight lines': 'টাইট লাইন',
         'Report type': 'রিপোর্টের ধরন', 'Language': 'ভাষা', 'Filters': 'ফিল্টার',
-        'Slack (days)': 'অতিরিক্ত দিন', 'Cumulative units': 'ক্রমযোজিত ইউনিট',
+        'Slack (days)': 'অতিরিক্ত দিন', 'Cumulative units': 'ক্রমযোজিত ইউনিট', 'Ship by': 'শিপ ডেডলাইন',
         'days late': 'দিন দেরি', 'units short': 'ইউনিট কম', 'port-dated': 'পোর্ট-তারিখ',
         'Arrives after the cancel date': 'ক্যানসেল তারিখের পরে পৌঁছায়',
         'Arrives after the start date but before cancel': 'শুরুর পরে কিন্তু ক্যানসেলের আগে পৌঁছায়',
@@ -9556,7 +9556,7 @@ _FR_T = {
         'Productions': '생산 오더', 'Style lines': '스타일 라인', 'Units': '수량',
         'Late lines': '지연 라인', 'Short lines': '부족 라인', 'Tight lines': '빠듯한 라인',
         'Report type': '리포트 유형', 'Language': '언어', 'Filters': '필터',
-        'Slack (days)': '여유 일수', 'Cumulative units': '누적 수량',
+        'Slack (days)': '여유 일수', 'Cumulative units': '누적 수량', 'Ship by': '선적 기한',
         'days late': '일 지연', 'units short': '수량 부족', 'port-dated': '항구 일정',
         'Arrives after the cancel date': '마감일 이후 도착',
         'Arrives after the start date but before cancel': '시작일 이후, 마감일 이전 도착',
@@ -9582,7 +9582,7 @@ _FR_T = {
         'Productions': 'Đơn sản xuất', 'Style lines': 'Dòng mã hàng', 'Units': 'Số lượng',
         'Late lines': 'Dòng trễ', 'Short lines': 'Dòng thiếu', 'Tight lines': 'Dòng sát hạn',
         'Report type': 'Loại báo cáo', 'Language': 'Ngôn ngữ', 'Filters': 'Bộ lọc',
-        'Slack (days)': 'Số ngày dư', 'Cumulative units': 'SL lũy kế',
+        'Slack (days)': 'Số ngày dư', 'Cumulative units': 'SL lũy kế', 'Ship by': 'Hạn xuất xưởng',
         'days late': 'ngày trễ', 'units short': 'thiếu', 'port-dated': 'theo lịch cảng',
         'Arrives after the cancel date': 'Đến sau ngày hủy',
         'Arrives after the start date but before cancel': 'Đến sau ngày bắt đầu, trước ngày hủy',
@@ -9782,13 +9782,13 @@ def factory_report():
     if per_production:
         HEADERS += ['Cumulative units']
         WIDTHS += [13]
-    HEADERS += ['Start', 'Cancel', 'Status', 'Issue']
-    WIDTHS += [12, 12, 15, 42]
+    HEADERS += ['Start', 'Cancel', 'Ship by', 'Status', 'Issue']
+    WIDTHS += [12, 12, 12, 15, 42]
     if not want_images:
         HEADERS = HEADERS[1:]
         WIDTHS = WIDTHS[1:]
     NUM_COLS = {'Units in production', 'Units needed', 'Cumulative units', 'Slack (days)'}
-    DATE_COLS = {'Ex-Factory', 'Arrival', 'Start', 'Cancel'}
+    DATE_COLS = {'Ex-Factory', 'Arrival', 'Start', 'Cancel', 'Ship by'}
     MONO_COLS = {'Production #', 'Style', 'Customer PO'}
 
     def _as_date(v):
@@ -9861,6 +9861,7 @@ def factory_report():
                 'Cumulative units': running if per_production else '',
                 'Start': r.get('start') or '',
                 'Cancel': r.get('cancel') or '',
+                'Ship by': r.get('shipBy') or '',
                 'Status': T(_FR_STATUS_LABEL.get(st, st)),
                 'Issue': _issue_text(r),
             }
