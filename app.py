@@ -9675,6 +9675,9 @@ def _factory_report_build(req, rows, code, lang, split, want_images, job=None):
     def _stage(s):
         if job is not None:
             job['stage'] = s
+            if job.get('jid'):   # keep the S3 ground truth's stage current too
+                _report_job_s3_put_status(job['jid'], {
+                    'status': 'building', 'stage': s, 'created': job['created']})
 
     # ── Images: one fetch per unique style, reused across every sheet ──
     img_by_style = {}
@@ -9967,12 +9970,48 @@ def _factory_report_build(req, rows, code, lang, split, want_images, job=None):
     return data, f"open-order-to-po_{code}_{stamp}.xlsx"
 
 
-# In-memory job store — one worker process, so a plain dict is fine. Jobs are
-# pruned after half an hour; a Render deploy mid-build loses the job and the
-# page tells the user to try again.
+# Job store: in-memory fast path PLUS S3 ground truth. This service runs as
+# multiple processes/instances in practice (learned the hard way with the
+# overrides extract-images job, Jul 2026): the POST that creates a job and the
+# poll that checks it routinely land on different processes, and a purely
+# in-memory store answers "expired" to a job that is building fine elsewhere.
+# Status and the finished workbook therefore live in S3; memory only
+# short-circuits the same-process case.
 _report_jobs = {}
 _report_jobs_lock = threading.Lock()
 _REPORT_JOB_TTL = 1800
+_REPORT_S3_PREFIX = 'inventory/factory_report_jobs/'
+
+
+def _report_job_s3_put_status(jid, d):
+    try:
+        get_s3().put_object(Bucket=S3_BUCKET, Key=f'{_REPORT_S3_PREFIX}{jid}.status.json',
+                            Body=json.dumps(d).encode('utf-8'),
+                            ContentType='application/json')
+    except Exception as e:
+        print(f"[FactoryReport] S3 status write failed for {jid}: {e}", flush=True)
+
+
+def _report_job_s3_get_status(jid):
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET,
+                                   Key=f'{_REPORT_S3_PREFIX}{jid}.status.json')
+        return json.loads(resp['Body'].read().decode('utf-8'))
+    except Exception:
+        return None
+
+
+def _report_job_s3_put_file(jid, data):
+    get_s3().put_object(Bucket=S3_BUCKET, Key=f'{_REPORT_S3_PREFIX}{jid}.xlsx', Body=data,
+                        ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+def _report_job_s3_get_file(jid):
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET, Key=f'{_REPORT_S3_PREFIX}{jid}.xlsx')
+        return resp['Body'].read()
+    except Exception:
+        return None
 
 
 def _prune_report_jobs():
@@ -9980,6 +10019,19 @@ def _prune_report_jobs():
     with _report_jobs_lock:
         for jid in [j for j, v in _report_jobs.items() if now - v['created'] > _REPORT_JOB_TTL]:
             _report_jobs.pop(jid, None)
+    # Best-effort S3 cleanup of finished/abandoned jobs older than 2 hours.
+    try:
+        s3 = get_s3()
+        listed = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=_REPORT_S3_PREFIX, MaxKeys=200)
+        from datetime import timezone as _tz
+        cutoff = datetime.now(_tz.utc).timestamp() - 7200
+        stale = [o['Key'] for o in listed.get('Contents', [])
+                 if o['LastModified'].timestamp() < cutoff]
+        if stale:
+            s3.delete_objects(Bucket=S3_BUCKET,
+                              Delete={'Objects': [{'Key': k} for k in stale[:100]]})
+    except Exception:
+        pass
 
 
 @app.route('/factory-report', methods=['POST', 'OPTIONS'])
@@ -10058,10 +10110,14 @@ def factory_report():
         return jsonify({'error': 'Too many reports building right now — try again in a minute.'}), 429
 
     jid = uuid.uuid4().hex
-    job = {'status': 'building', 'stage': 'queued', 'created': time.time(),
+    job = {'jid': jid, 'status': 'building', 'stage': 'queued', 'created': time.time(),
            'data': None, 'fname': None, 'error': None}
     with _report_jobs_lock:
         _report_jobs[jid] = job
+    # Ground truth BEFORE returning the id — the next poll may hit another
+    # process, and it must find the job there.
+    _report_job_s3_put_status(jid, {'status': 'building', 'stage': 'queued',
+                                    'created': job['created']})
 
     def _run():
         try:
@@ -10069,12 +10125,18 @@ def factory_report():
                                                 want_images, job=job)
             job['data'] = data
             job['fname'] = fname
+            _report_job_s3_put_file(jid, data)
             job['status'] = 'done'
+            _report_job_s3_put_status(jid, {'status': 'done', 'stage': 'done',
+                                            'created': job['created'], 'fname': fname})
         except Exception as e:
             import traceback as _tb
             _tb.print_exc()
             job['error'] = f'{type(e).__name__}: {e}'
             job['status'] = 'error'
+            _report_job_s3_put_status(jid, {'status': 'error', 'stage': 'error',
+                                            'created': job['created'],
+                                            'error': job['error']})
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'job': jid})
@@ -10088,11 +10150,23 @@ def factory_report_job(jid):
     token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
     if not _caller_identity(token):
         return jsonify({'error': 'Sign in to Versa Docs.'}), 401
+    if not re.fullmatch(r'[0-9a-f]{32}', jid or ''):
+        return jsonify({'error': 'Bad job id.'}), 400
     with _report_jobs_lock:
         job = _report_jobs.get(jid)
-    if not job:
+    if job:
+        return jsonify({'status': job['status'], 'stage': job['stage'], 'error': job['error']})
+    # Not ours — another process may own it. S3 is the ground truth.
+    s3job = _report_job_s3_get_status(jid)
+    if not s3job:
         return jsonify({'error': 'Report expired or the service restarted — build it again.'}), 404
-    return jsonify({'status': job['status'], 'stage': job['stage'], 'error': job['error']})
+    # A build whose process died mid-way stays 'building' in S3 forever —
+    # surface that honestly instead of letting the page poll into its timeout.
+    if s3job.get('status') == 'building' and time.time() - (s3job.get('created') or 0) > 900:
+        return jsonify({'status': 'error', 'stage': 'stale',
+                        'error': 'The build was interrupted — build it again.'})
+    return jsonify({'status': s3job.get('status'), 'stage': s3job.get('stage'),
+                    'error': s3job.get('error')})
 
 
 @app.route('/factory-report/job/<jid>/download', methods=['GET', 'OPTIONS'])
@@ -10103,12 +10177,22 @@ def factory_report_download(jid):
     token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
     if not _caller_identity(token):
         return jsonify({'error': 'Sign in to Versa Docs.'}), 401
+    if not re.fullmatch(r'[0-9a-f]{32}', jid or ''):
+        return jsonify({'error': 'Bad job id.'}), 400
     with _report_jobs_lock:
         job = _report_jobs.get(jid)
-    if not job or job['status'] != 'done' or not job['data']:
-        return jsonify({'error': 'Report not ready.'}), 404
-    return send_file(BytesIO(job['data']), as_attachment=True, download_name=job['fname'],
-                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    if job and job['status'] == 'done' and job['data']:
+        return send_file(BytesIO(job['data']), as_attachment=True, download_name=job['fname'],
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    # Cross-process download: the workbook lives in S3.
+    s3job = _report_job_s3_get_status(jid)
+    if s3job and s3job.get('status') == 'done':
+        data = _report_job_s3_get_file(jid)
+        if data:
+            return send_file(BytesIO(data), as_attachment=True,
+                             download_name=s3job.get('fname') or 'report.xlsx',
+                             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    return jsonify({'error': 'Report not ready.'}), 404
 
 
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
