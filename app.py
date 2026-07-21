@@ -17,6 +17,7 @@ import os
 import re
 import json
 import time
+import uuid
 import random
 import threading
 import concurrent.futures
@@ -9639,75 +9640,25 @@ def _fr_sheet_name(raw, used):
     return safe[:28] + '~xx'
 
 
-@app.route('/factory-report', methods=['POST', 'OPTIONS'])
-def factory_report():
-    """Excel report builder for the Versa-Docs Open Order to PO page.
+def _factory_report_build(req, rows, code, lang, split, want_images, job=None):
+    """Build the Open Order to PO workbook. Runs in a background thread for
+    big reports (a full all-factories build with ~1,600 embedded swatches
+    takes minutes — far past the 100s edge / 120s worker limits that killed
+    synchronous builds). `job`, when given, receives stage updates.
 
-    POST body:
-      factory   - 'TF'.. or 'ALL' (ignored for factory accounts, which are
-                  pinned to their own prefix exactly like /factory-view)
-      lang      - en|zh|bn|ko|vi   (report language, independent of the UI)
-      title     - report title for the summary sheet
-      split     - 'none' | 'production' | 'customer'  (one tab per group)
-      images    - bool, embed product thumbnails
-      filters   - free-text description of the filters used, for the cover
-      rows      - [{production, poName, factoryCode, style, brand, units,
-                    etd, arrival, portDated, fob, customer, orderNo,
-                    unitsNeeded, start, cancel, status, days, gap,
-                    bulk, fobPickup, est}]
-
-    Whitelisted by construction: only the fields above are read, and none of
-    them carry price or value data."""
-    if request.method == 'OPTIONS':
-        return '', 204
-
-    auth = request.headers.get('Authorization', '')
-    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
-    ident = _caller_identity(token)
-    if not ident:
-        return jsonify({'error': 'Sign in to Versa Docs to build a report.'}), 401
-
-    try:
-        req = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({'error': 'Invalid JSON body'}), 400
-
-    rows = req.get('rows') or []
-    if not isinstance(rows, list) or not rows:
-        return jsonify({'error': 'No rows to export'}), 400
-    if len(rows) > 20000:
-        return jsonify({'error': 'Report too large — narrow the filters'}), 413
-
-    lang = str(req.get('lang') or 'en').lower()
-    if lang not in ('en', 'zh', 'bn', 'ko', 'vi'):
-        lang = 'en'
-    split = str(req.get('split') or 'none').lower()
-    if split not in ('none', 'production', 'customer'):
-        split = 'none'
-    want_images = bool(req.get('images', True))
-
-    # ── Scope enforcement (server-side, same rule as /factory-view) ──
-    requested = str(req.get('factory') or 'ALL').strip().upper()
-    if ident['role'] == 'factory':
-        code = ident['factory_prefix']
-        if code not in FACTORY_NAMES:
-            return jsonify({'error': 'Your account is not linked to a factory yet.'}), 403
-        # Never trust client-side filtering for another factory's rows.
-        rows = [r for r in rows
-                if str(r.get('factoryCode') or _factory_label(r.get('production'))).upper() == code]
-        if not rows:
-            return jsonify({'error': 'No rows for your factory'}), 400
-    elif ident['role'] == 'staff':
-        code = requested if (requested == 'ALL' or requested in FACTORY_NAMES) else 'ALL'
-    else:
-        return jsonify({'error': 'Your account does not have access to this data.'}), 403
-
+    Returns (xlsx_bytes, download_name). All authorization and scope
+    enforcement happens in the route BEFORE this is called."""
     T = lambda s: _frt(lang, s)
     factory_name = T('All factories') if code == 'ALL' else FACTORY_NAMES.get(code, code)
+    t0 = time.time()
+    def _stage(s):
+        if job is not None:
+            job['stage'] = s
 
     # ── Images: one fetch per unique style, reused across every sheet ──
     img_by_style = {}
     if want_images:
+        _stage('images')
         try:
             uniq = []
             seen_styles = set()
@@ -9725,9 +9676,12 @@ def factory_report():
                 for i, item in enumerate(uniq):
                     if i in fetched:
                         img_by_style[item['sku']] = fetched[i]
+            print(f"[FactoryReport] images: {len(img_by_style)}/{len(uniq)} in "
+                  f"{time.time() - t0:.1f}s", flush=True)
         except Exception as e:
             print(f"[FactoryReport] image fetch failed: {e}", flush=True)
 
+    _stage('workbook')
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
 
@@ -9984,9 +9938,155 @@ def factory_report():
 
     wb.close()
     buf.seek(0)
+    data = buf.read()
+    print(f"[FactoryReport] built {code} lang={lang} split={split} rows={len(rows)} "
+          f"images={len(img_by_style)} -> {len(data) // 1024}KB in {time.time() - t0:.1f}s",
+          flush=True)
     stamp = datetime.utcnow().strftime('%Y-%m-%d')
-    fname = f"open-order-to-po_{code}_{stamp}.xlsx"
-    return send_file(buf, as_attachment=True, download_name=fname,
+    return data, f"open-order-to-po_{code}_{stamp}.xlsx"
+
+
+# In-memory job store — one worker process, so a plain dict is fine. Jobs are
+# pruned after half an hour; a Render deploy mid-build loses the job and the
+# page tells the user to try again.
+_report_jobs = {}
+_report_jobs_lock = threading.Lock()
+_REPORT_JOB_TTL = 1800
+
+
+def _prune_report_jobs():
+    now = time.time()
+    with _report_jobs_lock:
+        for jid in [j for j, v in _report_jobs.items() if now - v['created'] > _REPORT_JOB_TTL]:
+            _report_jobs.pop(jid, None)
+
+
+@app.route('/factory-report', methods=['POST', 'OPTIONS'])
+def factory_report():
+    """Excel report builder for the Versa-Docs Open Order to PO page.
+
+    Asynchronous: big builds (all factories, ~1,600 embedded swatches) take
+    minutes, far past the edge/worker timeouts — so this returns {'job': id}
+    immediately and a background thread builds the workbook. Poll
+    GET /factory-report/job/<id>, then GET /factory-report/job/<id>/download.
+    Payloads without 'async' keep the old synchronous behaviour for small
+    reports and backwards compatibility.
+
+    POST body: factory, lang, title, split, images, filters, async,
+    rows=[{production, poName, factoryCode, style, brand, units, etd,
+    arrival, portDated, fob, customer, orderNo, unitsNeeded, start, cancel,
+    shipBy, status, days, gap, bulk, fobPickup, est}].
+    Whitelisted by construction — no price or value field is ever read.
+
+    AUTHORIZATION: same rule as /factory-view — a factory account is pinned
+    to its own prefix regardless of the payload; staff may build any."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    ident = _caller_identity(token)
+    if not ident:
+        return jsonify({'error': 'Sign in to Versa Docs to build a report.'}), 401
+
+    try:
+        req = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    rows = req.get('rows') or []
+    if not isinstance(rows, list) or not rows:
+        return jsonify({'error': 'No rows to export'}), 400
+    if len(rows) > 20000:
+        return jsonify({'error': 'Report too large — narrow the filters'}), 413
+
+    lang = str(req.get('lang') or 'en').lower()
+    if lang not in ('en', 'zh', 'bn', 'ko', 'vi'):
+        lang = 'en'
+    split = str(req.get('split') or 'none').lower()
+    if split not in ('none', 'production', 'customer'):
+        split = 'none'
+    want_images = bool(req.get('images', True))
+
+    # ── Scope enforcement (server-side, same rule as /factory-view) ──
+    requested = str(req.get('factory') or 'ALL').strip().upper()
+    if ident['role'] == 'factory':
+        code = ident['factory_prefix']
+        if code not in FACTORY_NAMES:
+            return jsonify({'error': 'Your account is not linked to a factory yet.'}), 403
+        # Never trust client-side filtering for another factory's rows.
+        rows = [r for r in rows
+                if str(r.get('factoryCode') or _factory_label(r.get('production'))).upper() == code]
+        if not rows:
+            return jsonify({'error': 'No rows for your factory'}), 400
+    elif ident['role'] == 'staff':
+        code = requested if (requested == 'ALL' or requested in FACTORY_NAMES) else 'ALL'
+    else:
+        return jsonify({'error': 'Your account does not have access to this data.'}), 403
+
+    if not req.get('async'):
+        # Legacy synchronous path — fine for small no-image pulls.
+        data, fname = _factory_report_build(req, rows, code, lang, split, want_images)
+        return send_file(BytesIO(data), as_attachment=True, download_name=fname,
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    _prune_report_jobs()
+    with _report_jobs_lock:
+        building = sum(1 for v in _report_jobs.values() if v['status'] == 'building')
+    if building >= 3:
+        return jsonify({'error': 'Too many reports building right now — try again in a minute.'}), 429
+
+    jid = uuid.uuid4().hex
+    job = {'status': 'building', 'stage': 'queued', 'created': time.time(),
+           'data': None, 'fname': None, 'error': None}
+    with _report_jobs_lock:
+        _report_jobs[jid] = job
+
+    def _run():
+        try:
+            data, fname = _factory_report_build(req, rows, code, lang, split,
+                                                want_images, job=job)
+            job['data'] = data
+            job['fname'] = fname
+            job['status'] = 'done'
+        except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
+            job['error'] = f'{type(e).__name__}: {e}'
+            job['status'] = 'error'
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'job': jid})
+
+
+@app.route('/factory-report/job/<jid>', methods=['GET', 'OPTIONS'])
+def factory_report_job(jid):
+    if request.method == 'OPTIONS':
+        return '', 204
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    if not _caller_identity(token):
+        return jsonify({'error': 'Sign in to Versa Docs.'}), 401
+    with _report_jobs_lock:
+        job = _report_jobs.get(jid)
+    if not job:
+        return jsonify({'error': 'Report expired or the service restarted — build it again.'}), 404
+    return jsonify({'status': job['status'], 'stage': job['stage'], 'error': job['error']})
+
+
+@app.route('/factory-report/job/<jid>/download', methods=['GET', 'OPTIONS'])
+def factory_report_download(jid):
+    if request.method == 'OPTIONS':
+        return '', 204
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    if not _caller_identity(token):
+        return jsonify({'error': 'Sign in to Versa Docs.'}), 401
+    with _report_jobs_lock:
+        job = _report_jobs.get(jid)
+    if not job or job['status'] != 'done' or not job['data']:
+        return jsonify({'error': 'Report not ready.'}), 404
+    return send_file(BytesIO(job['data']), as_attachment=True, download_name=job['fname'],
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
