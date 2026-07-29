@@ -5350,6 +5350,15 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Karl Lagerfeld Paris',
+        'path': '/Versa Share Files/New Style Numbers/KLP NEW STYLE NUMBERS.xlsx',
+        'sheet': 'MASTER',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,            # pending David's review of the dry run
+    },
+    {
         'label': 'Jones New York',
         'path': '/Versa Share Files/New Style Numbers/JONES NEW YORK NEW STYLES 3.24.2023.xlsx',
         'sheet': 'MASTER NEW',        # David: this tab ONLY (MASTER + CVC DOBBY ignored)
