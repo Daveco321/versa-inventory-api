@@ -5350,6 +5350,17 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Jones New York',
+        'path': '/Versa Share Files/New Style Numbers/JONES NEW YORK NEW STYLES 3.24.2023.xlsx',
+        'sheet': 'MASTER NEW',        # David: this tab ONLY (MASTER + CVC DOBBY ignored)
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'key_prefix': 'JN_',          # a few rows list the bare serial ('129')
+        'key_prefix_aliases': {'JNY_': 'JN_'},   # some rows typed the long brand code
+        'header_row': 2,
+        'approved': False,            # pending David's review of the dry run
+    },
+    {
         'label': 'Geoffrey Beene — Pants',
         'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
         'sheet': 'PANTS',
@@ -5485,6 +5496,12 @@ def _parse_color_source(src, data):
                         f"color_col={src.get('color_col')!r}; headers: {headers[:12]})")
 
         prefix = str(src.get('key_prefix') or '')
+        # Optional prefix aliases: some files mix key spellings for one brand
+        # (Jones New York lists both JN_408 and JNY_408). Map alias prefixes to
+        # the canonical form BEFORE normalization so every row lands on the key
+        # the frontend actually looks up.
+        aliases = {str(a).strip().upper(): str(b).strip().upper()
+                   for a, b in (src.get('key_prefix_aliases') or {}).items()}
         # skip_keys are written as they appear IN THE FILE — run each through
         # the same normalize+namespace pipeline as data keys so they still
         # match on namespaced sources (a raw 'GB_042' entry must catch the
@@ -5508,7 +5525,14 @@ def _parse_color_source(src, data):
                 return {}, "more than 20,000 rows — refusing (wrong tab/columns?)"
             key_raw = row[key_col] if key_col < len(row) else None
             color_raw = row[color_col] if color_col < len(row) else None
-            key = _color_sync_normalize_key(key_raw, prefix)
+            key_in = str(key_raw or '')
+            if aliases:
+                ku = key_in.strip().upper()
+                for a, b in aliases.items():
+                    if ku.startswith(a):
+                        key_in = b + ku[len(a):]
+                        break
+            key = _color_sync_normalize_key(key_in, prefix)
             if key:
                 if src.get('key_namespace'):
                     key = _apply_key_namespace(key, src.get('key_namespace'))
