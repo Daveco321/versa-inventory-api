@@ -5349,6 +5349,39 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': False,
     },
+    # Nautica: MASTER - NA = classic NA_NNN namespace; MASTER - NT = the NT
+    # overflow namespace (serials past 999, NT 201 ≠ NA 201); BLAZER tab is
+    # natively keyed NA_B## (same convention as Geoffrey Beene). OLD MASTER /
+    # SUPERSHIRT / TRAVELER / STRETCH tabs ignored per David.
+    {
+        'label': 'Nautica — NA',
+        'path': '/Versa Share Files/New Style Numbers/NAUTICA NEW STYLES 4.10.xlsx',
+        'sheet': 'MASTER - NA',
+        'key_col': 'Style Number',
+        'color_col': 'Label Description',
+        'header_row': 1,              # this file has no banner row
+        'key_prefix_aliases': {'NAU_': 'NA_'},   # a few rows typed the long code
+        'approved': False,
+    },
+    {
+        'label': 'Nautica — NT',
+        'path': '/Versa Share Files/New Style Numbers/NAUTICA NEW STYLES 4.10.xlsx',
+        'sheet': 'MASTER - NT',
+        'key_col': 'Style Number',
+        'color_col': 'Label Description',
+        'header_row': 1,
+        'approved': False,
+    },
+    {
+        'label': 'Nautica — Blazers',
+        'path': '/Versa Share Files/New Style Numbers/NAUTICA NEW STYLES 4.10.xlsx',
+        'sheet': 'BLAZER',
+        'key_col': 'Style Number',
+        'color_col': 'Label Description',
+        'header_row': 1,
+        'key_namespace': 'blazer',    # tab already uses NA_B## natively
+        'approved': False,
+    },
     {
         'label': 'Lucky Brand',
         'path': '/Versa Share Files/New Style Numbers/LUCKY BRAND NEW STYLES.xlsx',
