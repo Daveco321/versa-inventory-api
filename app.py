@@ -5268,7 +5268,23 @@ def trigger_dropbox_photo_sync():
 #     'header_row': 1,                       # optional, 1-based, default 1
 #   }
 # Populated with David brand by brand — an empty list makes the sync a no-op.
-COLOR_SYNC_SOURCES = []
+# ONLY files David has explicitly mapped go in this list.
+COLOR_SYNC_SOURCES = [
+    {
+        'label': 'Ben Sherman',
+        'path': '/Versa Share Files/New Style Numbers/BEN SHERMAN NEW STYLES.xlsx',
+        'sheet': 'MASTER 1',          # row 1 is a title banner; headers live on row 2
+        'key_col': 'STYLE NUMBER',    # BE_NNN keys (XX_NNN form, matches frontend lookup)
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+    },
+]
+
+# Hourly automation gate: while the brand files are still being mapped and
+# reviewed one by one with David, ONLY the manual endpoint runs the sync
+# (POST /admin/refresh/colors, with ?dry_run=1 for a no-write preview).
+# Flip to True once the mapped sources are approved for unattended merging.
+COLOR_SYNC_AUTORUN = False
 
 _color_sync_lock = threading.Lock()
 _color_sync_status = {'last_run': None, 'last_result': None}
@@ -5305,12 +5321,17 @@ def _dropbox_download_path(path, timeout=60):
 def _color_sync_normalize_key(raw, prefix):
     """Map a source cell to a color-map key. Full style numbers pass through
     uppercased; bare digits become '<PREFIX><zero-padded-3>' to match the
-    frontend's XX_NNN fallback keys. Returns '' for unusable cells."""
+    frontend's XX_NNN fallback keys; XX_NNN-shaped keys get stray whitespace
+    collapsed ('BE _260' → 'BE_260') and digits zero-padded to 3, because the
+    frontend only ever looks up the padded form. Returns '' for unusable cells."""
     k = str(raw or '').strip().upper()
     if not k or len(k) > 40:
         return ''
     if k.isdigit():
         return f"{prefix}{k.zfill(3)}" if prefix else ''
+    m = re.match(r'^([A-Z0-9]{2})\s*_\s*(\d{1,3})$', k)
+    if m:
+        return f"{m.group(1)}_{int(m.group(2)):03d}"
     return k
 
 
@@ -5352,6 +5373,8 @@ def _parse_color_source(src, data):
 
         prefix = str(src.get('key_prefix') or '')
         rows = {}
+        dup_keys = set()
+        blank_color = 0
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             if len(rows) > 20000:
                 return {}, "more than 20,000 rows — refusing (wrong tab/columns?)"
@@ -5359,20 +5382,29 @@ def _parse_color_source(src, data):
             color_raw = row[color_col] if color_col < len(row) else None
             key = _color_sync_normalize_key(key_raw, prefix)
             color = str(color_raw or '').strip()
-            if not key or not color or len(color) > 200:
+            if key and not color:
+                blank_color += 1     # style number reserved, no color entered yet
                 continue
-            rows[key] = color
+            if not key or len(color) > 200:
+                continue
+            if key in rows and rows[key] != color:
+                dup_keys.add(key)    # same key listed twice with DIFFERENT colors
+            rows[key] = color        # last one wins — flagged in the report
+        src['_stats'] = {'dup_conflicting_keys': sorted(dup_keys)[:20],
+                         'blank_color_rows': blank_color}
         return rows, None
     finally:
         wb.close()
 
 
-def _merge_color_rows(ws, desired):
+def _merge_color_rows(ws, desired, apply=True):
     """Merge desired {key: color} into the master sheet. Updates existing rows
     in place (ALL duplicate occurrences of a key — the frontend reader is
-    last-duplicate-wins) and returns (updated_cell_count, adds) where adds is
-    the list of (key, color) pairs not yet present. Returns (None, None) when
-    the master schema is unrecognizable — callers must abort, never write."""
+    last-duplicate-wins) and returns (updated, adds): updated is a list of
+    (key, old_color, new_color) triples, adds the (key, color) pairs not yet
+    present. apply=False computes both WITHOUT touching the sheet (dry run).
+    Returns (None, None) when the master schema is unrecognizable — callers
+    must abort, never write."""
     headers = [str(c.value or '').strip().lower() for c in ws[1]]
 
     def find_col(*cands):
@@ -5392,24 +5424,30 @@ def _merge_color_rows(ws, desired):
         if k:
             existing.setdefault(k, []).append(r)
 
-    updates = 0
+    updated = []
     adds = []
     for key, color in desired.items():
         if key in existing:
+            changed = False
             for r in existing[key]:
                 cur = str(ws.cell(row=r, column=color_col + 1).value or '').strip()
                 if cur != color:
-                    ws.cell(row=r, column=color_col + 1).value = color
-                    updates += 1
+                    if apply:
+                        ws.cell(row=r, column=color_col + 1).value = color
+                    if not changed:
+                        updated.append((key, cur, color))
+                        changed = True
         else:
             adds.append((key, color))
-    return updates, adds
+    return updated, adds
 
 
-def sync_color_map_from_dropbox():
+def sync_color_map_from_dropbox(dry_run=False):
     """Pull every configured Dropbox color source and merge into the S3 master
-    color map. Add/update only — never deletes. Returns a result dict."""
-    result = {'status': 'ok', 'sources': [], 'adds': 0, 'updates': 0, 'wrote': False}
+    color map. Add/update only — never deletes. dry_run computes and reports
+    the full merge without writing anything. Returns a result dict."""
+    result = {'status': 'ok', 'sources': [], 'adds': 0, 'updates': 0,
+              'wrote': False, 'dry_run': bool(dry_run)}
     if not COLOR_SYNC_SOURCES:
         result['status'] = 'no_sources'
         _color_sync_status.update(last_run=time.time(), last_result=result)
@@ -5432,12 +5470,15 @@ def sync_color_map_from_dropbox():
                 result['sources'].append({'label': label, 'status': 'download_failed'})
                 continue
             rows, err = _parse_color_source(src, data)
+            stats = src.pop('_stats', {})
             if err:
                 result['sources'].append({'label': label, 'status': f'parse_error: {err}'})
                 continue
             desired.update(rows)
             ok_sources += 1
-            result['sources'].append({'label': label, 'status': 'ok', 'rows': len(rows)})
+            entry = {'label': label, 'status': 'ok', 'rows': len(rows)}
+            entry.update(stats)
+            result['sources'].append(entry)
 
         if ok_sources == 0:
             result['status'] = 'all_sources_failed'
@@ -5450,16 +5491,25 @@ def sync_color_map_from_dropbox():
                                       _append_rows, _upload_color_map, S3_COLOR_MAP_KEY)
         wb, _etag, _size = _download_color_map(get_s3, S3_BUCKET)
         ws = _resolve_color_map_sheet(wb)
-        updates, adds = _merge_color_rows(ws, desired)
-        if updates is None:
+        updated, adds = _merge_color_rows(ws, desired, apply=not dry_run)
+        if updated is None:
             result['status'] = 'master_schema_unrecognized'
             _color_sync_status.update(last_run=time.time(), last_result=result)
             return result
 
-        result['updates'] = updates
+        result['updates'] = len(updated)
         result['adds'] = len(adds)
-        if updates == 0 and not adds:
+        result['sample_adds'] = adds[:15]
+        result['sample_updates'] = [
+            {'key': k, 'old': old, 'new': new} for k, old, new in updated[:15]
+        ]
+        if not updated and not adds:
             print(f"  [ColorSync] ✓ {len(desired)} keys from {ok_sources} source(s) — master already current")
+            _color_sync_status.update(last_run=time.time(), last_result=result)
+            return result
+
+        if dry_run:
+            print(f"  [ColorSync] (dry run) {len(adds)} adds, {len(updated)} updates pending")
             _color_sync_status.update(last_run=time.time(), last_result=result)
             return result
 
@@ -5478,7 +5528,7 @@ def sync_color_map_from_dropbox():
             _append_rows(ws, adds)
         _upload_color_map(get_s3, S3_BUCKET, wb)
         result['wrote'] = True
-        print(f"  [ColorSync] ✓ Merged {ok_sources} source(s): {len(adds)} added, {updates} updated cell(s)")
+        print(f"  [ColorSync] ✓ Merged {ok_sources} source(s): {len(adds)} added, {len(updated)} updated key(s)")
         _color_sync_status.update(last_run=time.time(), last_result=result)
         return result
     except Exception as e:
@@ -5492,10 +5542,15 @@ def sync_color_map_from_dropbox():
 
 @app.route('/admin/refresh/colors', methods=['POST', 'OPTIONS'])
 def admin_refresh_colors():
-    """Force a Dropbox → S3 color-map sync and report what changed."""
+    """Force a Dropbox → S3 color-map sync and report what changed.
+    ?dry_run=1 (or JSON {"dry_run": true}) reports the merge without writing."""
     if request.method == 'OPTIONS':
         return '', 204
-    return jsonify(sync_color_map_from_dropbox())
+    dry = request.args.get('dry_run') in ('1', 'true', 'yes')
+    if not dry:
+        body = request.get_json(silent=True) or {}
+        dry = bool(body.get('dry_run'))
+    return jsonify(sync_color_map_from_dropbox(dry_run=dry))
 
 
 @app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
@@ -5844,9 +5899,10 @@ def hourly_resync():
             print(f"  ⚠ Production hourly refresh failed: {e}")
 
         # Refresh the color map from Dropbox sources every hour
-        # (no-op until COLOR_SYNC_SOURCES is populated)
+        # (gated off until the mapped sources are approved for automation)
         try:
-            sync_color_map_from_dropbox()
+            if COLOR_SYNC_AUTORUN:
+                sync_color_map_from_dropbox()
         except Exception as e:
             print(f"  ⚠ Color map hourly sync failed: {e}")
 
