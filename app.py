@@ -5381,7 +5381,10 @@ def _parse_color_source(src, data):
             key_raw = row[key_col] if key_col < len(row) else None
             color_raw = row[color_col] if color_col < len(row) else None
             key = _color_sync_normalize_key(key_raw, prefix)
-            color = str(color_raw or '').strip()
+            # Collapse ALL internal whitespace (double spaces, Excel in-cell
+            # line breaks) — otherwise cosmetic cell formatting shows up as a
+            # phantom overwrite of an identical color.
+            color = ' '.join(str(color_raw or '').split())
             if key and not color:
                 blank_color += 1     # style number reserved, no color entered yet
                 continue
