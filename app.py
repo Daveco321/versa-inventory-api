@@ -216,6 +216,9 @@ def _build_brand_aliases():
         if abbr in BRAND_FULL_NAMES:
             _BRAND_NAME_ALIASES[prefix.upper()] = BRAND_FULL_NAMES[abbr]
 _build_brand_aliases()
+# Alternate SKU brand codes (not in BRAND_IMAGE_PREFIX): NT = Nautica overflow
+# serials past 999 — brand strings like "NT" must normalize to Nautica.
+_BRAND_NAME_ALIASES['NT'] = 'Nautica'
 
 def _normalize_brand(raw):
     """Map any brand string variant to canonical full name. Falls back to the
@@ -904,8 +907,31 @@ def load_production_from_dropbox():
 
 
 def extract_image_code(sku, brand_abbr):
-    """Extract image code from SKU — strips size suffix first"""
-    prefix = BRAND_IMAGE_PREFIX.get(brand_abbr, brand_abbr[:2])
+    """Extract image code from SKU — strips size suffix first.
+
+    Prefix is normally the brand's default (NAUTICA → NA), but when the SKU's
+    own brand code (chars 3-4) is an ALTERNATE code for the same brand
+    (NT = Nautica overflow, serials restarted past 999), the SKU's code wins:
+    NT_201 and NA_201 are different styles and must never share an image code.
+    SKU_BRAND_CODE_MAP is defined later in the module — resolved at call time,
+    and the first call happens long after import completes.
+    """
+    s = str(sku or '').upper()
+    ab = str(brand_abbr or '').strip().upper()
+    # Canonicalize alternate brand spellings to the brand key — ledger/export
+    # callers pass whatever the source cell contained ('Nautica', 'NA', 'GB'),
+    # and the comparison below must be form-insensitive. For every attested
+    # value this is output-equivalent to the old code; it only matters for NT.
+    ab = SKU_BRAND_CODE_MAP.get(ab, ab)
+    prefix = None
+    # Standard layout: brand code at chars 3-4 (after the 2-char customer code);
+    # customer-less override keys (e.g. 'NTSU201SLP') carry it at chars 1-2.
+    for code in (s[2:4], s[0:2]):
+        if len(code) == 2 and ab and SKU_BRAND_CODE_MAP.get(code) == ab:
+            prefix = code
+            break
+    if prefix is None:
+        prefix = BRAND_IMAGE_PREFIX.get(ab, ab[:2])
     # Strip size suffix (everything after first dash)
     base_sku = sku.split('-')[0]
     numbers = re.findall(r'\d+', str(base_sku))
@@ -2894,6 +2920,12 @@ def parse_inventory_excel(file_bytes):
 
         sku = str(_col_val(rd, 'SKU') or '').strip()
         brand = str(_col_val(rd, 'Brand') or '').strip().upper()
+        if brand == 'NT':
+            # NT is the Nautica overflow SKU code (serials past 999), not a brand.
+            # The frontend force-corrects these rows to NAUTICA; without this the
+            # backend would group them as a separate 'NT' brand and the prebuilt
+            # Nautica workbooks would silently omit every NT style.
+            brand = 'NAUTICA'
         if not sku or sku == 'N/A' or not brand:
             continue
 
@@ -6342,6 +6374,10 @@ SKU_BRAND_CODE_MAP = {
     'GB': 'BEENE', 'NM': 'NICOLE', 'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN',
     'VD': 'VD', 'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
     'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE',
+    # NT = Nautica overflow: serials hit 999 (Jul 2026), new Nautica styles use
+    # NT with the serial namespace restarted — NT 201 ≠ NA 201. extract_image_code
+    # keys images/colors to NT_NNN for these SKUs.
+    'NT': 'NAUTICA',
 }
 
 # Friendly fit-code labels (from positions 9-10 of base SKU, e.g. "SL" → Slim/Long)
@@ -7860,6 +7896,7 @@ def _enrich_open_orders_with_inventory(open_styles):
         'GB': 'BEENE', 'NM': 'NICOLE', 'SH': 'SHAQ', 'TA': 'TAYION', 'MS': 'STRAHAN',
         'VD': 'VD', 'VR': 'VERSA', 'CK': 'CHEROKEE', 'AC': 'AMERICA', 'BL': 'BLO',
         'D9': 'DN', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE',
+        'NT': 'NAUTICA',  # Nautica overflow serials past 999
     }
 
     for s in open_styles:
