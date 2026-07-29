@@ -21,7 +21,7 @@ import uuid
 import random
 import threading
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 import boto3
@@ -4050,16 +4050,21 @@ def save_overrides():
             current = dict(_style_overrides)
 
         # SAFETY: merge incoming into current — never allow a smaller payload to wipe existing data
-        # Incoming keys add/update; keys not present in incoming are preserved from S3 state
-        merged = dict(current)
-        merged.update(overrides)
-
-        # If incoming count is suspiciously low vs current, only allow it if explicitly a delete op
+        # Incoming keys add/update; keys not present in incoming are preserved from S3 state.
+        # replace_all=True is the explicit opt-out: the payload becomes the entire dict,
+        # which is the only way to delete an override key through this endpoint.
         incoming_count = len(overrides)
         current_count = len(current)
-        if incoming_count < current_count and not req.get('replace_all', False):
-            # Merge only — do not shrink
-            print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
+        if req.get('replace_all', False):
+            merged = dict(overrides)
+            if incoming_count < current_count:
+                print(f"  ⚠ replace_all: shrinking overrides {current_count} → {incoming_count}")
+        else:
+            merged = dict(current)
+            merged.update(overrides)
+            if incoming_count < current_count:
+                # Merge only — do not shrink
+                print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
 
         # Find which styles have new/changed images (for CloudFront invalidation)
         changed_styles = [
