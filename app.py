@@ -5296,6 +5296,15 @@ COLOR_SYNC_SOURCES = [
         'skip_keys': ['CH_258', 'CH_279', 'CH_328', 'CH_361'],
         'approved': False,            # pending David's review of the dry run
     },
+    {
+        'label': 'DKNY',
+        'path': '/Versa Share Files/New Style Numbers/DKNY STYLES NUMBERS.xlsx',
+        'sheet': 'MASTER',            # single-tab file, same banner+header layout
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,            # pending David's review of the dry run
+    },
 ]
 
 # Hourly automation gate. When True, the hourly loop merges APPROVED sources
