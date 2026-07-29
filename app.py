@@ -5277,14 +5277,32 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',    # BE_NNN keys (XX_NNN form, matches frontend lookup)
         'color_col': 'DESCRIPTION',
         'header_row': 2,
+        'approved': True,             # David approved the full merge Jul 29 2026
+    },
+    {
+        'label': 'Chaps',
+        'path': '/Versa Share Files/New Style Numbers/CHAPS NEW STYLE NUMBERS.xlsx',
+        'sheet': 'DRESS SHIRTS',      # ONLY this tab — the TIES tab REUSES the same
+                                      # CH_NNN numbers for different products, and
+                                      # David excluded ties/hanky/shirt-and-tie sets
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        # No key_prefix: this sheet's bare-digit rows (420, 430, ...) are section
+        # banners, not styles — leave them skipped.
+        'header_row': 2,
+        # Section-banner rows whose DESCRIPTION cell holds a heading, not a color
+        # ("NEW WALMART CHAPS STYLES", "COSTCO USA SWATCHES"). Remove a key from
+        # this list once the file carries a real color for it.
+        'skip_keys': ['CH_258', 'CH_279', 'CH_328', 'CH_361'],
+        'approved': False,            # pending David's review of the dry run
     },
 ]
 
-# Hourly automation gate: while the brand files are still being mapped and
-# reviewed one by one with David, ONLY the manual endpoint runs the sync
-# (POST /admin/refresh/colors, with ?dry_run=1 for a no-write preview).
-# Flip to True once the mapped sources are approved for unattended merging.
-COLOR_SYNC_AUTORUN = False
+# Hourly automation gate. When True, the hourly loop merges APPROVED sources
+# only ('approved': True) — sources still under review with David never run
+# unattended; they are exercised via the manual endpoint
+# (POST /admin/refresh/colors?dry_run=1&source=<label>) until approved.
+COLOR_SYNC_AUTORUN = True
 
 _color_sync_lock = threading.Lock()
 _color_sync_status = {'last_run': None, 'last_result': None}
@@ -5332,6 +5350,11 @@ def _color_sync_normalize_key(raw, prefix):
     m = re.match(r'^([A-Z0-9]{2})\s*_\s*(\d{1,3})$', k)
     if m:
         return f"{m.group(1)}_{int(m.group(2)):03d}"
+    if re.search(r'\s', k):
+        # Whitespace remaining after the XX_NNN repair means the cell is not a
+        # single key (e.g. two style numbers pasted into one cell) — skip it;
+        # the parser reports these as malformed for manual fixing.
+        return ''
     return k
 
 
@@ -5372,9 +5395,11 @@ def _parse_color_source(src, data):
                         f"color_col={src.get('color_col')!r}; headers: {headers[:12]})")
 
         prefix = str(src.get('key_prefix') or '')
+        skip = {str(k).strip().upper() for k in (src.get('skip_keys') or [])}
         rows = {}
         dup_keys = set()
         blank_color = 0
+        malformed = []
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             if len(rows) > 20000:
                 return {}, "more than 20,000 rows — refusing (wrong tab/columns?)"
@@ -5385,16 +5410,22 @@ def _parse_color_source(src, data):
             # line breaks) — otherwise cosmetic cell formatting shows up as a
             # phantom overwrite of an identical color.
             color = ' '.join(str(color_raw or '').split())
-            if key and not color:
+            if not key:
+                raw_txt = ' '.join(str(key_raw or '').split())
+                if raw_txt and color:
+                    malformed.append(raw_txt[:40])   # unusable key next to a color
+                continue
+            if not color:
                 blank_color += 1     # style number reserved, no color entered yet
                 continue
-            if not key or len(color) > 200:
+            if key in skip or len(color) > 200:
                 continue
             if key in rows and rows[key] != color:
                 dup_keys.add(key)    # same key listed twice with DIFFERENT colors
             rows[key] = color        # last one wins — flagged in the report
         src['_stats'] = {'dup_conflicting_keys': sorted(dup_keys)[:20],
-                         'blank_color_rows': blank_color}
+                         'blank_color_rows': blank_color,
+                         'malformed_keys': malformed[:15]}
         return rows, None
     finally:
         wb.close()
@@ -5445,10 +5476,12 @@ def _merge_color_rows(ws, desired, apply=True):
     return updated, adds
 
 
-def sync_color_map_from_dropbox(dry_run=False):
-    """Pull every configured Dropbox color source and merge into the S3 master
+def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=False):
+    """Pull configured Dropbox color sources and merge into the S3 master
     color map. Add/update only — never deletes. dry_run computes and reports
-    the full merge without writing anything. Returns a result dict."""
+    the full merge without writing anything; only_label restricts the run to
+    one source; approved_only (the hourly path) skips sources still under
+    review. Returns a result dict."""
     result = {'status': 'ok', 'sources': [], 'adds': 0, 'updates': 0,
               'wrote': False, 'dry_run': bool(dry_run)}
     if not COLOR_SYNC_SOURCES:
@@ -5463,8 +5496,14 @@ def sync_color_map_from_dropbox(dry_run=False):
         downloads = {}
         desired = {}
         ok_sources = 0
+        considered = 0
         for src in COLOR_SYNC_SOURCES:
             label = src.get('label') or src.get('path')
+            if only_label and label != only_label:
+                continue
+            if approved_only and not src.get('approved'):
+                continue
+            considered += 1
             path = src.get('path')
             if path not in downloads:
                 downloads[path] = _dropbox_download_path(path)
@@ -5483,6 +5522,10 @@ def sync_color_map_from_dropbox(dry_run=False):
             entry.update(stats)
             result['sources'].append(entry)
 
+        if considered == 0:
+            result['status'] = 'no_matching_sources'
+            _color_sync_status.update(last_run=time.time(), last_result=result)
+            return result
         if ok_sources == 0:
             result['status'] = 'all_sources_failed'
             _color_sync_status.update(last_run=time.time(), last_result=result)
@@ -5546,14 +5589,14 @@ def sync_color_map_from_dropbox(dry_run=False):
 @app.route('/admin/refresh/colors', methods=['POST', 'OPTIONS'])
 def admin_refresh_colors():
     """Force a Dropbox → S3 color-map sync and report what changed.
-    ?dry_run=1 (or JSON {"dry_run": true}) reports the merge without writing."""
+    ?dry_run=1 (or JSON {"dry_run": true}) reports the merge without writing;
+    ?source=<label> (or JSON {"source": ...}) restricts the run to one source."""
     if request.method == 'OPTIONS':
         return '', 204
-    dry = request.args.get('dry_run') in ('1', 'true', 'yes')
-    if not dry:
-        body = request.get_json(silent=True) or {}
-        dry = bool(body.get('dry_run'))
-    return jsonify(sync_color_map_from_dropbox(dry_run=dry))
+    body = request.get_json(silent=True) or {}
+    dry = request.args.get('dry_run') in ('1', 'true', 'yes') or bool(body.get('dry_run'))
+    only = request.args.get('source') or body.get('source') or None
+    return jsonify(sync_color_map_from_dropbox(dry_run=dry, only_label=only))
 
 
 @app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
@@ -5905,7 +5948,7 @@ def hourly_resync():
         # (gated off until the mapped sources are approved for automation)
         try:
             if COLOR_SYNC_AUTORUN:
-                sync_color_map_from_dropbox()
+                sync_color_map_from_dropbox(approved_only=True)
         except Exception as e:
             print(f"  ⚠ Color map hourly sync failed: {e}")
 
