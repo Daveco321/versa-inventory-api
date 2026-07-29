@@ -5305,6 +5305,60 @@ COLOR_SYNC_SOURCES = [
         'header_row': 2,
         'approved': False,            # pending David's review of the dry run
     },
+    {
+        'label': 'Eddie Bauer',
+        'path': '/Versa Share Files/New Style Numbers/Eddie Bauer New Style #.xlsx',
+        'sheet': 'MASTER',
+        'key_col': 'STYLE #',         # this file's header differs from the others
+        'color_col': 'DESCRIPTION',   # actual header has a trailing space (stripped)
+        'header_row': 2,
+        # CAUTION for the final review: unlike Ben/Chaps/DKNY, this file's 32
+        # overwrites are ENTIRELY DIFFERENT colors vs the master (not respelled
+        # text) — one side is misnumbered/stale. David decides which wins.
+        'approved': False,
+    },
+    # Geoffrey Beene reuses the SAME GB_NNN numbers per category — each tab
+    # gets its own key namespace (see _apply_key_namespace). The bare GB_NNN
+    # rows in the master are the dress-shirt set.
+    {
+        'label': 'Geoffrey Beene — Dress Shirts',
+        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
+        'sheet': 'DRESS SHIRTS',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,
+    },
+    {
+        'label': 'Geoffrey Beene — Sportswear',
+        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
+        'sheet': 'SPORTSWEAR',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'sportswear',   # GB_036 → GB_SW_036
+        'approved': False,
+    },
+    {
+        'label': 'Geoffrey Beene — Blazers',
+        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
+        'sheet': 'BLAZERS',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
+        'approved': False,
+    },
+    {
+        'label': 'Geoffrey Beene — Pants',
+        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
+        'sheet': 'PANTS',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'pants',        # tab already uses GB_P01 form
+        'approved': False,
+    },
 ]
 
 # Hourly automation gate. When True, the hourly loop merges APPROVED sources
@@ -5367,6 +5421,33 @@ def _color_sync_normalize_key(raw, prefix):
     return k
 
 
+def _apply_key_namespace(key, namespace):
+    """Rewrite an XX_NNN key into a category namespace, mirroring how the
+    frontend categorizes SKUs. Brands like Geoffrey Beene reuse the same
+    style numbers per category (dress-shirt GB_036 ≠ sportswear GB_036 ≠
+    blazer GB_036), so each tab's keys must land in a distinct namespace:
+      sportswear: GB_036  → GB_SW_036   (frontend: sportswear fabric/collar)
+      blazer:     GB_001  → GB_B01      (frontend: B## serial, B01–B99)
+      pants:      GB_P01  passes through; GB_001 → GB_P01 (P## serial, US/GB)
+    Returns '' when the key can't be namespaced (reported as malformed)."""
+    if not namespace:
+        return key
+    m = re.match(r'^([A-Z0-9]{2})_(\d{3})$', key)
+    if namespace == 'sportswear':
+        if m:
+            return f"{m.group(1)}_SW_{m.group(2)}"
+        return key if re.match(r'^[A-Z0-9]{2}_SW_\d{3}$', key) else ''
+    if namespace == 'blazer':
+        if m and int(m.group(2)) <= 99:
+            return f"{m.group(1)}_B{int(m.group(2)):02d}"
+        return key if re.match(r'^[A-Z0-9]{2}_B\d\d$', key) else ''
+    if namespace == 'pants':
+        if m and int(m.group(2)) <= 99:
+            return f"{m.group(1)}_P{int(m.group(2)):02d}"
+        return key if re.match(r'^[A-Z0-9]{2}_P\d\d$', key) else ''
+    return ''
+
+
 def _parse_color_source(src, data):
     """Parse one source config against its workbook bytes.
     Returns (rows_dict key→color, error_string_or_None)."""
@@ -5404,7 +5485,20 @@ def _parse_color_source(src, data):
                         f"color_col={src.get('color_col')!r}; headers: {headers[:12]})")
 
         prefix = str(src.get('key_prefix') or '')
-        skip = {str(k).strip().upper() for k in (src.get('skip_keys') or [])}
+        # skip_keys are written as they appear IN THE FILE — run each through
+        # the same normalize+namespace pipeline as data keys so they still
+        # match on namespaced sources (a raw 'GB_042' entry must catch the
+        # post-transform 'GB_SW_042').
+        skip = set()
+        for sk in (src.get('skip_keys') or []):
+            sk_raw = str(sk).strip().upper()
+            skip.add(sk_raw)
+            sk_norm = _color_sync_normalize_key(sk_raw, prefix)
+            if sk_norm:
+                skip.add(sk_norm)
+                sk_ns = _apply_key_namespace(sk_norm, src.get('key_namespace'))
+                if sk_ns:
+                    skip.add(sk_ns)
         rows = {}
         dup_keys = set()
         blank_color = 0
@@ -5415,6 +5509,14 @@ def _parse_color_source(src, data):
             key_raw = row[key_col] if key_col < len(row) else None
             color_raw = row[color_col] if color_col < len(row) else None
             key = _color_sync_normalize_key(key_raw, prefix)
+            if key:
+                if src.get('key_namespace'):
+                    key = _apply_key_namespace(key, src.get('key_namespace'))
+                elif re.match(r'^[A-Z0-9]{2}_(SW_\d{3}|[BP]\d\d)$', key):
+                    # A namespaced-form key on a PLAIN tab is a stray row from a
+                    # category tab — writing it would poison the frontend's
+                    # first-priority lookup slot. Reject and report instead.
+                    key = ''
             # Collapse ALL internal whitespace (double spaces, Excel in-cell
             # line breaks) — otherwise cosmetic cell formatting shows up as a
             # phantom overwrite of an identical color.
@@ -5525,10 +5627,19 @@ def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=Fa
             if err:
                 result['sources'].append({'label': label, 'status': f'parse_error: {err}'})
                 continue
-            desired.update(rows)
-            ok_sources += 1
             entry = {'label': label, 'status': 'ok', 'rows': len(rows)}
             entry.update(stats)
+            # Cross-source collisions (two sources claiming the same key with
+            # different colors) are almost always a stray row — surface them
+            # instead of silently letting the later source win.
+            clashes = [k for k in rows if k in desired and desired[k] != rows[k]]
+            if clashes:
+                entry['cross_source_conflicts'] = [
+                    {'key': k, 'discarded': desired[k], 'kept': rows[k]}
+                    for k in sorted(clashes)[:10]
+                ]
+            desired.update(rows)
+            ok_sources += 1
             result['sources'].append(entry)
 
         if considered == 0:
@@ -5564,6 +5675,12 @@ def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=Fa
             return result
 
         if dry_run:
+            # Dry runs are the review surface — include the FULL change lists
+            # (bounded), not just the 15-row samples.
+            result['all_adds'] = adds[:500]
+            result['all_updates'] = [
+                {'key': k, 'old': old, 'new': new} for k, old, new in updated[:500]
+            ]
             print(f"  [ColorSync] (dry run) {len(adds)} adds, {len(updated)} updates pending")
             _color_sync_status.update(last_run=time.time(), last_result=result)
             return result
@@ -5599,13 +5716,33 @@ def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=Fa
 def admin_refresh_colors():
     """Force a Dropbox → S3 color-map sync and report what changed.
     ?dry_run=1 (or JSON {"dry_run": true}) reports the merge without writing;
-    ?source=<label> (or JSON {"source": ...}) restricts the run to one source."""
+    ?source=<label> (or JSON {"source": ...}) restricts the run to one source.
+
+    WRITE GATE: a real (writing) run only touches APPROVED sources — a bare
+    POST (or a forgotten dry_run flag) can never merge sources still under
+    review. Real-running an unapproved source requires BOTH naming it via
+    ?source= AND passing ?confirm=1."""
     if request.method == 'OPTIONS':
         return '', 204
     body = request.get_json(silent=True) or {}
     dry = request.args.get('dry_run') in ('1', 'true', 'yes') or bool(body.get('dry_run'))
     only = request.args.get('source') or body.get('source') or None
-    return jsonify(sync_color_map_from_dropbox(dry_run=dry, only_label=only))
+    confirm = request.args.get('confirm') in ('1', 'true', 'yes') or bool(body.get('confirm'))
+    approved_only = False
+    if not dry:
+        if only:
+            src = next((s for s in COLOR_SYNC_SOURCES
+                        if (s.get('label') or s.get('path')) == only), None)
+            if src is not None and not src.get('approved') and not confirm:
+                return jsonify({
+                    'status': 'confirm_required',
+                    'message': (f"Source '{only}' is not approved yet. Re-run with "
+                                f"?confirm=1 to write it anyway, or ?dry_run=1 to preview."),
+                }), 409
+        else:
+            approved_only = True
+    return jsonify(sync_color_map_from_dropbox(dry_run=dry, only_label=only,
+                                               approved_only=approved_only))
 
 
 @app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
