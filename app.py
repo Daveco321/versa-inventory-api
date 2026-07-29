@@ -5235,6 +5235,269 @@ def trigger_dropbox_photo_sync():
 # Each /admin/refresh/* endpoint clears the TTL marker for the corresponding data
 # source and triggers an immediate re-pull. Used by the Admin Tools panel.
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DROPBOX → S3 COLOR MAP SYNC
+#
+# The platform reads color descriptions from ONE file:
+# s3://<bucket>/"Inventory Colors Data/style_color_map.xlsx" (frontend
+# loadColorMapFromS3, refetched hourly). The team maintains colors in
+# per-brand Dropbox workbooks — this sync pulls each configured (file, tab)
+# pair and merges the rows into the S3 master so it stays the single
+# centralized source of truth.
+#
+# SAFETY MODEL (same spirit as the swatch extractor):
+#   • ADD + UPDATE only — a key missing from a Dropbox tab is NEVER deleted
+#     from the master (manual/swatch-committed rows survive).
+#   • A source that fails to download/parse is skipped and reported; it can
+#     never wipe or shrink the master.
+#   • The current master is backed up in S3 before every write.
+#   • No write happens when nothing changed.
+#
+# Each source maps ONE tab of ONE Dropbox workbook:
+#   {
+#     'label':      'Nautica — NT tab',      # for logs + refresh report
+#     'path':       '/Versa Share Files/.../Nautica Colors.xlsx',
+#     'sheet':      'NT',                    # tab name; ''/absent = first tab
+#     'key_col':    'Style',                 # header text (case-insensitive)
+#                                            # or 0-based column index
+#     'color_col':  'Color Description',     # same
+#     'key_prefix': 'NT_',                   # bare-digit cells ('201') become
+#                                            # 'NT_201' (frontend XX_NNN keys);
+#                                            # full style #s pass through as-is;
+#                                            # ''/absent = skip bare digits
+#     'header_row': 1,                       # optional, 1-based, default 1
+#   }
+# Populated with David brand by brand — an empty list makes the sync a no-op.
+COLOR_SYNC_SOURCES = []
+
+_color_sync_lock = threading.Lock()
+_color_sync_status = {'last_run': None, 'last_result': None}
+S3_COLOR_MAP_BACKUP_PREFIX = 'Inventory Colors Data/backups/'
+
+
+def _dropbox_download_path(path, timeout=60):
+    """Generic Dropbox file download with one 401 token-refresh retry.
+    Returns bytes or None."""
+    global _dropbox_token_expires
+    token = get_dropbox_token()
+    if not token:
+        return None
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Dropbox-API-Arg': json.dumps({'path': path})
+    }
+    resp = http_requests.post('https://content.dropboxapi.com/2/files/download',
+                              headers=headers, timeout=timeout)
+    if resp.status_code == 401:
+        _dropbox_token_expires = 0
+        token = get_dropbox_token()
+        if not token:
+            return None
+        headers['Authorization'] = f'Bearer {token}'
+        resp = http_requests.post('https://content.dropboxapi.com/2/files/download',
+                                  headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        print(f"  [ColorSync] ⚠ HTTP {resp.status_code} downloading {path}: {resp.text[:150]}")
+        return None
+    return resp.content
+
+
+def _color_sync_normalize_key(raw, prefix):
+    """Map a source cell to a color-map key. Full style numbers pass through
+    uppercased; bare digits become '<PREFIX><zero-padded-3>' to match the
+    frontend's XX_NNN fallback keys. Returns '' for unusable cells."""
+    k = str(raw or '').strip().upper()
+    if not k or len(k) > 40:
+        return ''
+    if k.isdigit():
+        return f"{prefix}{k.zfill(3)}" if prefix else ''
+    return k
+
+
+def _parse_color_source(src, data):
+    """Parse one source config against its workbook bytes.
+    Returns (rows_dict key→color, error_string_or_None)."""
+    try:
+        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
+    except Exception as e:
+        return {}, f"workbook load failed: {e}"
+    try:
+        sheet_name = str(src.get('sheet') or '').strip()
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                return {}, f"tab '{sheet_name}' not found (tabs: {', '.join(wb.sheetnames[:10])})"
+            ws = wb[sheet_name]
+        else:
+            ws = wb[wb.sheetnames[0]]
+
+        header_row = int(src.get('header_row') or 1)
+
+        def resolve_col(spec):
+            if isinstance(spec, int):
+                return spec
+            want = str(spec or '').strip().lower()
+            if not want:
+                return None
+            for idx, cell in enumerate(ws[header_row]):
+                if str(cell.value or '').strip().lower() == want:
+                    return idx
+            return None
+
+        key_col = resolve_col(src.get('key_col'))
+        color_col = resolve_col(src.get('color_col'))
+        if key_col is None or color_col is None:
+            headers = [str(c.value or '').strip() for c in ws[header_row]]
+            return {}, (f"columns not found (key_col={src.get('key_col')!r}, "
+                        f"color_col={src.get('color_col')!r}; headers: {headers[:12]})")
+
+        prefix = str(src.get('key_prefix') or '')
+        rows = {}
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            if len(rows) > 20000:
+                return {}, "more than 20,000 rows — refusing (wrong tab/columns?)"
+            key_raw = row[key_col] if key_col < len(row) else None
+            color_raw = row[color_col] if color_col < len(row) else None
+            key = _color_sync_normalize_key(key_raw, prefix)
+            color = str(color_raw or '').strip()
+            if not key or not color or len(color) > 200:
+                continue
+            rows[key] = color
+        return rows, None
+    finally:
+        wb.close()
+
+
+def _merge_color_rows(ws, desired):
+    """Merge desired {key: color} into the master sheet. Updates existing rows
+    in place (ALL duplicate occurrences of a key — the frontend reader is
+    last-duplicate-wins) and returns (updated_cell_count, adds) where adds is
+    the list of (key, color) pairs not yet present. Returns (None, None) when
+    the master schema is unrecognizable — callers must abort, never write."""
+    headers = [str(c.value or '').strip().lower() for c in ws[1]]
+
+    def find_col(*cands):
+        for cand in cands:
+            if cand.lower() in headers:
+                return headers.index(cand.lower())
+        return None
+
+    key_col = find_col('Key', 'Style_Number', 'Style_Num')
+    color_col = find_col('Color_Description')
+    if key_col is None or color_col is None:
+        return None, None
+
+    existing = {}
+    for r in range(2, ws.max_row + 1):
+        k = str(ws.cell(row=r, column=key_col + 1).value or '').strip().upper()
+        if k:
+            existing.setdefault(k, []).append(r)
+
+    updates = 0
+    adds = []
+    for key, color in desired.items():
+        if key in existing:
+            for r in existing[key]:
+                cur = str(ws.cell(row=r, column=color_col + 1).value or '').strip()
+                if cur != color:
+                    ws.cell(row=r, column=color_col + 1).value = color
+                    updates += 1
+        else:
+            adds.append((key, color))
+    return updates, adds
+
+
+def sync_color_map_from_dropbox():
+    """Pull every configured Dropbox color source and merge into the S3 master
+    color map. Add/update only — never deletes. Returns a result dict."""
+    result = {'status': 'ok', 'sources': [], 'adds': 0, 'updates': 0, 'wrote': False}
+    if not COLOR_SYNC_SOURCES:
+        result['status'] = 'no_sources'
+        _color_sync_status.update(last_run=time.time(), last_result=result)
+        return result
+
+    if not _color_sync_lock.acquire(blocking=False):
+        return {'status': 'busy'}
+    try:
+        # 1. Download each distinct file once, parse each configured tab
+        downloads = {}
+        desired = {}
+        ok_sources = 0
+        for src in COLOR_SYNC_SOURCES:
+            label = src.get('label') or src.get('path')
+            path = src.get('path')
+            if path not in downloads:
+                downloads[path] = _dropbox_download_path(path)
+            data = downloads[path]
+            if not data:
+                result['sources'].append({'label': label, 'status': 'download_failed'})
+                continue
+            rows, err = _parse_color_source(src, data)
+            if err:
+                result['sources'].append({'label': label, 'status': f'parse_error: {err}'})
+                continue
+            desired.update(rows)
+            ok_sources += 1
+            result['sources'].append({'label': label, 'status': 'ok', 'rows': len(rows)})
+
+        if ok_sources == 0:
+            result['status'] = 'all_sources_failed'
+            _color_sync_status.update(last_run=time.time(), last_result=result)
+            return result
+
+        # 2. Load the S3 master and compute the merge (reusing the swatch
+        #    extractor's schema-aware helpers so both writers stay consistent)
+        from swatch_extractor import (_download_color_map, _resolve_color_map_sheet,
+                                      _append_rows, _upload_color_map, S3_COLOR_MAP_KEY)
+        wb, _etag, _size = _download_color_map(get_s3, S3_BUCKET)
+        ws = _resolve_color_map_sheet(wb)
+        updates, adds = _merge_color_rows(ws, desired)
+        if updates is None:
+            result['status'] = 'master_schema_unrecognized'
+            _color_sync_status.update(last_run=time.time(), last_result=result)
+            return result
+
+        result['updates'] = updates
+        result['adds'] = len(adds)
+        if updates == 0 and not adds:
+            print(f"  [ColorSync] ✓ {len(desired)} keys from {ok_sources} source(s) — master already current")
+            _color_sync_status.update(last_run=time.time(), last_result=result)
+            return result
+
+        # 3. Backup the master in S3, then write
+        try:
+            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            get_s3().copy_object(
+                Bucket=S3_BUCKET,
+                CopySource={'Bucket': S3_BUCKET, 'Key': S3_COLOR_MAP_KEY},
+                Key=f"{S3_COLOR_MAP_BACKUP_PREFIX}style_color_map_{ts}.xlsx",
+            )
+        except Exception as e:
+            print(f"  [ColorSync] ⚠ Backup copy failed (continuing): {e}")
+
+        if adds:
+            _append_rows(ws, adds)
+        _upload_color_map(get_s3, S3_BUCKET, wb)
+        result['wrote'] = True
+        print(f"  [ColorSync] ✓ Merged {ok_sources} source(s): {len(adds)} added, {updates} updated cell(s)")
+        _color_sync_status.update(last_run=time.time(), last_result=result)
+        return result
+    except Exception as e:
+        print(f"  [ColorSync] ⚠ Sync failed: {e}")
+        result['status'] = f'error: {e}'
+        _color_sync_status.update(last_run=time.time(), last_result=result)
+        return result
+    finally:
+        _color_sync_lock.release()
+
+
+@app.route('/admin/refresh/colors', methods=['POST', 'OPTIONS'])
+def admin_refresh_colors():
+    """Force a Dropbox → S3 color-map sync and report what changed."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    return jsonify(sync_color_map_from_dropbox())
+
+
 @app.route('/admin/refresh/production', methods=['POST', 'OPTIONS'])
 def admin_refresh_production():
     """Force a fresh pull of the Style Ledger from Dropbox."""
@@ -5579,6 +5842,13 @@ def hourly_resync():
             load_production_from_dropbox()
         except Exception as e:
             print(f"  ⚠ Production hourly refresh failed: {e}")
+
+        # Refresh the color map from Dropbox sources every hour
+        # (no-op until COLOR_SYNC_SOURCES is populated)
+        try:
+            sync_color_map_from_dropbox()
+        except Exception as e:
+            print(f"  ⚠ Color map hourly sync failed: {e}")
 
 
 # ────────────────────────────────────────────────────────────────────────
