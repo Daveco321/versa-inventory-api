@@ -71,6 +71,11 @@ S3_SWATCH_HISTORY_KEY = os.environ.get('S3_SWATCH_HISTORY_KEY',
 # index.html). New swatch images get written as <SKU>.jpg in this folder.
 S3_STYLE_OVERRIDES_PREFIX = os.environ.get('S3_STYLE_OVERRIDES_PREFIX',
                                        'ALL INVENTORY Photos/STYLE OVERRIDES').rstrip('/')
+# Bottom-priority fallback swatches extracted from the brand style-number
+# files, keyed by XX_NNN image code (e.g. RG_001.jpg). The frontend probes
+# this prefix ONLY after every other image source has failed.
+S3_SWATCH_FALLBACK_PREFIX = os.environ.get('S3_SWATCH_FALLBACK_PREFIX',
+                                       'ALL INVENTORY Photos/SWATCH FALLBACK').rstrip('/')
 S3_IMAGE_HISTORY_KEY      = os.environ.get('S3_IMAGE_HISTORY_KEY',
                                        'inventory/swatch_image_upload_history.json')
 
@@ -333,15 +338,16 @@ def _bytes_to_data_url(jpeg_bytes):
     return f"data:image/jpeg;base64,{b64}"
 
 
-def _check_image_exists(s3, s3_bucket, sku):
-    """Check whether <SKU>.jpg or <SKU>.png already exists in STYLE OVERRIDES.
+def _check_image_exists(s3, s3_bucket, sku, prefix=None):
+    """Check whether <SKU>.jpg or <SKU>.png already exists under the prefix
+    (STYLE OVERRIDES by default).
 
     Returns the existing extension (e.g. 'jpg') if found, else None.
     Uses head_object — fast, no body download.
     """
     sku = sku.strip().upper()
     for ext in ('jpg', 'JPG', 'jpeg', 'JPEG', 'png', 'PNG'):
-        key = f"{S3_STYLE_OVERRIDES_PREFIX}/{sku}.{ext}"
+        key = f"{prefix or S3_STYLE_OVERRIDES_PREFIX}/{sku}.{ext}"
         try:
             s3.head_object(Bucket=s3_bucket, Key=key)
             return ext
@@ -350,14 +356,15 @@ def _check_image_exists(s3, s3_bucket, sku):
     return None
 
 
-def _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes):
-    """Upload a single swatch JPEG to S3 STYLE OVERRIDES as <SKU>.jpg.
+def _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes, prefix=None):
+    """Upload a single swatch JPEG as <SKU>.jpg under the prefix
+    (STYLE OVERRIDES by default).
 
     Always writes .jpg (lowercase) per existing convention. Returns the
     full S3 key written.
     """
     sku = sku.strip().upper()
-    key = f"{S3_STYLE_OVERRIDES_PREFIX}/{sku}.jpg"
+    key = f"{prefix or S3_STYLE_OVERRIDES_PREFIX}/{sku}.jpg"
     s3.put_object(
         Bucket=s3_bucket,
         Key=key,
@@ -668,6 +675,13 @@ def register_swatch_routes(app, get_s3, s3_bucket):
         if not images:
             return jsonify({'error': 'No images provided'}), 400
 
+        # target 'swatch_fallback' routes uploads to the bottom-priority
+        # SWATCH FALLBACK prefix (XX_NNN image-code keys) instead of the
+        # per-SKU STYLE OVERRIDES prefix.
+        target_prefix = (S3_SWATCH_FALLBACK_PREFIX
+                         if body.get('target') == 'swatch_fallback'
+                         else None)
+
         s3 = get_s3()
         uploaded, skipped, errors = [], [], []
 
@@ -691,7 +705,7 @@ def register_swatch_routes(app, get_s3, s3_bucket):
 
             # Duplicate check: skip unless explicitly overwriting
             try:
-                existing = _check_image_exists(s3, s3_bucket, sku)
+                existing = _check_image_exists(s3, s3_bucket, sku, prefix=target_prefix)
             except Exception as e:
                 errors.append({'sku': sku, 'error': f'Duplicate check failed: {e}'})
                 continue
@@ -701,7 +715,7 @@ def register_swatch_routes(app, get_s3, s3_bucket):
                 continue
 
             try:
-                key = _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes)
+                key = _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes, prefix=target_prefix)
                 uploaded.append({
                     'sku':       sku,
                     'key':       key,
