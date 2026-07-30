@@ -5350,6 +5350,15 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Robert Graham',
+        'path': '/Versa Share Files/New Style Numbers/ROBERT GRAHAM NEW STYLE NUMBERS.xlsx',
+        'sheet': 'MASTER',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,            # dry run showed zero diffs — master already in sync
+    },
+    {
         'label': 'Reebok',
         'path': '/Versa Share Files/New Style Numbers/REEBOK NEW STYLES .xlsx',   # NOTE: space before .xlsx is real
         'sheet': 'MASTER',
