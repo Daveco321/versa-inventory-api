@@ -81,7 +81,11 @@ CLOUDFRONT_URL = os.environ.get('CLOUDFRONT_URL', 'https://duv8yzuad6dsp.cloudfr
 # Derive CloudFront equivalents of S3 prefixes
 CLOUDFRONT_OVERRIDES_URL = f"{CLOUDFRONT_URL}/ALL+INVENTORY+Photos/STYLE+OVERRIDES"
 CLOUDFRONT_DROPBOX_SYNC_URL = f"{CLOUDFRONT_URL}/ALL+INVENTORY+Photos/DROPBOX_SYNC"
-CLOUDFRONT_PHOTOS_URL = f"{CLOUDFRONT_URL}/{S3_PHOTOS_PREFIX}" 
+CLOUDFRONT_PHOTOS_URL = f"{CLOUDFRONT_URL}/{S3_PHOTOS_PREFIX}"
+# Bottom-priority fallback swatches (extracted from the brand style-number
+# files, keyed by XX_NNN image code). Tried ONLY after every other image
+# source fails — mirrors the frontend's swatch-fallback rung.
+CLOUDFRONT_SWATCH_FALLBACK_URL = f"{CLOUDFRONT_URL}/ALL+INVENTORY+Photos/SWATCH+FALLBACK" 
 
 # Dropbox direct download URL for hourly inventory file
 # Dropbox shared link — will be converted to direct download at runtime
@@ -1955,6 +1959,13 @@ def get_image_cached(item, s3_base_url):
         image_code_cf = extract_image_code(sku, brand_abbr_cf)
         brand_url = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name_cf}/{image_code_cf}.jpg"
         result = _process_image_from_url(brand_url)
+
+    # 5. VERY LAST resort: fallback swatch extracted from the brand
+    #    style-number files (bottom priority — mirrors the frontend rung so
+    #    Excel export thumbnails match what the catalog shows)
+    if not result:
+        swatch_url = f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{image_code_cf}.jpg"
+        result = _process_image_from_url(swatch_url)
 
     # Cache result (even None to avoid re-fetching failures)
     with _img_lock:
@@ -5111,6 +5122,16 @@ def _fetch_raw_image(base_style, brand_abbr):
                     return resp.content, ct
         except Exception:
             continue
+
+    # 5. VERY LAST resort: fallback swatch from the brand style-number files
+    #    (bottom priority — mirrors the frontend's swatch-fallback rung)
+    try:
+        url = f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{image_code}.jpg"
+        resp = http_requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', '').lower():
+            return resp.content, resp.headers.get('Content-Type')
+    except Exception:
+        pass
 
     return None, None
 
