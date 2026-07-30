@@ -5350,6 +5350,21 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Reebok',
+        'path': '/Versa Share Files/New Style Numbers/REEBOK NEW STYLES .xlsx',   # NOTE: space before .xlsx is real
+        'sheet': 'MASTER',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        # ⚠ CONFLICT — DO NOT APPROVE WITHOUT DAVID RECONCILING THE FILE:
+        # unlike Eddie Bauer, here the MASTER is verifiably live-correct — five
+        # actively-stocked styles (BURBAW001SLS-005SLS) display the master's
+        # print descriptions, while this file claims those serials are solids
+        # (likely a renumbered new program). Running the 21 overwrites would
+        # put wrong colors on live catalog items.
+        'approved': False,
+    },
+    {
         'label': 'Nicole Miller',
         'path': '/Versa Share Files/New Style Numbers/NICOLE MILLER STYLE NUMBERS (version 1).xlsb.xlsx',
         'sheet': 'Sheet1',            # Sheet2 is a one-row scratch tab — ignored
