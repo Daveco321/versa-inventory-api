@@ -5349,6 +5349,44 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': False,
     },
+    # Shaq: three tabs with naturally distinct key namespaces (SH_NNN shirts /
+    # TSH_NN ties / JT_NNN shirt-tie sets) — no collisions. Shirts + ties split
+    # their description across TWO cells (col A + headerless col B) joined with
+    # a space; the master's 147 truncated "WHT GRND W/" Shaq rows came from a
+    # past sync that only read col A. Set SKUs (JTSHST002...) number by the
+    # CONTAINED SHIRT's serial, not the JT_ tab (verified mismatch) — so JT_
+    # rows are reference data, deliberately not auto-wired.
+    {
+        'label': 'Shaq — Shirts',
+        'path': '/Versa Share Files/New Style Numbers/SHAQ NEW STYLE NUMBERS.xlsx',
+        'sheet': 'SHIRTS ',           # trailing space in the tab name is real
+        'key_col': 'STYLE #',         # column C
+        'color_col': 'DESCRIPTION',   # column A ("WHT GRND W/")
+        'color_col2': 1,              # headerless column B ("BLUE MICRO CHECK")
+        'color_join': ' ',            # one description split across two cells
+        'header_row': 2,
+        'approved': False,
+    },
+    {
+        'label': 'Shaq — Ties',
+        'path': '/Versa Share Files/New Style Numbers/SHAQ NEW STYLE NUMBERS.xlsx',
+        'sheet': 'TIES',
+        'key_col': 'STYLE #',         # column C, native TSH_NN keys
+        'color_col': 'DESCRIPTION',
+        'color_col2': 1,
+        'color_join': ' ',
+        'header_row': 2,
+        'approved': False,
+    },
+    {
+        'label': 'Shaq — Shirt-Tie Sets',
+        'path': '/Versa Share Files/New Style Numbers/SHAQ NEW STYLE NUMBERS.xlsx',
+        'sheet': 'SHIRT-TIE SETS',
+        'key_col': 'STYLE #',         # column A, native JT_NNN keys
+        'color_col': 'DESCRIPTION',   # column B, full text incl. the tie
+        'header_row': 1,              # no banner on this tab
+        'approved': False,
+    },
     {
         'label': 'Robert Graham',
         'path': '/Versa Share Files/New Style Numbers/ROBERT GRAHAM NEW STYLE NUMBERS.xlsx',
@@ -5566,9 +5604,12 @@ def _parse_color_source(src, data):
     try:
         sheet_name = str(src.get('sheet') or '').strip()
         if sheet_name:
-            if sheet_name not in wb.sheetnames:
+            # Tolerate leading/trailing whitespace in the workbook's tab names
+            # (the Shaq file's shirts tab is literally named 'SHIRTS ').
+            actual = next((n for n in wb.sheetnames if n.strip() == sheet_name), None)
+            if actual is None:
                 return {}, f"tab '{sheet_name}' not found (tabs: {', '.join(wb.sheetnames[:10])})"
-            ws = wb[sheet_name]
+            ws = wb[actual]
         else:
             ws = wb[wb.sheetnames[0]]
 
