@@ -5349,6 +5349,15 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': False,
     },
+    {
+        'label': 'Neiman Marcus',
+        'path': '/Versa Share Files/New Style Numbers/NEIMAN MARCUS - NEW STYLES.xlsx',
+        'sheet': 'Sheet1',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,            # pending David's review of the dry run
+    },
     # Nautica: MASTER - NA = classic NA_NNN namespace; MASTER - NT = the NT
     # overflow namespace (serials past 999, NT 201 ≠ NA 201); BLAZER tab is
     # natively keyed NA_B## (same convention as Geoffrey Beene). OLD MASTER /
