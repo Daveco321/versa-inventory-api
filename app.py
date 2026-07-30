@@ -5350,6 +5350,18 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Nicole Miller',
+        'path': '/Versa Share Files/New Style Numbers/NICOLE MILLER STYLE NUMBERS (version 1).xlsb.xlsx',
+        'sheet': 'Sheet1',            # Sheet2 is a one-row scratch tab — ignored
+        'key_col': 'STYLE #',         # column C in this file
+        'color_col': 'GROUND COLOR',  # base shirt color
+        'color_col2': 'PRINT',        # contrast cuff/collar design
+        'color_join': '||',           # NM dual-color convention: the frontend
+                                      # splits GROUND||PRINT into ground + print
+        'header_row': 1,              # headers on row 1, no banner
+        'approved': False,            # pending David's review of the dry run
+    },
+    {
         'label': 'Neiman Marcus',
         'path': '/Versa Share Files/New Style Numbers/NEIMAN MARCUS - NEW STYLES.xlsx',
         'sheet': 'Sheet1',
@@ -5477,12 +5489,13 @@ def _color_sync_normalize_key(raw, prefix):
     collapsed ('BE _260' → 'BE_260') and digits zero-padded to 3, because the
     frontend only ever looks up the padded form. Returns '' for unusable cells."""
     k = str(raw or '').strip().upper()
-    if not k or len(k) > 40:
-        return ''
+    if not k or len(k) > 40 or k.endswith('_'):
+        return ''    # trailing-underscore keys ('NM_') have no serial — garbage
     if k.isdigit():
         return f"{prefix}{k.zfill(3)}" if prefix else ''
-    m = re.match(r'^([A-Z0-9]{2})\s*_\s*(\d{1,3})$', k)
+    m = re.match(r'^([A-Z0-9]{2})\s*[_\-]\s*(\d{1,3})$', k)
     if m:
+        # Repairs spacing AND hyphen typos: 'BE _260' / 'NM-372' → BE_260 / NM_372
         return f"{m.group(1)}_{int(m.group(2)):03d}"
     if re.search(r'\s', k):
         # Whitespace remaining after the XX_NNN repair means the cell is not a
@@ -5550,10 +5563,16 @@ def _parse_color_source(src, data):
 
         key_col = resolve_col(src.get('key_col'))
         color_col = resolve_col(src.get('color_col'))
-        if key_col is None or color_col is None:
+        # Optional second color component (Nicole Miller: GROUND + PRINT columns
+        # joined with '||' — the platform's dual-color convention, split by the
+        # frontend into ground/print display parts).
+        color_col2 = resolve_col(src.get('color_col2')) if src.get('color_col2') is not None else None
+        if key_col is None or color_col is None or (src.get('color_col2') is not None and color_col2 is None):
             headers = [str(c.value or '').strip() for c in ws[header_row]]
             return {}, (f"columns not found (key_col={src.get('key_col')!r}, "
-                        f"color_col={src.get('color_col')!r}; headers: {headers[:12]})")
+                        f"color_col={src.get('color_col')!r}, "
+                        f"color_col2={src.get('color_col2')!r}; headers: {headers[:12]})")
+        color_join = str(src.get('color_join') or '||')
 
         prefix = str(src.get('key_prefix') or '')
         # Optional prefix aliases: some files mix key spellings for one brand
@@ -5605,6 +5624,13 @@ def _parse_color_source(src, data):
             # line breaks) — otherwise cosmetic cell formatting shows up as a
             # phantom overwrite of an identical color.
             color = ' '.join(str(color_raw or '').split())
+            if color_col2 is not None:
+                c2_raw = row[color_col2] if color_col2 < len(row) else None
+                c2 = ' '.join(str(c2_raw or '').split())
+                if color and c2:
+                    color = f"{color}{color_join}{c2}"
+                elif c2 and not color:
+                    color = ''   # print with no ground — unusable, counts as blank
             if not key:
                 raw_txt = ' '.join(str(key_raw or '').split())
                 if raw_txt and color:
