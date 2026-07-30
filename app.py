@@ -5350,6 +5350,15 @@ COLOR_SYNC_SOURCES = [
         'approved': False,
     },
     {
+        'label': 'Vince Camuto',
+        'path': '/Versa Share Files/New Style Numbers/VINCE CAMUTO NEW STYLE NUMBERS.xlsx',
+        'sheet': 'MASTER',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'approved': False,            # pending David's review of the dry run
+    },
+    {
         'label': 'U.S. Polo',
         'path': '/Versa Share Files/New Style Numbers/USPA NEW STYLES 4.18.2023.xlsx',
         'sheet': 'MASTER LIST.',      # period in the tab name is real; OLD MASTER tab ignored
