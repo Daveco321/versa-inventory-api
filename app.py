@@ -5551,14 +5551,38 @@ COLOR_SYNC_SOURCES = [
         'header_row': 2,
         'approved': False,            # pending David's review of the dry run
     },
+    # NOTE: the GB workbook's own PANTS tab was dropped as a source — the
+    # dedicated ALL PANTS file below is the pants authority per David, and the
+    # two contradict on GB_P03/GB_P04 (swapped; ALL PANTS carries Pantone
+    # specs). David to fix/confirm the GB workbook's PANTS tab.
     {
-        'label': 'Geoffrey Beene — Pants',
-        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
-        'sheet': 'PANTS',
-        'key_col': 'STYLE #',
+        'label': 'All Pants — Nicole Miller',
+        'path': '/Versa Share Files/New Style Numbers/ALL PANTS - NEW STYLES.xlsx',
+        'sheet': 'NICOLE MILLER - PANTS',   # real tab name has a trailing space (handled)
+        'key_col': 'Style Number',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'key_namespace': 'pants',        # tab already uses GB_P01 form
+        'key_namespace': 'pants',           # native NM_P## keys
+        'approved': False,
+    },
+    {
+        'label': 'All Pants — U.S. Polo',
+        'path': '/Versa Share Files/New Style Numbers/ALL PANTS - NEW STYLES.xlsx',
+        'sheet': 'USPA - PANTS',
+        'key_col': 'Style Number',
+        'color_col': 'Label Description',   # full 'PANTS / HORSE' text (col C is pants-only)
+        'header_row': 2,
+        'key_namespace': 'pants',           # native US_P## keys
+        'approved': False,
+    },
+    {
+        'label': 'All Pants — Geoffrey Beene',
+        'path': '/Versa Share Files/New Style Numbers/ALL PANTS - NEW STYLES.xlsx',
+        'sheet': 'GEOFFREY BEENE - PANTS',
+        'key_col': 'Style Number',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'pants',           # native GB_P## keys, incl. Pantone specs
         'approved': False,
     },
 ]
