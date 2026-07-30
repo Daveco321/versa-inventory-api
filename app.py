@@ -5349,6 +5349,16 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': False,
     },
+    {
+        'label': 'U.S. Polo',
+        'path': '/Versa Share Files/New Style Numbers/USPA NEW STYLES 4.18.2023.xlsx',
+        'sheet': 'MASTER LIST.',      # period in the tab name is real; OLD MASTER tab ignored
+        'key_col': 'Style Number',    # column C
+        'color_col': 3,               # column D: authored full 'SHIRT / HORSE LOGO' text
+                                      # (cols E/F hold the split components — D is richer)
+        'header_row': 2,              # row 1 is blank in this file
+        'approved': False,            # pending David's review of the dry run
+    },
     # Shaq: three tabs with naturally distinct key namespaces (SH_NNN shirts /
     # TSH_NN ties / JT_NNN shirt-tie sets) — no collisions. Shirts + ties split
     # their description across TWO cells (col A + headerless col B) joined with
@@ -5555,9 +5565,9 @@ def _color_sync_normalize_key(raw, prefix):
         return ''    # trailing-underscore keys ('NM_') have no serial — garbage
     if k.isdigit():
         return f"{prefix}{k.zfill(3)}" if prefix else ''
-    m = re.match(r'^([A-Z0-9]{2})\s*[_\-]\s*(\d{1,3})$', k)
+    m = re.match(r'^([A-Z0-9]{2})[\s_\-]+(\d{1,3})$', k)
     if m:
-        # Repairs spacing AND hyphen typos: 'BE _260' / 'NM-372' → BE_260 / NM_372
+        # Repairs separator typos: 'BE _260' / 'NM-372' / 'US 274' → XX_NNN form
         return f"{m.group(1)}_{int(m.group(2)):03d}"
     if re.search(r'\s', k):
         # Whitespace remaining after the XX_NNN repair means the cell is not a
