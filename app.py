@@ -5349,6 +5349,44 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': False,
     },
+    # Von Dutch: SHIRTS and SHACKET tabs REUSE the same VD_NNN numbers for
+    # different products, and the master's bare VD rows are currently a MIX
+    # (77 shirt + 32 shacket values). Shackets (CO/SL/SF young-men fabrics)
+    # already resolve VD_SW_NNN-first, so: SHACKET → sportswear namespace,
+    # SHIRTS → takes over the bare namespace (fixes live shirt items that
+    # today display shacket colors). PANTS tab is natively VD_P## — literal
+    # P-serial SKUs (TMVDBAP07SCP) resolve it via the frontend's extended
+    # pants color-fallback; plain-serial BA pants keep their base-SKU rows.
+    {
+        'label': 'Von Dutch — Shirts',
+        'path': '/Versa Share Files/New Style Numbers/VON DUTCH STYLES NUMBERS.xlsx',
+        'sheet': 'SHIRTS',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'skip_keys': ['SHIR'],        # stray junk key in the tab
+        'approved': False,
+    },
+    {
+        'label': 'Von Dutch — Shackets',
+        'path': '/Versa Share Files/New Style Numbers/VON DUTCH STYLES NUMBERS.xlsx',
+        'sheet': 'SHACKET',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'sportswear',   # VD_NNN → VD_SW_NNN
+        'approved': False,
+    },
+    {
+        'label': 'Von Dutch — Pants',
+        'path': '/Versa Share Files/New Style Numbers/VON DUTCH STYLES NUMBERS.xlsx',
+        'sheet': 'PINSTRIPE PANTS',
+        'key_col': 'STYLE NUMBER',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'pants',        # tab already uses VD_P## natively
+        'approved': False,
+    },
     {
         'label': 'Vince Camuto',
         'path': '/Versa Share Files/New Style Numbers/VINCE CAMUTO NEW STYLE NUMBERS.xlsx',
