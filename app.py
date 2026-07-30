@@ -5453,21 +5453,9 @@ COLOR_SYNC_SOURCES = [
         'header_row': 2,
         'approved': False,            # dry run showed zero diffs — master already in sync
     },
-    {
-        'label': 'Reebok',
-        'path': '/Versa Share Files/New Style Numbers/REEBOK NEW STYLES .xlsx',   # NOTE: space before .xlsx is real
-        'sheet': 'MASTER',
-        'key_col': 'STYLE #',
-        'color_col': 'DESCRIPTION',
-        'header_row': 2,
-        # ⚠ CONFLICT — DO NOT APPROVE WITHOUT DAVID RECONCILING THE FILE:
-        # unlike Eddie Bauer, here the MASTER is verifiably live-correct — five
-        # actively-stocked styles (BURBAW001SLS-005SLS) display the master's
-        # print descriptions, while this file claims those serials are solids
-        # (likely a renumbered new program). Running the 21 overwrites would
-        # put wrong colors on live catalog items.
-        'approved': False,
-    },
+    # Reebok REMOVED entirely per David (Jul 30 2026): the file's 21 overwrites
+    # contradicted live-correct master data (actively-stocked BURBAW001-005
+    # styles display the master's print colors; the file claimed solids).
     {
         'label': 'Nicole Miller',
         'path': '/Versa Share Files/New Style Numbers/NICOLE MILLER STYLE NUMBERS (version 1).xlsb.xlsx',
@@ -5768,11 +5756,15 @@ def _parse_color_source(src, data):
                     key = ''
             # Collapse ALL internal whitespace (double spaces, Excel in-cell
             # line breaks) — otherwise cosmetic cell formatting shows up as a
-            # phantom overwrite of an identical color.
-            color = ' '.join(str(color_raw or '').split())
+            # phantom overwrite of an identical color. Excel error tokens from
+            # broken formulas (#VALUE! in Chaps CH_022) are NOT colors — treat
+            # as blank so the master keeps whatever it has.
+            def _clean_color(v):
+                s = ' '.join(str(v or '').split())
+                return '' if re.fullmatch(r'#(VALUE!|REF!|N/A|NAME\??|DIV/0!?|NULL!?)', s.upper()) else s
+            color = _clean_color(color_raw)
             if color_col2 is not None:
-                c2_raw = row[color_col2] if color_col2 < len(row) else None
-                c2 = ' '.join(str(c2_raw or '').split())
+                c2 = _clean_color(row[color_col2] if color_col2 < len(row) else None)
                 if color and c2:
                     color = f"{color}{color_join}{c2}"
                 elif c2 and not color:
