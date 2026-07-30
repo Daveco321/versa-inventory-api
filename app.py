@@ -5294,7 +5294,7 @@ COLOR_SYNC_SOURCES = [
         # ("NEW WALMART CHAPS STYLES", "COSTCO USA SWATCHES"). Remove a key from
         # this list once the file carries a real color for it.
         'skip_keys': ['CH_258', 'CH_279', 'CH_328', 'CH_361'],
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'DKNY',
@@ -5303,7 +5303,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'Eddie Bauer',
@@ -5315,7 +5315,7 @@ COLOR_SYNC_SOURCES = [
         # CAUTION for the final review: unlike Ben/Chaps/DKNY, this file's 32
         # overwrites are ENTIRELY DIFFERENT colors vs the master (not respelled
         # text) — one side is misnumbered/stale. David decides which wins.
-        'approved': False,
+        'approved': True,
     },
     # Geoffrey Beene reuses the SAME GB_NNN numbers per category — each tab
     # gets its own key namespace (see _apply_key_namespace). The bare GB_NNN
@@ -5327,7 +5327,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE #',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Geoffrey Beene — Sportswear',
@@ -5337,7 +5337,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'sportswear',   # GB_036 → GB_SW_036
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Geoffrey Beene — Blazers',
@@ -5347,7 +5347,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
-        'approved': False,
+        'approved': True,
     },
     # Von Dutch: SHIRTS and SHACKET tabs REUSE the same VD_NNN numbers for
     # different products, and the master's bare VD rows are currently a MIX
@@ -5365,7 +5365,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'skip_keys': ['SHIR'],        # stray junk key in the tab
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Von Dutch — Shackets',
@@ -5375,7 +5375,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'sportswear',   # VD_NNN → VD_SW_NNN
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Von Dutch — Pants',
@@ -5385,7 +5385,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'pants',        # tab already uses VD_P## natively
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Vince Camuto',
@@ -5394,7 +5394,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'U.S. Polo',
@@ -5404,7 +5404,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 3,               # column D: authored full 'SHIRT / HORSE LOGO' text
                                       # (cols E/F hold the split components — D is richer)
         'header_row': 2,              # row 1 is blank in this file
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     # Shaq: three tabs with naturally distinct key namespaces (SH_NNN shirts /
     # TSH_NN ties / JT_NNN shirt-tie sets) — no collisions. Shirts + ties split
@@ -5422,7 +5422,7 @@ COLOR_SYNC_SOURCES = [
         'color_col2': 1,              # headerless column B ("BLUE MICRO CHECK")
         'color_join': ' ',            # one description split across two cells
         'header_row': 2,
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Shaq — Ties',
@@ -5433,7 +5433,7 @@ COLOR_SYNC_SOURCES = [
         'color_col2': 1,
         'color_join': ' ',
         'header_row': 2,
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Shaq — Shirt-Tie Sets',
@@ -5442,7 +5442,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE #',         # column A, native JT_NNN keys
         'color_col': 'DESCRIPTION',   # column B, full text incl. the tie
         'header_row': 1,              # no banner on this tab
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Robert Graham',
@@ -5451,7 +5451,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE #',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # dry run showed zero diffs — master already in sync
+        'approved': True,            # dry run showed zero diffs — master already in sync
     },
     # Reebok REMOVED entirely per David (Jul 30 2026): the file's 21 overwrites
     # contradicted live-correct master data (actively-stocked BURBAW001-005
@@ -5466,7 +5466,7 @@ COLOR_SYNC_SOURCES = [
         'color_join': '||',           # NM dual-color convention: the frontend
                                       # splits GROUND||PRINT into ground + print
         'header_row': 1,              # headers on row 1, no banner
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'Neiman Marcus',
@@ -5475,7 +5475,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     # Nautica: MASTER - NA = classic NA_NNN namespace; MASTER - NT = the NT
     # overflow namespace (serials past 999, NT 201 ≠ NA 201); BLAZER tab is
@@ -5489,7 +5489,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'Label Description',
         'header_row': 1,              # this file has no banner row
         'key_prefix_aliases': {'NAU_': 'NA_'},   # a few rows typed the long code
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Nautica — NT',
@@ -5498,7 +5498,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'Style Number',
         'color_col': 'Label Description',
         'header_row': 1,
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Nautica — Blazers',
@@ -5508,7 +5508,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'Label Description',
         'header_row': 1,
         'key_namespace': 'blazer',    # tab already uses NA_B## natively
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'Lucky Brand',
@@ -5517,7 +5517,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'Karl Lagerfeld Paris',
@@ -5526,7 +5526,7 @@ COLOR_SYNC_SOURCES = [
         'key_col': 'STYLE NUMBER',
         'color_col': 'DESCRIPTION',
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     {
         'label': 'Jones New York',
@@ -5537,7 +5537,7 @@ COLOR_SYNC_SOURCES = [
         'key_prefix': 'JN_',          # a few rows list the bare serial ('129')
         'key_prefix_aliases': {'JNY_': 'JN_'},   # some rows typed the long brand code
         'header_row': 2,
-        'approved': False,            # pending David's review of the dry run
+        'approved': True,            # pending David's review of the dry run
     },
     # NOTE: the GB workbook's own PANTS tab was dropped as a source — the
     # dedicated ALL PANTS file below is the pants authority per David, and the
@@ -5551,7 +5551,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'pants',           # native NM_P## keys
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'All Pants — U.S. Polo',
@@ -5561,7 +5561,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'Label Description',   # full 'PANTS / HORSE' text (col C is pants-only)
         'header_row': 2,
         'key_namespace': 'pants',           # native US_P## keys
-        'approved': False,
+        'approved': True,
     },
     {
         'label': 'All Pants — Geoffrey Beene',
@@ -5571,7 +5571,7 @@ COLOR_SYNC_SOURCES = [
         'color_col': 'DESCRIPTION',
         'header_row': 2,
         'key_namespace': 'pants',           # native GB_P## keys, incl. Pantone specs
-        'approved': False,
+        'approved': True,
     },
 ]
 
