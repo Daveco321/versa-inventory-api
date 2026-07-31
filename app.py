@@ -5981,6 +5981,36 @@ def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=Fa
         _color_sync_lock.release()
 
 
+# ── TEMPORARY (Jul 30 2026): deploy-package transfer for David ──────────────
+# Accepts base64 files and writes them ONLY under the 'deploy/' prefix in the
+# S3 bucket (key prefix is forced server-side — this route cannot touch any
+# platform data). Used to hand the Netlify deploy folder to David's home
+# machine as plain public S3 URLs. REMOVE after use.
+@app.route('/admin/deploy-package-upload', methods=['POST', 'OPTIONS'])
+def admin_deploy_package_upload():
+    if request.method == 'OPTIONS':
+        return '', 204
+    body = request.get_json(silent=True) or {}
+    files = body.get('files') or []
+    if not files:
+        return jsonify({'error': 'No files provided'}), 400
+    s3 = get_s3()
+    written, errors = [], []
+    for f in files:
+        try:
+            name = str(f.get('name') or '').strip().lstrip('/')
+            if not name or '..' in name:
+                raise ValueError('bad name')
+            key = f"deploy/{name}"          # forced prefix — never anywhere else
+            data = base64.b64decode(f.get('b64') or '')
+            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
+                          ContentType=str(f.get('content_type') or 'application/octet-stream'))
+            written.append({'key': key, 'bytes': len(data)})
+        except Exception as e:
+            errors.append({'name': f.get('name'), 'error': str(e)[:120]})
+    return jsonify({'written': written, 'errors': errors})
+
+
 @app.route('/admin/refresh/colors', methods=['POST', 'OPTIONS'])
 def admin_refresh_colors():
     """Force a Dropbox → S3 color-map sync and report what changed.
