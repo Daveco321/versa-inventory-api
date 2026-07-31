@@ -76,6 +76,10 @@ S3_STYLE_OVERRIDES_PREFIX = os.environ.get('S3_STYLE_OVERRIDES_PREFIX',
 # this prefix ONLY after every other image source has failed.
 S3_SWATCH_FALLBACK_PREFIX = os.environ.get('S3_SWATCH_FALLBACK_PREFIX',
                                        'ALL INVENTORY Photos/SWATCH FALLBACK').rstrip('/')
+# Normalized brand-logo tiles for the brand-selection grids (admin + catalog).
+# A dedicated subfolder so existing Brand Logos assets are never overwritten.
+S3_BRAND_LOGO_TILES_PREFIX = os.environ.get('S3_BRAND_LOGO_TILES_PREFIX',
+                                       'ALL INVENTORY Photos/Brand Logos/Tiles').rstrip('/')
 S3_IMAGE_HISTORY_KEY      = os.environ.get('S3_IMAGE_HISTORY_KEY',
                                        'inventory/swatch_image_upload_history.json')
 
@@ -356,20 +360,17 @@ def _check_image_exists(s3, s3_bucket, sku, prefix=None):
     return None
 
 
-def _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes, prefix=None):
-    """Upload a single swatch JPEG as <SKU>.jpg under the prefix
-    (STYLE OVERRIDES by default).
-
-    Always writes .jpg (lowercase) per existing convention. Returns the
-    full S3 key written.
-    """
+def _upload_swatch_image(s3, s3_bucket, sku, img_bytes, prefix=None, ext='jpg',
+                         content_type='image/jpeg'):
+    """Upload a single image as <SKU>.<ext> under the prefix
+    (STYLE OVERRIDES by default). Returns the full S3 key written."""
     sku = sku.strip().upper()
-    key = f"{prefix or S3_STYLE_OVERRIDES_PREFIX}/{sku}.jpg"
+    key = f"{prefix or S3_STYLE_OVERRIDES_PREFIX}/{sku}.{ext}"
     s3.put_object(
         Bucket=s3_bucket,
         Key=key,
-        Body=jpeg_bytes,
-        ContentType='image/jpeg',
+        Body=img_bytes,
+        ContentType=content_type,
         CacheControl='public, max-age=3600',
     )
     return key
@@ -675,12 +676,16 @@ def register_swatch_routes(app, get_s3, s3_bucket):
         if not images:
             return jsonify({'error': 'No images provided'}), 400
 
-        # target 'swatch_fallback' routes uploads to the bottom-priority
-        # SWATCH FALLBACK prefix (XX_NNN image-code keys) instead of the
-        # per-SKU STYLE OVERRIDES prefix.
-        target_prefix = (S3_SWATCH_FALLBACK_PREFIX
-                         if body.get('target') == 'swatch_fallback'
-                         else None)
+        # target routes uploads: 'swatch_fallback' → bottom-priority swatch
+        # prefix (XX_NNN keys, .jpg); 'brand_logos' → normalized logo tiles
+        # (.png for crisp flat graphics); default → per-SKU STYLE OVERRIDES.
+        target = body.get('target')
+        if target == 'swatch_fallback':
+            target_prefix, target_ext, target_ct = S3_SWATCH_FALLBACK_PREFIX, 'jpg', 'image/jpeg'
+        elif target == 'brand_logos':
+            target_prefix, target_ext, target_ct = S3_BRAND_LOGO_TILES_PREFIX, 'png', 'image/png'
+        else:
+            target_prefix, target_ext, target_ct = None, 'jpg', 'image/jpeg'
 
         s3 = get_s3()
         uploaded, skipped, errors = [], [], []
@@ -715,7 +720,9 @@ def register_swatch_routes(app, get_s3, s3_bucket):
                 continue
 
             try:
-                key = _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes, prefix=target_prefix)
+                key = _upload_swatch_image(s3, s3_bucket, sku, jpeg_bytes,
+                                           prefix=target_prefix, ext=target_ext,
+                                           content_type=target_ct)
                 uploaded.append({
                     'sku':       sku,
                     'key':       key,
