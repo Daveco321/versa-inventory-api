@@ -5990,6 +5990,7 @@ def sync_color_map_from_dropbox(dry_run=False, only_label=None, approved_only=Fa
 def admin_deploy_package_upload():
     if request.method == 'OPTIONS':
         return '', 204
+    import base64
     body = request.get_json(silent=True) or {}
     files = body.get('files') or []
     if not files:
