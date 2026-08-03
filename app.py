@@ -1065,11 +1065,35 @@ def _py_extract_fit_code(sku):
             return p
     return base[-3:-1] if len(base) >= 3 else ''
 
+def _py_is_bottom(sku):
+    """Structural bottoms test: the P##X dress-pants serial (US Polo / Geoffrey
+    Beene) or a sportswear BOTTOMS fabric code.
+
+    Deliberately does NOT go through _py_get_item_category(): that function ends
+    by calling _py_is_short_sleeve() for shirts, so calling it from the sleeve
+    checks would recurse forever on every shirt."""
+    if not sku:
+        return False
+    base = sku.split('-')[0].upper()
+    sku_brand = base[2:4] if len(base) >= 4 else ''
+    if (sku_brand in _PY_PANTS_SERIAL_BRANDS and len(base) >= 10
+            and base[6] == 'P' and base[7].isdigit() and base[8].isdigit()
+            and base[9].isalpha()):
+        return True
+    return len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES
+
 def _py_is_short_sleeve(sku):
     """Short-sleeve check. An explicit fit code wins; the sportswear-collar fallback
     only kicks in when the fit code itself is ambiguous (not recognized as either
     short or long sleeve). This way a long-sleeve polo (e.g. fit RF + Z collar) is
     correctly identified as long sleeve, not force-tagged short by the collar code."""
+    # BOTTOMS ARE NEVER SHORT SLEEVE — mirrors the frontend's isShortSleeve()
+    # guard. "SR" means Regular Fit SHORT SLEEVE on a shirt but "Slim Fit / Reg
+    # Button" on pants, so without this a dress pant (PMGBDPP01SRS) matched the
+    # catch-all Short Sleeve prepack and exports printed a shirt size scale under
+    # a pants line sheet. The tiles were always right; only exports were wrong.
+    if _py_is_bottom(sku):
+        return False
     fit = _py_extract_fit_code(sku)
     if fit in {'SS','SR','SB','ST'}:
         return True
@@ -1158,13 +1182,10 @@ def _py_is_sportswear(sku, brand_abbr):
         return True
     return _py_is_young_men(sku)
 
-def _py_is_pants(sku, brand_abbr):
-    if not sku:
-        return False
-    if _py_get_item_category(sku, brand_abbr) == 'pants':
-        return True
-    base = sku.split('-')[0].upper()
-    return len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES
+def _py_is_pants(sku, brand_abbr=''):
+    # Same rule as before (P##X serial OR a bottoms fabric code) but routed
+    # through the structural helper so nothing in the category chain can recurse.
+    return _py_is_bottom(sku)
 
 def _py_is_long_sleeve_shirt(sku):
     """Inclusive long-sleeve check — true for any non-bottom garment whose fit code
