@@ -2125,7 +2125,7 @@ def _factory_label(production_ref, full_name=False):
 
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
-                     flow_mode=False):
+                     flow_mode=False, headers_override=None):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -2147,7 +2147,11 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
     worksheet.hide_gridlines(2)
     worksheet.freeze_panes(1, 0)
 
-    if catalog_mode:
+    if headers_override is not None:
+        # Caller-defined column set (ship-plan line sheets) — same visual
+        # treatment, custom columns. Widths/formats still resolve by name.
+        headers = list(headers_override)
+    elif catalog_mode:
         # ── Catalog exports: no committed/allocated, simplified layout ──
         if view_mode == 'incoming':
             headers = ['IMAGE', 'SKU', 'Brand']
@@ -2223,6 +2227,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
         'Warehouse': 18,
+        # Ship-plan line-sheet columns (Confirm Pre-PO exports)
+        'Units to Ship': 13, 'Shortfall': 12, 'Can Ship': 15,
+        'Held By / Source': 34,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2267,13 +2274,18 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Ex-Factory': lambda item: item.get('ex_factory', ''),
         'Arrival': lambda item: item.get('arrival', ''),
         'Warehouse': lambda item: item.get('warehouse', ''),
+        # Ship-plan line-sheet columns (Confirm Pre-PO exports)
+        'Units to Ship': lambda item: item.get('units_ship', 0),
+        'Shortfall': lambda item: item.get('shortfall', 0),
+        'Can Ship': lambda item: item.get('can_ship', ''),
+        'Held By / Source': lambda item: item.get('source', ''),
     }
 
     # Determine which columns are numeric for formatting
     NUMERIC_HEADERS = {
         'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'Incoming',
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
-        'Committed', 'Allocated'
+        'Committed', 'Allocated', 'Units to Ship', 'Shortfall'
     }
 
     for r, item in enumerate(data):
@@ -4033,6 +4045,70 @@ def export_multi():
                                            catalog_mode=catalog_mode, view_mode=view_mode,
                                            flow_mode=flow_mode,
                                            prepack_defaults=prepack_defaults)
+        ts = datetime.now().strftime('%Y-%m-%d')
+        return send_file(BytesIO(xl_bytes),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, download_name=f"{fname}_{ts}.xlsx")
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+# ── Ship-plan line-sheet export (Confirm Pre-PO) ─────────────────────────
+# Multi-tab workbook in the standard line-sheet format (embedded images,
+# styled headers) with ship-plan columns. Tabs are CALLER-defined — the tool
+# sends flat / per-brand / per-brand+color groupings; the server just renders.
+SHIP_PLAN_HEADERS = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
+                     'Production #', 'Ex-Factory', 'Arrival', 'Warehouse',
+                     'Units to Ship', 'Shortfall', 'Can Ship', 'Held By / Source']
+
+
+def build_ship_plan_excel(tabs, s3_base_url):
+    output = BytesIO()
+    wb = xlsxwriter.Workbook(output, {'in_memory': True, 'strings_to_formulas': False})
+    # One image fetch for the whole workbook (dedupes by base style), then
+    # slice per tab — same pattern as build_multi_brand_excel.
+    all_items = []
+    offsets = []
+    for t in tabs:
+        rows = t.get('items') or []
+        offsets.append((len(all_items), len(rows)))
+        all_items.extend(rows)
+    images = download_images_for_items(all_items, s3_base_url)
+    seen = set()
+    for ti, t in enumerate(tabs):
+        # xlsxwriter also rejects names that start/end with an apostrophe
+        name = re.sub(r'[\\/*?\[\]:]', '', str(t.get('name') or ''))[:31].strip().strip("'") or f'Tab_{ti + 1}'
+        if name in seen:  # xlsxwriter RAISES on duplicate sheet names
+            for i in range(2, 1000):
+                cand = f"{name[:31 - len(str(i)) - 1]}_{i}"
+                if cand not in seen:
+                    name = cand
+                    break
+        seen.add(name)
+        ws = wb.add_worksheet(name)
+        fmts, headers = _setup_worksheet(wb, ws, headers_override=SHIP_PLAN_HEADERS)
+        off, cnt = offsets[ti]
+        local = {i - off: img for i, img in images.items() if off <= i < off + cnt}
+        # No size charts here — a ship plan is about allocation, not prepacks.
+        _write_rows(wb, ws, t.get('items') or [], local, fmts, headers=headers)
+    wb.close()
+    output.seek(0)
+    return output.getvalue()
+
+
+@app.route('/export-ship-plan', methods=['POST', 'OPTIONS'])
+def export_ship_plan():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        req = request.get_json() or {}
+        tabs = req.get('tabs') or []
+        if not tabs or not any(t.get('items') for t in tabs):
+            return jsonify({"error": "No rows to export"}), 400
+        s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
+        fname = req.get('filename', 'Ship_Plan')
+        xl_bytes = build_ship_plan_excel(tabs, s3_url)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
