@@ -1929,10 +1929,21 @@ def get_image_cached(item, s3_base_url):
 
     result = None
 
-    # 2. Try STYLE+OVERRIDES via CloudFront
+    # 2. Try STYLE+OVERRIDES via CloudFront.
+    #    An override uploaded against a SKU that carries a suffix (ROBLCH001-WS,
+    #    the "-WS"/"-V" variants) is stored under that FULL sku, not the base —
+    #    so try the full sku first and only then the base. Looking up the base
+    #    alone made those styles export as "No Image" even though the catalog
+    #    showed them fine (Black Label line sheet, Aug 2026).
     base_style_for_url = get_base_style(sku)
-    override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style_for_url}.jpg"
-    result = _process_image_from_url(override_url)
+    sku_u = str(sku).upper()
+    override_candidates = [sku_u] if sku_u != base_style_for_url else []
+    override_candidates.append(base_style_for_url)
+    for _cand in override_candidates:
+        override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{_cand}.jpg"
+        result = _process_image_from_url(override_url)
+        if result:
+            break
 
     # 2.5. Try sportswear-folder match (longest-prefix on filename — see
     #      find_sportswear_image_match docstring). This is what catches
