@@ -4603,14 +4603,35 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
             'units_ship': qty,
             'shortfall': remaining,
             '_bucket': _apo_classify_color(color, brand_abbr),
+            '_arr': gate,   # sort key: gating arrival date (None = now or TBD)
         })
 
     tabs_by = {}
     for r in rows:
         bucket = 'Fancies' if r.pop('_bucket') == 'fancies' else 'Solids'
         tabs_by.setdefault(f"{r['brand_full']} {bucket}", []).append(r)
-    tabs = [{'name': name, 'items': sorted(items, key=lambda x: -x['units_ship'])}
-            for name, items in sorted(tabs_by.items())]
+
+    # Chronological within each tab (David, Aug 4 2026): in-warehouse rows
+    # first (available now), then production-covered rows by soonest arrival,
+    # then date-TBD production, no-supply lines last; units desc breaks ties.
+    def _row_order(r):
+        has_prod = bool(r['production'])
+        has_wh = bool(r['warehouse'])
+        if has_wh and not has_prod:
+            grp = 0
+        elif has_prod and r['arrival'] != 'TBD':
+            grp = 1
+        elif has_prod:
+            grp = 2
+        else:
+            grp = 3
+        return (grp, r['_arr'] or datetime.max.date(), -r['units_ship'])
+    tabs = []
+    for name, items in sorted(tabs_by.items()):
+        items.sort(key=_row_order)
+        for it in items:
+            it.pop('_arr', None)
+        tabs.append({'name': name, 'items': items})
     # No Shortfall column on the weekly APO report (David, Aug 4 2026) —
     # the CPP tool's own exports keep it.
     apo_headers = [h for h in SHIP_PLAN_HEADERS if h != 'Shortfall']
