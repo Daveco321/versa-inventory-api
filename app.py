@@ -4059,8 +4059,8 @@ def export_multi():
 # styled headers) with ship-plan columns. Tabs are CALLER-defined — the tool
 # sends flat / per-brand / per-brand+color groupings; the server just renders.
 SHIP_PLAN_HEADERS = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
-                     'Production #', 'Ex-Factory', 'Arrival', 'Warehouse',
-                     'Units to Ship', 'Shortfall', 'Can Ship', 'Held By / Source']
+                     'Production #', 'Arrival', 'Warehouse',
+                     'Units to Ship', 'Shortfall']
 
 
 def build_ship_plan_excel(tabs, s3_base_url):
