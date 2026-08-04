@@ -2230,6 +2230,8 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         # Ship-plan line-sheet columns (Confirm Pre-PO exports)
         'Units to Ship': 13, 'Shortfall': 12, 'Can Ship': 15,
         'Held By / Source': 34,
+        # Customer Selling line sheets
+        'Trajectory': 34, 'Seen': 24,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2279,6 +2281,9 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Shortfall': lambda item: item.get('shortfall', 0),
         'Can Ship': lambda item: item.get('can_ship', ''),
         'Held By / Source': lambda item: item.get('source', ''),
+        # Customer Selling line sheets (best/okay/worst tabs)
+        'Trajectory': lambda item: item.get('trajectory', ''),
+        'Seen': lambda item: item.get('seen', ''),
     }
 
     # Determine which columns are numeric for formatting
@@ -4111,7 +4116,15 @@ def export_ship_plan():
             return jsonify({"error": "No rows to export"}), 400
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Ship_Plan')
-        xl_bytes = build_ship_plan_excel(tabs, s3_url)
+        # Optional caller-defined column set (Customer Selling sheets send
+        # their own). Unknown header names render blank; IMAGE must stay in
+        # column 0 because the renderer anchors images there.
+        cols = req.get('columns')
+        if cols:
+            cols = [str(c) for c in cols][:20]
+            if not cols or cols[0] != 'IMAGE':
+                cols = ['IMAGE'] + [c for c in cols if c != 'IMAGE']
+        xl_bytes = build_ship_plan_excel(tabs, s3_url, headers=cols)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
