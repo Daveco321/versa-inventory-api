@@ -4063,7 +4063,10 @@ SHIP_PLAN_HEADERS = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
                      'Units to Ship', 'Shortfall']
 
 
-def build_ship_plan_excel(tabs, s3_base_url):
+def build_ship_plan_excel(tabs, s3_base_url, headers=None):
+    """headers=None → the full SHIP_PLAN_HEADERS set (Confirm Pre-PO exports);
+    callers may pass a trimmed list (the weekly APO report drops Shortfall)."""
+    sheet_headers = list(headers) if headers else SHIP_PLAN_HEADERS
     output = BytesIO()
     wb = xlsxwriter.Workbook(output, {'in_memory': True, 'strings_to_formulas': False})
     # One image fetch for the whole workbook (dedupes by base style), then
@@ -4087,11 +4090,11 @@ def build_ship_plan_excel(tabs, s3_base_url):
                     break
         seen.add(name)
         ws = wb.add_worksheet(name)
-        fmts, headers = _setup_worksheet(wb, ws, headers_override=SHIP_PLAN_HEADERS)
+        fmts, hdrs = _setup_worksheet(wb, ws, headers_override=sheet_headers)
         off, cnt = offsets[ti]
         local = {i - off: img for i, img in images.items() if off <= i < off + cnt}
         # No size charts here — a ship plan is about allocation, not prepacks.
-        _write_rows(wb, ws, t.get('items') or [], local, fmts, headers=headers)
+        _write_rows(wb, ws, t.get('items') or [], local, fmts, headers=hdrs)
     wb.close()
     output.seek(0)
     return output.getvalue()
@@ -4608,7 +4611,10 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         tabs_by.setdefault(f"{r['brand_full']} {bucket}", []).append(r)
     tabs = [{'name': name, 'items': sorted(items, key=lambda x: -x['units_ship'])}
             for name, items in sorted(tabs_by.items())]
-    return build_ship_plan_excel(tabs, S3_PHOTOS_URL), len(rows)
+    # No Shortfall column on the weekly APO report (David, Aug 4 2026) —
+    # the CPP tool's own exports keep it.
+    apo_headers = [h for h in SHIP_PLAN_HEADERS if h != 'Shortfall']
+    return build_ship_plan_excel(tabs, S3_PHOTOS_URL, headers=apo_headers), len(rows)
 
 
 @app.route('/export-apo-brandcolor', methods=['GET', 'OPTIONS'])
