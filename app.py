@@ -4472,6 +4472,20 @@ def _apo_parse_date(v):
 def _apo_fmt_date(d):
     return f'{d.strftime("%b")} {d.day}, {d.year}' if d else ''
 
+def _apo_prod_arrival(p, pants):
+    """Effective arrival for a production row, mirroring the frontend's
+    loadProductionFromS3 transit rule: the ledger's real arrival (port date
+    + 10) when present, else ETD + 45 days (55 for pants). Rows with neither
+    date are genuinely TBD."""
+    from datetime import timedelta
+    ad = _apo_parse_date(p.get('arrival'))
+    if ad:
+        return ad
+    etd = _apo_parse_date(p.get('etd'))
+    if etd:
+        return etd + timedelta(days=55 if pants else 45)
+    return None
+
 def build_apo_brandcolor_excel(customer, exclude_tokens=None):
     """All open allocations for one customer → line-sheet xlsx bytes with
     <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines)."""
@@ -4533,9 +4547,8 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         if not b or units <= 0:
             continue
         prod_by_base.setdefault(b, []).append(p)
-    for lst in prod_by_base.values():
-        lst.sort(key=lambda p: (_apo_parse_date(p.get('arrival')) is None,
-                                _apo_parse_date(p.get('arrival')) or datetime.max.date()))
+    # (sorted per style below — the effective arrival is transit-rule dependent
+    # and the pants/45-vs-55 split is a property of the style)
 
     rows = []
     for base, qty in agg.items():
@@ -4557,8 +4570,12 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         take_wh = min(qty, wh_free)
         remaining = qty - take_wh
 
+        pants = _py_is_bottom(base)
+        plist = sorted(prod_by_base.get(base, []),
+                       key=lambda p: (_apo_prod_arrival(p, pants) is None,
+                                      _apo_prod_arrival(p, pants) or datetime.max.date()))
         pulls, gate, tbd = [], None, False
-        for p in prod_by_base.get(base, []):
+        for p in plist:
             if remaining <= 0:
                 break
             take = min(remaining, int(p.get('units') or 0))
@@ -4566,7 +4583,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
                 continue
             remaining -= take
             pulls.append(str(p.get('production') or '—'))
-            ad = _apo_parse_date(p.get('arrival'))
+            ad = _apo_prod_arrival(p, pants)
             if ad is None:
                 tbd = True
             elif gate is None or ad > gate:
