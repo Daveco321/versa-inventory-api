@@ -4118,6 +4118,504 @@ def export_ship_plan():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+# ── APO brand-color line sheets (weekly email report) ────────────────────────
+# GET /export-apo-brandcolor?customer=<name>[&exclude_po=TK[,TOK2]]
+# ALL open allocations (the /apo Dropbox feed) for one customer, rendered as a
+# line-sheet workbook with one tab per "<Brand> Solids"/"<Brand> Fancies"
+# bucket — the same visual format and the same color rule as the Confirm
+# Pre-PO tool's "By Brand + Color" export. The helpers below are faithful
+# Python ports of the frontend functions of the same name (index.html);
+# if the frontend color rules change, change them here too.
+#
+# Supply columns use a documented SIMPLE rule (not the frontend routing
+# engine): warehouse free stock first (committed/allocated are NEGATIVE in
+# the feed; the line's own qty is added back since 'allocated' already
+# contains it), then production FIFO by arrival date. The Confirm Pre-PO
+# tool remains the authority on exact engine placement.
+
+_APO_BRAND_FULL = {  # frontend BRAND_MAPPING key → full_name
+    'NAUTICA': 'Nautica', 'DKNY': 'DKNY', 'EB': 'Eddie Bauer', 'REEBOK': 'Reebok',
+    'VINCE': 'Vince Camuto', 'BEN': 'Ben Sherman', 'USPA': 'U.S. Polo Assn.',
+    'CHAPS': 'Chaps', 'LUCKY': 'Lucky Brand', 'JNY': 'Jones New York',
+    'BEENE': 'Geoffrey Beene', 'NICOLE': 'Nicole Miller', 'SHAQ': "Shaquille O'Neal",
+    'TAYION': 'Tayion', 'STRAHAN': 'Michael Strahan', 'VD': 'Von Dutch',
+    'VERSA': 'Versa', 'CHEROKEE': 'Cherokee', 'AMERICA': 'American Crew',
+    'BLO': 'Bloomingdales Private Label', 'BLACK': 'Black Label', 'DN': 'Divine 9',
+    'KL': 'Karl Lagerfeld Paris', 'NE': 'Neiman Marcus', 'RG': 'Robert Graham',
+    'DH': 'Daniel Hechter',
+}
+
+_APO_BRAND_PREFIX = {  # frontend BRAND_IMAGE_PREFIX (brand key → 2-char SKU code)
+    'NAUTICA': 'NA', 'DKNY': 'DK', 'EB': 'EB', 'REEBOK': 'RB', 'VINCE': 'VC',
+    'BEN': 'BE', 'USPA': 'US', 'CHAPS': 'CH', 'LUCKY': 'LB', 'JNY': 'JN',
+    'BEENE': 'GB', 'NICOLE': 'NM', 'SHAQ': 'SH', 'TAYION': 'TA', 'STRAHAN': 'MS',
+    'VD': 'VD', 'VERSA': 'VR', 'CHEROKEE': 'CK', 'AMERICA': 'AC', 'BLO': 'BL',
+    'BLACK': 'BL', 'DN': 'D9', 'KL': 'KL', 'RG': 'RG', 'NE': 'NE', 'DH': 'DH',
+}
+
+_apo_color_map_cache = {'map': None, 'time': 0.0}
+_APO_COLOR_MAP_TTL = 3600  # frontend refetches hourly; match it
+
+def _apo_color_map():
+    """style_color_map.xlsx from S3 as {KEY: raw color description}. Mirrors
+    the frontend loadColorMapFromS3: 'Color Map' sheet (else first), key col
+    'Key' (fallback 'Style_Number', 'Style_Num'), value 'Color_Description'."""
+    now = time.time()
+    if _apo_color_map_cache['map'] is not None and now - _apo_color_map_cache['time'] < _APO_COLOR_MAP_TTL:
+        return _apo_color_map_cache['map']
+    try:
+        from swatch_extractor import _download_color_map, _resolve_color_map_sheet
+        wb, _etag, _size = _download_color_map(get_s3, S3_BUCKET)
+        ws = _resolve_color_map_sheet(wb)
+        rows = ws.iter_rows(values_only=True)
+        headers = [str(c or '').strip() for c in next(rows)]
+        def _ci(name):
+            try: return headers.index(name)
+            except ValueError: return -1
+        i_key, i_sn, i_sn2, i_val = _ci('Key'), _ci('Style_Number'), _ci('Style_Num'), _ci('Color_Description')
+        cmap = {}
+        for r in rows:
+            def _cell(i):
+                return str(r[i]).strip() if (0 <= i < len(r) and r[i] is not None) else ''
+            key = _cell(i_key) or _cell(i_sn) or _cell(i_sn2)
+            val = _cell(i_val)
+            if key and val:
+                cmap[key.upper()] = val
+        wb.close()
+        _apo_color_map_cache['map'] = cmap
+        _apo_color_map_cache['time'] = now
+        print(f'[APO Export] color map loaded: {len(cmap)} keys')
+        return cmap
+    except Exception as e:
+        print(f'[APO Export] color map load failed: {e}')
+        return _apo_color_map_cache['map'] or {}
+
+_APO_COLOR_ABBR = {'BLK': 'Black', 'WHT': 'White', 'BLU': 'Blue', 'NVY': 'Navy', 'GRY': 'Grey'}
+
+def _apo_format_color(raw):
+    """Port of frontend formatColorName."""
+    if not raw:
+        return ''
+    s = str(raw).strip()
+    def _word(m):
+        w = m.group(1)
+        hit = _APO_COLOR_ABBR.get(w.upper())
+        return hit if hit else (w[:1].upper() + w[1:].lower())
+    s = re.sub(r'\b([A-Za-z]+)\b', _word, s)
+    return re.sub(r'\s{2,}', ' ', s).strip()
+
+def _apo_has_pants_serial(base):
+    """Port of frontend hasPantsSerial (US/GB brands, P## serial)."""
+    return (len(base) >= 10 and base[2:4] in _PY_PANTS_SERIAL_BRANDS and base[6] == 'P'
+            and base[7].isdigit() and base[8].isdigit() and base[9].isalpha())
+
+def _apo_is_sportswear(base):
+    """Port of frontend isSportswear (collar/fabric checks skip pants serials)."""
+    if not _apo_has_pants_serial(base):
+        if len(base) >= 11 and base[-1] in _PY_SPORTSWEAR_COLLARS:
+            return True
+        if len(base) >= 6 and base[4:6] in _PY_SPORTSWEAR_FABRICS:
+            return True
+    return len(base) >= 6 and base[4:6] in _PY_YM_FABRIC_CODES
+
+def _apo_sku_prefix(base, brand_abbr):
+    """Port of frontend skuImagePrefix."""
+    for code in (base[2:4], base[0:2]):
+        if len(code) == 2 and brand_abbr and SKU_BRAND_CODE_MAP.get(code) == brand_abbr:
+            return code
+    return _APO_BRAND_PREFIX.get(brand_abbr, (brand_abbr or '')[:2])
+
+def _apo_color_fallback_keys(base, brand_abbr):
+    """Port of frontend styleColorFallbackKeys — category namespace first,
+    legacy bare key always last."""
+    b = (base or '').upper()
+    prefix = _apo_sku_prefix(b, brand_abbr)
+    keys = []
+    serial = b[6:9] if len(b) >= 9 else ''
+    numbers = re.findall(r'\d+', b)
+    padded = max(numbers, key=len).rjust(3, '0') if numbers else None
+    if re.match(r'^P\d\d$', serial) or _apo_has_pants_serial(b):
+        keys.append(f'{prefix}_{serial}')
+    elif re.match(r'^B\d\d$', serial):  # isBlazer: serial only, by design
+        keys.append(f'{prefix}_{serial}')
+    elif padded and _apo_is_sportswear(b):
+        keys.append(f'{prefix}_SW_{padded}')
+    if padded:
+        keys.append(f'{prefix}_{padded}')
+    return keys
+
+def _apo_style_color(base, brand_abbr):
+    """Port of frontend getStyleColorInfo → the display string (or '')."""
+    ov = _style_overrides.get(base) or {}
+    if ov.get('color'):
+        return str(ov['color'])
+    cmap = _apo_color_map()
+    raw = cmap.get(base)
+    if not raw:
+        for k in _apo_color_fallback_keys(base, brand_abbr):
+            raw = cmap.get(k)
+            if raw:
+                break
+    if not raw:
+        return ''
+    if '||' in raw:  # Nicole Miller dual-color "ground||print"
+        parts = raw.split('||')
+        return (_apo_format_color(parts[0]) + ' ' + _apo_format_color(parts[1])).strip()
+    return _apo_format_color(raw)
+
+_APO_BLUE_FAMILY = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b')
+_APO_PRINT_RE = re.compile(r'\bprint\b|\bprnt\b|\bgrnd\b|\bstripe\b|\bstripes\b|\bgeo\b|\bcheck\b')
+
+def _apo_classify_color(color_display, brand_abbr):
+    """Port of frontend classifyColor. Buckets: white/black/navy/other_solids/
+    fancies; the report folds the first four into 'Solids'."""
+    if not color_display:
+        return 'fancies'
+    c = str(color_display).strip().lower()
+    # Two-part colors: split ONLY on slash with whitespace on BOTH sides;
+    # "W/" means "with" and must never split. Recurse on the first half.
+    parts = re.split(r'\s+/\s+', c)
+    if len(parts) > 1 and parts[0].strip():
+        return _apo_classify_color(parts[0].strip(), brand_abbr)
+    has_print = bool(_APO_PRINT_RE.search(c))
+    if not has_print and re.search(r'\bdobby\b', c):
+        if re.search(r'\bwhite\b|\bivory\b|\bcream\b', c):
+            return 'white'
+        if re.search(r'\bblack\b', c):
+            return 'black'
+        if _APO_BLUE_FAMILY.search(c):
+            return 'navy'
+        return 'other_solids'
+    m = re.match(r'^(.*?)\s*\bs(?:olid|ld)\b', c)
+    if not has_print and m and _APO_BLUE_FAMILY.search(m.group(1)):
+        return 'navy'
+    m2 = re.match(r'^(\S+)\s+s(?:olid|ld)$', c)
+    if m2 and not has_print:
+        b = m2.group(1)
+        if b == 'white':
+            return 'white'
+        if b == 'black':
+            return 'black'
+        return 'other_solids'
+    if brand_abbr == 'USPA' and not has_print:
+        m3 = re.match(r'^(\S+)\s+s(?:olid|ld)', c)
+        if m3:
+            b = m3.group(1)
+            if b in ('white', 'ivory', 'cream'):
+                return 'white'
+            if b == 'black':
+                return 'black'
+            return 'other_solids'
+    if not has_print and re.search(r'\bs(?:olid|ld)\b', c):
+        return 'other_solids'
+    return 'fancies'
+
+_APO_FABRIC_RULES = {  # frontend FABRIC_RULES, verbatim
+    "AW": "4 Way Stretch", "CA": "Catatonic 95% Polyester / 5% Spandex",
+    "TD": "CVC Dobby 60% Polyester / 40% Cotton", "CH": "Chambray TC Stretch",
+    "CS": "Cooling Stretch", "CV": "Cotton / Poly CVC",
+    "DS": "4 Way Stretch Dobby 95% Polyester / 5% Spandex",
+    "OX": "PINPOINT Oxford 65%/35% Poly/Cotton", "PP": "100% Polyester- 150D",
+    "SA": "150D - Sateen 100% POLYESTER", "LN": "100% Slab Linen",
+    "ST": "97% Cotton 3% spandex", "SW": "97% Cotton 3% Stretch Twill",
+    "SU": "Stretch Supershirt (95% Polyester, 5% Spandex)", "TR": "Traverler Stretch",
+    "TW": "4 way stretch twill", "TS": "TC Stretch (77% POLYESTER /20% COTTON /3%SPANDEX)",
+    "WS": "4 Way Stretch (95%,5%) Sateen", "PC": "TC Poplin 65%/35% Poly/Cotton",
+    "PT": "97% Poly 3% Stretch - 150D STRETCH", "VS": "Viscose (31%) Stretch",
+    "VP": "50% Viscose 50%Polyester", "LP": "Linen Polyester/Spandex",
+    "MR": "50% microfiber 50% rayon", "CT": "100% Cotton", "CP": "98% Cotton / 2% Spandex",
+    "BP": "50% BAMBOO / 50% POLYESTER", "TC": "TC Stretch (52P,45C,3S %)",
+    "SC": "60% Cotton, 38% Poly, 2% Spand",
+    "BM": "30% Rayon made from Bamboo / 30% Microfiber / 36% Poly / 4% Spandex Twill",
+    "VM": "62% Poly 35% Viscose made from Bamboo 3% Spendex",
+    "SP": "52% Poly 45% COTTON 3% Spand CVC YARN DYE",
+    "TP": "Solid Twill 21%Rayon/75.5%Poly/3.5%Spandex", "LC": "Linen 51% Cotton / 49% Poly",
+    "CX": "97% Cotton / 3% Polyster", "WF": "96% Poly 4% Spandex waffle",
+    "FT": "97% POLY/ 3% SPANDEX - FLAX TEXTURE",
+    "CE": "88% Polyester/ 7% Cellulose/ 5% spandex - Tech", "PK": "100% Polyester - knit",
+    "PD": "60% Cotton/ 40% polyester - Dobby",
+    "PY": "50% cotton / 47% polyester/ 3% spandex - CVC OXFORD",
+    "UP": "95% poly / 5%spandex ---Perforated", "NY": "78% Nylon / 22% Spandex - 165GSM",
+    "CL": "35% Lyocell/35%Cotton/27% Nylon/3%Spandex", "PM": "50% Polyester / 50% Microfiber",
+    "PX": "95% Polyester / 5% Spandex - Core", "CN": "71% Cotton / 27% Nylon / 2% Spandex",
+    "MP": "74% Modal / 26% Polyester", "LE": "100% Linen",
+    "PE": "96% POLYESTER / 4% SPANDEX - END ON END", "OC": "100% Cotton - OXFORD",
+    "CD": "65% Polyester / 35% Cotton - Dobby", "CY": "100% Cotton - Yarn Dye",
+    "CW": "100% Cotton - Twill", "CJ": "100% Cotton - Jacquard", "LT": "45% Cotton / 55% Linen",
+    "DP": "95% POLYESTER / 5% SPANDEX - KNIT PERFORMANCE",
+    "PR": "87% Polyamide / 13% Elastic - 149GSM - Rhone",
+    "PS": "94% Polyester / 6% Spandex - 210GSM Knit", "CG": "100% Cotton - Poplin 105gsm",
+    "PA": "88% Polyester / 12% Spandex 160GSM - Seamless Lux Knit",
+    "PN": "88% Polyester / 12% Spandex 160GSM - Non-Seamless", "CF": "100% Cotton 50s 2 ply",
+    "CB": "98% Cotton / 2% Spandex (Bloomingdale)", "KN": "KNITS", "WT": "WOVEN TOPS",
+    "SD": "SWEATERS", "SF": "Flannel (Shacket)", "SB": "Trucker (Shacket)",
+    "CO": "Corduroy (Overshirt)", "SL": "Twill (Shacket)",
+    "YD": "65% Polyester / 35% Cotton Yarn Dye", "KS": "Knit Sport Coat",
+    "LA": "8% Lyocell / 88% Polyester / 4% Spandex 120GSM",
+    "NP": "78% Nylon / 22% Spandex - 180GSM Premium Nylon",
+    "PB": "100% Polyester - Imitation Cotton 130GSM",
+    "PF": "92% Polyester / 8% Spandex 150GSM - Dobby",
+    "PG": "73% Polyester / 5% Spandex / 22% Recycled Fiber 130GSM - Chambray End-on-End",
+    "PH": "100% Polyester Polo - Mesh Sweater Knit", "PO": "100% Polyester Polo - Pique",
+    "PJ": "100% Polyester Polo - Jersey", "PL": "100% Polyester Polo - Sweater Knit",
+    "PU": "92% Polyester / 8% Spandex 150GSM - Lux Twisted Dobby",
+    "PV": "94% Polyester / 6% Spandex - 210GSM", "PW": "100% Polyester Polo - Waffle",
+    "PZ": "94% Polyester / 6% Spandex - 210GSM", "SE": "88% Polyester / 12% Spandex - 180GSM",
+    "TB": "Polyester Rayon Blend", "WB": "Wool Polyester Rayon Blend", "TH": "TSHIRT",
+    "HE": "HENLEY", "BC": "CARPENTERS (Bottoms)", "BR": "RIPSTOPS (Bottoms)",
+    "BH": "HEAVY WEIGHT (Bottoms)", "BA": "PINSTRIPE (Bottoms)",
+    "CK": "100% Cotton 100s 2 Ply (Kirkland)", "CM": "100% Cotton - Dobby for KLP",
+}
+
+def _apo_format_fabric(raw):
+    """Port of frontend formatFabricName (typo fixes, spacing, Title Case)."""
+    if not raw or len(str(raw)) <= 2:
+        return str(raw or '')
+    s = str(raw)
+    s = re.sub(r'Polyster\b', 'Polyester', s, flags=re.I)
+    s = re.sub(r'Spendex\b', 'Spandex', s, flags=re.I)
+    s = re.sub(r'Spand\b', 'Spandex', s, flags=re.I)
+    s = re.sub(r'Traverler\b', 'Traveler', s, flags=re.I)
+    s = re.sub(r'Cataonic\b', 'Cationic', s, flags=re.I)
+    s = re.sub(r'-{2,}', '-', s)
+    s = s.replace('/', ' / ')
+    s = re.sub(r'(\d)\s*%\s*', r'\1% ', s)
+    s = re.sub(r'\s*-\s*', ' - ', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    def _word(m):
+        w = m.group(1)
+        if w.lower() in ('from', 'made', 'with') and m.start() > 0:
+            return w.lower()
+        return w[:1].upper() + w[1:].lower()
+    s = re.sub(r'\b([a-zA-Z]+)\b', _word, s)
+    s = re.sub(r'\bCvc\b', 'CVC', s)
+    s = re.sub(r'\bTc\b', 'TC', s)
+    s = re.sub(r'\bGsm\b', 'GSM', s)
+    return s
+
+def _apo_fabrication(base):
+    """Port of frontend getFabricFromSKU → description string."""
+    ov = _style_overrides.get(base) or {}
+    # Live overrides carry 'fabrication' (frontend field); 'fabric' is legacy.
+    if ov.get('fabrication') or ov.get('fabric'):
+        return str(ov.get('fabrication') or ov.get('fabric'))
+    brand = base[2:4] if len(base) >= 4 else ''
+    fab = base[4:6] if len(base) >= 6 else ''
+    if not fab:
+        return 'Standard Fabric'
+    name = _APO_FABRIC_RULES.get(fab, '')
+    # Brand-specific substitutions (frontend parseSkuComponents)
+    if brand == 'CH':
+        if fab == 'YD':
+            name = '50% Microfiber / 50% Polyester Yarn Dye'
+        if fab == 'PT':
+            name = '97% Polyester / 3% Spandex (150D STRETCH)'
+    if brand == 'BE' and fab == 'YD':
+        name = '77% Poly / 20% Cotton / 3% Spandex'
+    if brand == 'US' and fab == 'CD':
+        name = '65% Polyester / 35% Cotton'
+    if fab == 'PP' and len(base) >= 9 and base[6] == 'P' and base[7].isdigit():
+        name = '100% Polyester Woven Pant'
+    if not name:
+        return 'Standard Fabric'
+    return _apo_format_fabric(name)
+
+_APO_FIT_LABELS = {  # frontend fitCodeToLabel short forms
+    'SL': 'Slim Fit', 'RF': 'Regular Fit', 'TF': 'Tailored Fit', 'MF': 'Modern Fit',
+    'BT': 'Big & Tall', 'WB': 'Big & Tall (Von Dutch)', 'BB': 'Big Fit', 'TT': 'Tall Fit',
+    'SB': 'Short Sleeve Big', 'ST': 'Short Sleeve Tall', 'CF': 'Classic Fit',
+    'AF': 'Athletic Fit', 'SS': 'Slim Fit Short Sleeve', 'SR': 'Regular Fit Short Sleeve',
+    'SE': 'Slim Fit Extended Button', 'SH': 'Slim Fit Hook & Eye',
+    'CE': 'Classic Fit Extended Button', 'CH': 'Classic Fit Hook & Eye',
+    'CR': 'Classic Fit Reg Button', 'SF': 'Straight Fit', 'SC': 'Straight Fit Hook & Eye',
+    'RR': 'Relaxed Fit', 'BR': 'Single Breaster', 'DB': 'Double Breaster',
+}
+_APO_PANTS_FIT_FULL = {  # frontend PANTS_FIT_CODES (full labels win on pants)
+    'SE': 'Slim Fit / Extended Button', 'SH': 'Slim Fit / Hook & Eye Closure',
+    'SR': 'Slim Fit / Reg Button', 'CE': 'Classic Fit / Extended Button',
+    'CH': 'Classic Fit / Hook & Eye Closure', 'CR': 'Classic Fit / Reg Button',
+    'SF': 'Straight Fit / Reg Button', 'SC': 'Straight Fit / Hook & Eye Closure',
+    'RR': 'Relaxed Fit / Reg Button',
+}
+
+def _apo_fit_label(base):
+    """Port of frontend getFitFromSKU (override → label; pants adjustments)."""
+    ov = _style_overrides.get(base) or {}
+    if ov.get('fit'):
+        return str(ov['fit'])
+    try:
+        code = _py_extract_fit_code(base) or ''
+    except Exception:
+        code = ''
+    pants = _py_is_bottom(base)
+    if pants and code in _APO_PANTS_FIT_FULL:
+        return _APO_PANTS_FIT_FULL[code]
+    label = _APO_FIT_LABELS.get(code, 'Slim Fit')
+    if pants:
+        label = re.sub(r'\s*(Long|Short)\s*Sleeve\s*', ' ', label, flags=re.I)
+        label = re.sub(r'\s{2,}', ' ', label).strip() or 'Slim Fit'
+    return label
+
+def _apo_parse_date(v):
+    from datetime import date as _d
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, _d):
+        return v
+    try:
+        return datetime.fromisoformat(str(v)[:19]).date()
+    except Exception:
+        return None
+
+def _apo_fmt_date(d):
+    return f'{d.strftime("%b")} {d.day}, {d.year}' if d else ''
+
+def build_apo_brandcolor_excel(customer, exclude_tokens=None):
+    """All open allocations for one customer → line-sheet xlsx bytes with
+    <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines)."""
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    if not apo_rows:
+        apo_rows = load_apo_from_dropbox() or []
+    cust_l = str(customer or '').strip().lower()
+    excl = [t.strip().upper() for t in (exclude_tokens or []) if t and t.strip()]
+
+    # Aggregate this customer's open allocations to base style (mirrors the
+    # CPP picker: qty <= 0 rows dropped; styles compared on base style).
+    agg = {}
+    for a in apo_rows:
+        if str(a.get('customer') or '').strip().lower() != cust_l:
+            continue
+        try:
+            qty = int(a.get('qty') or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        po = str(a.get('po') or '').upper()
+        if excl and any(t in po for t in excl):
+            continue
+        base = get_base_style(str(a.get('style') or ''))
+        if not base:
+            continue
+        agg[base] = agg.get(base, 0) + qty
+    if not agg:
+        return None, 0
+
+    # Per-base inventory aggregation (feed rows are per size-variant SKU).
+    with _inv_lock:
+        inv_items = list(_inventory.get('items') or [])
+    inv_by_base = {}
+    for it in inv_items:
+        b = get_base_style(it.get('sku') or '')
+        if not b:
+            continue
+        d = inv_by_base.setdefault(b, {'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0,
+                                       'committed': 0, 'allocated': 0,
+                                       'brand_abbr': it.get('brand_abbr') or '',
+                                       'brand_full': it.get('brand_full') or ''})
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'committed', 'allocated'):
+            try:
+                d[k] += int(it.get(k) or 0)
+            except Exception:
+                pass
+
+    # Production per base, dated arrivals first (FIFO), undated last.
+    prod_by_base = {}
+    for p in (load_production_from_dropbox() or []):
+        b = get_base_style(str(p.get('style') or ''))
+        try:
+            units = int(p.get('units') or 0)
+        except Exception:
+            units = 0
+        if not b or units <= 0:
+            continue
+        prod_by_base.setdefault(b, []).append(p)
+    for lst in prod_by_base.values():
+        lst.sort(key=lambda p: (_apo_parse_date(p.get('arrival')) is None,
+                                _apo_parse_date(p.get('arrival')) or datetime.max.date()))
+
+    rows = []
+    for base, qty in agg.items():
+        inv = inv_by_base.get(base)
+        brand_abbr = (inv and inv['brand_abbr']) or SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
+        brand_full = (inv and inv['brand_full']) or _APO_BRAND_FULL.get(brand_abbr, brand_abbr or 'Other')
+        color = _apo_style_color(base, brand_abbr)
+
+        # Warehouse first: committed/allocated are NEGATIVE; add the line's own
+        # qty back since 'allocated' already includes this allocation.
+        wh_names = []
+        wh_free = 0
+        if inv:
+            wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa']
+            wh_free = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + qty))
+            for k, nm in (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA')):
+                if inv[k] > 0:
+                    wh_names.append(nm)
+        take_wh = min(qty, wh_free)
+        remaining = qty - take_wh
+
+        pulls, gate, tbd = [], None, False
+        for p in prod_by_base.get(base, []):
+            if remaining <= 0:
+                break
+            take = min(remaining, int(p.get('units') or 0))
+            if take <= 0:
+                continue
+            remaining -= take
+            pulls.append(str(p.get('production') or '—'))
+            ad = _apo_parse_date(p.get('arrival'))
+            if ad is None:
+                tbd = True
+            elif gate is None or ad > gate:
+                gate = ad
+
+        rows.append({
+            'sku': base, 'brand_abbr': brand_abbr, 'brand_full': brand_full,
+            'color': color,
+            'fit': _apo_fit_label(base),
+            'fabrication': _apo_fabrication(base),
+            'production': ', '.join(dict.fromkeys(pulls)),
+            'arrival': ('TBD' if tbd else _apo_fmt_date(gate)) if pulls else '',
+            'warehouse': (', '.join(wh_names) or '—') if take_wh > 0 else '',
+            'units_ship': qty,
+            'shortfall': remaining,
+            '_bucket': _apo_classify_color(color, brand_abbr),
+        })
+
+    tabs_by = {}
+    for r in rows:
+        bucket = 'Fancies' if r.pop('_bucket') == 'fancies' else 'Solids'
+        tabs_by.setdefault(f"{r['brand_full']} {bucket}", []).append(r)
+    tabs = [{'name': name, 'items': sorted(items, key=lambda x: -x['units_ship'])}
+            for name, items in sorted(tabs_by.items())]
+    return build_ship_plan_excel(tabs, S3_PHOTOS_URL), len(rows)
+
+
+@app.route('/export-apo-brandcolor', methods=['GET', 'OPTIONS'])
+def export_apo_brandcolor():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        customer = (request.args.get('customer') or '').strip()
+        if not customer:
+            return jsonify({'error': 'customer parameter required'}), 400
+        excl = (request.args.get('exclude_po') or '').split(',')
+        xl_bytes, n = build_apo_brandcolor_excel(customer, excl)
+        if not xl_bytes:
+            return jsonify({'error': f'No open allocations for {customer}'}), 404
+        ts = datetime.now().strftime('%Y-%m-%d')
+        fname = re.sub(r'[\\/:*?"<>|]+', '', f'{customer} Allocations - By Color-Brand')
+        return send_file(BytesIO(xl_bytes),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, download_name=f'{fname}_{ts}.xlsx')
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
 # ── Style Overrides ────────────────────────────────
 @app.route('/overrides', methods=['GET', 'OPTIONS'])
 def get_overrides():
