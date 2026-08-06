@@ -4381,6 +4381,9 @@ _APO_FABRIC_RULES = {  # frontend FABRIC_RULES, verbatim
     "HE": "HENLEY", "BC": "CARPENTERS (Bottoms)", "BR": "RIPSTOPS (Bottoms)",
     "BH": "HEAVY WEIGHT (Bottoms)", "BA": "PINSTRIPE (Bottoms)",
     "CK": "100% Cotton 100s 2 Ply (Kirkland)", "CM": "100% Cotton - Dobby for KLP",
+    # Style rules Ver 3 (Aug 6, 2026)
+    "CQ": "97% Cotton / 3% Spandex - Sateen 135GSM", "CR": "100% Cotton - Sateen 112GSM",
+    "CU": "100% Cotton - Knit", "PQ": "65% Polyester / 35% Cotton - TC Twill",
 }
 
 def _apo_format_fabric(raw):
