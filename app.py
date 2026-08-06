@@ -7256,14 +7256,53 @@ def _normalize_label(raw):
     if 'okay' in s or 'ok' in s or 'medium' in s: return 'okay'
     return None  # unknown labels dropped silently
 
+# Style numbers in selling recaps: 6 brand/customer letters (+ optional 7th for
+# pants P-serials like ROUSPPP02SRS), 2-3 digit serial, 2-3 letter suffix.
+_SELLING_SKU_RE = re.compile(r'^[A-Z]{6}[A-Z]?\d{2,3}[A-Z]{2,3}(-[A-Z0-9]+)?$')
+
+def _selling_header_map(header_row):
+    """Map a header row's column names → field indices, or None if the row
+    doesn't look like a recognizable header (caller falls back to the legacy
+    positional layout). Handles both layouts seen in the wild:
+      legacy: BRAND | TYPE | STYLE NO. | DESCRIPTION | LABEL
+      new   : BRAND | STYLE | DESCRIPTION | COLOR | LABEL   (Burlington 8.5.26)
+    """
+    if not header_row:
+        return None
+    cells = [(str(c).strip().lower() if c is not None else '') for c in header_row]
+    if not cells or cells[0] not in ('brand', 'brands'):
+        return None
+    idx = {}
+    for i, c in enumerate(cells):
+        key = c.replace('.', '').replace('#', '').replace('_', ' ').strip()
+        if key in ('brand', 'brands'):
+            idx.setdefault('brand', i)
+        elif key == 'type':
+            idx.setdefault('type', i)
+        elif key in ('style no', 'style number', 'style', 'styles', 'sku', 'style  no'):
+            idx.setdefault('sku', i)
+        elif key in ('description', 'desc'):
+            idx.setdefault('desc', i)
+        elif key in ('color', 'colour', 'colors', 'color name'):
+            idx.setdefault('color', i)
+        elif key in ('label', 'labels', 'rating'):
+            idx.setdefault('label', i)
+    # Without a style column the map is useless — fall back to positional.
+    if 'sku' not in idx:
+        return None
+    return idx
+
 def _parse_selling_workbook(xlsx_bytes):
     """Parse the selling-data xlsx into a JSON-friendly structure.
-    Returns: { 'sheets': [ {name, rows: [{brand, type, sku, description, label}]} ] }
+    Returns: { 'sheets': [ {name, rows: [{brand, type, sku, description, color, label}]} ] }
     Sheet order in the output matches the source workbook (typically chronological).
     Tolerant to:
       - Variable column counts beyond the expected 5
-      - Header row variations
+      - Per-sheet column layouts (mapped by header names; positional fallback)
       - Extra notes/columns in some sheets (e.g. 12.2 has commentary on the right)
+      - Layout drift: if the mapped style cell doesn't look like a style #, the
+        row is rescanned for a cell that does (guards against future reorders
+        on sheets whose headers we can't map)
     """
     import io
     import openpyxl
@@ -7272,19 +7311,47 @@ def _parse_selling_workbook(xlsx_bytes):
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         rows = []
+        col_map = None  # per-sheet header mapping (None → legacy positional)
         for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
             if row_idx == 0:
-                # Header row — skip if it looks like one
+                col_map = _selling_header_map(row)
+                if col_map is not None:
+                    continue
+                # Header-ish but unmappable (or blank) row — skip it
                 first_cell = (str(row[0]) if row and row[0] is not None else '').strip().lower()
                 if first_cell in ('brand', 'brands', ''):
                     continue
             if not row or row[0] is None:
                 continue
-            brand = (str(row[0]).strip() if len(row) > 0 and row[0] is not None else '')
-            type_ = (str(row[1]).strip() if len(row) > 1 and row[1] is not None else '')
-            sku   = (str(row[2]).strip().upper() if len(row) > 2 and row[2] is not None else '')
-            desc  = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else '')
-            label = _normalize_label(row[4] if len(row) > 4 else None)
+
+            def _cell(i):
+                if i is None or len(row) <= i or row[i] is None:
+                    return ''
+                return str(row[i]).strip()
+
+            if col_map:
+                brand = _cell(col_map.get('brand'))
+                type_ = _cell(col_map.get('type'))
+                sku   = _cell(col_map.get('sku')).upper()
+                desc  = _cell(col_map.get('desc'))
+                color = _cell(col_map.get('color'))
+                label = _normalize_label(_cell(col_map.get('label')) or None)
+            else:
+                brand = _cell(0)
+                type_ = _cell(1)
+                sku   = _cell(2).upper()
+                desc  = _cell(3)
+                color = ''
+                label = _normalize_label(row[4] if len(row) > 4 else None)
+
+            # Safety net: if what we grabbed doesn't look like a style number,
+            # scan the row for a cell that does (catches column reorders).
+            if sku and not _SELLING_SKU_RE.match(sku):
+                for c in row:
+                    cu = str(c).strip().upper() if c is not None else ''
+                    if cu and _SELLING_SKU_RE.match(cu):
+                        sku = cu
+                        break
             if not sku:
                 continue
             rows.append({
@@ -7292,6 +7359,7 @@ def _parse_selling_workbook(xlsx_bytes):
                 'type': type_,
                 'sku': sku,
                 'description': desc,
+                'color': color,
                 'label': label,
             })
         if rows:
