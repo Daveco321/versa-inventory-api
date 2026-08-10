@@ -2142,6 +2142,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even']}),
         'num_odd':  workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd'],  'num_format': '#,##0'}),
         'num_even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '#,##0'}),
+        # Highlight rows (item['_yellow']) — Can Ship Today substitution rows
+        'yellow':     workbook.add_format({**base, 'bg_color': '#FFF3B0'}),
+        'num_yellow': workbook.add_format({**base, 'bg_color': '#FFF3B0', 'num_format': '#,##0'}),
     }
 
     worksheet.hide_gridlines(2)
@@ -2232,6 +2235,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Held By / Source': 34,
         # Customer Selling line sheets
         'Trajectory': 34, 'Seen': 24,
+        # APO "Can Ship Today" tab
+        'PO #': 24, 'Units Allocated': 14, 'Ships Today': 12,
+        'Waiting On': 24, 'Sub Available': 34,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2284,20 +2290,30 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         # Customer Selling line sheets (best/okay/worst tabs)
         'Trajectory': lambda item: item.get('trajectory', ''),
         'Seen': lambda item: item.get('seen', ''),
+        # APO "Can Ship Today" tab
+        'PO #': lambda item: item.get('po', ''),
+        'Units Allocated': lambda item: item.get('units_alloc', 0),
+        'Ships Today': lambda item: item.get('ships_today', 0),
+        'Waiting On': lambda item: item.get('waiting_on', ''),
+        'Sub Available': lambda item: item.get('sub_available', ''),
     }
 
     # Determine which columns are numeric for formatting
     NUMERIC_HEADERS = {
         'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'Incoming',
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
-        'Committed', 'Allocated', 'Units to Ship', 'Shortfall'
+        'Committed', 'Allocated', 'Units to Ship', 'Shortfall',
+        'Units Allocated', 'Ships Today'
     }
 
     for r, item in enumerate(data):
         row = r + 1
         even = r % 2 == 1
-        cf = fmts['even'] if even else fmts['odd']
-        nf = fmts['num_even'] if even else fmts['num_odd']
+        if item.get('_yellow'):
+            cf, nf = fmts['yellow'], fmts['num_yellow']
+        else:
+            cf = fmts['even'] if even else fmts['odd']
+            nf = fmts['num_even'] if even else fmts['num_odd']
 
         for c, h in enumerate(headers):
             getter = FIELD_MAP.get(h)
@@ -4095,7 +4111,7 @@ def build_ship_plan_excel(tabs, s3_base_url, headers=None):
                     break
         seen.add(name)
         ws = wb.add_worksheet(name)
-        fmts, hdrs = _setup_worksheet(wb, ws, headers_override=sheet_headers)
+        fmts, hdrs = _setup_worksheet(wb, ws, headers_override=(t.get('headers') or sheet_headers))
         off, cnt = offsets[ti]
         local = {i - off: img for i, img in images.items() if off <= i < off + cnt}
         # No size charts here — a ship plan is about allocation, not prepacks.
@@ -4517,7 +4533,10 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
 
     # Aggregate this customer's open allocations to base style (mirrors the
     # CPP picker: qty <= 0 rows dropped; styles compared on base style).
+    # Also keep PO-level lines for the "Can Ship Today" tab.
     agg = {}
+    lines = []
+    line_ix = {}
     for a in apo_rows:
         if str(a.get('customer') or '').strip().lower() != cust_l:
             continue
@@ -4534,6 +4553,13 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         if not base:
             continue
         agg[base] = agg.get(base, 0) + qty
+        po_disp = str(a.get('po') or '').strip() or '—'
+        lk = (po_disp, base)
+        if lk in line_ix:
+            lines[line_ix[lk]]['qty'] += qty
+        else:
+            line_ix[lk] = len(lines)
+            lines.append({'po': po_disp, 'base': base, 'qty': qty})
     if not agg:
         return None, 0
 
@@ -4648,6 +4674,94 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         for it in items:
             it.pop('_arr', None)
         tabs.append({'name': name, 'items': items})
+
+    # ── "Can Ship Today" tab (David, Aug 10 2026) ────────────────────────────
+    # PO-level: every allocation line that could leave the warehouse today.
+    # Own free stock first (same warehouse-first pool rule as the brand tabs);
+    # when a line is stuck waiting on production, surface a same-design
+    # substitute — identical style under another customer prefix — that has
+    # free warehouse stock now. Substitution rows are highlighted yellow,
+    # mirroring the Confirm Pre-PO tool's sub suggestions.
+    wh_pool = {}
+    for base, q in agg.items():
+        inv = inv_by_base.get(base)
+        if not inv:
+            wh_pool[base] = 0
+            continue
+        wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa']
+        wh_pool[base] = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + q))
+
+    # Free-now stock per inventory base (NO qty add-back — a sub is not
+    # allocated to this line), grouped by design (base minus customer prefix).
+    sub_free = {}
+    design_ix = {}
+    for b, d in inv_by_base.items():
+        wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa']
+        free = max(0, min(wt, wt + d['committed'] + d['allocated']))
+        if free > 0 and len(b) >= 8:
+            sub_free[b] = free
+            design_ix.setdefault(b[2:], []).append(b)
+    for k in design_ix:
+        design_ix[k].sort(key=lambda b: -sub_free[b])
+
+    def _earliest_arrival_text(base):
+        pants = _py_is_bottom(base)
+        best, tbd = None, False
+        for p in prod_by_base.get(base, []):
+            ad = _apo_prod_arrival(p, pants)
+            if ad is None:
+                tbd = True
+            elif best is None or ad < best:
+                best = ad
+        if best:
+            return f"arrives {_apo_fmt_date(best)}"
+        return 'production date TBD' if tbd else 'no supply'
+
+    ship_rows = []
+    for ln in lines:
+        base, qty, po = ln['base'], ln['qty'], ln['po']
+        take_wh = min(qty, wh_pool.get(base, 0))
+        wh_pool[base] = wh_pool.get(base, 0) - take_wh
+        rem = qty - take_wh
+        sub_txt, sub_take = '', 0
+        if rem > 0 and len(base) >= 8:
+            for cand in design_ix.get(base[2:], []):
+                if cand == base or sub_free.get(cand, 0) <= 0:
+                    continue
+                sub_take = min(rem, sub_free[cand])
+                sub_free[cand] -= sub_take
+                sub_txt = f"{cand} — {sub_take:,} free now"
+                break
+        if take_wh <= 0 and sub_take <= 0:
+            continue  # nothing can leave today for this line
+        inv = inv_by_base.get(base)
+        s_abbr = (inv and inv['brand_abbr']) or SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
+        s_full = (inv and inv['brand_full']) or _APO_BRAND_FULL.get(s_abbr, s_abbr or 'Other')
+        ship_rows.append({
+            'sku': base, 'brand_abbr': s_abbr, 'brand_full': s_full,
+            'color': _apo_style_color(base, s_abbr),
+            'fit': _apo_fit_label(base),
+            'fabrication': _apo_fabrication(base),
+            'po': po,
+            'units_alloc': qty,
+            'ships_today': take_wh,
+            'waiting_on': '' if rem <= 0 else _earliest_arrival_text(base),
+            'sub_available': sub_txt,
+            '_yellow': sub_take > 0,
+            '_ord': (0 if rem <= 0 else (1 if take_wh > 0 else 2), -(take_wh + sub_take)),
+        })
+    ship_rows.sort(key=lambda r: r['_ord'])
+    for r in ship_rows:
+        r.pop('_ord', None)
+    if ship_rows:
+        tabs.insert(0, {
+            'name': 'Can Ship Today',
+            'items': ship_rows,
+            'headers': ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
+                        'PO #', 'Units Allocated', 'Ships Today',
+                        'Waiting On', 'Sub Available'],
+        })
+
     # No Shortfall column on the weekly APO report (David, Aug 4 2026) —
     # the CPP tool's own exports keep it.
     apo_headers = [h for h in SHIP_PLAN_HEADERS if h != 'Shortfall']
