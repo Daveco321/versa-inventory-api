@@ -4640,11 +4640,14 @@ def build_apo_dollar_summary(customer, exclude_tokens=None):
     rows = []
     for brand, units in sorted(by_brand.items(), key=lambda kv: -kv[1]):
         price = cust_avg.get((cust_l, brand)) or brand_avg.get(brand)
+        # Value uses the ROUNDED (displayed) price so units × Avg Price always
+        # reproduces Est. Value exactly when someone checks it in Excel.
+        p2 = round(price, 2) if price else None
         rows.append({
             'brand': brand,
             'units': units,
-            'price': round(price, 2) if price else None,
-            'value': round(units * price) if price else None,
+            'price': p2,
+            'value': round(units * p2) if p2 else None,
             'price_source': 'customer' if (cust_l, brand) in cust_avg
                             else ('cross' if brand in brand_avg else None),
         })
@@ -4781,8 +4784,10 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
         if dollars:
             sb = _apo_style_brand(base)
             p = d_cust_avg.get((cust_l, sb)) or d_brand_avg.get(sb)
-            row['est_price'] = round(p, 2) if p else None
-            row['est_value'] = round(qty * p) if p else None
+            # Rounded price for BOTH columns so units × price = value in Excel.
+            p2 = round(p, 2) if p else None
+            row['est_price'] = p2
+            row['est_value'] = round(qty * p2) if p2 else None
         rows.append(row)
 
     tabs_by = {}
