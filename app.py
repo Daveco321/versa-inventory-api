@@ -2145,6 +2145,11 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         # Highlight rows (item['_yellow']) — Can Ship Today substitution rows
         'yellow':     workbook.add_format({**base, 'bg_color': '#FFF3B0'}),
         'num_yellow': workbook.add_format({**base, 'bg_color': '#FFF3B0', 'num_format': '#,##0'}),
+        # Currency columns (Allocation Dollar Value Estimated report)
+        'price_odd':  workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd'],  'num_format': '$#,##0.00'}),
+        'price_even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '$#,##0.00'}),
+        'val_odd':    workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd'],  'num_format': '$#,##0'}),
+        'val_even':   workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '$#,##0'}),
     }
 
     worksheet.hide_gridlines(2)
@@ -2238,6 +2243,8 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         # APO "POs Ready to Ship" tab
         'PO #': 16, 'Units': 12, 'Ship Window': 24,
         'Available': 32, 'Original Arrival': 20,
+        # Allocation Dollar Value Estimated report
+        'Est. Price': 12, 'Est. Value': 14,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2296,6 +2303,9 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Ship Window': lambda item: item.get('ship_window', ''),
         'Available': lambda item: item.get('available', ''),
         'Original Arrival': lambda item: item.get('orig_arrival', ''),
+        # Allocation Dollar Value Estimated report
+        'Est. Price': lambda item: item.get('est_price') if item.get('est_price') is not None else '—',
+        'Est. Value': lambda item: item.get('est_value') if item.get('est_value') is not None else '—',
     }
 
     # Determine which columns are numeric for formatting
@@ -2314,11 +2324,18 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         else:
             cf = fmts['even'] if even else fmts['odd']
             nf = fmts['num_even'] if even else fmts['num_odd']
+        pf = fmts.get('price_even' if even else 'price_odd', nf)
+        vf = fmts.get('val_even' if even else 'val_odd', nf)
 
         for c, h in enumerate(headers):
             getter = FIELD_MAP.get(h)
             val = getter(item) if getter else ''
-            fmt = nf if h in NUMERIC_HEADERS else cf
+            if h == 'Est. Price':
+                fmt = pf
+            elif h == 'Est. Value':
+                fmt = vf
+            else:
+                fmt = nf if h in NUMERIC_HEADERS else cf
             worksheet.write(row, c, val, fmt)
 
         img = images.get(r)
@@ -4542,9 +4559,110 @@ def _fetch_a2000_orders():
     return _oo_orders_cache['data'] or []
 
 
-def build_apo_brandcolor_excel(customer, exclude_tokens=None):
+# ── Allocation Dollar Value Estimated (David, Aug 10 2026) ───────────────────
+# Average sales price by (customer, brand) from live A2000 open orders,
+# units-weighted, recomputed on every report run. Brand is derived from the
+# STYLE CODE (chars 3-4) on both the price side and the allocation side so
+# the two always join, regardless of feed brand-name quirks (e.g. 'NM').
+
+_APO_DOLLAR_CUST = {   # report customer → A2000 feed customer codes
+    'tjx': {'TJMA', 'MARS'},
+    'ross': {'ROSS'},
+    'burlington': {'BURL'},
+}
+
+def _apo_style_brand(base):
+    abbr = SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
+    return _APO_BRAND_FULL.get(abbr, abbr or 'Other')
+
+def _apo_avg_price_maps():
+    """Returns (cust_avg, brand_avg): units-weighted average price keyed by
+    (report-customer, brand_full) and by brand_full across the big 3."""
+    per_cust = {}
+    per_brand = {}
+    for o in _fetch_a2000_orders():
+        if o.get('reportType') != 'a2000':
+            continue
+        code = str(o.get('customer') or '').strip().upper()
+        cust_l = next((k for k, codes in _APO_DOLLAR_CUST.items() if code in codes), None)
+        if not cust_l:
+            continue
+        try:
+            price = float(o.get('salesPrice') or 0)
+        except Exception:
+            price = 0.0
+        units = int(o.get('openQty') or 0) + int(o.get('pickQty') or 0)
+        if price <= 0 or units <= 0:
+            continue
+        base = get_base_style(str(o.get('style') or ''))
+        brand = _apo_style_brand(base)
+        if not brand or brand == 'Other':
+            continue
+        a = per_cust.setdefault((cust_l, brand), [0, 0.0])
+        a[0] += units
+        a[1] += units * price
+        b = per_brand.setdefault(brand, [0, 0.0])
+        b[0] += units
+        b[1] += units * price
+    cust_avg = {k: v[1] / v[0] for k, v in per_cust.items() if v[0] > 0}
+    brand_avg = {k: v[1] / v[0] for k, v in per_brand.items() if v[0] > 0}
+    return cust_avg, brand_avg
+
+def build_apo_dollar_summary(customer, exclude_tokens=None):
+    """Units + estimated $ by brand for one customer's open allocations —
+    the numbers behind the Allocation Dollar Value email summary. Price
+    fallback order: this customer's avg for the brand → big-3 cross-customer
+    avg for the brand → unpriced (value omitted, flagged)."""
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    if not apo_rows:
+        apo_rows = load_apo_from_dropbox() or []
+    cust_l = str(customer or '').strip().lower()
+    excl = [t.strip().upper() for t in (exclude_tokens or []) if t and t.strip()]
+    by_brand = {}
+    for a in apo_rows:
+        if str(a.get('customer') or '').strip().lower() != cust_l:
+            continue
+        try:
+            qty = int(a.get('qty') or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        po = str(a.get('po') or '').upper()
+        if excl and any(t in po for t in excl):
+            continue
+        base = get_base_style(str(a.get('style') or ''))
+        if not base:
+            continue
+        by_brand[_apo_style_brand(base)] = by_brand.get(_apo_style_brand(base), 0) + qty
+    cust_avg, brand_avg = _apo_avg_price_maps()
+    rows = []
+    for brand, units in sorted(by_brand.items(), key=lambda kv: -kv[1]):
+        price = cust_avg.get((cust_l, brand)) or brand_avg.get(brand)
+        rows.append({
+            'brand': brand,
+            'units': units,
+            'price': round(price, 2) if price else None,
+            'value': round(units * price) if price else None,
+            'price_source': 'customer' if (cust_l, brand) in cust_avg
+                            else ('cross' if brand in brand_avg else None),
+        })
+    return {
+        'customer': customer,
+        'brands': rows,
+        'total_units': sum(r['units'] for r in rows),
+        'total_value': sum(r['value'] for r in rows if r['value'] is not None),
+        'unpriced_brands': [r['brand'] for r in rows if r['value'] is None],
+    }
+
+
+def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
     """All open allocations for one customer → line-sheet xlsx bytes with
-    <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines)."""
+    <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines).
+    dollars=True (Allocation Dollar Value Estimated report): adds Est. Price /
+    Est. Value columns from live A2000 average prices and SKIPS the
+    'POs Ready to Ship' tab."""
     with _apo_lock:
         apo_rows = list(_apo_data)
     if not apo_rows:
@@ -4606,6 +4724,8 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
     # (sorted per style below — the effective arrival is transit-rule dependent
     # and the pants/45-vs-55 split is a property of the style)
 
+    d_cust_avg, d_brand_avg = _apo_avg_price_maps() if dollars else ({}, {})
+
     rows = []
     for base, qty in agg.items():
         inv = inv_by_base.get(base)
@@ -4645,7 +4765,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
             elif gate is None or ad > gate:
                 gate = ad
 
-        rows.append({
+        row = {
             'sku': base, 'brand_abbr': brand_abbr, 'brand_full': brand_full,
             'color': color,
             'fit': _apo_fit_label(base),
@@ -4657,7 +4777,13 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
             'shortfall': remaining,
             '_bucket': _apo_classify_color(color, brand_abbr),
             '_arr': gate,   # sort key: gating arrival date (None = now or TBD)
-        })
+        }
+        if dollars:
+            sb = _apo_style_brand(base)
+            p = d_cust_avg.get((cust_l, sb)) or d_brand_avg.get(sb)
+            row['est_price'] = round(p, 2) if p else None
+            row['est_value'] = round(qty * p) if p else None
+        rows.append(row)
 
     tabs_by = {}
     for r in rows:
@@ -4726,7 +4852,8 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         return 'production date TBD' if tbd else 'no supply'
 
     po_rows = []
-    a2k_codes = _A2000_CUST.get(cust_l)
+    # Dollar-value report: same brand tabs, NO "POs Ready to Ship" tab.
+    a2k_codes = None if dollars else _A2000_CUST.get(cust_l)
     my_lines = []
     if a2k_codes:
         for o in _fetch_a2000_orders():
@@ -4826,6 +4953,8 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
     # No Shortfall column on the weekly APO report (David, Aug 4 2026) —
     # the CPP tool's own exports keep it.
     apo_headers = [h for h in SHIP_PLAN_HEADERS if h != 'Shortfall']
+    if dollars:
+        apo_headers = apo_headers + ['Est. Price', 'Est. Value']
     return build_ship_plan_excel(tabs, S3_PHOTOS_URL, headers=apo_headers), len(rows)
 
 
@@ -4838,14 +4967,34 @@ def export_apo_brandcolor():
         if not customer:
             return jsonify({'error': 'customer parameter required'}), 400
         excl = (request.args.get('exclude_po') or '').split(',')
-        xl_bytes, n = build_apo_brandcolor_excel(customer, excl)
+        dollars = str(request.args.get('dollars') or '').strip() in ('1', 'true', 'yes')
+        xl_bytes, n = build_apo_brandcolor_excel(customer, excl, dollars=dollars)
         if not xl_bytes:
             return jsonify({'error': f'No open allocations for {customer}'}), 404
         ts = datetime.now().strftime('%Y-%m-%d')
-        fname = re.sub(r'[\\/:*?"<>|]+', '', f'{customer} Allocations - By Color-Brand')
+        label = 'Dollar Value Estimated' if dollars else 'By Color-Brand'
+        fname = re.sub(r'[\\/:*?"<>|]+', '', f'{customer} Allocations - {label}')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True, download_name=f'{fname}_{ts}.xlsx')
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/apo-dollar-summary', methods=['GET', 'OPTIONS'])
+def apo_dollar_summary_route():
+    """Units + estimated $ by brand for one customer's open allocations —
+    powers the Allocation Dollar Value Estimated email summary. Prices are
+    the same average-price maps the dollars=1 workbook uses."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        customer = (request.args.get('customer') or '').strip()
+        if not customer:
+            return jsonify({'error': 'customer parameter required'}), 400
+        excl = (request.args.get('exclude_po') or '').split(',')
+        return jsonify(build_apo_dollar_summary(customer, excl))
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
