@@ -2235,9 +2235,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Held By / Source': 34,
         # Customer Selling line sheets
         'Trajectory': 34, 'Seen': 24,
-        # APO "Can Ship Today" tab
-        'PO #': 24, 'Units Allocated': 14, 'Ships Today': 12,
-        'Waiting On': 24, 'Sub Available': 34,
+        # APO "POs Ready to Ship" tab
+        'PO #': 16, 'Units': 12, 'Ship Window': 24,
+        'Available': 32, 'Original Arrival': 20,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2290,12 +2290,12 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         # Customer Selling line sheets (best/okay/worst tabs)
         'Trajectory': lambda item: item.get('trajectory', ''),
         'Seen': lambda item: item.get('seen', ''),
-        # APO "Can Ship Today" tab
+        # APO "POs Ready to Ship" tab
         'PO #': lambda item: item.get('po', ''),
-        'Units Allocated': lambda item: item.get('units_alloc', 0),
-        'Ships Today': lambda item: item.get('ships_today', 0),
-        'Waiting On': lambda item: item.get('waiting_on', ''),
-        'Sub Available': lambda item: item.get('sub_available', ''),
+        'Units': lambda item: item.get('units_alloc', 0),
+        'Ship Window': lambda item: item.get('ship_window', ''),
+        'Available': lambda item: item.get('available', ''),
+        'Original Arrival': lambda item: item.get('orig_arrival', ''),
     }
 
     # Determine which columns are numeric for formatting
@@ -2303,7 +2303,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'Incoming',
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
         'Committed', 'Allocated', 'Units to Ship', 'Shortfall',
-        'Units Allocated', 'Ships Today'
+        'Units'
     }
 
     for r, item in enumerate(data):
@@ -4521,6 +4521,27 @@ def _apo_prod_arrival(p, pants):
         return etd + timedelta(days=55 if pants else 45)
     return None
 
+# A2000 open orders come from the open-orders platform's public feed; cached
+# briefly so the three per-customer workbooks in one report share a fetch.
+_oo_orders_cache = {'data': None, 'time': 0.0}
+
+def _fetch_a2000_orders():
+    now = time.time()
+    if _oo_orders_cache['data'] is not None and now - _oo_orders_cache['time'] < 600:
+        return _oo_orders_cache['data']
+    try:
+        r = http_requests.get('https://open-orders-api.onrender.com/api/orders', timeout=45)
+        if r.status_code == 200:
+            orders = (r.json() or {}).get('orders') or []
+            _oo_orders_cache['data'] = orders
+            _oo_orders_cache['time'] = now
+            return orders
+        print(f"[APO report] open-orders fetch HTTP {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[APO report] open-orders fetch failed: {e}", flush=True)
+    return _oo_orders_cache['data'] or []
+
+
 def build_apo_brandcolor_excel(customer, exclude_tokens=None):
     """All open allocations for one customer → line-sheet xlsx bytes with
     <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines)."""
@@ -4533,10 +4554,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
 
     # Aggregate this customer's open allocations to base style (mirrors the
     # CPP picker: qty <= 0 rows dropped; styles compared on base style).
-    # Also keep PO-level lines for the "Can Ship Today" tab.
     agg = {}
-    lines = []
-    line_ix = {}
     for a in apo_rows:
         if str(a.get('customer') or '').strip().lower() != cust_l:
             continue
@@ -4553,13 +4571,6 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
         if not base:
             continue
         agg[base] = agg.get(base, 0) + qty
-        po_disp = str(a.get('po') or '').strip() or '—'
-        lk = (po_disp, base)
-        if lk in line_ix:
-            lines[line_ix[lk]]['qty'] += qty
-        else:
-            line_ix[lk] = len(lines)
-            lines.append({'po': po_disp, 'base': base, 'qty': qty})
     if not agg:
         return None, 0
 
@@ -4675,24 +4686,21 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
             it.pop('_arr', None)
         tabs.append({'name': name, 'items': items})
 
-    # ── "Can Ship Today" tab (David, Aug 10 2026) ────────────────────────────
-    # PO-level: every allocation line that could leave the warehouse today.
-    # Own free stock first (same warehouse-first pool rule as the brand tabs);
-    # when a line is stuck waiting on production, surface a same-design
-    # substitute — identical style under another customer prefix — that has
-    # free warehouse stock now. Substitution rows are highlighted yellow,
-    # mirroring the Confirm Pre-PO tool's sub suggestions.
-    wh_pool = {}
-    for base, q in agg.items():
-        inv = inv_by_base.get(base)
-        if not inv:
-            wh_pool[base] = 0
-            continue
-        wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa']
-        wh_pool[base] = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + q))
+    # ── "POs Ready to Ship" tab (David, Aug 10 2026 v2) ──────────────────────
+    # REAL A2000 POs only (open-orders feed — allocations stay on the brand
+    # tabs). A PO makes this tab ONLY if every open line can ship COMPLETE
+    # today: own free warehouse stock, or — for a style that isn't available —
+    # the identical design under another customer prefix with enough free
+    # stock ("available now", yellow row, original style's arrival kept).
+    # All-or-nothing per PO: a PO with any uncoverable line is left off.
+    _A2000_CUST = {
+        'tjx': {'TJMA', 'MARS'},   # TJ Maxx + Marshalls (US — never TK Maxx/UK/CA/AU)
+        'ross': {'ROSS'},
+        'burlington': {'BURL'},
+    }
 
-    # Free-now stock per inventory base (NO qty add-back — a sub is not
-    # allocated to this line), grouped by design (base minus customer prefix).
+    # Free-now stock per inventory base (no add-back — a sub carries its own
+    # commitments), grouped by design (base minus 2-char customer prefix).
     sub_free = {}
     design_ix = {}
     for b, d in inv_by_base.items():
@@ -4717,49 +4725,102 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None):
             return f"arrives {_apo_fmt_date(best)}"
         return 'production date TBD' if tbd else 'no supply'
 
-    ship_rows = []
-    for ln in lines:
-        base, qty, po = ln['base'], ln['qty'], ln['po']
-        take_wh = min(qty, wh_pool.get(base, 0))
-        wh_pool[base] = wh_pool.get(base, 0) - take_wh
-        rem = qty - take_wh
-        sub_txt, sub_take = '', 0
-        if rem > 0 and len(base) >= 8:
-            for cand in design_ix.get(base[2:], []):
-                if cand == base or sub_free.get(cand, 0) <= 0:
+    po_rows = []
+    a2k_codes = _A2000_CUST.get(cust_l)
+    my_lines = []
+    if a2k_codes:
+        for o in _fetch_a2000_orders():
+            if (o.get('reportType') == 'a2000'
+                    and str(o.get('customer') or '').strip().upper() in a2k_codes
+                    and int(o.get('openQty') or 0) > 0):
+                my_lines.append(o)
+    if my_lines:
+        # 'committed' in the ATS feed carries A2000 open orders, so add back
+        # this customer's own open qty per base (same add-back idea as the
+        # allocation tabs use for 'allocated').
+        own_qty = {}
+        for o in my_lines:
+            b = get_base_style(str(o.get('style') or ''))
+            own_qty[b] = own_qty.get(b, 0) + int(o.get('openQty') or 0)
+        own_pool = {}
+        for b, q in own_qty.items():
+            d = inv_by_base.get(b)
+            if not d:
+                own_pool[b] = 0
+                continue
+            wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa']
+            own_pool[b] = max(0, min(wt, wt + d['committed'] + d['allocated'] + q))
+
+        def _oiso(s):
+            try:
+                return datetime.fromisoformat(str(s)[:19]).date()
+            except Exception:
+                return None
+
+        by_po = {}
+        for o in my_lines:
+            by_po.setdefault(str(o.get('orderNo') or '—').strip(), []).append(o)
+
+        def _po_sort(kv):
+            po, ls = kv
+            ds = [d for d in (_oiso(l.get('startDate')) for l in ls) if d]
+            return (min(ds) if ds else datetime.max.date(), po)
+
+        for po, ls in sorted(by_po.items(), key=_po_sort):
+            # Tentative pass — commit pool consumption only if the WHOLE PO fits.
+            plan, ok = [], True
+            tent_own, tent_sub = {}, {}
+            for o in ls:
+                b = get_base_style(str(o.get('style') or ''))
+                need = int(o.get('openQty') or 0)
+                if own_pool.get(b, 0) - tent_own.get(b, 0) >= need:
+                    tent_own[b] = tent_own.get(b, 0) + need
+                    plan.append((o, b, need, None))
                     continue
-                sub_take = min(rem, sub_free[cand])
-                sub_free[cand] -= sub_take
-                sub_txt = f"{cand} — {sub_take:,} free now"
-                break
-        if take_wh <= 0 and sub_take <= 0:
-            continue  # nothing can leave today for this line
-        inv = inv_by_base.get(base)
-        s_abbr = (inv and inv['brand_abbr']) or SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
-        s_full = (inv and inv['brand_full']) or _APO_BRAND_FULL.get(s_abbr, s_abbr or 'Other')
-        ship_rows.append({
-            'sku': base, 'brand_abbr': s_abbr, 'brand_full': s_full,
-            'color': _apo_style_color(base, s_abbr),
-            'fit': _apo_fit_label(base),
-            'fabrication': _apo_fabrication(base),
-            'po': po,
-            'units_alloc': qty,
-            'ships_today': take_wh,
-            'waiting_on': '' if rem <= 0 else _earliest_arrival_text(base),
-            'sub_available': sub_txt,
-            '_yellow': sub_take > 0,
-            '_ord': (0 if rem <= 0 else (1 if take_wh > 0 else 2), -(take_wh + sub_take)),
-        })
-    ship_rows.sort(key=lambda r: r['_ord'])
-    for r in ship_rows:
-        r.pop('_ord', None)
-    if ship_rows:
+                sub = None
+                if len(b) >= 8:
+                    for cand in design_ix.get(b[2:], []):
+                        if cand != b and sub_free.get(cand, 0) - tent_sub.get(cand, 0) >= need:
+                            sub = cand
+                            break
+                if sub:
+                    tent_sub[sub] = tent_sub.get(sub, 0) + need
+                    plan.append((o, b, need, sub))
+                else:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            for b, q in tent_own.items():
+                own_pool[b] = own_pool.get(b, 0) - q
+            for cand, q in tent_sub.items():
+                sub_free[cand] = sub_free.get(cand, 0) - q
+            for o, b, need, sub in plan:
+                inv = inv_by_base.get(b) or (inv_by_base.get(sub) if sub else None)
+                s_abbr = (inv and inv['brand_abbr']) or SKU_BRAND_CODE_MAP.get(b[2:4] if len(b) >= 4 else '', '')
+                s_full = (inv and inv['brand_full']) or _APO_BRAND_FULL.get(s_abbr, s_abbr or 'Other')
+                sd, cd = _oiso(o.get('startDate')), _oiso(o.get('cancelDate'))
+                window = ' – '.join(x for x in (
+                    _apo_fmt_date(sd) if sd else '', _apo_fmt_date(cd) if cd else '') if x)
+                po_rows.append({
+                    'sku': b, 'brand_abbr': s_abbr, 'brand_full': s_full,
+                    'color': _apo_style_color(b, s_abbr),
+                    'fit': _apo_fit_label(b),
+                    'fabrication': _apo_fabrication(b),
+                    'po': po,
+                    'units_alloc': need,
+                    'ship_window': window,
+                    'available': f"{sub} — available now" if sub else 'In warehouse',
+                    'orig_arrival': _earliest_arrival_text(b) if sub else '',
+                    '_yellow': bool(sub),
+                })
+    if po_rows:
         tabs.insert(0, {
-            'name': 'Can Ship Today',
-            'items': ship_rows,
+            'name': 'POs Ready to Ship',
+            'items': po_rows,
             'headers': ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
-                        'PO #', 'Units Allocated', 'Ships Today',
-                        'Waiting On', 'Sub Available'],
+                        'PO #', 'Units', 'Ship Window',
+                        'Available', 'Original Arrival'],
         })
 
     # No Shortfall column on the weekly APO report (David, Aug 4 2026) —
