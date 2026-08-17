@@ -11376,7 +11376,14 @@ def factory_view():
     # ── Inventory (warehouse TOTAL only — per-warehouse breakdown withheld) ──
     with _inv_lock:
         inv_items = list(_inventory['items'])
-    inventory_rows = []
+    # MERGE duplicate feed rows per exact SKU (BUGBSA002SLS bug, Aug 13 2026):
+    # the ATS feed can carry a real stock row PLUS a zero-stock row that only
+    # holds the commitment. Consumers of this bundle (weekly factory emails,
+    # orders2po) key inventory by SKU last-row-wins, so the duplicate wiped the
+    # warehouse and routed in-stock POs onto far-future productions as "late".
+    # Merge rule: warehouses/incoming SUM; committed/allocated are style-level
+    # figures duplicated onto each row — keep the largest magnitude, never sum.
+    inv_by_sku = {}
     for item in inv_items:
         sku = str(item.get('sku', '') or '').strip().upper()
         if sku not in sku_set:
@@ -11386,13 +11393,21 @@ def factory_view():
                          + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0))
         except (ValueError, TypeError):
             warehouse = 0
-        inventory_rows.append({
-            'sku': sku,
-            'warehouse': warehouse,
-            'incoming': int(item.get('incoming', 0) or 0),
-            'committed': int(item.get('committed', 0) or 0),
-            'allocated': int(item.get('allocated', 0) or 0),
-        })
+        incoming = int(item.get('incoming', 0) or 0)
+        committed = int(item.get('committed', 0) or 0)
+        allocated = int(item.get('allocated', 0) or 0)
+        m = inv_by_sku.get(sku)
+        if m is None:
+            inv_by_sku[sku] = {'sku': sku, 'warehouse': warehouse, 'incoming': incoming,
+                               'committed': committed, 'allocated': allocated}
+        else:
+            m['warehouse'] += warehouse
+            m['incoming'] += incoming
+            if abs(committed) > abs(m['committed']):
+                m['committed'] = committed
+            if abs(allocated) > abs(m['allocated']):
+                m['allocated'] = allocated
+    inventory_rows = list(inv_by_sku.values())
 
     # ── Suppression overrides (S3-backed exemption list, same source as
     # GET /suppression-overrides) — the frontend's arrival-suppression rule
