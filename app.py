@@ -2729,8 +2729,43 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     return buf.getvalue()
 
 
+def _safe_multi_sheet_name(raw, seen, idx):
+    # Same rules the ship-plan builder handles: xlsxwriter RAISES on duplicate
+    # sheet names and rejects names that start/end with an apostrophe. Custom
+    # per-tab names (line-sheet cart) make collisions likely — two views of the
+    # same brand — so dedupe with a _2.._999 suffix.
+    name = re.sub(r'[\\/*?\[\]:]', '', str(raw or ''))[:31].strip().strip("'") or f"Brand_{idx + 1}"
+    if name in seen:
+        for i in range(2, 1000):
+            cand = f"{name[:31 - len(str(i)) - 1]}_{i}"
+            if cand not in seen:
+                name = cand
+                break
+    seen.add(name)
+    return name
+
+
 def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None):
+    # Per-tab overrides (line-sheet cart): an entry may carry its own tab_name,
+    # view_mode, flow_mode and keep_order. Anything missing falls back to the
+    # workbook-global arguments, so pre-existing callers behave byte-identically.
+    # catalog_mode stays workbook-global on purpose — mixing admin and customer
+    # tabs in one file is how committed/allocated data leaks to a customer.
+    _VALID_VIEWS = ('all', 'ats', 'incoming')
+
+    def _tab_view(b):
+        v = str(b.get('view_mode') or view_mode).lower()
+        # An unknown value would silently fall into _setup_worksheet's admin
+        # else-branch and render a different column set — fall back instead.
+        return v if v in _VALID_VIEWS else view_mode
+
+    def _tab_flow(b):
+        return bool(b.get('flow_mode', flow_mode))
+
     for b in brands_list:
+        b['items'] = b.get('items') or []
+        if b.get('keep_order'):
+            continue  # curated tab: the caller's row order IS the layout
         sort_key = 'total_ats' if catalog_mode else 'total_warehouse'
         b['items'] = sorted(b['items'], key=lambda x: x.get(sort_key, 0), reverse=True)
 
@@ -2750,8 +2785,9 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
 
+    _seen_names = set()
     for bi, brand in enumerate(brands_list):
-        safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
+        safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _seen_names, bi)
         ws = wb.add_worksheet(safe)
         # Monkey-patch worksheet.write to catch string-as-format bugs
         _orig_ws_write = ws.write
@@ -2767,8 +2803,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 _orig(r, c)
         ws.write = _safe_ws_write
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
-                                         catalog_mode=catalog_mode, view_mode=view_mode,
-                                         flow_mode=flow_mode)
+                                         catalog_mode=catalog_mode, view_mode=_tab_view(brand),
+                                         flow_mode=_tab_flow(brand))
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -2777,10 +2813,13 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
                         has_color=has_color, headers=headers, catalog_mode=catalog_mode)
-        try:
-            _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
-        except Exception as e:
-            print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
+        # An empty tab would render the hardcoded fallback size grids on an
+        # otherwise blank sheet — skip charts entirely when there are no rows.
+        if brand['items']:
+            try:
+                _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
+            except Exception as e:
+                print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
 
     try:
         wb.close()
@@ -2792,12 +2831,13 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         buf = BytesIO()
         wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
+        _retry_seen = set()
         for bi, brand in enumerate(brands_list):
-            safe = re.sub(r'[\\/*?\[\]:]', '', brand['brand_name'])[:31] or f"Brand_{bi+1}"
+            safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _retry_seen, bi)
             ws = wb.add_worksheet(safe)
             fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
-                                             catalog_mode=catalog_mode, view_mode=view_mode,
-                                             flow_mode=flow_mode)
+                                             catalog_mode=catalog_mode, view_mode=_tab_view(brand),
+                                             flow_mode=_tab_flow(brand))
             start, count = offsets[bi]
             local_imgs = {}
             for li in range(count):
