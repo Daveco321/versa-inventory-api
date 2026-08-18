@@ -2729,19 +2729,21 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     return buf.getvalue()
 
 
-def _safe_multi_sheet_name(raw, seen, idx):
-    # Same rules the ship-plan builder handles: xlsxwriter RAISES on duplicate
-    # sheet names and rejects names that start/end with an apostrophe. Custom
-    # per-tab names (line-sheet cart) make collisions likely — two views of the
-    # same brand — so dedupe with a _2.._999 suffix.
-    name = re.sub(r'[\\/*?\[\]:]', '', str(raw or ''))[:31].strip().strip("'") or f"Brand_{idx + 1}"
-    if name in seen:
+def _safe_multi_sheet_name(raw, seen, idx, fallback_prefix='Brand'):
+    # xlsxwriter RAISES on duplicate sheet names and rejects names that start
+    # or end with an apostrophe. Custom per-tab names (line-sheet cart) make
+    # collisions likely — two views of the same brand — so dedupe with a
+    # _2.._999 suffix. Excel treats sheet names as CASE-INSENSITIVELY unique
+    # ('Nautica Sale' vs 'NAUTICA SALE' still raises), so the seen set holds
+    # lowercased names.
+    name = re.sub(r'[\\/*?\[\]:]', '', str(raw or ''))[:31].strip().strip("'") or f"{fallback_prefix}_{idx + 1}"
+    if name.lower() in seen:
         for i in range(2, 1000):
             cand = f"{name[:31 - len(str(i)) - 1]}_{i}"
-            if cand not in seen:
+            if cand.lower() not in seen:
                 name = cand
                 break
-    seen.add(name)
+    seen.add(name.lower())
     return name
 
 
@@ -4158,15 +4160,9 @@ def build_ship_plan_excel(tabs, s3_base_url, headers=None):
     images = download_images_for_items(all_items, s3_base_url)
     seen = set()
     for ti, t in enumerate(tabs):
-        # xlsxwriter also rejects names that start/end with an apostrophe
-        name = re.sub(r'[\\/*?\[\]:]', '', str(t.get('name') or ''))[:31].strip().strip("'") or f'Tab_{ti + 1}'
-        if name in seen:  # xlsxwriter RAISES on duplicate sheet names
-            for i in range(2, 1000):
-                cand = f"{name[:31 - len(str(i)) - 1]}_{i}"
-                if cand not in seen:
-                    name = cand
-                    break
-        seen.add(name)
+        # Same sanitize + case-insensitive dedupe as the multi-brand builder
+        # (Excel sheet names are case-insensitively unique; xlsxwriter raises).
+        name = _safe_multi_sheet_name(t.get('name'), seen, ti, fallback_prefix='Tab')
         ws = wb.add_worksheet(name)
         fmts, hdrs = _setup_worksheet(wb, ws, headers_override=(t.get('headers') or sheet_headers))
         off, cnt = offsets[ti]
