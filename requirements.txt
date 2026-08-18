@@ -7,6 +7,10 @@ requests
 Pillow
 gunicorn
 gevent
+# gunicorn's gevent worker imports packaging.version at boot (newer gunicorn
+# releases stopped vendoring it) — without this line the service builds fine
+# and then dies on startup with ModuleNotFoundError: packaging (Aug 2026).
+packaging
 reportlab
 pymupdf
 opencv-python-headless
