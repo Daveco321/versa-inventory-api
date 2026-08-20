@@ -12796,6 +12796,93 @@ def api_ai_agent():
                               'elapsed_seconds': round(time.time() - started, 1)}})
 
 
+# ============================================================
+# MCP CONNECTOR — the same five agent tools for claude.ai
+# ============================================================
+# Implements the Model Context Protocol's Streamable HTTP transport as a
+# plain Flask route (JSON-RPC 2.0 over POST, single JSON responses — the
+# spec allows servers to skip SSE). David adds the URL as a custom
+# connector in claude.ai settings and full Claude can query the live
+# platform from any chat, including mobile. Stateless: no sessions.
+# Auth: if the MCP_TOKEN env var is set, the token must appear in the
+# URL path (/mcp/<token>); unset = open, matching this API's posture.
+
+_MCP_PROTOCOL_VERSION = '2025-06-18'
+
+_MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
+Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
+
+
+def _mcp_rpc_result(rid, result):
+    return jsonify({'jsonrpc': '2.0', 'id': rid, 'result': result})
+
+
+def _mcp_rpc_error(rid, code, message):
+    return jsonify({'jsonrpc': '2.0', 'id': rid, 'error': {'code': code, 'message': message}})
+
+
+def _mcp_handle(payload):
+    if not isinstance(payload, dict):
+        return _mcp_rpc_error(None, -32600, 'batch requests not supported'), 400
+    method = payload.get('method')
+    rid = payload.get('id')
+    params = payload.get('params') or {}
+    # Notifications (no id) are acknowledged with 202 and no body
+    if rid is None:
+        return ('', 202)
+    if method == 'initialize':
+        return _mcp_rpc_result(rid, {
+            'protocolVersion': _MCP_PROTOCOL_VERSION,
+            'capabilities': {'tools': {}},
+            'serverInfo': {'name': 'versa-inventory', 'version': '1.0.0'},
+            'instructions': _MCP_INSTRUCTIONS,
+        })
+    if method == 'ping':
+        return _mcp_rpc_result(rid, {})
+    if method == 'tools/list':
+        tools = [{'name': t['name'], 'description': t['description'],
+                  'inputSchema': t['input_schema']} for t in _AI_AGENT_TOOLS]
+        return _mcp_rpc_result(rid, {'tools': tools})
+    if method == 'tools/call':
+        name = params.get('name')
+        args = params.get('arguments') or {}
+        fn = _AI_AGENT_TOOL_FNS.get(name)
+        if fn is None:
+            return _mcp_rpc_error(rid, -32602, f'unknown tool: {name}')
+        try:
+            out = fn(args)
+            text = json.dumps(out, default=str)
+            if len(text) > 90000:
+                text = text[:90000] + '... [truncated]'
+            return _mcp_rpc_result(rid, {'content': [{'type': 'text', 'text': text}],
+                                         'isError': bool(isinstance(out, dict) and out.get('error'))})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _mcp_rpc_result(rid, {'content': [{'type': 'text', 'text': f'Tool error: {e}'}],
+                                         'isError': True})
+    return _mcp_rpc_error(rid, -32601, f'method not found: {method}')
+
+
+@app.route('/mcp', methods=['POST', 'GET', 'DELETE', 'OPTIONS'])
+@app.route('/mcp/<token>', methods=['POST', 'GET', 'DELETE', 'OPTIONS'])
+def mcp_endpoint(token=None):
+    if request.method == 'OPTIONS':
+        return '', 204
+    required = os.environ.get('MCP_TOKEN')
+    if required and token != required:
+        return jsonify({'error': 'unauthorized'}), 401
+    if request.method != 'POST':
+        # No server-initiated SSE stream; stateless single-response server.
+        return jsonify({'error': 'POST JSON-RPC messages to this endpoint'}), 405
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return _mcp_rpc_error(None, -32700, 'parse error'), 400
+    result = _mcp_handle(payload)
+    return result
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
