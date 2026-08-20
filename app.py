@@ -12560,10 +12560,37 @@ def _ai_tool_build_line_sheet(params):
     prod_by_base = {}
     for p in prods_all:
         prod_by_base.setdefault(_ai_agent_base(p.get('style')), []).append(p)
+    agg_cache = None
     for ti, t in enumerate(tabs_in[:4]):
-        rows, _ = _ai_agent_filter(t)
-        color_q = (t.get('color') or '').strip().lower() or None
+        skus_req = []
+        seen_req = set()
+        for s in (t.get('skus') or []):
+            su = str(s or '').strip().upper()
+            # Dedupe on the RESOLVED base (resolution below also keys on base) so a
+            # base and its size-suffixed twin can't render the same style twice.
+            sb = _ai_agent_base(su)
+            if su and sb and sb not in seen_req:
+                seen_req.add(sb)
+                skus_req.append(su)
+        missing_req = []
+        if skus_req:
+            # Explicit style list: exactly these bases in this order, no other
+            # filters second-guess the caller's curation.
+            if agg_cache is None:
+                agg_cache = _ai_agent_agg_inventory()
+            rows = []
+            for su in skus_req:
+                r = agg_cache.get(_ai_agent_base(su))
+                if r is not None:
+                    rows.append(r)
+                else:
+                    missing_req.append(su)
+            color_q = None
+        else:
+            rows, _ = _ai_agent_filter(t)
+            color_q = (t.get('color') or '').strip().lower() or None
         items = []
+        over_cap = rows[300:]
         for r in rows[:300]:
             color, fit, fab = _ai_agent_enrich(r)
             if color_q:
@@ -12607,10 +12634,15 @@ def _ai_tool_build_line_sheet(params):
                     'ex_factory': etd_s, 'arrival': arr_s, 'po_ref': po_ref}
             items.append(item)
         if not items:
-            summary.append({'tab': t.get('title') or f'Tab {ti + 1}', 'styles': 0, 'skipped': True})
+            entry = {'tab': t.get('title') or f'Tab {ti + 1}', 'styles': 0, 'skipped': True}
+            if missing_req:
+                entry['skus_not_found'] = missing_req
+            summary.append(entry)
             continue
         try:
-            _annotate_items_for_prepack(items)
+            # Returns annotated COPIES — assigning is what makes Override Tool size
+            # packs and fit/customer-narrowed prepack rules reach the size charts.
+            items = _annotate_items_for_prepack(items)
         except Exception:
             pass
         stock = (t.get('stock') or 'any').strip().lower()
@@ -12618,7 +12650,16 @@ def _ai_tool_build_line_sheet(params):
         name = t.get('title') or f"{(t.get('brand') or (t.get('brands') or ['Styles'])[0])} {view_mode}"
         tabs_out.append({'brand_name': str(name), 'tab_name': str(name), 'items': items,
                          'view_mode': view_mode, 'flow_mode': False, 'keep_order': True})
-        summary.append({'tab': str(name), 'styles': len(items)})
+        entry = {'tab': str(name), 'styles': len(items)}
+        if missing_req:
+            entry['skus_not_found'] = missing_req
+        if over_cap:
+            # Never let a silent cap read as full coverage: name the dropped styles
+            # on the curated path so the model can move them to another tab or warn.
+            entry['truncated'] = True
+            entry['styles_dropped_over_300_cap'] = ([r['style'] for r in over_cap]
+                                                    if skus_req else len(over_cap))
+        summary.append(entry)
     if not tabs_out:
         return {'error': 'no styles matched any tab filters', 'tabs': summary}
     try:
@@ -12670,7 +12711,9 @@ _AI_AGENT_TOOLS = [
          'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'limit': {'type': 'integer'}}}},
     {'name': 'build_line_sheet',
      'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
-                     'tabs = list of filter objects (same filters as query_inventory, plus title). '
+                     'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
+                     'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
+                     'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
                      'Max 4 tabs, 300 styles per tab. Takes up to a minute. Present the returned download_url '
                      'to the user as a clickable link.'),
@@ -12678,6 +12721,7 @@ _AI_AGENT_TOOLS = [
          'tabs': {'type': 'array', 'items': {'type': 'object', 'properties': {
              'title': {'type': 'string'}, 'brand': {'type': 'string'},
              'brands': {'type': 'array', 'items': {'type': 'string'}},
+             'skus': {'type': 'array', 'items': {'type': 'string'}},
              'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
              'color': {'type': 'string'}, 'stock': {'type': 'string', 'enum': ['any', 'warehouse', 'overseas']},
              'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
@@ -12698,7 +12742,8 @@ _AI_AGENT_TOOL_GUIDANCE = """
 LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
-UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. After your tools finish, respond in the required JSON format.
+CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus, or the saveLineSheetViews action's skus param. Never ask the user to paste style numbers you can look up.
+UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. Never emit a queryInventory action — it is retired; its output rendered only in the user's browser and never came back to you. After your tools finish, respond in the required JSON format.
 The message field renders as raw HTML in the chat bubble. Format with HTML only: <b>, <br>, &bull; lists, <a> links. NEVER markdown (**bold**, ##, tables) — it shows as literal asterisks.
 """
 
@@ -12720,6 +12765,10 @@ def api_ai_agent():
     messages = body.get('messages') or []
     convo = [{'role': m.get('role'), 'content': m.get('content')}
              for m in messages if m.get('role') in ('user', 'assistant') and m.get('content')]
+    # Anthropic requires the first message to be role 'user' — clients that window
+    # their history can start on an assistant turn, which 400s the whole request.
+    while convo and convo[0]['role'] != 'user':
+        convo.pop(0)
     if not convo:
         return jsonify({'error': 'messages required'}), 400
     model = body.get('model') or AI_AGENT_MODEL
