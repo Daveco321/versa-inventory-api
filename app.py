@@ -12169,6 +12169,632 @@ def factory_report_download(jid):
     return jsonify({'error': 'Report not ready.'}), 404
 
 
+# ============================================================
+# AI AGENT — server-side tool loop for the platform chatbot
+# ============================================================
+# The old /api/ai-proxy is a one-shot passthrough: the model gets a big
+# snapshot and answers blind. This endpoint runs a real agentic loop —
+# the model calls tools that query the LIVE in-memory data (inventory,
+# production ledger, APO, open orders) and can build line sheet files,
+# iterating until it has a grounded answer. The frontend chat keeps its
+# existing response contract: the final assistant text passes through in
+# an Anthropic-shaped envelope, so the client parser is unchanged.
+#
+# Uses the official anthropic SDK (lazy import so a missing package can
+# never kill boot — the endpoint 503s instead; lesson of the packaging
+# deploy failure). Model: claude-opus-5 (thinking on by default there;
+# effort medium keeps chat latency sane — override via env).
+
+_ai_agent_sdk_client = None
+
+
+def _ai_agent_client():
+    global _ai_agent_sdk_client
+    if _ai_agent_sdk_client is None:
+        import anthropic  # lazy: boot survives a missing package
+        key = os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDE_API_KEY')
+        if not key:
+            raise RuntimeError('ANTHROPIC_API_KEY not configured')
+        _ai_agent_sdk_client = anthropic.Anthropic(api_key=key)
+    return _ai_agent_sdk_client
+
+
+AI_AGENT_MODEL = os.environ.get('AI_AGENT_MODEL', 'claude-opus-5')
+AI_AGENT_EFFORT = os.environ.get('AI_AGENT_EFFORT', 'medium')
+_AI_AGENT_MAX_ITER = int(os.environ.get('AI_AGENT_MAX_ITER', '8'))
+_AI_AGENT_WALL_SECONDS = int(os.environ.get('AI_AGENT_WALL_SECONDS', '110'))
+_AI_AGENT_SELF_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://versa-inventory-api.onrender.com').rstrip('/')
+
+
+def _ai_agent_base(sku):
+    return str(sku or '').split('-')[0].strip().upper()
+
+
+def _ai_agent_agg_inventory():
+    """Aggregate the per-size feed rows to one record per base style.
+    Physical quantities SUM across size rows; committed/allocated are
+    style-level NEGATIVE figures duplicated onto each size row, so keep
+    the largest magnitude — never sum (the BUGBSA002SLS lesson)."""
+    with _inv_lock:
+        items = list(_inventory.get('items') or [])
+    agg = {}
+    for it in items:
+        base = _ai_agent_base(it.get('sku'))
+        if not base:
+            continue
+        r = agg.get(base)
+        if r is None:
+            r = {'style': base, 'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
+                 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'incoming': 0, 'total_ats': 0,
+                 'committed': 0, 'allocated': 0, 'size_rows': 0}
+            agg[base] = r
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'incoming', 'total_ats'):
+            try:
+                r[k] += int(it.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        for k in ('committed', 'allocated'):
+            try:
+                v = int(it.get(k) or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if abs(v) > abs(r[k]):
+                r[k] = v
+        r['size_rows'] += 1
+    for r in agg.values():
+        r['total_warehouse'] = r['jtw'] + r['tr'] + r['dcw'] + r['qa']
+    return agg
+
+
+def _ai_agent_prod_for(base, prods=None):
+    """Production ledger rows for one base style with effective arrivals."""
+    if prods is None:
+        with _production_lock:
+            prods = list(_production_data)
+    base = base.upper()
+    out = []
+    for p in prods:
+        if _ai_agent_base(p.get('style')) != base:
+            continue
+        pants = False
+        try:
+            pants = _py_is_bottom(base)
+        except Exception:
+            pass
+        arr = None
+        try:
+            arr = _apo_prod_arrival(p, pants)
+        except Exception:
+            pass
+        out.append({
+            'production': p.get('production'), 'po_name': p.get('poName'),
+            'units': p.get('units'), 'etd': p.get('etd'),
+            'arrival': str(arr) if arr else ('FOB/' + str(p.get('fob_note') or 'TBD') if p.get('fob_flag') else 'TBD'),
+            'port_dated': bool(p.get('port_dated')),
+        })
+    return out
+
+
+def _ai_agent_filter(params):
+    """Shared filter over aggregated inventory. Returns (rows, prods_snapshot).
+    Rows are enriched with color/fit/fabrication lazily AFTER filtering."""
+    agg = _ai_agent_agg_inventory()
+    with _production_lock:
+        prods = list(_production_data)
+
+    brands = params.get('brands') or ([params['brand']] if params.get('brand') else [])
+    brand_keys = set()
+    for b in brands:
+        bu = str(b or '').strip().upper()
+        if not bu:
+            continue
+        brand_keys.add(bu)
+        for abbr, full in (BRAND_FULL_NAMES or {}).items():
+            if str(full).upper() == bu:
+                brand_keys.add(str(abbr).upper())
+    category = (params.get('category') or '').strip().lower() or None
+    fabric_codes = {str(f).strip().upper() for f in (params.get('fabric_codes') or []) if str(f).strip()}
+    color_q = (params.get('color') or '').strip().lower() or None
+    search = (params.get('search') or '').strip().upper() or None
+    stock = (params.get('stock') or 'any').strip().lower()
+    min_units = int(params.get('min_units') or 0)
+    arrive_before = _apo_parse_date(params.get('arrive_before')) if params.get('arrive_before') else None
+    arrive_after = _apo_parse_date(params.get('arrive_after')) if params.get('arrive_after') else None
+
+    # Pre-index qualifying production arrivals when a date window is set
+    date_window = arrive_before or arrive_after
+    qual_units = {}
+    if date_window:
+        for p in prods:
+            b = _ai_agent_base(p.get('style'))
+            if not b:
+                continue
+            try:
+                arr = _apo_prod_arrival(p, _py_is_bottom(b))
+            except Exception:
+                arr = None
+            if not arr:
+                continue
+            if arrive_before and not (arr <= arrive_before):
+                continue
+            if arrive_after and not (arr >= arrive_after):
+                continue
+            qual_units[b] = qual_units.get(b, 0) + int(p.get('units') or 0)
+
+    rows = []
+    for base, r in agg.items():
+        wh = r['total_warehouse']
+        inc = r['incoming']
+        if stock == 'warehouse' and wh <= 0:
+            continue
+        if stock == 'overseas' and inc <= 0:
+            continue
+        if stock == 'any' and wh <= 0 and inc <= 0:
+            continue
+        if brand_keys and r['brand_abbr'] not in brand_keys:
+            continue
+        if search and search not in base:
+            continue
+        if fabric_codes and (len(base) < 6 or base[4:6] not in fabric_codes):
+            continue
+        if category:
+            try:
+                if category in ('blazer', 'blazers'):
+                    if not _py_is_blazer(base):
+                        continue
+                elif not _py_matches_category(base, r['brand_abbr'], category):
+                    continue
+            except Exception:
+                continue
+        if date_window and base not in qual_units:
+            continue
+        basis = wh if stock == 'warehouse' else (inc if stock == 'overseas' else max(r['total_ats'], wh + inc))
+        if min_units and basis < min_units:
+            continue
+        if date_window:
+            r = dict(r)
+            r['qualifying_po_units'] = qual_units.get(base, 0)
+        rows.append(r)
+
+    sort = (params.get('sort') or 'total_ats').strip().lower()
+    key = {'warehouse': 'total_warehouse', 'incoming': 'incoming'}.get(sort, 'total_ats')
+    rows.sort(key=lambda x: x.get(key, 0), reverse=True)
+    return rows, prods
+
+
+def _ai_agent_enrich(r):
+    base = r['style']
+    ab = r['brand_abbr']
+    try:
+        color = _apo_style_color(base, ab) or ''
+    except Exception:
+        color = ''
+    try:
+        fab = _apo_fabrication(base) or ''
+    except Exception:
+        fab = ''
+    try:
+        fit = _apo_fit_label(base) or ''
+    except Exception:
+        fit = ''
+    return color, fit, fab
+
+
+def _ai_tool_query_inventory(params):
+    rows, _prods = _ai_agent_filter(params)
+    color_q = (params.get('color') or '').strip().lower() or None
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+    out_rows = []
+    tot_wh = tot_inc = tot_ats = 0
+    matched = 0
+    for r in rows:
+        color, fit, fab = _ai_agent_enrich(r)
+        if color_q:
+            try:
+                bucket = _apo_classify_color(color, r['brand_abbr'])
+            except Exception:
+                bucket = ''
+            cl = color.lower()
+            if color_q in ('solid', 'solids'):
+                if bucket == 'fancies':
+                    continue
+            elif color_q in ('fancy', 'fancies'):
+                if bucket != 'fancies':
+                    continue
+            elif color_q not in cl and color_q != bucket:
+                continue
+        matched += 1
+        tot_wh += r['total_warehouse']
+        tot_inc += r['incoming']
+        tot_ats += r['total_ats']
+        if len(out_rows) < limit:
+            row = {'style': r['style'], 'brand': r['brand_abbr'], 'color': color, 'fit': fit,
+                   'fabrication': fab, 'warehouse': r['total_warehouse'], 'incoming': r['incoming'],
+                   'total_ats': r['total_ats'], 'committed_units': abs(r['committed']),
+                   'allocated_units': abs(r['allocated'])}
+            if 'qualifying_po_units' in r:
+                row['qualifying_po_units'] = r['qualifying_po_units']
+            out_rows.append(row)
+    return {'matched_styles': matched, 'total_warehouse_units': tot_wh, 'total_incoming_units': tot_inc,
+            'total_ats_units': tot_ats, 'rows': out_rows, 'truncated': matched > len(out_rows),
+            'note': 'quantities aggregate all size rows per base style; committed/allocated shown as positive magnitudes'}
+
+
+def _ai_tool_style_detail(params):
+    base = _ai_agent_base(params.get('style'))
+    if not base:
+        return {'error': 'style required'}
+    agg = _ai_agent_agg_inventory()
+    r = agg.get(base)
+    with _inv_lock:
+        size_rows = [dict(it) for it in (_inventory.get('items') or []) if _ai_agent_base(it.get('sku')) == base]
+    if not r and not size_rows:
+        # Style not in the current feed — still report classification + production
+        try:
+            ab = _apo_style_brand(base) or ''
+        except Exception:
+            ab = ''
+        r = {'style': base, 'brand_abbr': ab, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'incoming': 0,
+             'total_ats': 0, 'committed': 0, 'allocated': 0, 'total_warehouse': 0, 'size_rows': 0}
+    color, fit, fab = _ai_agent_enrich(r)
+    try:
+        category = _py_get_item_category(base, r['brand_abbr'])
+    except Exception:
+        category = ''
+    prods = _ai_agent_prod_for(base)
+    with _apo_lock:
+        apo = [{'customer': a.get('customer'), 'qty': a.get('qty'), 'po': a.get('po')}
+               for a in (_apo_data or []) if _ai_agent_base(a.get('style')) == base]
+    orders_out = []
+    try:
+        orders, ok = _fetch_all_open_orders()
+        if ok:
+            for o in orders:
+                if _ai_agent_base(o.get('style') or o.get('baseStyle')) != base:
+                    continue
+                if not (o.get('openQty') or o.get('pickQty')):
+                    continue
+                orders_out.append({'customer': o.get('customerFull') or o.get('customer'),
+                                   'order_no': o.get('orderNo'), 'open_qty': o.get('openQty'),
+                                   'pick_qty': o.get('pickQty'), 'start': o.get('startDate'),
+                                   'cancel': o.get('cancelDate')})
+    except Exception:
+        pass
+    return {'style': base, 'brand': r['brand_abbr'], 'color': color, 'fit': fit, 'fabrication': fab,
+            'category': category, 'warehouse': {'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
+            'total': r['total_warehouse']}, 'incoming': r['incoming'], 'total_ats': r['total_ats'],
+            'committed_units': abs(r['committed']), 'allocated_units': abs(r['allocated']),
+            'size_variants': [{'sku': s.get('sku'), 'warehouse': (s.get('jtw') or 0) + (s.get('tr') or 0) + (s.get('dcw') or 0) + (s.get('qa') or 0),
+                               'incoming': s.get('incoming'), 'total_ats': s.get('total_ats')} for s in size_rows[:40]],
+            'production_orders': prods[:20], 'apo_allocations': apo[:20], 'open_orders': orders_out[:20],
+            'image_url': f'{_AI_AGENT_SELF_URL}/image/{base}'}
+
+
+def _ai_tool_brand_summary(params):
+    agg = _ai_agent_agg_inventory()
+    brand = (params.get('brand') or '').strip().upper()
+    if brand:
+        for abbr, full in (BRAND_FULL_NAMES or {}).items():
+            if str(full).upper() == brand:
+                brand = str(abbr).upper()
+                break
+    by_brand = {}
+    for r in agg.values():
+        if r['total_warehouse'] <= 0 and r['incoming'] <= 0:
+            continue
+        b = r['brand_abbr'] or '?'
+        s = by_brand.setdefault(b, {'brand': b, 'styles': 0, 'warehouse_units': 0, 'incoming_units': 0, 'total_ats': 0})
+        s['styles'] += 1
+        s['warehouse_units'] += r['total_warehouse']
+        s['incoming_units'] += r['incoming']
+        s['total_ats'] += r['total_ats']
+    if not brand:
+        rows = sorted(by_brand.values(), key=lambda x: x['total_ats'], reverse=True)
+        return {'brands': rows}
+    fabs, cats = {}, {}
+    for r in agg.values():
+        if r['brand_abbr'] != brand or (r['total_warehouse'] <= 0 and r['incoming'] <= 0):
+            continue
+        base = r['style']
+        try:
+            fab = _apo_fabrication(base) or 'Unknown'
+        except Exception:
+            fab = 'Unknown'
+        code = base[4:6] if len(base) >= 6 else '??'
+        f = fabs.setdefault(code, {'fabric_code': code, 'fabrication': fab, 'styles': 0, 'warehouse_units': 0, 'incoming_units': 0})
+        f['styles'] += 1
+        f['warehouse_units'] += r['total_warehouse']
+        f['incoming_units'] += r['incoming']
+        try:
+            cat = _py_get_item_category(base, brand)
+        except Exception:
+            cat = 'unknown'
+        c = cats.setdefault(cat, {'category': cat, 'styles': 0, 'units': 0})
+        c['styles'] += 1
+        c['units'] += r['total_warehouse'] + r['incoming']
+    return {'summary': by_brand.get(brand) or {'brand': brand, 'styles': 0},
+            'fabrications': sorted(fabs.values(), key=lambda x: x['warehouse_units'] + x['incoming_units'], reverse=True),
+            'categories': sorted(cats.values(), key=lambda x: x['units'], reverse=True)}
+
+
+def _ai_tool_open_orders(params):
+    orders, ok = _fetch_all_open_orders()
+    if not ok and not orders:
+        return {'error': 'open orders feed unavailable right now'}
+    cust_q = (params.get('customer') or '').strip().lower() or None
+    style_q = _ai_agent_base(params.get('style')) if params.get('style') else None
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+    rows, tot_qty, tot_val, matched = [], 0, 0.0, 0
+    for o in orders:
+        open_qty = int(o.get('openQty') or 0) + int(o.get('pickQty') or 0)
+        if open_qty <= 0:
+            continue
+        cust = str(o.get('customerFull') or o.get('customer') or '')
+        if cust_q and cust_q not in cust.lower() and cust_q not in str(o.get('customer') or '').lower():
+            continue
+        if style_q and _ai_agent_base(o.get('style') or o.get('baseStyle')) != style_q:
+            continue
+        matched += 1
+        tot_qty += open_qty
+        try:
+            tot_val += float(o.get('openValue') or 0) + float(o.get('pickValue') or 0)
+        except (TypeError, ValueError):
+            pass
+        if len(rows) < limit:
+            rows.append({'customer': cust, 'order_no': o.get('orderNo'), 'style': o.get('style'),
+                         'open_qty': open_qty, 'start': o.get('startDate'), 'cancel': o.get('cancelDate'),
+                         'is_bulk': bool(o.get('isPipeline'))})
+    return {'matched_orders': matched, 'total_open_units': tot_qty, 'total_open_value': round(tot_val, 2),
+            'rows': rows, 'truncated': matched > len(rows)}
+
+
+def _ai_tool_build_line_sheet(params):
+    tabs_in = params.get('tabs') or []
+    if not isinstance(tabs_in, list) or not tabs_in:
+        return {'error': 'tabs required: a list of filter objects, one per tab'}
+    customer_view = bool(params.get('customer_view'))
+    tabs_out = []
+    summary = []
+    with _production_lock:
+        prods_all = list(_production_data)
+    prod_by_base = {}
+    for p in prods_all:
+        prod_by_base.setdefault(_ai_agent_base(p.get('style')), []).append(p)
+    for ti, t in enumerate(tabs_in[:4]):
+        rows, _ = _ai_agent_filter(t)
+        color_q = (t.get('color') or '').strip().lower() or None
+        items = []
+        for r in rows[:300]:
+            color, fit, fab = _ai_agent_enrich(r)
+            if color_q:
+                try:
+                    bucket = _apo_classify_color(color, r['brand_abbr'])
+                except Exception:
+                    bucket = ''
+                cl = color.lower()
+                if color_q in ('solid', 'solids'):
+                    if bucket == 'fancies':
+                        continue
+                elif color_q in ('fancy', 'fancies'):
+                    if bucket != 'fancies':
+                        continue
+                elif color_q not in cl and color_q != bucket:
+                    continue
+            base = r['style']
+            # Nearest production dates for delivery columns
+            etd_s = arr_s = po_ref = ''
+            best = None
+            for p in prod_by_base.get(base, []):
+                try:
+                    arr = _apo_prod_arrival(p, _py_is_bottom(base))
+                except Exception:
+                    arr = None
+                if arr and (best is None or arr < best[0]):
+                    best = (arr, p)
+            if best:
+                arr_s = str(best[0])
+                etd_s = str(best[1].get('etd') or '')
+                po_ref = str(best[1].get('production') or '')
+            wh_names = [n for n, k in (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa')) if r[k] > 0]
+            item = {'sku': base, 'brand_abbr': r['brand_abbr'],
+                    'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
+                    'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
+                    'fabrication': fab, 'delivery': 'ATS' if r['total_warehouse'] > 0 else (arr_s or 'Overseas'),
+                    'total_ats': r['total_ats'], 'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
+                    'incoming': r['incoming'], 'total_warehouse': r['total_warehouse'],
+                    'committed': r['committed'], 'allocated': r['allocated'],
+                    'warehouse': ', '.join(wh_names) or '—',
+                    'ex_factory': etd_s, 'arrival': arr_s, 'po_ref': po_ref}
+            items.append(item)
+        if not items:
+            summary.append({'tab': t.get('title') or f'Tab {ti + 1}', 'styles': 0, 'skipped': True})
+            continue
+        try:
+            _annotate_items_for_prepack(items)
+        except Exception:
+            pass
+        stock = (t.get('stock') or 'any').strip().lower()
+        view_mode = 'incoming' if stock == 'overseas' else ('ats' if stock == 'warehouse' else 'all')
+        name = t.get('title') or f"{(t.get('brand') or (t.get('brands') or ['Styles'])[0])} {view_mode}"
+        tabs_out.append({'brand_name': str(name), 'tab_name': str(name), 'items': items,
+                         'view_mode': view_mode, 'flow_mode': False, 'keep_order': True})
+        summary.append({'tab': str(name), 'styles': len(items)})
+    if not tabs_out:
+        return {'error': 'no styles matched any tab filters', 'tabs': summary}
+    try:
+        pd_snap = _fresh_prepack_defaults()
+    except Exception:
+        pd_snap = None
+    xl = build_multi_brand_excel(tabs_out, S3_PHOTOS_URL, catalog_mode=customer_view,
+                                 view_mode='all', flow_mode=False, prepack_defaults=pd_snap)
+    fname = re.sub(r'[^A-Za-z0-9 _.-]+', '', str(params.get('filename') or 'AI Line Sheet')).strip() or 'AI Line Sheet'
+    key = f"claude uploaded/{fname} {datetime.now().strftime('%Y-%m-%d %H%M%S')}.xlsx"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=xl,
+                        ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    from urllib.parse import quote
+    url = f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}"
+    return {'download_url': url, 'tabs': summary, 'customer_view': customer_view,
+            'note': 'give the user this link as a clickable download'}
+
+
+_AI_AGENT_TOOLS = [
+    {'name': 'query_inventory',
+     'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
+                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers), "
+                     "fabric_codes (2-letter SKU codes), color (color word, or solids/fancies/white/black/navy), "
+                     "search (substring of style #), stock (any|warehouse|overseas), min_units, "
+                     "arrive_before/arrive_after (YYYY-MM-DD, filters styles with production arriving in that window and "
+                     "reports qualifying_po_units). Totals cover ALL matches even when rows are truncated. "
+                     "Use for ANY quantity/availability question."),
+     'input_schema': {'type': 'object', 'properties': {
+         'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
+         'color': {'type': 'string'}, 'search': {'type': 'string'},
+         'stock': {'type': 'string', 'enum': ['any', 'warehouse', 'overseas']},
+         'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
+         'sort': {'type': 'string', 'enum': ['total_ats', 'warehouse', 'incoming']},
+         'limit': {'type': 'integer'}}}},
+    {'name': 'style_detail',
+     'description': ('Everything about ONE style (base style # or full SKU): per-warehouse stock, size variants, '
+                     'incoming production orders with arrival dates, APO allocations, open customer orders, '
+                     'color/fit/fabrication/category, image link. Use when asked about a specific style number.'),
+     'input_schema': {'type': 'object', 'properties': {'style': {'type': 'string'}}, 'required': ['style']}},
+    {'name': 'brand_summary',
+     'description': ('Without brand: every brand with style counts and unit totals. With brand: that brand plus its '
+                     'fabrication rollup (codes, descriptions, units) and category rollup.'),
+     'input_schema': {'type': 'object', 'properties': {'brand': {'type': 'string'}}}},
+    {'name': 'open_orders_lookup',
+     'description': ('Open customer orders (A2000 + bulks) with quantities, dollars, and ship windows. '
+                     'Filter by customer name and/or style #.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'limit': {'type': 'integer'}}}},
+    {'name': 'build_line_sheet',
+     'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
+                     'tabs = list of filter objects (same filters as query_inventory, plus title). '
+                     'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
+                     'Max 4 tabs, 300 styles per tab. Takes up to a minute. Present the returned download_url '
+                     'to the user as a clickable link.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'tabs': {'type': 'array', 'items': {'type': 'object', 'properties': {
+             'title': {'type': 'string'}, 'brand': {'type': 'string'},
+             'brands': {'type': 'array', 'items': {'type': 'string'}},
+             'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
+             'color': {'type': 'string'}, 'stock': {'type': 'string', 'enum': ['any', 'warehouse', 'overseas']},
+             'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
+             'limit': {'type': 'integer'}}}},
+         'customer_view': {'type': 'boolean'}, 'filename': {'type': 'string'}},
+         'required': ['tabs']}},
+]
+
+_AI_AGENT_TOOL_FNS = {
+    'query_inventory': _ai_tool_query_inventory,
+    'style_detail': _ai_tool_style_detail,
+    'brand_summary': _ai_tool_brand_summary,
+    'open_orders_lookup': _ai_tool_open_orders,
+    'build_line_sheet': _ai_tool_build_line_sheet,
+}
+
+_AI_AGENT_TOOL_GUIDANCE = """
+LIVE DATA TOOLS
+You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
+build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
+UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. After your tools finish, respond in the required JSON format.
+"""
+
+_AI_AGENT_DEFAULT_SYSTEM = (
+    'You are the Versa Group inventory assistant with live data tools. Answer questions about inventory, '
+    'production, and orders using the tools. Be concise and concrete; cite real numbers from tool results.'
+    + _AI_AGENT_TOOL_GUIDANCE)
+
+
+@app.route('/api/ai-agent', methods=['POST', 'OPTIONS'])
+def api_ai_agent():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        client = _ai_agent_client()
+    except Exception as e:
+        return jsonify({'error': f'AI agent unavailable: {e}'}), 503
+    body = request.get_json(silent=True) or {}
+    messages = body.get('messages') or []
+    convo = [{'role': m.get('role'), 'content': m.get('content')}
+             for m in messages if m.get('role') in ('user', 'assistant') and m.get('content')]
+    if not convo:
+        return jsonify({'error': 'messages required'}), 400
+    model = body.get('model') or AI_AGENT_MODEL
+    max_tokens = min(int(body.get('max_tokens') or 8192), 16000)
+    system_static = str(body.get('system_static') or '')
+    system_dynamic = str(body.get('system_dynamic') or '')
+    if system_static:
+        static_text = system_static + '\n' + _AI_AGENT_TOOL_GUIDANCE
+    else:
+        static_text = _AI_AGENT_DEFAULT_SYSTEM
+    system = [{'type': 'text', 'text': static_text, 'cache_control': {'type': 'ephemeral'}}]
+    if system_dynamic:
+        system.append({'type': 'text', 'text': system_dynamic})
+
+    started = time.time()
+    iterations = 0
+    tools_used = []
+    usage_tot = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+    force_final = False
+    final_text = ''
+    try:
+        while True:
+            iterations += 1
+            kwargs = {}
+            if force_final:
+                kwargs['tool_choice'] = {'type': 'none'}
+            resp = client.with_options(timeout=90.0).messages.create(
+                model=model, max_tokens=max_tokens, system=system, messages=convo,
+                tools=_AI_AGENT_TOOLS, output_config={'effort': AI_AGENT_EFFORT}, **kwargs)
+            u = getattr(resp, 'usage', None)
+            if u:
+                for k in usage_tot:
+                    usage_tot[k] += int(getattr(u, k, 0) or 0)
+            if resp.stop_reason == 'refusal':
+                final_text = json.dumps({'message': 'I can\'t help with that request.', 'actions': []})
+                break
+            if resp.stop_reason == 'pause_turn':
+                convo.append({'role': 'assistant', 'content': resp.content})
+                continue
+            tool_uses = [b for b in resp.content if getattr(b, 'type', '') == 'tool_use']
+            if not tool_uses:
+                final_text = ''.join(getattr(b, 'text', '') for b in resp.content if getattr(b, 'type', '') == 'text')
+                break
+            convo.append({'role': 'assistant', 'content': resp.content})
+            results = []
+            for tu in tool_uses:
+                tools_used.append(tu.name)
+                fn = _AI_AGENT_TOOL_FNS.get(tu.name)
+                try:
+                    if fn is None:
+                        raise ValueError(f'unknown tool {tu.name}')
+                    out = fn(tu.input or {})
+                    content = json.dumps(out, default=str)
+                    if len(content) > 60000:
+                        content = content[:60000] + '... [truncated]'
+                    results.append({'type': 'tool_result', 'tool_use_id': tu.id, 'content': content})
+                except Exception as te:
+                    results.append({'type': 'tool_result', 'tool_use_id': tu.id,
+                                    'content': f'Tool error: {te}', 'is_error': True})
+            convo.append({'role': 'user', 'content': results})
+            if iterations >= _AI_AGENT_MAX_ITER or (time.time() - started) > _AI_AGENT_WALL_SECONDS:
+                force_final = True
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'AI agent failed: {e}'}), 502
+
+    print(f"[AI-Agent] {iterations} iterations, tools={tools_used}, "
+          f"in={usage_tot['input_tokens']} cached={usage_tot['cache_read_input_tokens']} "
+          f"out={usage_tot['output_tokens']}, {time.time() - started:.1f}s")
+    return jsonify({'content': [{'type': 'text', 'text': final_text}], 'model': model,
+                    'stop_reason': 'end_turn', 'usage': usage_tot,
+                    'agent': {'iterations': iterations, 'tools': tools_used,
+                              'elapsed_seconds': round(time.time() - started, 1)}})
+
+
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
