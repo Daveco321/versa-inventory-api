@@ -12699,6 +12699,7 @@ LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
 UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. After your tools finish, respond in the required JSON format.
+The message field renders as raw HTML in the chat bubble. Format with HTML only: <b>, <br>, &bull; lists, <a> links. NEVER markdown (**bold**, ##, tables) — it shows as literal asterisks.
 """
 
 _AI_AGENT_DEFAULT_SYSTEM = (
