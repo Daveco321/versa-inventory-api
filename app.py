@@ -1979,7 +1979,10 @@ def get_image_cached(item, s3_base_url):
     override_candidates = [sku_u] if sku_u != base_style_for_url else []
     override_candidates.append(base_style_for_url)
     for _cand in override_candidates:
-        override_url = f"{CLOUDFRONT_OVERRIDES_URL}/{_cand}.jpg"
+        # S3 direct, not CloudFront — see the matching note in _fetch_raw_image:
+        # server-side reads must always see the current file (edge POPs held a
+        # replaced image for up to 24h; querystring busting is a no-op here).
+        override_url = f"{S3_OVERRIDES_IMG_URL}/{_cand}.jpg"
         result = _process_image_from_url(override_url)
         if result:
             break
@@ -6151,8 +6154,14 @@ def _fetch_raw_image(base_style, brand_abbr):
         except Exception:
             pass
 
-    # 1. Try STYLE+OVERRIDES via CloudFront (fast CDN)
-    override_base = f"{CLOUDFRONT_OVERRIDES_URL}/{base_style}"
+    # 1. Try STYLE+OVERRIDES — S3 DIRECT, deliberately not CloudFront.
+    #    Server-side fetches must always see the CURRENT file: the distribution
+    #    ignores query strings (no cache-busting possible) and the invalidation
+    #    call silently skips when CLOUDFRONT_DISTRIBUTION_ID is unset, so a
+    #    replaced override image kept serving stale from Render's edge POP for
+    #    up to the 24h TTL (VD pants fix, Aug 2026). Results land in
+    #    _web_img_cache anyway, so the extra origin hit is once per style.
+    override_base = f"{S3_OVERRIDES_IMG_URL}/{base_style}"
     for ext in ['.jpg', '.png', '.jpeg']:
         try:
             url = override_base + ext
