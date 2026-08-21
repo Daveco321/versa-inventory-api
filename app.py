@@ -5230,6 +5230,13 @@ def save_overrides():
                         ]
                         for k in stale_override_keys:
                             _img_cache.pop(k, None)
+                # The /image proxy keeps its own per-worker cache with no TTL —
+                # without this eviction an updated override image kept serving
+                # stale bytes until an instance restart (VD pants fix, Aug 2026).
+                with _web_img_lock:
+                    for s in changed_styles:
+                        _web_img_cache.pop(str(s).upper(), None)
+                        _web_img_cache.pop(get_base_style(s), None)
                 print(f"  ✓ Cleared _img_cache for {len(changed_styles)} changed override styles")
 
             # ── Trigger background regen of pre-built exports ──
@@ -5349,6 +5356,11 @@ def _run_override_image_extraction():
         with _img_lock:
             for b in uploaded:
                 _img_cache.pop(b, None)
+        # Also evict the /image proxy's per-worker cache (no TTL — see the
+        # matching eviction in save_overrides).
+        with _web_img_lock:
+            for b in uploaded:
+                _web_img_cache.pop(str(b).upper(), None)
         trigger_background_generation()
 
         size_after = len(json.dumps(snapshot))
