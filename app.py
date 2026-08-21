@@ -5120,8 +5120,21 @@ def save_overrides():
             return jsonify({"error": "'overrides' must be an object"}), 400
 
         global _style_overrides
+        # ALWAYS reload from S3 before merging — same rule as GET /overrides.
+        # A cold worker's empty in-memory map must never be the merge base: on
+        # 2026-08-21 a POST hit a just-deployed instance, merged against {},
+        # and rewrote the canonical file with only the payload — wiping every
+        # override (restored from a local backup; the async overrides_backups
+        # writer had silently stopped in March 2026). S3 is the source of truth.
+        load_overrides_from_s3()
         with _overrides_lock:
             current = dict(_style_overrides)
+            loaded_etag = _s3_overrides_etag
+        # If the reload failed AND memory holds nothing, refuse to merge-save —
+        # the result would overwrite the canonical file with just this payload.
+        # replace_all is exempt: its payload IS the whole intended state.
+        if not current and not loaded_etag and not req.get('replace_all', False):
+            return jsonify({"error": "Overrides not loaded from S3 — save refused to avoid data loss. Retry shortly."}), 503
 
         # SAFETY: merge incoming into current — never allow a smaller payload to wipe existing data
         # Incoming keys add/update; keys not present in incoming are preserved from S3 state.
