@@ -5140,6 +5140,21 @@ def save_overrides():
                 # Merge only — do not shrink
                 print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
 
+        # Per-key tombstones: the frontend's delete flow removes a key from its map,
+        # but merge mode preserves missing keys — so UI deletions never persisted
+        # (the editor's "deletion may not persist" toast). 'deleted' lists exact keys
+        # to remove; a key also present in 'overrides' wins (kept), so delete+recreate
+        # in one save can never lose the new value. Ignored under replace_all (the
+        # payload is already the entire dict there).
+        deleted_applied = 0
+        deleted_keys = req.get('deleted') or []
+        if deleted_keys and not req.get('replace_all', False):
+            for k in deleted_keys:
+                if isinstance(k, str) and k not in overrides and merged.pop(k, None) is not None:
+                    deleted_applied += 1
+            if deleted_applied:
+                print(f"  🗑 Tombstones applied: {deleted_applied} of {len(deleted_keys)} keys removed")
+
         # Find which styles have new/changed images (for CloudFront invalidation)
         changed_styles = [
             style for style, data in overrides.items()
@@ -5191,7 +5206,8 @@ def save_overrides():
                 # Unconditional — the generator queues a follow-up if a run is in flight
                 trigger_background_generation()
 
-            return jsonify({"success": True, "count": len(merged), "invalidated": len(changed_styles)})
+            return jsonify({"success": True, "count": len(merged), "invalidated": len(changed_styles),
+                            "deleted_applied": deleted_applied})
         else:
             return jsonify({"error": "Failed to save to S3"}), 500
     except Exception as e:
