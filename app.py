@@ -945,6 +945,24 @@ def extract_image_code(sku, brand_abbr):
     return f"{prefix}_{base_sku}"
 
 
+# Bottoms fabric codes (chars 5-6 of the base style). Bottoms must never
+# borrow imagery through the brand+serial fallback keys above — those keys
+# are fabric-blind, so pants VDBA008 was serving the VDSL008 overshirt photo
+# (extract_image_code → 'VD_008' for both). The frontend already restricts
+# non-shirt items to precise sources; these helpers give the backend chains
+# the same rule. Precise sources (uploaded overrides, STYLE+OVERRIDES,
+# sportswear filename match — which includes the fabric code in the match
+# string) still apply to bottoms; only the brand_serial rungs are skipped.
+# NOTE: US Polo / Geoffrey Beene pants use P##-pattern fabric slots, not
+# these codes — their photo conventions are established and left untouched.
+BOTTOMS_FABRIC_CODES = {'BA', 'BC', 'BR', 'BH'}
+
+
+def is_bottoms_style(sku):
+    base = str(sku or '').split('-')[0].upper()
+    return len(base) >= 6 and base[4:6] in BOTTOMS_FABRIC_CODES
+
+
 def find_sportswear_image_match(base_style, brand_abbr=None):
     """Find the best-matching sportswear image filename for a SKU.
 
@@ -1978,14 +1996,18 @@ def get_image_cached(item, s3_base_url):
         if sw_match:
             result = get_dropbox_thumbnail(sw_match)
 
+    # Bottoms never use the brand+serial rungs below (fabric-blind keys —
+    # VD pants were exporting the same-serial shirt photo). See is_bottoms_style.
+    _no_serial_fallback = is_bottoms_style(sku)
+
     # 3. Try Dropbox photos
-    if not result:
+    if not result and not _no_serial_fallback:
         brand_abbr = item.get('brand_abbr', item.get('brand', ''))
         image_code = extract_image_code(sku, brand_abbr)
         result = get_dropbox_thumbnail(image_code)
 
     # 4. Fallback to CloudFront brand folder
-    if not result:
+    if not result and not _no_serial_fallback:
         brand_abbr_cf = item.get('brand_abbr', item.get('brand', ''))
         folder_name_cf = FOLDER_MAPPING.get(brand_abbr_cf, brand_abbr_cf)
         image_code_cf = extract_image_code(sku, brand_abbr_cf)
@@ -1995,7 +2017,7 @@ def get_image_cached(item, s3_base_url):
     # 5. VERY LAST resort: fallback swatch extracted from the brand
     #    style-number files (bottom priority — mirrors the frontend rung so
     #    Excel export thumbnails match what the catalog shows)
-    if not result:
+    if not result and not _no_serial_fallback:
         swatch_url = f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{image_code_cf}.jpg"
         result = _process_image_from_url(swatch_url)
 
@@ -6098,6 +6120,9 @@ def _fetch_raw_image(base_style, brand_abbr):
     """Download raw image bytes: base64 override → S3 override → Dropbox → S3 brand folder"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     image_code = extract_image_code(base_style, brand_abbr)
+    # Bottoms never use the brand+serial rungs (fabric-blind keys — VD pants
+    # were serving the same-serial shirt photo). See is_bottoms_style.
+    _no_serial_fallback = is_bottoms_style(base_style)
 
     # 0. Platform base64 override (highest priority)
     override_data = _style_overrides.get(base_style)
@@ -6128,7 +6153,7 @@ def _fetch_raw_image(base_style, brand_abbr):
             continue
 
     # 2. Try CloudFront DROPBOX_SYNC (fastest — edge cached)
-    if image_code.upper() in _dropbox_photo_index:
+    if not _no_serial_fallback and image_code.upper() in _dropbox_photo_index:
         sync_base = f"{CLOUDFRONT_DROPBOX_SYNC_URL}/{image_code}"
         for ext in ['.jpg', '.png']:
             try:
@@ -6165,33 +6190,36 @@ def _fetch_raw_image(base_style, brand_abbr):
             return sw_bytes, sw_ct
 
     # 3. Try Dropbox photos (disk cache → API download)
-    dbx_bytes, dbx_ct = get_dropbox_image_bytes(image_code)
-    if dbx_bytes:
-        return dbx_bytes, dbx_ct
+    if not _no_serial_fallback:
+        dbx_bytes, dbx_ct = get_dropbox_image_bytes(image_code)
+        if dbx_bytes:
+            return dbx_bytes, dbx_ct
 
     # 4. Fallback to S3 brand folder
-    folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
-    brand_base = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name}/{image_code}"
-    for ext in ['.jpg', '.png', '.jpeg']:
-        try:
-            url = brand_base + ext
-            resp = http_requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                ct = resp.headers.get('Content-Type', '').lower()
-                if 'image' in ct:
-                    return resp.content, ct
-        except Exception:
-            continue
+    if not _no_serial_fallback:
+        folder_name = FOLDER_MAPPING.get(brand_abbr, brand_abbr)
+        brand_base = f"{CLOUDFRONT_PHOTOS_URL}/{folder_name}/{image_code}"
+        for ext in ['.jpg', '.png', '.jpeg']:
+            try:
+                url = brand_base + ext
+                resp = http_requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    ct = resp.headers.get('Content-Type', '').lower()
+                    if 'image' in ct:
+                        return resp.content, ct
+            except Exception:
+                continue
 
     # 5. VERY LAST resort: fallback swatch from the brand style-number files
     #    (bottom priority — mirrors the frontend's swatch-fallback rung)
-    try:
-        url = f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{image_code}.jpg"
-        resp = http_requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', '').lower():
-            return resp.content, resp.headers.get('Content-Type')
-    except Exception:
-        pass
+    if not _no_serial_fallback:
+        try:
+            url = f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{image_code}.jpg"
+            resp = http_requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', '').lower():
+                return resp.content, resp.headers.get('Content-Type')
+        except Exception:
+            pass
 
     return None, None
 
