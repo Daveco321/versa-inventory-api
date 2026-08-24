@@ -4388,7 +4388,10 @@ def _apo_classify_color(color_display, brand_abbr):
     if len(parts) > 1 and parts[0].strip():
         return _apo_classify_color(parts[0].strip(), brand_abbr)
     has_print = bool(_APO_PRINT_RE.search(c))
-    if not has_print and re.search(r'\bdobby\b', c):
+    # Dobby is a woven texture, not a print — ANY name containing "dobby" is a
+    # solid (David, Aug 24 2026), even when the name carries a stripe/check/
+    # print word ("White Jacquard Stripe Dobby"). Mirrors frontend classifyColor.
+    if re.search(r'\bdobby\b', c):
         if re.search(r'\bwhite\b|\bivory\b|\bcream\b', c):
             return 'white'
         if re.search(r'\bblack\b', c):
@@ -12479,6 +12482,9 @@ def _ai_tool_query_inventory(params):
             elif color_q in ('fancy', 'fancies'):
                 if bucket != 'fancies':
                     continue
+            # blue/indigo also match the navy bucket (it holds the whole blue family)
+            elif color_q in ('blue', 'indigo', 'navy/blue', 'navy blue') and bucket == 'navy':
+                pass
             elif color_q not in cl and color_q != bucket:
                 continue
         matched += 1
@@ -12683,6 +12689,9 @@ def _ai_tool_build_line_sheet(params):
                 elif color_q in ('fancy', 'fancies'):
                     if bucket != 'fancies':
                         continue
+                # blue/indigo also match the navy bucket (it holds the whole blue family)
+                elif color_q in ('blue', 'indigo', 'navy/blue', 'navy blue') and bucket == 'navy':
+                    pass
                 elif color_q not in cl and color_q != bucket:
                     continue
             base = r['style']
@@ -12760,7 +12769,9 @@ _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
                      "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers), "
-                     "fabric_codes (2-letter SKU codes), color (color word, or solids/fancies/white/black/navy), "
+                     "fabric_codes (2-letter SKU codes), color (color word, or buckets: solids/fancies/white/black/navy — "
+                     "the navy bucket covers the whole blue family incl. blue/indigo, and any color name containing "
+                     "'dobby' counts as a SOLID even with stripe/check words), "
                      "search (substring of style #), stock (any|warehouse|overseas), min_units, "
                      "arrive_before/arrive_after (YYYY-MM-DD, filters styles with production arriving in that window and "
                      "reports qualifying_po_units). Totals cover ALL matches even when rows are truncated. "
