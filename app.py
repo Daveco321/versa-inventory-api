@@ -12690,7 +12690,10 @@ def _past_po_row(p, include_lines=True):
            'status': 'shipped' if p.get('shipped') else 'cancelled_or_pulled',
            'ship_start': p.get('start') or None, 'cancel': p.get('cancel') or None,
            'left_book': p.get('lastSeen') or None,
-           'units': p.get('units'), 'value': p.get('value')}
+           'units': p.get('units'), 'value': p.get('value'),
+           # peak booked state — a partially-shipped PO's true size (the plain
+           # units/value fields hold only the last-day residual)
+           'units_peak': p.get('unitsPeak'), 'value_peak': p.get('valuePeak')}
     if include_lines:
         row['lines'] = [{'style': l.get('style'), 'qty': l.get('qty'),
                          'price': l.get('price'), 'value': l.get('value')}
@@ -12813,6 +12816,68 @@ def _ai_tool_past_orders(params):
     if partial:
         out['note'] = 'some customers failed to load — results may be partial'
     return out
+
+
+def _ai_tool_sales_history(params):
+    """Invoice-level sales history (A2000 InvoiceReport backfill on the
+    open-orders service): real invoice dates + shipped quantities, Nov 2019 →
+    the last ingest. Proxied live; the upstream serves prebuilt aggregates."""
+    cust_q = (params.get('customer') or '').strip()
+    style_q = (params.get('style') or '').strip()
+    month_q = (params.get('month') or '').strip()
+    from_q = (params.get('from') or '').strip()
+    to_q = (params.get('to') or '').strip()
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+    try:
+        if style_q:
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history",
+                                     params={'style': style_q}, timeout=45)
+            data = resp.json()
+            if not data.get('ready'):
+                return {'error': 'sales history backfill not available yet'}
+            rows = data.get('rows') or []
+            return {'style_query': data.get('style_query'), 'matched_qty': data.get('matched_qty'),
+                    'matched_value': data.get('matched_value'), 'rows': rows[:limit],
+                    'truncated': bool(data.get('truncated')) or len(rows) > limit}
+        if cust_q:
+            qp = {'account': cust_q}
+            if month_q:
+                qp['month'] = month_q
+            elif from_q or to_q:
+                if from_q:
+                    qp['from'] = from_q
+                if to_q:
+                    qp['to'] = to_q
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", params=qp, timeout=45)
+            data = resp.json()
+            if not data.get('ready'):
+                return {'error': 'sales history backfill not available yet'}
+            if 'pos' in data:   # ranged query → PO rollups with style lines
+                pos = data.get('pos') or []
+                return {'customer': data.get('account'), 'from': data.get('from'), 'to': data.get('to'),
+                        'po_count': data.get('poCount'), 'units': data.get('units'),
+                        'value': data.get('value'), 'rows': pos[:limit],
+                        'truncated': bool(data.get('truncated')) or len(pos) > limit}
+            return {'customer': data.get('account'), 'invoice_rows': data.get('rows'),
+                    'po_count': data.get('poCount'), 'years': data.get('years'),
+                    'months': data.get('months'), 'divisions': data.get('divisions'),
+                    'top_styles': (data.get('topStyles') or [])[:30],
+                    'recent_pos': (data.get('posRecent') or [])[:limit],
+                    'note': 'divisions: OB = bulk, DS = dropship'}
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", timeout=45)
+        data = resp.json()
+        if not data.get('ready'):
+            return {'error': 'sales history backfill not available yet'}
+        return {'source': data.get('source'), 'totals': data.get('totals'),
+                'years': data.get('years'),
+                'customers': [{'customer': c.get('customer'), 'units': c.get('units'),
+                               'value': c.get('value'), 'invoices': c.get('invoiceCount'),
+                               'first': c.get('firstInv'), 'last': c.get('lastInv')}
+                              for c in (data.get('customers') or [])[:60]],
+                'note': ('invoice ground truth (real invoice dates + shipped quantities). '
+                         'Use past_orders_lookup for POs newer than source.to (book-tracked).')}
+    except Exception as e:
+        return {'error': f'sales history unavailable: {e}'}
 
 
 def _ai_tool_build_line_sheet(params):
@@ -12995,6 +13060,18 @@ _AI_AGENT_TOOLS = [
          'status': {'type': 'string', 'enum': ['all', 'shipped', 'cancelled']},
          'received_after': {'type': 'string'}, 'received_before': {'type': 'string'},
          'limit': {'type': 'integer'}}}},
+    {'name': 'sales_history_lookup',
+     'description': ('INVOICED sales history (ground truth): A2000 invoice records with real invoice dates '
+                     'and actually-shipped quantities, Nov 2019 through the last backfill ingest. '
+                     'No args = company summary (per-customer lifetime + per-year totals). '
+                     'customer = that customer\'s years/months/top styles/recent POs; add month (YYYY-MM) '
+                     'or from/to (YYYY-MM-DD) for that period\'s POs WITH style lines. '
+                     'style = search a style # (substring) across all invoices. '
+                     'For POs newer than the backfill, use past_orders_lookup (book-tracked, updated daily).'),
+     'input_schema': {'type': 'object', 'properties': {
+         'customer': {'type': 'string'}, 'style': {'type': 'string'},
+         'month': {'type': 'string'}, 'from': {'type': 'string'}, 'to': {'type': 'string'},
+         'limit': {'type': 'integer'}}}},
     {'name': 'build_line_sheet',
      'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
                      'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
@@ -13022,6 +13099,7 @@ _AI_AGENT_TOOL_FNS = {
     'brand_summary': _ai_tool_brand_summary,
     'open_orders_lookup': _ai_tool_open_orders,
     'past_orders_lookup': _ai_tool_past_orders,
+    'sales_history_lookup': _ai_tool_sales_history,
     'build_line_sheet': _ai_tool_build_line_sheet,
 }
 
@@ -13148,7 +13226,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
 
 
 def _mcp_rpc_result(rid, result):
