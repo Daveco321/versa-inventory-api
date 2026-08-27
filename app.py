@@ -12632,6 +12632,189 @@ def _ai_tool_open_orders(params):
             'rows': rows, 'truncated': matched > len(rows)}
 
 
+# ── Past orders (received-PO history) — proxied from the open-orders service ──
+# The open-orders API snapshots the order book daily (since 2026-06-03) and
+# rolls every PO that leaves the book into a per-customer archive
+# (/api/po-history). This lets the AI agent + MCP connector query that history.
+_po_hist_proxy_cache = {'summary': None, 'summary_at': 0.0, 'accounts': {}, 'accounts_at': {},
+                        'fail_until': {}}
+_po_hist_proxy_lock = threading.Lock()
+_PO_HIST_PROXY_TTL = 900       # 15 min — the archive gains at most one new day per day
+_PO_HIST_FAIL_BACKOFF = 120    # after a failed fetch, don't re-hit that key for 2 min
+
+
+def _fetch_po_history(account=None):
+    """Fetch the received-PO archive (summary, or one account's POs) from the
+    open-orders service, cached module-level. Returns (payload_or_None, ok)."""
+    now = time.time()
+    key = (str(account).strip().upper() if account else None) or None
+    with _po_hist_proxy_lock:
+        if key is None:
+            cached, at = _po_hist_proxy_cache['summary'], _po_hist_proxy_cache['summary_at']
+        else:
+            cached = _po_hist_proxy_cache['accounts'].get(key)
+            at = _po_hist_proxy_cache['accounts_at'].get(key, 0.0)
+        fail_until = _po_hist_proxy_cache['fail_until'].get(key or '__summary__', 0.0)
+    if cached is not None and now - at < _PO_HIST_PROXY_TTL:
+        return cached, True
+    if now < fail_until:
+        # Recent failure — serve whatever we have without re-hitting a dead
+        # upstream (mirrors _fetch_all_open_orders' backoff for the sync worker).
+        return cached, cached is not None
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/po-history",
+                                 params=({'account': key} if key else None), timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        if not data.get('ready'):
+            return data, False   # index still building server-side — don't cache
+        with _po_hist_proxy_lock:
+            if key is None:
+                _po_hist_proxy_cache['summary'] = data
+                _po_hist_proxy_cache['summary_at'] = time.time()
+            else:
+                _po_hist_proxy_cache['accounts'][key] = data
+                _po_hist_proxy_cache['accounts_at'][key] = time.time()
+        return data, True
+    except Exception as e:
+        print(f"[PastOrders] po-history fetch failed ({key or 'summary'}): {e}", flush=True)
+        with _po_hist_proxy_lock:
+            _po_hist_proxy_cache['fail_until'][key or '__summary__'] = time.time() + _PO_HIST_FAIL_BACKOFF
+        return cached, cached is not None
+
+
+def _past_po_row(p, include_lines=True):
+    row = {'customer': p.get('customer'), 'customer_full': p.get('customerFull'),
+           'order_no': p.get('orderNo'),
+           'status': 'shipped' if p.get('shipped') else 'cancelled_or_pulled',
+           'ship_start': p.get('start') or None, 'cancel': p.get('cancel') or None,
+           'left_book': p.get('lastSeen') or None,
+           'units': p.get('units'), 'value': p.get('value')}
+    if include_lines:
+        row['lines'] = [{'style': l.get('style'), 'qty': l.get('qty'),
+                         'price': l.get('price'), 'value': l.get('value')}
+                        for l in (p.get('lines') or [])]
+    return row
+
+
+def _ai_tool_past_orders(params):
+    summary, ok = _fetch_po_history()
+    if summary is None:
+        return {'error': 'past-orders archive unavailable right now'}
+    if not summary.get('ready'):
+        prog = summary.get('progress') or {}
+        return {'building': True,
+                'note': (f"the archive index is still building "
+                         f"({prog.get('done', 0)}/{prog.get('total', 0)} days) — retry in a minute")}
+    accounts = [a for a in (summary.get('accounts') or [])
+                if (a.get('poCount') or 0) > 0 or (a.get('cancelledCount') or 0) > 0]
+    cust_q = (params.get('customer') or '').strip() or None
+    style_q = (params.get('style') or '').strip().upper() or None
+    status_q = (params.get('status') or 'all').strip().lower()
+    after_q = (params.get('received_after') or '').strip() or None
+    before_q = (params.get('received_before') or '').strip() or None
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+
+    def _keep(p):
+        if status_q == 'shipped' and not p.get('shipped'):
+            return False
+        if status_q in ('cancelled', 'pulled', 'cancelled_or_pulled') and p.get('shipped'):
+            return False
+        seen = p.get('lastSeen') or ''
+        if after_q and seen < after_q:
+            return False
+        if before_q and seen > before_q:
+            return False
+        return True
+
+    # ── No filters: per-customer summary ──
+    if not cust_q and not style_q:
+        ignored = [k for k, v in (('status', status_q != 'all'), ('received_after', bool(after_q)),
+                                  ('received_before', bool(before_q))) if v]
+        extra = {'filters_ignored': ignored, 'note2': 'status/date filters apply only with a customer or style'} if ignored else {}
+        return {**extra, 'history_start': '2026-06-03', 'latest_date': summary.get('latestDate'),
+                'note': ("'received' = the day a PO left the open-order book (shipped-out approximation, "
+                         "accurate to ~1 day). cancelled/pulled = left before its ship window opened."),
+                'totals': summary.get('totals'),
+                'customers': [{'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
+                               'received_pos': a.get('poCount'), 'units': a.get('units'),
+                               'value': a.get('value'),
+                               'cancelled_pos': a.get('cancelledCount'),
+                               'cancelled_value': a.get('cancelledValue'),
+                               'first_received': a.get('firstReceived') or None,
+                               'last_received': a.get('lastReceived') or None}
+                              for a in accounts]}
+
+    # ── Customer filter: resolve to ONE account code ──
+    if cust_q:
+        cl = cust_q.lower()
+        matches = [a for a in accounts
+                   if cl == str(a.get('customer') or '').lower()
+                   or cl in str(a.get('customerFull') or '').lower()]
+        if not matches:
+            return {'error': f"no past-order customer matches '{cust_q}'",
+                    'customers': [a.get('customerFull') or a.get('customer') for a in accounts]}
+        if len(matches) > 1 and not any(cl == str(a.get('customer') or '').lower() for a in matches):
+            return {'ambiguous_customer': [{'customer': a.get('customer'),
+                                            'customer_full': a.get('customerFull')} for a in matches]}
+        acct = next((a for a in matches if cl == str(a.get('customer') or '').lower()), matches[0])
+        if not acct.get('customer'):
+            return {'error': 'that account has no customer code in the archive'}
+        data, _ok = _fetch_po_history(acct.get('customer'))
+        if data is None or not data.get('ready'):
+            return {'error': f"couldn't load history for {acct.get('customer')} right now"}
+        pos = [p for p in (data.get('pos') or []) if _keep(p)]
+        if style_q:
+            pos = [p for p in pos
+                   if any(style_q in str(l.get('style') or '').upper() for l in (p.get('lines') or []))]
+        pos.sort(key=lambda p: str(p.get('lastSeen') or ''), reverse=True)
+        if style_q:
+            # Totals count only the MATCHING style lines, not whole POs.
+            tot_units = sum(l.get('qty') or 0 for p in pos for l in (p.get('lines') or [])
+                            if style_q in str(l.get('style') or '').upper())
+            tot_val = round(sum(l.get('value') or 0 for p in pos for l in (p.get('lines') or [])
+                                if style_q in str(l.get('style') or '').upper()), 2)
+        else:
+            tot_units = sum(p.get('units') or 0 for p in pos)
+            tot_val = round(sum(p.get('value') or 0 for p in pos), 2)
+        out = {'customer': acct.get('customer'), 'customer_full': acct.get('customerFull'),
+               'matched_pos': len(pos), 'total_units': tot_units, 'total_value': tot_val,
+               'rows': [_past_po_row(p) for p in pos[:limit]],
+               'truncated': len(pos) > limit}
+        if style_q:
+            out['note'] = f"total_units/total_value count only lines matching '{style_q}'; rows show full POs"
+        return out
+
+    # ── Style search across every customer ──
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        fetched = list(ex.map(lambda a: _fetch_po_history(a.get('customer')), accounts))
+    hits = []
+    partial = False
+    for a, (data, _ok) in zip(accounts, fetched):
+        if data is None or not data.get('ready'):
+            partial = True
+            continue
+        for p in (data.get('pos') or []):
+            if not _keep(p):
+                continue
+            for l in (p.get('lines') or []):
+                if style_q in str(l.get('style') or '').upper():
+                    hits.append({'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
+                                 'order_no': p.get('orderNo'),
+                                 'status': 'shipped' if p.get('shipped') else 'cancelled_or_pulled',
+                                 'left_book': p.get('lastSeen') or None, 'style': l.get('style'),
+                                 'qty': l.get('qty'), 'price': l.get('price'), 'value': l.get('value')})
+    hits.sort(key=lambda h: str(h.get('left_book') or ''), reverse=True)
+    tot_qty = sum(h.get('qty') or 0 for h in hits)
+    tot_val = round(sum(h.get('value') or 0 for h in hits), 2)
+    out = {'style_query': style_q, 'matched_lines': len(hits), 'total_units': tot_qty,
+           'total_value': tot_val, 'rows': hits[:limit], 'truncated': len(hits) > limit}
+    if partial:
+        out['note'] = 'some customers failed to load — results may be partial'
+    return out
+
+
 def _ai_tool_build_line_sheet(params):
     tabs_in = params.get('tabs') or []
     if not isinstance(tabs_in, list) or not tabs_in:
@@ -12798,6 +12981,20 @@ _AI_AGENT_TOOLS = [
                      'Filter by customer name and/or style #.'),
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'limit': {'type': 'integer'}}}},
+    {'name': 'past_orders_lookup',
+     'description': ('CLOSED order history (past orders): every customer PO that already LEFT the open-order '
+                     'book, archived daily since 2026-06-03. status separates shipped vs cancelled_or_pulled '
+                     '(left the book before its ship window opened); left_book = the day it shipped out '
+                     '(accurate to about a day). No args = per-customer summary. customer = that '
+                     "customer's past POs with style lines. style = search a style # (substring) across "
+                     'every customer\'s history — a cold call can take up to a minute while per-customer '
+                     'archives load. received_after/received_before filter on left_book (YYYY-MM-DD). '
+                     'Use open_orders_lookup for orders still open.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'customer': {'type': 'string'}, 'style': {'type': 'string'},
+         'status': {'type': 'string', 'enum': ['all', 'shipped', 'cancelled']},
+         'received_after': {'type': 'string'}, 'received_before': {'type': 'string'},
+         'limit': {'type': 'integer'}}}},
     {'name': 'build_line_sheet',
      'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
                      'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
@@ -12824,6 +13021,7 @@ _AI_AGENT_TOOL_FNS = {
     'style_detail': _ai_tool_style_detail,
     'brand_summary': _ai_tool_brand_summary,
     'open_orders_lookup': _ai_tool_open_orders,
+    'past_orders_lookup': _ai_tool_past_orders,
     'build_line_sheet': _ai_tool_build_line_sheet,
 }
 
@@ -12935,8 +13133,9 @@ def api_ai_agent():
 
 
 # ============================================================
-# MCP CONNECTOR — the same five agent tools for claude.ai
+# MCP CONNECTOR — the same agent tools for claude.ai
 # ============================================================
+# Serves the same agent tools as /api/ai-agent, over MCP.
 # Implements the Model Context Protocol's Streamable HTTP transport as a
 # plain Flask route (JSON-RPC 2.0 over POST, single JSON responses — the
 # spec allows servers to skip SSE). David adds the URL as a custom
@@ -12949,7 +13148,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
 
 
 def _mcp_rpc_result(rid, result):
