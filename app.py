@@ -12779,8 +12779,12 @@ def _ai_tool_past_orders(params):
             tot_val = round(sum(l.get('value') or 0 for p in pos for l in (p.get('lines') or [])
                                 if style_q in str(l.get('style') or '').upper()), 2)
         else:
-            tot_units = sum(p.get('units') or 0 for p in pos)
-            tot_val = round(sum(p.get('value') or 0 for p in pos), 2)
+            # Shipped POs count at their PEAK booked size (the last-day residual
+            # understates partial shipments); pulled POs keep their final state.
+            tot_units = sum(((p.get('unitsPeak') or p.get('units') or 0) if p.get('shipped')
+                             else (p.get('units') or 0)) for p in pos)
+            tot_val = round(sum(((p.get('valuePeak') or p.get('value') or 0) if p.get('shipped')
+                                 else (p.get('value') or 0)) for p in pos), 2)
         out = {'customer': acct.get('customer'), 'customer_full': acct.get('customerFull'),
                'matched_pos': len(pos), 'total_units': tot_units, 'total_value': tot_val,
                'rows': [_past_po_row(p) for p in pos[:limit]],
@@ -12818,6 +12822,37 @@ def _ai_tool_past_orders(params):
     return out
 
 
+def _sales_resolve_customer(cust_q):
+    """Resolve a customer NAME or code to the exact invoice account code.
+    Upstream matches codes exactly, so 'Burlington' must become 'BURL' here.
+    Uses the sales summary's code list + the po-history accounts' full names.
+    Returns (code, None) on success or (None, error_dict) on failure."""
+    resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", timeout=45)
+    data = resp.json()
+    if not data.get('ready'):
+        return None, {'error': 'sales history backfill not available yet'}
+    codes = [str(c.get('customer') or '') for c in (data.get('customers') or [])]
+    cu = cust_q.strip().upper()
+    if cu in codes:
+        return cu, None
+    # full-name resolution via the po-history account directory
+    name_map = {}
+    hist, _ok = _fetch_po_history()
+    for a in ((hist or {}).get('accounts') or []):
+        name_map[str(a.get('customer') or '').upper()] = str(a.get('customerFull') or '')
+    matches = [c for c in codes
+               if cu in c.upper() or (name_map.get(c.upper()) and cu in name_map[c.upper()].upper())]
+    if not matches:
+        return None, {'error': f"no invoiced customer matches '{cust_q}'",
+                      'customers': [(name_map.get(c.upper()) and f"{c} ({name_map[c.upper()]})") or c
+                                    for c in codes]}
+    if len(matches) > 1:
+        return None, {'ambiguous_customer': [{'customer': c,
+                                              'customer_full': name_map.get(c.upper()) or c}
+                                             for c in matches]}
+    return matches[0], None
+
+
 def _ai_tool_sales_history(params):
     """Invoice-level sales history (A2000 InvoiceReport backfill on the
     open-orders service): real invoice dates + shipped quantities, Nov 2019 →
@@ -12830,17 +12865,37 @@ def _ai_tool_sales_history(params):
     limit = max(1, min(int(params.get('limit') or 30), 200))
     try:
         if style_q:
+            code = None
+            if cust_q:
+                code, err = _sales_resolve_customer(cust_q)
+                if err:
+                    return err
             resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history",
                                      params={'style': style_q}, timeout=45)
             data = resp.json()
             if not data.get('ready'):
                 return {'error': 'sales history backfill not available yet'}
             rows = data.get('rows') or []
-            return {'style_query': data.get('style_query'), 'matched_qty': data.get('matched_qty'),
-                    'matched_value': data.get('matched_value'), 'rows': rows[:limit],
-                    'truncated': bool(data.get('truncated')) or len(rows) > limit}
+            out = {'style_query': data.get('style_query')}
+            if code:
+                rows = [r for r in rows if str(r.get('customer') or '').upper() == code]
+                out['customer'] = code
+                out['matched_qty'] = sum(r.get('qty') or 0 for r in rows)
+                out['matched_value'] = round(sum(r.get('value') or 0 for r in rows), 2)
+                if data.get('truncated'):
+                    out['note'] = ('upstream capped the search at its newest 500 lines — older matches '
+                                   'for this customer may be missing; totals cover the returned lines only')
+            else:
+                out['matched_qty'] = data.get('matched_qty')
+                out['matched_value'] = data.get('matched_value')
+            out['rows'] = rows[:limit]
+            out['truncated'] = bool(data.get('truncated')) or len(rows) > limit
+            return out
         if cust_q:
-            qp = {'account': cust_q}
+            code, err = _sales_resolve_customer(cust_q)
+            if err:
+                return err
+            qp = {'account': code}
             if month_q:
                 qp['month'] = month_q
             elif from_q or to_q:
@@ -12858,7 +12913,7 @@ def _ai_tool_sales_history(params):
                         'po_count': data.get('poCount'), 'units': data.get('units'),
                         'value': data.get('value'), 'rows': pos[:limit],
                         'truncated': bool(data.get('truncated')) or len(pos) > limit}
-            return {'customer': data.get('account'), 'invoice_rows': data.get('rows'),
+            return {'customer': data.get('account'), 'invoice_row_count': data.get('rows'),
                     'po_count': data.get('poCount'), 'years': data.get('years'),
                     'months': data.get('months'), 'divisions': data.get('divisions'),
                     'top_styles': (data.get('topStyles') or [])[:30],
@@ -13050,7 +13105,9 @@ _AI_AGENT_TOOLS = [
      'description': ('CLOSED order history (past orders): every customer PO that already LEFT the open-order '
                      'book, archived daily since 2026-06-03. status separates shipped vs cancelled_or_pulled '
                      '(left the book before its ship window opened); left_book = the day it shipped out '
-                     '(accurate to about a day). No args = per-customer summary. customer = that '
+                     '(accurate to about a day). Rows carry units (last-day residual) AND units_peak '
+                     '(true booked size — use units_peak for shipped POs; totals already do). '
+                     'No args = per-customer summary. customer = that '
                      "customer's past POs with style lines. style = search a style # (substring) across "
                      'every customer\'s history — a cold call can take up to a minute while per-customer '
                      'archives load. received_after/received_before filter on left_book (YYYY-MM-DD). '
