@@ -12935,6 +12935,20 @@ def _ai_tool_sales_history(params):
         return {'error': f'sales history unavailable: {e}'}
 
 
+def _sisc(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sfsc(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _ai_tool_build_sales_sheet(params):
     """Build a downloadable Excel SALES SHEET with photos for one customer:
     invoiced shipments (real invoice dates), book-tracked shipped-awaiting-
@@ -13018,14 +13032,14 @@ def _ai_tool_build_sales_sheet(params):
                 continue
             if str(o.get('customer') or '').upper() != code:
                 continue
-            qty = si(o.get('openQty')) + si(o.get('pickQty'))
+            qty = _sisc(o.get('openQty')) + _sisc(o.get('pickQty'))
             if qty <= 0:
                 continue
             po = str(o.get('orderNo') or '?')
             e = agg.setdefault(po, {'po': po, 'start': '', 'cancel': '', 'units': 0,
                                     'value': 0.0, 'lines': {}})
             e['units'] += qty
-            e['value'] += sf(o.get('openValue')) + sf(o.get('pickValue'))
+            e['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
             st = (o.get('startDate') or '')[:10]
             cn = (o.get('cancelDate') or '')[:10]
             if st and (not e['start'] or st < e['start']):
@@ -13035,7 +13049,7 @@ def _ai_tool_build_sales_sheet(params):
             sk = str(o.get('style') or '').strip()
             ln = e['lines'].setdefault(sk.upper(), {'style': sk, 'qty': 0, 'value': 0.0})
             ln['qty'] += qty
-            ln['value'] += sf(o.get('openValue')) + sf(o.get('pickValue'))
+            ln['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
         open_pos = sorted(agg.values(), key=lambda p: p['start'] or '9999')
         if not ok3 and not open_pos:
             notes.append('open-orders feed unavailable — on-order tab may be incomplete')
@@ -13048,8 +13062,8 @@ def _ai_tool_build_sales_sheet(params):
         rows = []
         for p in inv_pos:
             for l in (p.get('lines') or []):
-                q = si(l.get('qty'))
-                v = sf(l.get('value'))
+                q = _sisc(l.get('qty'))
+                v = _sfsc(l.get('value'))
                 rows.append({'style': l.get('style') or '', 'color': l.get('color') or '',
                              'po': p.get('po') or '', 'div': 'Dropship' if p.get('div') == 'DS' else 'Wholesale',
                              'first': p.get('firstInv') or '', 'last': p.get('lastInv') or '',
@@ -13066,13 +13080,13 @@ def _ai_tool_build_sales_sheet(params):
         for p in pend_pos:
             lines = p.get('linesPeak') or p.get('lines') or []
             for l in lines:
-                q = si(l.get('qty'))
-                v = sf(l.get('value'))
+                q = _sisc(l.get('qty'))
+                v = _sfsc(l.get('value'))
                 rows.append({'style': l.get('style') or '', 'color': '',
                              'po': p.get('orderNo') or '', 'div': '',
                              'first': p.get('start') or '', 'last': p.get('lastSeen') or '',
                              'invs': '',
-                             'qty': q, 'price': round(v / q, 2) if q else sf(l.get('price')), 'value': round(v, 2)})
+                             'qty': q, 'price': round(v / q, 2) if q else _sfsc(l.get('price')), 'value': round(v, 2)})
         rows.sort(key=lambda r: (r['last'], r['po']), reverse=True)
         return rows
 
