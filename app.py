@@ -12935,6 +12935,282 @@ def _ai_tool_sales_history(params):
         return {'error': f'sales history unavailable: {e}'}
 
 
+def _ai_tool_build_sales_sheet(params):
+    """Build a downloadable Excel SALES SHEET with photos for one customer:
+    invoiced shipments (real invoice dates), book-tracked shipped-awaiting-
+    invoice POs (peak sizes), and current open hard POs. Uploaded to S3 like
+    build_line_sheet; returns a public download_url."""
+    cust_q = (params.get('customer') or '').strip()
+    if not cust_q:
+        return {'error': 'customer required'}
+    code, err = _sales_resolve_customer(cust_q)
+    if err:
+        return err
+    # full display name from the po-history directory
+    full_name = code
+    hist_sum, _ok = _fetch_po_history()
+    for a in ((hist_sum or {}).get('accounts') or []):
+        if str(a.get('customer') or '').upper() == code:
+            full_name = a.get('customerFull') or code
+            break
+
+    # ── date bounds: from/to win; year / month are conveniences ──
+    from_q = (params.get('from') or '').strip()
+    to_q = (params.get('to') or '').strip()
+    year_q = (str(params.get('year') or '')).strip()
+    month_q = (params.get('month') or '').strip()
+    if not from_q and not to_q:
+        if month_q:
+            from_q, to_q = month_q + '-01', month_q + '-31'
+        elif year_q:
+            from_q, to_q = year_q + '-01-01', year_q + '-12-31'
+    lo = from_q or '0000-00-00'
+    hi = to_q or '9999-99-99'
+    period_label = (f"{from_q or 'start of history'} → {to_q or 'today'}"
+                    if (from_q or to_q) else 'Full history')
+
+    include = params.get('include') or ['invoiced', 'shipped_pending', 'on_order']
+    if isinstance(include, str):
+        include = [include]
+    include = {str(x).strip().lower() for x in include}
+    group_by = (params.get('group_by') or 'po').strip().lower()
+    notes = []
+
+    # ── 1. invoiced PO rollups with style lines ──
+    inv_pos, inv_po_set = [], set()
+    if 'invoiced' in include:
+        try:
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history",
+                                     params={'account': code, 'from': lo, 'to': hi}, timeout=60)
+            data = resp.json()
+            if data.get('ready'):
+                inv_pos = data.get('pos') or []
+                inv_po_set = {p.get('po') for p in inv_pos}
+                if data.get('truncated'):
+                    notes.append('invoiced list truncated at 1500 POs — narrow the date range for full coverage')
+            else:
+                notes.append('invoice backfill unavailable — invoiced tab skipped')
+        except Exception as e:
+            notes.append(f'invoiced data failed to load: {e}')
+
+    # ── 2. book-tracked shipped POs not yet invoiced (peak sizes) ──
+    pend_pos = []
+    if 'shipped_pending' in include:
+        data, _ok2 = _fetch_po_history(code)
+        if data and data.get('ready'):
+            for p in (data.get('pos') or []):
+                if not p.get('shipped') or p.get('orderNo') in inv_po_set:
+                    continue
+                seen = p.get('lastSeen') or ''
+                if seen < lo or seen > hi:
+                    continue
+                pend_pos.append(p)
+        elif data is None:
+            notes.append('book-tracked archive unavailable — awaiting-invoice tab skipped')
+
+    # ── 3. current open hard POs (no bulks/allocations; not date-filtered) ──
+    open_pos = []
+    if 'on_order' in include:
+        orders, ok3 = _fetch_all_open_orders()
+        agg = {}
+        for o in orders:
+            if o.get('isPipeline'):
+                continue
+            if str(o.get('customer') or '').upper() != code:
+                continue
+            qty = si(o.get('openQty')) + si(o.get('pickQty'))
+            if qty <= 0:
+                continue
+            po = str(o.get('orderNo') or '?')
+            e = agg.setdefault(po, {'po': po, 'start': '', 'cancel': '', 'units': 0,
+                                    'value': 0.0, 'lines': {}})
+            e['units'] += qty
+            e['value'] += sf(o.get('openValue')) + sf(o.get('pickValue'))
+            st = (o.get('startDate') or '')[:10]
+            cn = (o.get('cancelDate') or '')[:10]
+            if st and (not e['start'] or st < e['start']):
+                e['start'] = st
+            if cn and (not e['cancel'] or cn > e['cancel']):
+                e['cancel'] = cn
+            sk = str(o.get('style') or '').strip()
+            ln = e['lines'].setdefault(sk.upper(), {'style': sk, 'qty': 0, 'value': 0.0})
+            ln['qty'] += qty
+            ln['value'] += sf(o.get('openValue')) + sf(o.get('pickValue'))
+        open_pos = sorted(agg.values(), key=lambda p: p['start'] or '9999')
+        if not ok3 and not open_pos:
+            notes.append('open-orders feed unavailable — on-order tab may be incomplete')
+
+    if not inv_pos and not pend_pos and not open_pos:
+        return {'error': f'nothing found for {full_name} ({code}) in {period_label} with include={sorted(include)}'}
+
+    # ── flatten into per-tab line rows: (style, color, po, d1, d2, extra, qty, price, value) ──
+    def _line_rows_invoiced():
+        rows = []
+        for p in inv_pos:
+            for l in (p.get('lines') or []):
+                q = si(l.get('qty'))
+                v = sf(l.get('value'))
+                rows.append({'style': l.get('style') or '', 'color': l.get('color') or '',
+                             'po': p.get('po') or '', 'div': 'Dropship' if p.get('div') == 'DS' else 'Wholesale',
+                             'first': p.get('firstInv') or '', 'last': p.get('lastInv') or '',
+                             'invs': p.get('invoices') or 1,
+                             'qty': q, 'price': round(v / q, 2) if q else 0, 'value': round(v, 2)})
+        if group_by == 'month':
+            rows.sort(key=lambda r: (r['last'][:7], r['po'], -r['qty']), reverse=True)
+        else:
+            rows.sort(key=lambda r: (r['last'], r['po'], -r['qty']), reverse=True)
+        return rows
+
+    def _line_rows_pending():
+        rows = []
+        for p in pend_pos:
+            lines = p.get('linesPeak') or p.get('lines') or []
+            for l in lines:
+                q = si(l.get('qty'))
+                v = sf(l.get('value'))
+                rows.append({'style': l.get('style') or '', 'color': '',
+                             'po': p.get('orderNo') or '', 'div': '',
+                             'first': p.get('start') or '', 'last': p.get('lastSeen') or '',
+                             'invs': '',
+                             'qty': q, 'price': round(v / q, 2) if q else sf(l.get('price')), 'value': round(v, 2)})
+        rows.sort(key=lambda r: (r['last'], r['po']), reverse=True)
+        return rows
+
+    def _line_rows_open():
+        rows = []
+        for p in open_pos:
+            for l in sorted(p['lines'].values(), key=lambda x: -x['qty']):
+                q = l['qty']
+                v = l['value']
+                rows.append({'style': l['style'], 'color': '',
+                             'po': p['po'], 'div': '',
+                             'first': p['start'], 'last': p['cancel'], 'invs': '',
+                             'qty': q, 'price': round(v / q, 2) if q else 0, 'value': round(v, 2)})
+        return rows
+
+    tabs = []
+    if inv_pos:
+        tabs.append(('Invoiced', _line_rows_invoiced(),
+                     ['Image', 'Style', 'Color', 'PO #', 'Division', 'First Invoiced', 'Last Invoiced', 'Qty', 'Unit Price', 'Value'],
+                     lambda r: [r['style'], r['color'], r['po'], r['div'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
+    if pend_pos:
+        tabs.append(('Shipped - Awaiting Invoice', _line_rows_pending(),
+                     ['Image', 'Style', 'PO #', 'Window Start', 'Left Book', 'Qty (peak booked)', 'Est. Price', 'Est. Value'],
+                     lambda r: [r['style'], r['po'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
+    if open_pos:
+        tabs.append(('On Order', _line_rows_open(),
+                     ['Image', 'Style', 'PO #', 'Window Start', 'Cancel', 'Qty', 'Unit Price', 'Value'],
+                     lambda r: [r['style'], r['po'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
+
+    ROW_CAP = 3000
+    buf = BytesIO()
+    wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
+    f_title = wb.add_format({'bold': True, 'font_size': 16, 'font_name': 'Calibri'})
+    f_sub = wb.add_format({'font_size': 10, 'font_color': '#666666', 'font_name': 'Calibri'})
+    f_head = wb.add_format({'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#6D28D9',
+                            'border': 1, 'align': 'center', 'valign': 'vcenter', 'font_name': 'Calibri'})
+    f_cell = wb.add_format({'border': 1, 'valign': 'vcenter', 'font_name': 'Calibri'})
+    f_cell2 = wb.add_format({'border': 1, 'valign': 'vcenter', 'bg_color': '#F5F3FF', 'font_name': 'Calibri'})
+    f_num = wb.add_format({'border': 1, 'valign': 'vcenter', 'num_format': '#,##0', 'font_name': 'Calibri'})
+    f_num2 = wb.add_format({'border': 1, 'valign': 'vcenter', 'num_format': '#,##0', 'bg_color': '#F5F3FF', 'font_name': 'Calibri'})
+    f_money = wb.add_format({'border': 1, 'valign': 'vcenter', 'num_format': '$#,##0.00', 'font_name': 'Calibri'})
+    f_money2 = wb.add_format({'border': 1, 'valign': 'vcenter', 'num_format': '$#,##0.00', 'bg_color': '#F5F3FF', 'font_name': 'Calibri'})
+    f_bold = wb.add_format({'bold': True, 'font_name': 'Calibri'})
+
+    # Summary tab
+    ws = wb.add_worksheet('Summary')
+    ws.set_column(0, 0, 30)
+    ws.set_column(1, 1, 46)
+    ws.write(0, 0, f'{full_name} — Sales Sheet', f_title)
+    ws.write(1, 0, f'Period: {period_label} · generated {datetime.now().strftime("%b %d, %Y %H:%M")}', f_sub)
+    srow = 3
+    for name, rows, _h, _g in tabs:
+        units = sum(r['qty'] for r in rows)
+        value = sum(r['value'] for r in rows)
+        pos_ct = len({r['po'] for r in rows})
+        ws.write(srow, 0, name, f_bold)
+        ws.write(srow, 1, f'{pos_ct:,} POs · {units:,} units · ${value:,.2f}')
+        srow += 1
+    srow += 1
+    for n in ['Invoiced = A2000 invoice records (real invoice dates and shipped quantities).',
+              'Awaiting invoice = left the open-order book after its window opened; quantities are the PEAK booked size.',
+              'On order = current open hard POs (bulks and allocations excluded), regardless of the date filter.'] + notes:
+        ws.write(srow, 0, n, f_sub)
+        srow += 1
+
+    for name, rows, headers, getter in tabs:
+        wsx = wb.add_worksheet(name[:31])
+        truncated = len(rows) > ROW_CAP
+        rows = rows[:ROW_CAP]
+        wsx.set_column(0, 0, 14)
+        wsx.set_column(1, 1, 18)
+        for ci in range(2, len(headers)):
+            wsx.set_column(ci, ci, 16)
+        wsx.set_row(0, 22)
+        for ci, h in enumerate(headers):
+            wsx.write(0, ci, h, f_head)
+        wsx.freeze_panes(1, 0)
+        # Photos only for modern-taxonomy SKUs — legacy invoice styles (NAU-10395SS,
+        # SHAQ-22-106…) would collapse to bogus bases and could attach wrong images.
+        def _img_sku(style):
+            base = get_base_style(str(style or '').upper())
+            return base if re.match(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$', base) else ''
+        img_items = [{'sku': _img_sku(r['style']), 'brand_abbr': ''} for r in rows]
+        try:
+            for it in img_items:
+                try:
+                    it['brand_abbr'] = _apo_style_brand(it['sku']) or ''
+                except Exception:
+                    pass
+            images = download_images_for_items(img_items, S3_PHOTOS_URL, use_cache=True)
+        except Exception:
+            images = {}
+        for ri, r in enumerate(rows):
+            row = ri + 1
+            wsx.set_row(row, 60)
+            cf = f_cell2 if ri % 2 else f_cell
+            nf = f_num2 if ri % 2 else f_num
+            mf = f_money2 if ri % 2 else f_money
+            vals = getter(r)
+            for ci, v in enumerate(vals):
+                col = ci + 1
+                h = headers[col]
+                if h in ('Qty', 'Qty (peak booked)'):
+                    wsx.write(row, col, v, nf)
+                elif h in ('Unit Price', 'Value', 'Est. Price', 'Est. Value'):
+                    wsx.write(row, col, v, mf)
+                else:
+                    wsx.write(row, col, v, cf)
+            img = images.get(ri)
+            if img:
+                try:
+                    wsx.insert_image(row, 0, 'img.png', _padded_image_opts(img))
+                except Exception:
+                    wsx.write(row, 0, '', cf)
+            else:
+                wsx.write(row, 0, '', cf)
+        if truncated:
+            notes.append(f'{name}: only the first {ROW_CAP:,} lines are in the sheet')
+
+    wb.close()
+    buf.seek(0)
+    fname = re.sub(r'[^A-Za-z0-9 _.-]+', '', str(params.get('filename') or f'{full_name} Sales Sheet')).strip() or 'Sales Sheet'
+    key = f"claude uploaded/{fname} {datetime.now().strftime('%Y-%m-%d %H%M%S')}.xlsx"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=buf.read(),
+                        ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    from urllib.parse import quote
+    url = f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}"
+    out = {'download_url': url, 'customer': code, 'customer_full': full_name,
+           'period': period_label,
+           'tabs': [{'tab': n, 'lines': min(len(r), ROW_CAP), 'pos': len({x['po'] for x in r}),
+                     'units': sum(x['qty'] for x in r), 'value': round(sum(x['value'] for x in r), 2)}
+                    for n, r, _h, _g in tabs],
+           'note': 'give the user this link as a clickable download'}
+    if notes:
+        out['warnings'] = notes
+    return out
+
+
 def _ai_tool_build_line_sheet(params):
     tabs_in = params.get('tabs') or []
     if not isinstance(tabs_in, list) or not tabs_in:
@@ -13129,6 +13405,27 @@ _AI_AGENT_TOOLS = [
          'customer': {'type': 'string'}, 'style': {'type': 'string'},
          'month': {'type': 'string'}, 'from': {'type': 'string'}, 'to': {'type': 'string'},
          'limit': {'type': 'integer'}}}},
+    {'name': 'build_sales_sheet',
+     'description': ('Build a downloadable Excel SALES SHEET with photos for ONE customer\'s past selling '
+                     'and pipeline: an Invoiced tab (real invoice dates + shipped quantities per PO and '
+                     'style), a Shipped-Awaiting-Invoice tab (book-tracked POs at peak booked size), and '
+                     'an On Order tab (current open hard POs with ship windows; bulks excluded). '
+                     'customer accepts a name or code (Winners, Burlington, ROSS…). Date filters: from/to '
+                     '(YYYY-MM-DD), or year (2026), or month (YYYY-MM) — applies to invoiced + awaiting; '
+                     'On Order always shows the current book. include narrows the tabs '
+                     "(['invoiced','shipped_pending','on_order']); group_by 'po' (default) or 'month' sets "
+                     'the sort. Takes up to a minute. Present the returned download_url to the user as a '
+                     'clickable link. Use this whenever the user wants past selling as a line sheet / '
+                     'document rather than numbers in chat.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'customer': {'type': 'string'},
+         'from': {'type': 'string'}, 'to': {'type': 'string'},
+         'year': {'type': 'string'}, 'month': {'type': 'string'},
+         'include': {'type': 'array', 'items': {'type': 'string',
+                     'enum': ['invoiced', 'shipped_pending', 'on_order']}},
+         'group_by': {'type': 'string', 'enum': ['po', 'month']},
+         'filename': {'type': 'string'}},
+         'required': ['customer']}},
     {'name': 'build_line_sheet',
      'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
                      'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
@@ -13157,6 +13454,7 @@ _AI_AGENT_TOOL_FNS = {
     'open_orders_lookup': _ai_tool_open_orders,
     'past_orders_lookup': _ai_tool_past_orders,
     'sales_history_lookup': _ai_tool_sales_history,
+    'build_sales_sheet': _ai_tool_build_sales_sheet,
     'build_line_sheet': _ai_tool_build_line_sheet,
 }
 
@@ -13283,7 +13581,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_line_sheet to produce a real Excel with photos (returns a download URL; it takes up to a minute)."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute)."""
 
 
 def _mcp_rpc_result(rid, result):
