@@ -15,6 +15,7 @@ except ImportError:
 
 import os
 import re
+import hmac
 import json
 import time
 import uuid
@@ -26,7 +27,7 @@ from io import BytesIO
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-from flask import Flask, request, jsonify, send_file, Response, make_response
+from flask import Flask, request, jsonify, send_file, Response, make_response, g
 from flask_cors import CORS
 import xlsxwriter
 import requests as http_requests
@@ -48,10 +49,11 @@ CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
-        # Authorization is required by /factory-view, which authenticates the
-        # caller's Versa-Docs session. Without it here the browser's preflight
-        # never grants the header and the request is blocked before it is sent.
-        "allow_headers": ["Content-Type", "Authorization"]
+        # Authorization is required by /factory-view and by the staff-session
+        # gate (authz_gate); X-Api-Key is the machine-caller credential.
+        # Without them here the browser's preflight never grants the header
+        # and the request is blocked before it is sent.
+        "allow_headers": ["Content-Type", "Authorization", "X-Api-Key"]
     }
 })
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
@@ -7303,6 +7305,14 @@ def _save_saved_catalogs(catalogs):
             )
         except Exception as be:
             print(f"[Saved Catalogs] Backup failed (non-fatal): {be}", flush=True)
+        try:
+            # Invalidate the authz gate's short-lived catalog cache so an edited
+            # catalog's slug resolves to the new filters immediately.
+            with _catalog_cache_lock:
+                _catalog_cache['list'] = None
+                _catalog_cache['ts'] = 0.0
+        except Exception:
+            pass
         return True
     except Exception as e:
         print(f"[Saved Catalogs] Save to S3 error: {e}", flush=True)
@@ -7313,7 +7323,7 @@ def _cors_json(data, status=200):
     resp = make_response(jsonify(data), status)
     resp.headers['Access-Control-Allow-Origin'] = '*'
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
-    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Api-Key'
     return resp
 
 def _invalidate_cloudfront(paths):
@@ -7346,7 +7356,7 @@ def handle_saved_catalogs():
         resp = make_response('', 204)
         resp.headers['Access-Control-Allow-Origin'] = '*'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Api-Key'
         return resp
 
     try:
@@ -7401,7 +7411,7 @@ def reorder_saved_catalogs():
         resp = make_response('', 204)
         resp.headers['Access-Control-Allow-Origin'] = '*'
         resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Api-Key'
         return resp
     try:
         data = request.get_json()
@@ -7425,7 +7435,7 @@ def delete_saved_catalog(idx):
         resp = make_response('', 204)
         resp.headers['Access-Control-Allow-Origin'] = '*'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Api-Key'
         return resp
     try:
         catalogs = _load_saved_catalogs()
@@ -7452,6 +7462,433 @@ def ensure_worker_initialized():
         _worker_initialized = True
         print("\n  [before_request] First request — triggering startup sync...")
         threading.Thread(target=startup_sync, daemon=True).start()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ACCESS CONTROL (authz gate)
+#
+# Identity tiers:
+#   staff    — Versa-Docs Supabase session (profiles.role = 'staff'): full access
+#   factory  — Versa-Docs Supabase session (role = 'factory'): /production and
+#              /api/ai-proxy only (Versa-Docs ledger + note translation);
+#              /factory-view and /factory-report keep their own inline auth
+#   machine  — X-Api-Key header == INVENTORY_API_KEY env: read-only data +
+#              report endpoints (open-orders-api emails, FBA tools, AM ship tool)
+#   oo       — open-orders team bearer token (validated against the open-orders
+#              API /api/auth/me): read-only data + POST /suppression-overrides
+#   anonymous— catalog links only: GET reads carrying a valid catalog_slug get
+#              a response SCOPED to that saved catalog's brands/styles
+#
+# AUTH_MODE env: 'off' (default) = never blocks, only logs would-deny lines and
+# applies catalog scoping when an anonymous request presents a valid slug.
+# 'on' = enforce. A single request can preview enforcement with
+# ?authz_preview=1 regardless of mode (used to validate before flipping).
+#
+# Always open (no identity needed): /health, /, /image/*, /dropbox-photos,
+# /sportswear-*, /mcp* (own path token), /factory-view + /factory-report*
+# (own inline auth), /catalog/match. /image stays public forever: image URLs
+# are hard-embedded in already-sent customer presentations and <img> tags
+# cannot carry headers.
+# ═════════════════════════════════════════════════════════════════════════════
+
+AUTH_MODE = (os.environ.get('AUTH_MODE', 'off') or 'off').strip().lower()   # 'off' | 'on'
+INVENTORY_API_KEY = (os.environ.get('INVENTORY_API_KEY', '') or '').strip()
+
+print(f"[authz] AUTH_MODE={AUTH_MODE} | machine key {'set' if INVENTORY_API_KEY else 'NOT SET'} | "
+      f"MCP_TOKEN {'set' if os.environ.get('MCP_TOKEN') else 'NOT SET — /mcp is open to anyone!'}",
+      flush=True)
+
+_AUTHZ_OPEN_EXACT = {'/', '/health', '/favicon.ico',
+                     # image-index reads used by catalog pages and image fallback
+                     # chains; exact paths only so /dropbox-photos/sync (a write
+                     # trigger) is NOT covered and stays staff-only
+                     '/dropbox-photos', '/sportswear-photos'}
+_AUTHZ_OPEN_PREFIXES = ('/image/', '/mcp', '/factory-view', '/factory-report',
+                        '/sportswear-match/', '/catalog/')
+# GET endpoints a customer catalog page needs. Anonymous access requires a valid
+# catalog_slug and the response is scoped; staff/machine/oo tiers get them full.
+_AUTHZ_CATALOG_READS = {
+    '/inventory', '/sync', '/overrides', '/overrides/version',
+    '/allocations', '/allocations/version', '/manual-allocations',
+    '/deduction-assignments', '/banner-rules', '/prepack-defaults',
+    '/suppression-overrides', '/production', '/apo', '/saved-catalogs',
+}
+# Extra GET endpoints the machine key may use (report/export pulls).
+_AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports'}
+
+_AUTHZ_ALL_BRAND_FLAGS = ('all', 'all_brands', 'wh_all_brands', 'os_all_brands')
+
+# ── Saved-catalog cache (60s) so slug lookups don't hit S3 per request ──────
+_catalog_cache = {'ts': 0.0, 'list': None}
+_catalog_cache_lock = threading.Lock()
+
+def _load_saved_catalogs_cached(max_age=60):
+    now = time.time()
+    with _catalog_cache_lock:
+        if _catalog_cache['list'] is not None and now - _catalog_cache['ts'] < max_age:
+            return _catalog_cache['list']
+    cats = _load_saved_catalogs()
+    with _catalog_cache_lock:
+        _catalog_cache['ts'] = time.time()
+        _catalog_cache['list'] = cats
+    return cats
+
+# ── Open-orders team token introspection (for the open-orders frontends) ────
+_oo_token_cache = {}          # token -> (expires_at, bool)
+_oo_token_lock = threading.Lock()
+
+def _oo_token_valid(token):
+    now = time.time()
+    with _oo_token_lock:
+        hit = _oo_token_cache.get(token)
+        if hit and hit[0] > now:
+            return hit[1]
+    ok = False
+    try:
+        r = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/auth/me",
+                              headers={'Authorization': f'Bearer {token}'}, timeout=8)
+        ok = (r.status_code == 200)
+    except Exception as e:
+        print(f"[authz] open-orders introspection failed: {e}", flush=True)
+    with _oo_token_lock:
+        _oo_token_cache[token] = (now + (600 if ok else 120), ok)
+        if len(_oo_token_cache) > 500:
+            for k in [k for k, v in _oo_token_cache.items() if v[0] <= now]:
+                _oo_token_cache.pop(k, None)
+    return ok
+
+def _request_identity():
+    """Resolve the current request's credential to a tier dict, or None."""
+    if hasattr(g, '_authz_ident'):
+        return g._authz_ident
+    ident = None
+    try:
+        key = (request.headers.get('X-Api-Key') or '').strip()
+        if key and INVENTORY_API_KEY and hmac.compare_digest(key, INVENTORY_API_KEY):
+            ident = {'tier': 'machine'}
+        else:
+            auth = request.headers.get('Authorization', '')
+            token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+            if token.startswith('eyJ') and token.count('.') == 2:
+                # Supabase JWT (Versa-Docs accounts) — shape-checked before any
+                # network call so garbage tokens can't spam Supabase.
+                prof = _caller_identity(token)
+                if prof:
+                    role = (prof.get('role') or '').lower()
+                    ident = {'tier': 'staff' if role == 'staff' else 'factory',
+                             'prefix': prof.get('factory_prefix') or ''}
+            elif token and token.count('.') == 1:
+                # open-orders HMAC token shape (b64payload.signature)
+                if _oo_token_valid(token):
+                    ident = {'tier': 'oo'}
+    except Exception as e:
+        print(f"[authz] identity resolution error: {e}", flush=True)
+    g._authz_ident = ident
+    return ident
+
+# ── Catalog scope: what an anonymous holder of a slug may see ───────────────
+
+def _catalog_scope_for_slug(slug):
+    """Build a scope dict for a valid saved-catalog slug, else None."""
+    if not slug:
+        return None
+    entry = next((c for c in _load_saved_catalogs_cached()
+                  if str(c.get('slug') or '') == slug), None)
+    if entry is None:
+        return None
+    pub_entry = {k: entry.get(k) for k in ('name', 'url', 'brands', 'slug')}
+    scope = {'slug': slug, 'entry': pub_entry, 'all': False,
+             'brands': set(), 'brands_norm': set(), 'styles': set()}
+    from urllib.parse import urlparse, parse_qsl
+    try:
+        q = dict(parse_qsl(urlparse(str(entry.get('url') or '')).query,
+                           keep_blank_values=True))
+    except Exception:
+        q = {}
+    if any(q.get(f) for f in _AUTHZ_ALL_BRAND_FLAGS):
+        scope['all'] = True
+        return scope
+    for key in ('brands', 'wh_brands', 'os_brands'):
+        for b in str(q.get(key) or '').split(','):
+            b = b.strip().upper()
+            if b:
+                scope['brands'].add(b)
+    for b in (entry.get('brands') or []):
+        b = str(b).strip().upper()
+        if b:
+            scope['brands'].add(b)
+    for s in str(q.get('skus') or '').split(','):
+        s = s.strip().upper()
+        if s:
+            scope['styles'].add(get_base_style(s))
+    # pos= catalogs are PO-scoped: pull the matching production rows' styles in.
+    po_filter = {p.strip().upper() for p in str(q.get('pos') or '').split(',') if p.strip()}
+    if po_filter:
+        try:
+            for row in (_production_data or []):
+                if (str(row.get('production') or '').strip().upper() in po_filter or
+                        str(row.get('poName') or '').strip().upper() in po_filter):
+                    st = str(row.get('style') or '').strip().upper()
+                    if st:
+                        scope['styles'].add(get_base_style(st))
+        except Exception:
+            pass
+    for b in list(scope['brands']):
+        try:
+            scope['brands_norm'].add(_normalize_brand(b).upper())
+        except Exception:
+            pass
+    if not scope['brands'] and not scope['styles']:
+        # Degenerate entry (no url params, no brands recorded). Serving nothing
+        # would break the link; serve unscoped and say so loudly.
+        print(f"[authz] WARNING catalog slug {slug} has no derivable scope — serving unscoped",
+              flush=True)
+        scope['all'] = True
+    return scope
+
+_authz_brand_idx = {'etag': None, 'map': {}}
+
+def _authz_base_brand(base):
+    """base style -> item brand (upper), from the in-memory inventory."""
+    with _inv_lock:
+        etag = _inventory.get('etag')
+        items = _inventory.get('items') or []
+    idx = _authz_brand_idx
+    if idx['etag'] != etag or not idx['map']:
+        m = {}
+        for it in items:
+            b = str(it.get('brand') or '').upper()
+            sku = str(it.get('sku') or '')
+            if b and sku:
+                m.setdefault(get_base_style(sku), b)
+        idx['map'] = m
+        idx['etag'] = etag
+    return idx['map'].get(base, '')
+
+def _scope_has_style(scope, sku):
+    if scope.get('all'):
+        return True
+    base = get_base_style(str(sku or ''))
+    if not base:
+        return False
+    if base in scope['styles']:
+        return True
+    b = _authz_base_brand(base)
+    if b and b in scope['brands']:
+        return True
+    # Fallbacks for styles absent from inventory: brand letters in the SKU,
+    # then the customer-prefix brand groupings the frontend also uses.
+    code = base[2:4] if len(base) >= 4 else ''
+    ab = str(SKU_BRAND_CODE_MAP.get(code, '') or '').upper()
+    if ab and ab in scope['brands']:
+        return True
+    return base[:2] in scope['brands']
+
+def _scope_has_brandstr(scope, raw):
+    if scope.get('all'):
+        return True
+    s = str(raw or '').strip().upper()
+    if not s:
+        return False
+    if s in scope['brands']:
+        return True
+    try:
+        return _normalize_brand(s).upper() in scope['brands_norm']
+    except Exception:
+        return False
+
+def _scope_has_item(scope, it):
+    if scope.get('all'):
+        return True
+    b = str(it.get('brand') or '').upper()
+    if b and b in scope['brands']:
+        return True
+    return _scope_has_style(scope, it.get('sku'))
+
+def _flt_inventory(data, scope):
+    items = data.get('inventory')
+    if isinstance(items, list):
+        kept = [it for it in items if _scope_has_item(scope, it)]
+        data['inventory'] = kept
+        data['item_count'] = len(kept)
+    return data
+
+def _flt_overrides(data, scope):
+    ov = data.get('overrides')
+    if isinstance(ov, dict):
+        data['overrides'] = {k: v for k, v in ov.items() if _scope_has_style(scope, k)}
+    return data
+
+def _flt_alloc(data, scope):
+    rows = data.get('allocations')
+    if isinstance(rows, list):
+        data['allocations'] = [r for r in rows if _scope_has_style(scope, r.get('sku'))]
+    return data
+
+def _flt_deductions(data, scope):
+    d = data.get('assignments')
+    if isinstance(d, dict):
+        data['assignments'] = {k: v for k, v in d.items() if _scope_has_style(scope, k)}
+    return data
+
+def _flt_suppression(data, scope):
+    ov = data.get('overrides')
+    if isinstance(ov, list):
+        data['overrides'] = [s for s in ov if _scope_has_style(scope, s)]
+    return data
+
+def _flt_production(data, scope):
+    rows = data.get('production')
+    if isinstance(rows, list):
+        data['production'] = [r for r in rows
+                              if _scope_has_style(scope, r.get('style'))
+                              or _scope_has_brandstr(scope, r.get('brand'))]
+    return data
+
+def _flt_apo(data, scope):
+    rows = data.get('apo')
+    if isinstance(rows, list):
+        kept = [r for r in rows if _scope_has_style(scope, r.get('style'))]
+        data['apo'] = kept
+        data['count'] = len(kept)
+    return data
+
+def _flt_saved_catalogs(data, scope):
+    # Anonymous slug holders see exactly one entry: their own catalog.
+    return [scope['entry']]
+
+_SCOPE_FILTERS = {
+    '/inventory': _flt_inventory,
+    '/sync': _flt_inventory,
+    '/overrides': _flt_overrides,
+    '/allocations': _flt_alloc,
+    '/manual-allocations': _flt_alloc,
+    '/deduction-assignments': _flt_deductions,
+    '/suppression-overrides': _flt_suppression,
+    '/production': _flt_production,
+    '/apo': _flt_apo,
+    '/saved-catalogs': _flt_saved_catalogs,
+    # /overrides/version, /allocations/version, /banner-rules, /prepack-defaults
+    # pass through unfiltered: version stamps and global display config.
+}
+
+# ── Gate ────────────────────────────────────────────────────────────────────
+_authz_log_seen = {}
+
+def _authz_log(path, method, reason, enforced):
+    key = (path, method, reason, enforced)
+    now = time.time()
+    if now - _authz_log_seen.get(key, 0) < 60:
+        return
+    if len(_authz_log_seen) > 500:
+        _authz_log_seen.clear()
+    _authz_log_seen[key] = now
+    verb = 'DENY' if enforced else 'would-deny'
+    print(f"[authz] {verb} {method} {path} — {reason}", flush=True)
+
+@app.before_request
+def authz_gate():
+    if request.method == 'OPTIONS':
+        return None
+    path = request.path.rstrip('/') or '/'
+    if path in _AUTHZ_OPEN_EXACT or path.startswith(_AUTHZ_OPEN_PREFIXES):
+        return None
+    method = 'GET' if request.method == 'HEAD' else request.method
+    ident = _request_identity()
+    if ident:
+        tier = ident.get('tier')
+        if tier == 'staff':
+            return None
+        if tier == 'machine' and method == 'GET' and (
+                path in _AUTHZ_CATALOG_READS or path in _AUTHZ_MACHINE_EXTRA
+                or path.startswith('/download/')):
+            return None
+        if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
+                             or (method == 'POST' and path == '/suppression-overrides')):
+            return None
+        if tier == 'factory' and path in ('/production', '/api/ai-proxy'):
+            return None
+        reason = f"tier '{tier}' not allowed here"
+    else:
+        if method == 'GET' and path in _AUTHZ_CATALOG_READS:
+            slug = (request.args.get('catalog_slug') or '').strip()
+            scope = _catalog_scope_for_slug(slug) if slug else None
+            if scope is not None:
+                g._catalog_scope = scope
+                return None
+            had_auth = bool(request.headers.get('Authorization') or request.headers.get('X-Api-Key'))
+            reason = ('anonymous, unknown catalog_slug' if slug
+                      else ('credential rejected' if had_auth else 'anonymous, no credential'))
+        else:
+            had_auth = bool(request.headers.get('Authorization') or request.headers.get('X-Api-Key'))
+            reason = 'credential rejected' if had_auth else 'anonymous, no credential'
+    enforced = (AUTH_MODE == 'on') or (request.args.get('authz_preview') == '1')
+    _authz_log(path, request.method, reason, enforced)
+    if enforced:
+        return jsonify({'error': 'auth required',
+                        'detail': reason,
+                        'hint': 'sign in on the platform, or open a valid catalog link'}), 401
+    return None
+
+@app.after_request
+def apply_catalog_scope(resp):
+    scope = getattr(g, '_catalog_scope', None)
+    if scope is None or resp.status_code != 200:
+        return resp
+    path = request.path.rstrip('/') or '/'
+    fn = _SCOPE_FILTERS.get(path)
+    if fn is None:
+        return resp
+    if 'application/json' not in (resp.content_type or ''):
+        return resp
+    try:
+        data = json.loads(resp.get_data(as_text=True))
+        data = fn(data, scope)
+        resp.set_data(json.dumps(data, default=str))
+        resp.headers['X-Catalog-Scope'] = str(scope.get('slug') or '')
+    except Exception as e:
+        # Fail open (the link must keep working) but say so loudly.
+        print(f"[authz] scope filter error on {path}: {e}", flush=True)
+    return resp
+
+# ── Public slug resolver for legacy full-parameter catalog links ────────────
+
+def _authz_canon_qs(qs):
+    """Canonicalize a catalog query string for matching: drop volatile params,
+    apply the same *_all_brands cleanup the frontend does, sort."""
+    from urllib.parse import parse_qsl, urlencode
+    try:
+        pairs = parse_qsl(str(qs or '').lstrip('?'), keep_blank_values=True)
+    except Exception:
+        return ''
+    keys = {k for k, _v in pairs}
+    drop = {'_', 'catalog', 'catalog_slug', 'authz_preview'}
+    if 'wh_all_brands' in keys:
+        drop.add('wh_brands')
+    if 'os_all_brands' in keys:
+        drop.add('os_brands')
+    kept = sorted((k, v) for k, v in pairs if k not in drop)
+    return urlencode(kept)
+
+@app.route('/catalog/match', methods=['GET', 'OPTIONS'])
+def catalog_match():
+    """Resolve a full-parameter catalog link to its saved slug (if any).
+    Public: answers only 'this exact saved link's slug', never lists catalogs."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    canon = _authz_canon_qs(request.args.get('qs') or '')
+    if canon:
+        from urllib.parse import urlparse
+        for c in _load_saved_catalogs_cached():
+            try:
+                if (c.get('slug') and
+                        _authz_canon_qs(urlparse(str(c.get('url') or '')).query) == canon):
+                    return _cors_json({'slug': c['slug']})
+            except Exception:
+                continue
+    return _cors_json({'slug': None})
+
+# ═══════════════════════════ end access control ═════════════════════════════
 
 
 def hourly_resync():
