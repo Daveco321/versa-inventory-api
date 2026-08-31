@@ -671,11 +671,20 @@ _nj_fba_units = 0       # '-FBA' earmarked pieces (excluded from shippable)
 _nj_unmatched = []      # [{'item_id','qty','description','reason'}] admin report
 _nj_last_sync = 0
 
-_NJ_SIZE_TOKEN = re.compile(r'^\d{1,2}(-\d{1,2}(\.\d)?)?$')
+# Single size token after split('-'): whole or half sizes (15, 15.5, 34).
+# Audit fix: the old pattern's combined 'NN-NN.N' branch was dead code post
+# split, so half sizes like 16.5 never stripped and those rows were dropped.
+_NJ_SIZE_TOKEN = re.compile(r'^\d{1,2}(\.\d)?$')
+_NJ_ALPHA_SIZES = {'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
+                   'ST', 'MT', 'LT', 'XLT'}
+# 'V' is NOT a size: -V variants are distinct sellable styles on this
+# platform, so an NJ row for BASE-V keys to BASE-V, never folded into BASE.
+_NJ_BASE_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}[A-Z0-9]?(-V)?$')
 
 def _nj_parse_item_id(item_id):
-    """Split an NJ ITEM_ID into (base_style, is_fba, looks_versa).
-    Handles 'BASE 15-15.5 32', 'BASE-14-32', 'BASE-L-FBA', bare 'BASE'."""
+    """Split an NJ ITEM_ID into (style_key, is_fba, looks_versa).
+    Handles 'BASE 15-15.5 32', 'BASE-14-32', 'BASE-16.5-34', 'BASE-L-FBA',
+    'BASE-V', bare 'BASE'. The style_key keeps a '-V' suffix when present."""
     iid = str(item_id or '').strip().upper()
     if not iid:
         return '', False, False
@@ -683,15 +692,12 @@ def _nj_parse_item_id(item_id):
     is_fba = token.endswith('-FBA')
     if is_fba:
         token = token[:-4]
-    # strip trailing dash-size chains (-14-32, -L, -2XL, -16.5-34)
     parts = token.split('-')
     while len(parts) > 1 and (_NJ_SIZE_TOKEN.match(parts[-1])
-                              or parts[-1] in ('XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
-                                               'ST', 'MT', 'LT', 'XLT', 'V')):
+                              or parts[-1] in _NJ_ALPHA_SIZES):
         parts.pop()
     base = '-'.join(parts)
-    # Versa base styles: letters+digits pattern [XX][XX][XX][###][XX](X?)
-    looks_versa = bool(re.match(r'^[A-Z]{6}\d{3}[A-Z]{2,3}[A-Z0-9]?$', base))
+    looks_versa = bool(_NJ_BASE_RE.match(base))
     return base, is_fba, looks_versa
 
 def load_nj_from_dropbox():
@@ -758,18 +764,78 @@ def load_nj_from_dropbox():
                                   'reason': 'legacy id (no platform style)'})
                 continue
             by_base[base] = by_base.get(base, 0) + qty
+        # Unknown brand codes are decided HERE, once per load (never during the
+        # hourly re-merge — appending there duplicated report rows all day).
+        for base in list(by_base.keys()):
+            if not _nj_brand_for_base(base):
+                unmatched.append({'item_id': base, 'qty': by_base.pop(base),
+                                  'description': '', 'reason': 'unknown brand code'})
+        total = sum(by_base.values())
+        # Truncation guard: a partial upload/read must not wipe most of the
+        # warehouse. Reject drops below 60% of the previous good load.
+        with _nj_lock:
+            prev_total = sum(_nj_by_base.values())
+        if prev_total > 0 and total < prev_total * 0.6:
+            print(f"[NJ] REJECTED load: {total} pcs vs previous {prev_total} "
+                  f"(>40% drop — likely partial file). Keeping previous data.", flush=True)
+            return False
         with _nj_lock:
             _nj_by_base = by_base
             _nj_fba_units = fba_units
             _nj_unmatched = unmatched
             _nj_last_sync = time.time()
-        total = sum(by_base.values())
-        print(f"[NJ] loaded: {len(by_base)} base styles / {total} pcs shippable; "
+        print(f"[NJ] loaded: {len(by_base)} styles / {total} pcs shippable; "
               f"{fba_units} pcs FBA-earmarked; {len(unmatched)} unmatched rows "
               f"({neg_rows} negative)", flush=True)
+        # Persist the good load so a restarting worker can hydrate even if
+        # Dropbox is unreachable at boot (best-effort).
+        try:
+            get_s3().put_object(Bucket=S3_BUCKET, Key='inventory/nj_onhand_cache.json',
+                                Body=json.dumps({'by_base': by_base, 'fba_units': fba_units,
+                                                 'unmatched': unmatched, 'ts': time.time()}),
+                                ContentType='application/json')
+        except Exception as e:
+            print(f"[NJ] S3 cache write failed (non-fatal): {e}", flush=True)
         return True
     except Exception as e:
         print(f"[NJ] load failed ({e}) — keeping previous NJ data", flush=True)
+        return False
+
+def _nj_brand_for_base(base):
+    """Brand for an NJ style key, with the platform's correction rules the
+    plain letter map misses. Returns '' when underivable."""
+    b = str(base or '').upper()
+    if b.endswith('-V'):
+        b = b[:-2]
+    if b.startswith('LUCK'):
+        return 'LUCKY'
+    if b.startswith('VP'):
+        return 'VERSA'
+    code = b[2:4] if len(b) >= 4 else ''
+    return SKU_BRAND_CODE_MAP.get(code, '')
+
+def _nj_hydrate_from_s3():
+    """Boot fallback: load the last good NJ snapshot from S3 when the Dropbox
+    pull fails and this worker has no data yet."""
+    global _nj_by_base, _nj_fba_units, _nj_unmatched, _nj_last_sync
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET, Key='inventory/nj_onhand_cache.json')
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        by_base = {str(k): int(v) for k, v in (data.get('by_base') or {}).items()}
+        if not by_base:
+            return False
+        with _nj_lock:
+            if _nj_by_base:      # a real load beat us — keep it
+                return True
+            _nj_by_base = by_base
+            _nj_fba_units = int(data.get('fba_units') or 0)
+            _nj_unmatched = list(data.get('unmatched') or [])
+            _nj_last_sync = float(data.get('ts') or 0)
+        print(f"[NJ] hydrated {len(by_base)} styles / {sum(by_base.values())} pcs "
+              f"from S3 cache (Dropbox unavailable at boot)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[NJ] S3 hydrate failed: {e}", flush=True)
         return False
 
 def _apply_nj_to_items(items):
@@ -781,9 +847,9 @@ def _apply_nj_to_items(items):
     total_ats on the carrying row grow by nj — NJ is sellable stock."""
     with _nj_lock:
         remaining = dict(_nj_by_base)
-    # Idempotent re-apply: strip any previous merge (synthesized rows and the
-    # nj component of totals) before applying fresh numbers.
-    items = [it for it in items if not it.get('_nj_synth')]
+    # Idempotent re-apply on COPIES: never mutate dicts that in-flight requests
+    # may be serializing (torn-read fix), and drop prior synthesized rows.
+    items = [dict(it) for it in items if not it.get('_nj_synth')]
     for it in items:
         prev = int(it.get('nj') or 0)
         if prev:
@@ -792,31 +858,34 @@ def _apply_nj_to_items(items):
         it['nj'] = 0
     if not remaining:
         return items
-    by_base_rows = {}
+    # Carrier rule (audit fix): NJ always rides the row whose sku EQUALS the
+    # NJ style key (bare base, or BASE-V for variant styles). If the feed has
+    # no such row, we synthesize one — never park base-level NJ on an
+    # arbitrary sized row, which broke exact-SKU consumers (factory view,
+    # early-ship pools, per-size AI answers).
+    rows_by_sku = {}
+    rows_by_base = {}
     for it in items:
-        base = get_base_style(str(it.get('sku') or ''))
-        by_base_rows.setdefault(base, []).append(it)
-    for base, qty in list(remaining.items()):
-        rows = by_base_rows.get(base)
-        if not rows:
+        sku = str(it.get('sku') or '').upper()
+        rows_by_sku.setdefault(sku, it)
+        rows_by_base.setdefault(get_base_style(sku), it)
+    for key, qty in remaining.items():
+        carrier = rows_by_sku.get(key)
+        if carrier is not None:
+            carrier['nj'] = qty
+            carrier['total_warehouse'] = int(carrier.get('total_warehouse') or 0) + qty
+            carrier['total_ats'] = int(carrier.get('total_ats') or 0) + qty
             continue
-        carrier = next((r for r in rows if str(r.get('sku') or '').upper() == base), rows[0])
-        carrier['nj'] = qty
-        carrier['total_warehouse'] = int(carrier.get('total_warehouse') or 0) + qty
-        carrier['total_ats'] = int(carrier.get('total_ats') or 0) + qty
-        remaining.pop(base, None)
-    # NJ-only styles: synthesize a base row so they appear on the platform
-    for base, qty in remaining.items():
-        code = base[2:4] if len(base) >= 4 else ''
-        brand = SKU_BRAND_CODE_MAP.get(code, '')
+        # Synthesize the carrier. Brand: prefer a real sibling row's brand,
+        # else the correction-aware letter map.
+        sibling = rows_by_base.get(get_base_style(key))
+        brand = str(sibling.get('brand') or '').upper() if sibling else _nj_brand_for_base(key)
         if not brand:
-            with _nj_lock:
-                _nj_unmatched.append({'item_id': base, 'qty': qty,
-                                      'description': '', 'reason': 'unknown brand code'})
-            continue
+            continue   # loader already routed unknown-brand bases to the report
+        name = str(sibling.get('name') or '') if sibling else ''
         items.append({
-            'sku': base, 'brand': brand, 'brand_abbr': brand,
-            'brand_full': BRAND_FULL_NAMES.get(brand, brand), 'name': '',
+            'sku': key, 'brand': brand, 'brand_abbr': brand,
+            'brand_full': BRAND_FULL_NAMES.get(brand, brand), 'name': name,
             'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': qty,
             'incoming': 0, 'committed': 0, 'allocated': 0,
             'total_ats': qty, 'total_warehouse': qty,
@@ -827,11 +896,17 @@ def _apply_nj_to_items(items):
 
 def _nj_reapply_to_inventory():
     """Re-merge the NJ cache onto the CURRENT in-memory items (used after the
-    10am refresh so new numbers show without waiting for the next ATS sync)."""
+    10am refresh so new numbers show without waiting for the next ATS sync).
+    Rebuilds the brands index too — prebuilt brand workbooks regenerate from
+    it, and leaving it stale served yesterday's synthesized rows (audit fix)."""
     with _inv_lock:
         items = _apply_nj_to_items(list(_inventory['items']))
         _inventory['items'] = items
         _inventory['item_count'] = len(items)
+        try:
+            _inventory['brands'] = _group_by_brand(items)
+        except Exception as e:
+            print(f"[NJ] brands rebuild failed: {e}", flush=True)
 
 def nj_daily_resync_loop():
     """Refresh the NJ feed ONCE per day at 10:00 AM Eastern (per David: never
@@ -7919,10 +7994,13 @@ def _catalog_scope_for_slug(slug):
 _authz_brand_idx = {'etag': None, 'map': {}}
 
 def _authz_base_brand(base):
-    """base style -> item brand (upper), from the in-memory inventory."""
+    """base style -> item brand (upper), from the in-memory inventory.
+    Cache key = identity of the items list: the Dropbox sync stamps a constant
+    etag string, so keying on etag alone froze this map for the worker's whole
+    life (audit fix) — every accepted sync/NJ re-apply swaps the list object."""
     with _inv_lock:
-        etag = _inventory.get('etag')
         items = _inventory.get('items') or []
+        etag = (id(items), len(items))
     idx = _authz_brand_idx
     if idx['etag'] != etag or not idx['map']:
         m = {}
@@ -8361,9 +8439,14 @@ def startup_sync():
     # NJ warehouse daily feed: one hydrating load at boot (same day's 08:45
     # snapshot), then ONLY the 10am daily loop — never hourly, per David.
     try:
-        load_nj_from_dropbox()
+        if not load_nj_from_dropbox():
+            _nj_hydrate_from_s3()
     except Exception as e:
         print(f"  ⚠ NJ startup load failed: {e}")
+        try:
+            _nj_hydrate_from_s3()
+        except Exception:
+            pass
 
     # Load Style Ledger (production data) from Dropbox
     try:
@@ -9572,6 +9655,7 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
 
     # Dedupe by base style (one row per style, regardless of size variants)
     by_style = {}
+    _ctx_nj_by_base = {}
     for it in items_snap:
         sku = it.get('sku', '')
         base = sku.split('-')[0].upper()
@@ -9606,9 +9690,14 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
         fabric = ov.get('fabric')  or it.get('fabrication')  or ''
         fit    = ov.get('fit')     or it.get('fit')          or ''
 
-        # Keep the highest-stock variant per base style (most representative)
+        # Keep the highest-stock variant per base style (most representative).
+        # NJ rides ONE carrier row per base, so the pick is made nj-neutral and
+        # the base's full NJ total is re-added after the loop — otherwise a
+        # non-carrier max row silently drops the whole NJ quantity (audit fix).
+        njq = int(it.get('nj') or 0)
+        _ctx_nj_by_base[base] = _ctx_nj_by_base.get(base, 0) + njq
         prev = by_style.get(base)
-        if prev and (prev['total_warehouse'] + prev['incoming']) > (wh + inc):
+        if prev and (prev['total_warehouse'] + prev['incoming']) > ((wh - njq) + inc):
             continue
         by_style[base] = {
             'style': base,
@@ -9617,11 +9706,18 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
             'color': color,
             'fabric': fabric,
             'fit': fit,
-            'total_warehouse': wh,
+            'total_warehouse': wh - njq,
             'incoming': inc,
-            'total_ats': it.get('total_ats', 0),
+            'total_ats': int(it.get('total_ats', 0) or 0) - njq,
             'in_current_pipeline': True,
         }
+
+    # Re-add each base's full NJ quantity onto its kept representative row.
+    for _b, _row in by_style.items():
+        _njt = _ctx_nj_by_base.get(_b, 0)
+        if _njt:
+            _row['total_warehouse'] += _njt
+            _row['total_ats'] += _njt
 
     # 'all_styles_ever' — augment with every style that exists in the overrides
     # database but isn't already in the live inventory feed. These represent
@@ -12245,20 +12341,27 @@ def factory_view():
         if sku not in sku_set:
             continue
         try:
+            nj_qty = int(item.get('nj', 0) or 0)
             warehouse = (int(item.get('jtw', 0) or 0) + int(item.get('tr', 0) or 0)
                          + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0)
-                         + int(item.get('nj', 0) or 0))
+                         + nj_qty)
         except (ValueError, TypeError):
-            warehouse = 0
+            warehouse, nj_qty = 0, 0
         incoming = int(item.get('incoming', 0) or 0)
         committed = int(item.get('committed', 0) or 0)
         allocated = int(item.get('allocated', 0) or 0)
         m = inv_by_sku.get(sku)
         if m is None:
-            inv_by_sku[sku] = {'sku': sku, 'warehouse': warehouse, 'incoming': incoming,
+            # 'nj' rides along separately (still no per-warehouse breakdown of
+            # the four factory-served warehouses): consumers need it to EXCLUDE
+            # NJ from landed-batch suppression checks — 3PL stock never arrives
+            # through a production line (audit fix).
+            inv_by_sku[sku] = {'sku': sku, 'warehouse': warehouse, 'nj': nj_qty,
+                               'incoming': incoming,
                                'committed': committed, 'allocated': allocated}
         else:
             m['warehouse'] += warehouse
+            m['nj'] = m.get('nj', 0) + nj_qty
             m['incoming'] += incoming
             if abs(committed) > abs(m['committed']):
                 m['committed'] = committed
@@ -14048,6 +14151,7 @@ def _ai_tool_build_line_sheet(params):
                     'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
                     'fabrication': fab, 'delivery': 'ATS' if r['total_warehouse'] > 0 else (arr_s or 'Overseas'),
                     'total_ats': r['total_ats'], 'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
+                    'nj': r.get('nj', 0),
                     'incoming': r['incoming'], 'total_warehouse': r['total_warehouse'],
                     'committed': r['committed'], 'allocated': r['allocated'],
                     'warehouse': ', '.join(wh_names) or '—',
