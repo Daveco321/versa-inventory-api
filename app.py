@@ -655,6 +655,212 @@ _apo_data = []
 _apo_lock = threading.Lock()
 _apo_last_sync = 0
 
+# ── NJ warehouse (3PL BZ FM, Edison NJ) daily on-hand feed ──────────────────
+# The 3PL drops INVENTORY_OH.CSV into Dropbox every morning ~08:45 ET
+# (ITEM_ID, PIECES_ONHAND, DESCRIPTION, ALT_ITEM_ID1=UPC, ITEM_CLASS,
+# DEFAULT_CFG). ITEM_IDs are a mix: Versa SKUs with dash sizes
+# (AMBEAW360SLP-14-32), Versa SKUs with space sizes (BONASU543RFP 16-16.5 32),
+# bare base styles, '-FBA' earmarked rows, and legacy non-Versa IDs
+# (NAU-008-WHITE XL). Aggregation per base style happens at load; results
+# merge onto inventory items as the 'nj' field during every sync.
+DROPBOX_NJ_PATH = os.environ.get('DROPBOX_NJ_PATH', '/backup/Inventory/INVENTORY_OH.CSV')
+
+_nj_lock = threading.Lock()
+_nj_by_base = {}        # base style (upper) -> pieces on hand (shippable)
+_nj_fba_units = 0       # '-FBA' earmarked pieces (excluded from shippable)
+_nj_unmatched = []      # [{'item_id','qty','description','reason'}] admin report
+_nj_last_sync = 0
+
+_NJ_SIZE_TOKEN = re.compile(r'^\d{1,2}(-\d{1,2}(\.\d)?)?$')
+
+def _nj_parse_item_id(item_id):
+    """Split an NJ ITEM_ID into (base_style, is_fba, looks_versa).
+    Handles 'BASE 15-15.5 32', 'BASE-14-32', 'BASE-L-FBA', bare 'BASE'."""
+    iid = str(item_id or '').strip().upper()
+    if not iid:
+        return '', False, False
+    token = iid.split(' ')[0]                       # drop space-separated size
+    is_fba = token.endswith('-FBA')
+    if is_fba:
+        token = token[:-4]
+    # strip trailing dash-size chains (-14-32, -L, -2XL, -16.5-34)
+    parts = token.split('-')
+    while len(parts) > 1 and (_NJ_SIZE_TOKEN.match(parts[-1])
+                              or parts[-1] in ('XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
+                                               'ST', 'MT', 'LT', 'XLT', 'V')):
+        parts.pop()
+    base = '-'.join(parts)
+    # Versa base styles: letters+digits pattern [XX][XX][XX][###][XX](X?)
+    looks_versa = bool(re.match(r'^[A-Z]{6}\d{3}[A-Z]{2,3}[A-Z0-9]?$', base))
+    return base, is_fba, looks_versa
+
+def load_nj_from_dropbox():
+    """Fetch + aggregate the NJ warehouse CSV. Keeps prior data on any failure
+    so warehouse totals never oscillate on a bad read."""
+    global _nj_by_base, _nj_fba_units, _nj_unmatched, _nj_last_sync
+    token = get_dropbox_token()
+    if not token:
+        print("[NJ] no Dropbox token — keeping previous NJ data", flush=True)
+        return False
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_NJ_PATH}),
+        }
+        ns = os.environ.get('DROPBOX_NJ_NAMESPACE_ID', os.environ.get('DROPBOX_APO_NAMESPACE_ID', ''))
+        if ns:
+            headers['Dropbox-API-Path-Root'] = json.dumps({'.tag': 'namespace_id', 'namespace_id': ns})
+        resp = http_requests.post('https://content.dropboxapi.com/2/files/download',
+                                  headers=headers, timeout=30)
+        if resp.status_code == 401:
+            global _dropbox_token_expires
+            _dropbox_token_expires = 0
+            token = get_dropbox_token()
+            headers['Authorization'] = f'Bearer {token}'
+            resp = http_requests.post('https://content.dropboxapi.com/2/files/download',
+                                      headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"[NJ] download failed HTTP {resp.status_code} — keeping previous NJ data", flush=True)
+            return False
+        text = resp.content.decode('utf-8-sig', errors='replace')
+        import csv as _csv
+        from io import StringIO as _SIO
+        rows = list(_csv.DictReader(_SIO(text)))
+        if len(rows) < 500:      # file is ~2,500 rows; a tiny read is a partial upload
+            print(f"[NJ] only {len(rows)} rows — likely partial file, keeping previous NJ data", flush=True)
+            return False
+        by_base, fba_units, unmatched = {}, 0, []
+        neg_rows = 0
+        for r in rows:
+            try:
+                qty = int(float(str(r.get('PIECES_ONHAND') or '0').replace(',', '')))
+            except Exception:
+                qty = 0
+            if qty == 0:
+                continue
+            iid = str(r.get('ITEM_ID') or '').strip()
+            if qty < 0:
+                neg_rows += 1
+                unmatched.append({'item_id': iid, 'qty': qty,
+                                  'description': str(r.get('DESCRIPTION') or '')[:60],
+                                  'reason': 'negative on-hand'})
+                continue
+            base, is_fba, looks_versa = _nj_parse_item_id(iid)
+            if is_fba:
+                fba_units += qty
+                unmatched.append({'item_id': iid, 'qty': qty,
+                                  'description': str(r.get('DESCRIPTION') or '')[:60],
+                                  'reason': 'FBA earmarked (not shippable)'})
+                continue
+            if not looks_versa:
+                unmatched.append({'item_id': iid, 'qty': qty,
+                                  'description': str(r.get('DESCRIPTION') or '')[:60],
+                                  'reason': 'legacy id (no platform style)'})
+                continue
+            by_base[base] = by_base.get(base, 0) + qty
+        with _nj_lock:
+            _nj_by_base = by_base
+            _nj_fba_units = fba_units
+            _nj_unmatched = unmatched
+            _nj_last_sync = time.time()
+        total = sum(by_base.values())
+        print(f"[NJ] loaded: {len(by_base)} base styles / {total} pcs shippable; "
+              f"{fba_units} pcs FBA-earmarked; {len(unmatched)} unmatched rows "
+              f"({neg_rows} negative)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[NJ] load failed ({e}) — keeping previous NJ data", flush=True)
+        return False
+
+def _apply_nj_to_items(items):
+    """Merge NJ per-base quantities onto freshly parsed inventory items.
+    The full base quantity lands on exactly ONE row per base (the bare-base
+    row when present, else the first row seen) so every base-level sum stays
+    correct; siblings get nj=0. Bases with no feed row at all get a synthesized
+    row so NJ-only styles still exist on the platform. total_warehouse and
+    total_ats on the carrying row grow by nj — NJ is sellable stock."""
+    with _nj_lock:
+        remaining = dict(_nj_by_base)
+    # Idempotent re-apply: strip any previous merge (synthesized rows and the
+    # nj component of totals) before applying fresh numbers.
+    items = [it for it in items if not it.get('_nj_synth')]
+    for it in items:
+        prev = int(it.get('nj') or 0)
+        if prev:
+            it['total_warehouse'] = int(it.get('total_warehouse') or 0) - prev
+            it['total_ats'] = int(it.get('total_ats') or 0) - prev
+        it['nj'] = 0
+    if not remaining:
+        return items
+    by_base_rows = {}
+    for it in items:
+        base = get_base_style(str(it.get('sku') or ''))
+        by_base_rows.setdefault(base, []).append(it)
+    for base, qty in list(remaining.items()):
+        rows = by_base_rows.get(base)
+        if not rows:
+            continue
+        carrier = next((r for r in rows if str(r.get('sku') or '').upper() == base), rows[0])
+        carrier['nj'] = qty
+        carrier['total_warehouse'] = int(carrier.get('total_warehouse') or 0) + qty
+        carrier['total_ats'] = int(carrier.get('total_ats') or 0) + qty
+        remaining.pop(base, None)
+    # NJ-only styles: synthesize a base row so they appear on the platform
+    for base, qty in remaining.items():
+        code = base[2:4] if len(base) >= 4 else ''
+        brand = SKU_BRAND_CODE_MAP.get(code, '')
+        if not brand:
+            with _nj_lock:
+                _nj_unmatched.append({'item_id': base, 'qty': qty,
+                                      'description': '', 'reason': 'unknown brand code'})
+            continue
+        items.append({
+            'sku': base, 'brand': brand, 'brand_abbr': brand,
+            'brand_full': BRAND_FULL_NAMES.get(brand, brand), 'name': '',
+            'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': qty,
+            'incoming': 0, 'committed': 0, 'allocated': 0,
+            'total_ats': qty, 'total_warehouse': qty,
+            'container': '', 'receive_date': '', 'lot_number': '', 'image': '',
+            '_nj_synth': True,
+        })
+    return items
+
+def _nj_reapply_to_inventory():
+    """Re-merge the NJ cache onto the CURRENT in-memory items (used after the
+    10am refresh so new numbers show without waiting for the next ATS sync)."""
+    with _inv_lock:
+        items = _apply_nj_to_items(list(_inventory['items']))
+        _inventory['items'] = items
+        _inventory['item_count'] = len(items)
+
+def nj_daily_resync_loop():
+    """Refresh the NJ feed ONCE per day at 10:00 AM Eastern (per David: never
+    hourly). The 3PL's export lands ~08:45 ET, so 10:00 gives safe margin."""
+    while True:
+        try:
+            try:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime as _dt
+                now = _dt.now(ZoneInfo('America/New_York'))
+                target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+                if target <= now:
+                    target = target + timedelta(days=1)
+                wait = (target - now).total_seconds()
+            except Exception:
+                # tz database unavailable: fall back to 14:00 UTC (10am EDT)
+                from datetime import datetime as _dt
+                now = _dt.utcnow()
+                target = now.replace(hour=14, minute=0, second=0, microsecond=0)
+                if target <= now:
+                    target = target + timedelta(days=1)
+                wait = (target - now).total_seconds()
+            time.sleep(max(60, wait))
+            if load_nj_from_dropbox():
+                _nj_reapply_to_inventory()
+        except Exception as e:
+            print(f"[NJ] daily loop error: {e}", flush=True)
+            time.sleep(3600)
+
 
 def load_allocation_from_s3():
     """Load allocation CSV from S3 and return as list of dicts"""
@@ -2243,7 +2449,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         if is_order:
             headers.append('Qty Selected')
         if not incoming_only:
-            headers.extend(['JTW', 'TR', 'DCW', 'QA'])
+            headers.extend(['JTW', 'TR', 'DCW', 'QA', 'NJ'])
         headers.append('Incoming')
         if not incoming_only:
             headers.append('Total Warehouse')
@@ -2258,7 +2464,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
         'Production #': 16, 'PO Name': 30, 'PO Ref #': 22, 'Factory': 14,
-        'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'Incoming': 12,
+        'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'NJ': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
         'Warehouse': 18,
@@ -2307,6 +2513,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'TR': lambda item: item.get('tr', 0),
         'DCW': lambda item: item.get('dcw', 0),
         'QA': lambda item: item.get('qa', 0),
+        'NJ': lambda item: item.get('nj', 0),
         'Incoming': lambda item: item.get('incoming', 0),
         'Total Warehouse': lambda item: item.get('total_warehouse', 0),
         'Total ATS': lambda item: item.get('total_ats', 0),
@@ -2337,7 +2544,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
 
     # Determine which columns are numeric for formatting
     NUMERIC_HEADERS = {
-        'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'Incoming',
+        'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'NJ', 'Incoming',
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
         'Committed', 'Allocated', 'Units to Ship', 'Shortfall',
         'Units'
@@ -3195,6 +3402,7 @@ def sync_from_dropbox():
         if not items:
             print("  ⚠ No valid rows parsed from Dropbox file")
             return False
+        items = _apply_nj_to_items(items)
 
         # ── SANITY CHECK ────────────────────────────────────────────────
         # If the parsed data looks materially worse than the previous accepted
@@ -3294,7 +3502,7 @@ def sync_inventory():
         return False
 
     try:
-        items = parse_inventory_excel(data)
+        items = _apply_nj_to_items(parse_inventory_excel(data))
     except Exception as e:
         print(f"  Failed to parse inventory: {e}")
         return False
@@ -3631,6 +3839,7 @@ def inventory_debug():
                         'tr': m.get('tr'),
                         'dcw': m.get('dcw'),
                         'qa': m.get('qa'),
+            'nj': m.get('nj', 0),
                         'incoming': m.get('incoming'),
                         'total_ats': m.get('total_ats'),
                     } for m in matches]
@@ -4769,11 +4978,11 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
         b = get_base_style(it.get('sku') or '')
         if not b:
             continue
-        d = inv_by_base.setdefault(b, {'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0,
+        d = inv_by_base.setdefault(b, {'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0,
                                        'committed': 0, 'allocated': 0,
                                        'brand_abbr': it.get('brand_abbr') or '',
                                        'brand_full': it.get('brand_full') or ''})
-        for k in ('jtw', 'tr', 'dcw', 'qa', 'committed', 'allocated'):
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'committed', 'allocated'):
             try:
                 d[k] += int(it.get(k) or 0)
             except Exception:
@@ -4807,9 +5016,9 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
         wh_names = []
         wh_free = 0
         if inv:
-            wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa']
+            wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa'] + inv.get('nj', 0)
             wh_free = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + qty))
-            for k, nm in (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA')):
+            for k, nm in (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA'), ('nj', 'NJ')):
                 if inv[k] > 0:
                     wh_names.append(nm)
         take_wh = min(qty, wh_free)
@@ -4901,7 +5110,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
     sub_free = {}
     design_ix = {}
     for b, d in inv_by_base.items():
-        wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa']
+        wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa'] + d.get('nj', 0)
         free = max(0, min(wt, wt + d['committed'] + d['allocated']))
         if free > 0 and len(b) >= 8:
             sub_free[b] = free
@@ -4946,7 +5155,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
             if not d:
                 own_pool[b] = 0
                 continue
-            wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa']
+            wt = d['jtw'] + d['tr'] + d['dcw'] + d['qa'] + d.get('nj', 0)
             own_pool[b] = max(0, min(wt, wt + d['committed'] + d['allocated'] + q))
 
         def _oiso(s):
@@ -7195,6 +7404,45 @@ def admin_refresh_apo():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/admin/refresh/nj', methods=['POST', 'OPTIONS'])
+def admin_refresh_nj():
+    """Force a fresh pull of the NJ warehouse on-hand CSV from Dropbox.
+    (Automatic refresh is once daily at 10am ET — this is the manual lever.)"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        ok = load_nj_from_dropbox()
+        if ok:
+            _nj_reapply_to_inventory()
+        with _nj_lock:
+            return jsonify({
+                'status': 'ok' if ok else 'kept-previous',
+                'last_sync': _nj_last_sync,
+                'base_styles': len(_nj_by_base),
+                'shippable_units': sum(_nj_by_base.values()),
+                'fba_earmarked_units': _nj_fba_units,
+                'unmatched_rows': len(_nj_unmatched),
+            })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/admin/nj-unmatched', methods=['GET', 'OPTIONS'])
+def admin_nj_unmatched():
+    """NJ rows that could not be counted as shippable platform stock:
+    legacy non-Versa IDs, FBA-earmarked pieces, negatives, unknown brand codes."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    with _nj_lock:
+        return jsonify({
+            'last_sync': _nj_last_sync,
+            'shippable_base_styles': len(_nj_by_base),
+            'shippable_units': sum(_nj_by_base.values()),
+            'fba_earmarked_units': _nj_fba_units,
+            'unmatched': sorted(_nj_unmatched, key=lambda r: -abs(r.get('qty') or 0)),
+        })
+
+
 @app.route('/admin/refresh/inventory', methods=['POST', 'OPTIONS'])
 def admin_refresh_inventory():
     """Force a fresh pull of inventory (ATS) from S3."""
@@ -7255,6 +7503,13 @@ def admin_sync_status():
             'age_seconds': int(now - _apo_last_sync) if _apo_last_sync else None,
             'row_count': len(_apo_data),
             'auto_interval_minutes': 60,
+        },
+        'nj_warehouse': {
+            'last_sync_iso': _epoch_to_iso(_nj_last_sync) if _nj_last_sync else None,
+            'age_seconds': int(now - _nj_last_sync) if _nj_last_sync else None,
+            'row_count': len(_nj_by_base),
+            'shippable_units': sum(_nj_by_base.values()),
+            'auto_interval_minutes': 1440,
         },
         'dropbox_photos': {
             'last_sync_iso': _epoch_to_iso(_dropbox_photos_last_sync) if _dropbox_photos_last_sync else None,
@@ -8103,6 +8358,13 @@ def startup_sync():
     except Exception as e:
         print(f"  ⚠ APO startup load failed: {e}")
 
+    # NJ warehouse daily feed: one hydrating load at boot (same day's 08:45
+    # snapshot), then ONLY the 10am daily loop — never hourly, per David.
+    try:
+        load_nj_from_dropbox()
+    except Exception as e:
+        print(f"  ⚠ NJ startup load failed: {e}")
+
     # Load Style Ledger (production data) from Dropbox
     try:
         load_production_from_dropbox()
@@ -8138,6 +8400,9 @@ def startup_sync():
 
     # Start Style Ledger fast-lane (10-min Dropbox pull, independent of hourly_resync)
     threading.Thread(target=production_resync_loop, daemon=True, name='production-resync').start()
+
+    # NJ warehouse: once-daily 10:00 AM ET refresh (the 3PL exports ~08:45 ET)
+    threading.Thread(target=nj_daily_resync_loop, daemon=True, name='nj-daily').start()
 
     # Start daily selling-data Dropbox sync + warm caches now (non-blocking)
     threading.Thread(target=daily_selling_sync_loop, daemon=True, name='selling-sync').start()
@@ -8937,7 +9202,7 @@ def _build_full_catalog_index():
                 'color': it.get('color', ''),
                 'fabric': it.get('fabrication', ''),
                 'fit': it.get('fit', ''),
-                'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)),
+                'total_warehouse': (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)+it.get('nj',0)),
                 'incoming': it.get('incoming', 0),
                 'total_ats': it.get('total_ats', 0),
                 'in_current_pipeline': True,
@@ -9322,7 +9587,7 @@ def _ai_build_inventory_context(ats_source='all', target_brands=None,
             if item_canon not in target_brand_canonicals and brand_abbr not in target_brand_canonicals:
                 continue
 
-        wh = (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0))
+        wh = (it.get('jtw',0)+it.get('tr',0)+it.get('dcw',0)+it.get('qa',0)+it.get('nj',0))
         inc = it.get('incoming', 0)
         if ats_source == 'warehouse_only' and wh <= 0:
             continue
@@ -11981,7 +12246,8 @@ def factory_view():
             continue
         try:
             warehouse = (int(item.get('jtw', 0) or 0) + int(item.get('tr', 0) or 0)
-                         + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0))
+                         + int(item.get('dcw', 0) or 0) + int(item.get('qa', 0) or 0)
+                         + int(item.get('nj', 0) or 0))
         except (ValueError, TypeError):
             warehouse = 0
         incoming = int(item.get('incoming', 0) or 0)
@@ -12780,10 +13046,10 @@ def _ai_agent_agg_inventory():
         r = agg.get(base)
         if r is None:
             r = {'style': base, 'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
-                 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'incoming': 0, 'total_ats': 0,
+                 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'incoming': 0, 'total_ats': 0,
                  'committed': 0, 'allocated': 0, 'size_rows': 0}
             agg[base] = r
-        for k in ('jtw', 'tr', 'dcw', 'qa', 'incoming', 'total_ats'):
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'incoming', 'total_ats'):
             try:
                 r[k] += int(it.get(k) or 0)
             except (TypeError, ValueError):
@@ -12797,7 +13063,7 @@ def _ai_agent_agg_inventory():
                 r[k] = v
         r['size_rows'] += 1
     for r in agg.values():
-        r['total_warehouse'] = r['jtw'] + r['tr'] + r['dcw'] + r['qa']
+        r['total_warehouse'] = r['jtw'] + r['tr'] + r['dcw'] + r['qa'] + r.get('nj', 0)
     return agg
 
 
@@ -12992,7 +13258,7 @@ def _ai_tool_style_detail(params):
             ab = _apo_style_brand(base) or ''
         except Exception:
             ab = ''
-        r = {'style': base, 'brand_abbr': ab, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'incoming': 0,
+        r = {'style': base, 'brand_abbr': ab, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'incoming': 0,
              'total_ats': 0, 'committed': 0, 'allocated': 0, 'total_warehouse': 0, 'size_rows': 0}
     color, fit, fab = _ai_agent_enrich(r)
     try:
@@ -13019,10 +13285,10 @@ def _ai_tool_style_detail(params):
     except Exception:
         pass
     return {'style': base, 'brand': r['brand_abbr'], 'color': color, 'fit': fit, 'fabrication': fab,
-            'category': category, 'warehouse': {'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
+            'category': category, 'warehouse': {'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'], 'nj': r.get('nj', 0),
             'total': r['total_warehouse']}, 'incoming': r['incoming'], 'total_ats': r['total_ats'],
             'committed_units': abs(r['committed']), 'allocated_units': abs(r['allocated']),
-            'size_variants': [{'sku': s.get('sku'), 'warehouse': (s.get('jtw') or 0) + (s.get('tr') or 0) + (s.get('dcw') or 0) + (s.get('qa') or 0),
+            'size_variants': [{'sku': s.get('sku'), 'warehouse': (s.get('jtw') or 0) + (s.get('tr') or 0) + (s.get('dcw') or 0) + (s.get('qa') or 0) + (s.get('nj') or 0),
                                'incoming': s.get('incoming'), 'total_ats': s.get('total_ats')} for s in size_rows[:40]],
             'production_orders': prods[:20], 'apo_allocations': apo[:20], 'open_orders': orders_out[:20],
             'image_url': f'{_AI_AGENT_SELF_URL}/image/{base}'}
@@ -13776,7 +14042,7 @@ def _ai_tool_build_line_sheet(params):
                 arr_s = str(best[0])
                 etd_s = str(best[1].get('etd') or '')
                 po_ref = str(best[1].get('production') or '')
-            wh_names = [n for n, k in (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa')) if r[k] > 0]
+            wh_names = [n for n, k in (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa'), ('NJ', 'nj')) if r[k] > 0]
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
                     'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
                     'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
@@ -14068,7 +14334,7 @@ def api_ai_agent():
 _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
-Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
+Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA/NJ). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
 Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute)."""
 
 
