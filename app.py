@@ -7515,6 +7515,10 @@ _AUTHZ_CATALOG_READS = {
 }
 # Extra GET endpoints the machine key may use (report/export pulls).
 _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports'}
+# POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
+# of the already-scoped data the page holds). Anonymous access still requires
+# a valid catalog_slug, like the reads.
+_AUTHZ_CATALOG_POSTS = {'/export', '/export-multi', '/export-pdf'}
 
 _AUTHZ_ALL_BRAND_FLAGS = ('all', 'all_brands', 'wh_all_brands', 'os_all_brands')
 
@@ -7544,14 +7548,20 @@ def _oo_token_valid(token):
         if hit and hit[0] > now:
             return hit[1]
     ok = False
+    transient = False
     try:
         r = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/auth/me",
                               headers={'Authorization': f'Bearer {token}'}, timeout=8)
         ok = (r.status_code == 200)
     except Exception as e:
+        # Network/timeout, not a real rejection — cache only briefly so a
+        # cold-starting open-orders service doesn't 401 a valid session for
+        # two minutes (observed during browser testing).
+        transient = True
         print(f"[authz] open-orders introspection failed: {e}", flush=True)
     with _oo_token_lock:
-        _oo_token_cache[token] = (now + (600 if ok else 120), ok)
+        ttl = 600 if ok else (20 if transient else 120)
+        _oo_token_cache[token] = (now + ttl, ok)
         if len(_oo_token_cache) > 500:
             for k in [k for k, v in _oo_token_cache.items() if v[0] <= now]:
                 _oo_token_cache.pop(k, None)
@@ -7611,18 +7621,23 @@ def _catalog_scope_for_slug(slug):
     for key in ('brands', 'wh_brands', 'os_brands'):
         for b in str(q.get(key) or '').split(','):
             b = b.strip().upper()
-            if b:
+            # __SEG__ is the frontend's placeholder token for segment links
+            # whose brand list was stripped — it is not a brand.
+            if b and b != '__SEG__':
                 scope['brands'].add(b)
     for b in (entry.get('brands') or []):
         b = str(b).strip().upper()
-        if b:
+        if b and b != '__SEG__':
             scope['brands'].add(b)
     for s in str(q.get('skus') or '').split(','):
         s = s.strip().upper()
         if s:
             scope['styles'].add(get_base_style(s))
-    # pos= catalogs are PO-scoped: pull the matching production rows' styles in.
-    po_filter = {p.strip().upper() for p in str(q.get('pos') or '').split(',') if p.strip()}
+    # pos= catalogs (and segment wh_pos/os_pos variants) are PO-scoped: pull
+    # the matching production rows' styles in.
+    po_filter = set()
+    for key in ('pos', 'wh_pos', 'os_pos'):
+        po_filter.update(p.strip().upper() for p in str(q.get(key) or '').split(',') if p.strip())
     if po_filter:
         try:
             for row in (_production_data or []):
@@ -7665,6 +7680,17 @@ def _authz_base_brand(base):
         idx['etag'] = etag
     return idx['map'].get(base, '')
 
+def _scope_brand_match(scope, b):
+    """Brand string vs scope, tolerant of the frontend's alias spellings."""
+    if not b:
+        return False
+    if b in scope['brands']:
+        return True
+    try:
+        return _normalize_brand(b).upper() in scope['brands_norm']
+    except Exception:
+        return False
+
 def _scope_has_style(scope, sku):
     if scope.get('all'):
         return True
@@ -7673,14 +7699,13 @@ def _scope_has_style(scope, sku):
         return False
     if base in scope['styles']:
         return True
-    b = _authz_base_brand(base)
-    if b and b in scope['brands']:
+    if _scope_brand_match(scope, _authz_base_brand(base)):
         return True
     # Fallbacks for styles absent from inventory: brand letters in the SKU,
     # then the customer-prefix brand groupings the frontend also uses.
     code = base[2:4] if len(base) >= 4 else ''
     ab = str(SKU_BRAND_CODE_MAP.get(code, '') or '').upper()
-    if ab and ab in scope['brands']:
+    if ab and _scope_brand_match(scope, ab):
         return True
     return base[:2] in scope['brands']
 
@@ -7700,8 +7725,7 @@ def _scope_has_brandstr(scope, raw):
 def _scope_has_item(scope, it):
     if scope.get('all'):
         return True
-    b = str(it.get('brand') or '').upper()
-    if b and b in scope['brands']:
+    if _scope_brand_match(scope, str(it.get('brand') or '').upper()):
         return True
     return _scope_has_style(scope, it.get('sku'))
 
@@ -7799,10 +7823,17 @@ def authz_gate():
         tier = ident.get('tier')
         if tier == 'staff':
             return None
-        if tier == 'machine' and method == 'GET' and (
-                path in _AUTHZ_CATALOG_READS or path in _AUTHZ_MACHINE_EXTRA
-                or path.startswith('/download/')):
-            return None
+        if tier == 'machine':
+            # No /saved-catalogs for the machine key: the catalog list holds
+            # every customer's slug (the anonymous scope keys) and no machine
+            # consumer needs it. POST /admin/claude-uploads is the standing
+            # Claude file-delivery channel.
+            if method == 'GET' and ((path in _AUTHZ_CATALOG_READS and path != '/saved-catalogs')
+                                    or path in _AUTHZ_MACHINE_EXTRA
+                                    or path.startswith('/download/')):
+                return None
+            if method == 'POST' and path == '/admin/claude-uploads':
+                return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
             return None
@@ -7810,7 +7841,8 @@ def authz_gate():
             return None
         reason = f"tier '{tier}' not allowed here"
     else:
-        if method == 'GET' and path in _AUTHZ_CATALOG_READS:
+        if ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
+                or (method == 'POST' and path in _AUTHZ_CATALOG_POSTS)):
             slug = (request.args.get('catalog_slug') or '').strip()
             scope = _catalog_scope_for_slug(slug) if slug else None
             if scope is not None:
