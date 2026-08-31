@@ -667,6 +667,7 @@ DROPBOX_NJ_PATH = os.environ.get('DROPBOX_NJ_PATH', '/backup/Inventory/INVENTORY
 
 _nj_lock = threading.Lock()
 _nj_by_base = {}        # base style (upper) -> pieces on hand (shippable)
+_nj_sizes = {}          # base style (upper) -> {full ITEM_ID: pieces} breakdown
 _nj_fba_units = 0       # '-FBA' earmarked pieces (excluded from shippable)
 _nj_unmatched = []      # [{'item_id','qty','description','reason'}] admin report
 _nj_last_sync = 0
@@ -703,7 +704,7 @@ def _nj_parse_item_id(item_id):
 def load_nj_from_dropbox():
     """Fetch + aggregate the NJ warehouse CSV. Keeps prior data on any failure
     so warehouse totals never oscillate on a bad read."""
-    global _nj_by_base, _nj_fba_units, _nj_unmatched, _nj_last_sync
+    global _nj_by_base, _nj_sizes, _nj_fba_units, _nj_unmatched, _nj_last_sync
     token = get_dropbox_token()
     if not token:
         print("[NJ] no Dropbox token — keeping previous NJ data", flush=True)
@@ -735,7 +736,7 @@ def load_nj_from_dropbox():
         if len(rows) < 500:      # file is ~2,500 rows; a tiny read is a partial upload
             print(f"[NJ] only {len(rows)} rows — likely partial file, keeping previous NJ data", flush=True)
             return False
-        by_base, fba_units, unmatched = {}, 0, []
+        by_base, by_sizes, fba_units, unmatched = {}, {}, 0, []
         neg_rows = 0
         for r in rows:
             try:
@@ -764,10 +765,13 @@ def load_nj_from_dropbox():
                                   'reason': 'legacy id (no platform style)'})
                 continue
             by_base[base] = by_base.get(base, 0) + qty
+            sz = by_sizes.setdefault(base, {})
+            sz[iid] = sz.get(iid, 0) + qty
         # Unknown brand codes are decided HERE, once per load (never during the
         # hourly re-merge — appending there duplicated report rows all day).
         for base in list(by_base.keys()):
             if not _nj_brand_for_base(base):
+                by_sizes.pop(base, None)
                 unmatched.append({'item_id': base, 'qty': by_base.pop(base),
                                   'description': '', 'reason': 'unknown brand code'})
         total = sum(by_base.values())
@@ -781,6 +785,7 @@ def load_nj_from_dropbox():
             return False
         with _nj_lock:
             _nj_by_base = by_base
+            _nj_sizes = by_sizes
             _nj_fba_units = fba_units
             _nj_unmatched = unmatched
             _nj_last_sync = time.time()
@@ -791,7 +796,8 @@ def load_nj_from_dropbox():
         # Dropbox is unreachable at boot (best-effort).
         try:
             get_s3().put_object(Bucket=S3_BUCKET, Key='inventory/nj_onhand_cache.json',
-                                Body=json.dumps({'by_base': by_base, 'fba_units': fba_units,
+                                Body=json.dumps({'by_base': by_base, 'sizes': by_sizes,
+                                                 'fba_units': fba_units,
                                                  'unmatched': unmatched, 'ts': time.time()}),
                                 ContentType='application/json')
         except Exception as e:
@@ -817,7 +823,7 @@ def _nj_brand_for_base(base):
 def _nj_hydrate_from_s3():
     """Boot fallback: load the last good NJ snapshot from S3 when the Dropbox
     pull fails and this worker has no data yet."""
-    global _nj_by_base, _nj_fba_units, _nj_unmatched, _nj_last_sync
+    global _nj_by_base, _nj_sizes, _nj_fba_units, _nj_unmatched, _nj_last_sync
     try:
         resp = get_s3().get_object(Bucket=S3_BUCKET, Key='inventory/nj_onhand_cache.json')
         data = json.loads(resp['Body'].read().decode('utf-8'))
@@ -828,6 +834,8 @@ def _nj_hydrate_from_s3():
             if _nj_by_base:      # a real load beat us — keep it
                 return True
             _nj_by_base = by_base
+            _nj_sizes = {str(k): {str(s): int(q) for s, q in (v or {}).items()}
+                         for k, v in (data.get('sizes') or {}).items()}
             _nj_fba_units = int(data.get('fba_units') or 0)
             _nj_unmatched = list(data.get('unmatched') or [])
             _nj_last_sync = float(data.get('ts') or 0)
@@ -847,6 +855,7 @@ def _apply_nj_to_items(items):
     total_ats on the carrying row grow by nj — NJ is sellable stock."""
     with _nj_lock:
         remaining = dict(_nj_by_base)
+        sizes_snap = {k: dict(v) for k, v in _nj_sizes.items()}
     # Idempotent re-apply on COPIES: never mutate dicts that in-flight requests
     # may be serializing (torn-read fix), and drop prior synthesized rows.
     items = [dict(it) for it in items if not it.get('_nj_synth')]
@@ -856,6 +865,7 @@ def _apply_nj_to_items(items):
             it['total_warehouse'] = int(it.get('total_warehouse') or 0) - prev
             it['total_ats'] = int(it.get('total_ats') or 0) - prev
         it['nj'] = 0
+        it.pop('nj_sizes', None)
     if not remaining:
         return items
     # Carrier rule (audit fix): NJ always rides the row whose sku EQUALS the
@@ -875,6 +885,8 @@ def _apply_nj_to_items(items):
             carrier['nj'] = qty
             carrier['total_warehouse'] = int(carrier.get('total_warehouse') or 0) + qty
             carrier['total_ats'] = int(carrier.get('total_ats') or 0) + qty
+            if sizes_snap.get(key):
+                carrier['nj_sizes'] = sizes_snap[key]
             continue
         # Synthesize the carrier. Brand: prefer a real sibling row's brand,
         # else the correction-aware letter map.
@@ -883,7 +895,7 @@ def _apply_nj_to_items(items):
         if not brand:
             continue   # loader already routed unknown-brand bases to the report
         name = str(sibling.get('name') or '') if sibling else ''
-        items.append({
+        row = {
             'sku': key, 'brand': brand, 'brand_abbr': brand,
             'brand_full': BRAND_FULL_NAMES.get(brand, brand), 'name': name,
             'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': qty,
@@ -891,7 +903,10 @@ def _apply_nj_to_items(items):
             'total_ats': qty, 'total_warehouse': qty,
             'container': '', 'receive_date': '', 'lot_number': '', 'image': '',
             '_nj_synth': True,
-        })
+        }
+        if sizes_snap.get(key):
+            row['nj_sizes'] = sizes_snap[key]
+        items.append(row)
     return items
 
 def _nj_reapply_to_inventory():
@@ -4340,6 +4355,10 @@ def export_single():
         if not req or 'data' not in req:
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
+        # Anonymous catalog holders: NJ is admin-only. Scrub even client-posted
+        # rows so a stale cached page can't export NJ numbers.
+        if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
+            data = _strip_nj_rows(data)
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
@@ -4386,6 +4405,8 @@ def export_pdf():
         if not req or 'data' not in req:
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
+        if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
+            data = _strip_nj_rows(data)
         if not data:
             return jsonify({"error": "Empty data"}), 400
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -4414,6 +4435,10 @@ def export_multi():
         if not req or 'brands' not in req:
             return jsonify({"error": "Missing 'brands'"}), 400
         brands_data = req['brands']
+        if getattr(g, '_catalog_scope', None) is not None and isinstance(brands_data, list):
+            for _b in brands_data:
+                if isinstance(_b, dict) and isinstance(_b.get('items'), list):
+                    _b['items'] = _strip_nj_rows(_b['items'])
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
@@ -8062,10 +8087,39 @@ def _scope_has_item(scope, it):
         return True
     return _scope_has_style(scope, it.get('sku'))
 
+def _strip_nj_rows(rows):
+    """NJ warehouse data is ADMIN-ONLY (per David): customer catalog views and
+    exports must never see it. Drops NJ-synthesized rows entirely and removes
+    NJ quantities (and their share of the totals) from every other row.
+    Returns new row dicts — never mutates the caller's list."""
+    out = []
+    for it in rows:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        if it.get('_nj_synth'):
+            continue
+        nj = int(it.get('nj') or 0)
+        if nj or 'nj' in it or 'nj_sizes' in it:
+            it = dict(it)
+            if nj:
+                it['total_warehouse'] = max(0, int(it.get('total_warehouse') or 0) - nj)
+                it['total_ats'] = int(it.get('total_ats') or 0) - nj
+            it.pop('nj', None)
+            it.pop('nj_sizes', None)
+        # Client-computed warehouse-names strings ride export payloads.
+        wh = it.get('warehouse')
+        if isinstance(wh, str) and 'NJ' in wh.upper():
+            it = dict(it)
+            parts = [p for p in re.split(r'[,/]\s*', wh) if p.strip().upper() != 'NJ']
+            it['warehouse'] = ', '.join(p.strip() for p in parts if p.strip())
+        out.append(it)
+    return out
+
 def _flt_inventory(data, scope):
     items = data.get('inventory')
     if isinstance(items, list):
-        kept = [it for it in items if _scope_has_item(scope, it)]
+        kept = _strip_nj_rows([it for it in items if _scope_has_item(scope, it)])
         data['inventory'] = kept
         data['item_count'] = len(kept)
     return data
