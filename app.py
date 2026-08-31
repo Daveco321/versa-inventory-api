@@ -10192,11 +10192,16 @@ def ai_suggestions():
 OPEN_ORDERS_API_URL = os.environ.get('OPEN_ORDERS_API_URL',
                                      'https://open-orders-api.onrender.com')
 
+def _oo_api_headers():
+    """Machine credential for calls to the open-orders service. Shares the
+    INVENTORY_API_KEY value; harmless while that service's reads are open."""
+    return {'X-Api-Key': INVENTORY_API_KEY} if INVENTORY_API_KEY else {}
+
 def _fetch_open_orders():
     """Hit the open-orders-api /api/orders endpoint and return the raw list.
     Returns [] on any error so the caller can surface a clean message."""
     try:
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", timeout=30)
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", headers=_oo_api_headers(), timeout=30)
         if resp.status_code != 200:
             print(f"[OpenOrders] /api/orders returned {resp.status_code}", flush=True)
             return []
@@ -11629,7 +11634,7 @@ def _fetch_fob_customers():
                 and now - _fob_customers_cache['fetched_at'] < _ALL_OPEN_ORDERS_TTL):
             return list(_fob_customers_cache['data'])
     try:
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/fob-customers", timeout=10)
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/fob-customers", headers=_oo_api_headers(), timeout=10)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
@@ -11674,7 +11679,7 @@ def _fetch_all_open_orders():
             return (list(stale) if stale else []), False
 
     try:
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", timeout=15)
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", headers=_oo_api_headers(), timeout=15)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
         orders = resp.json().get('orders', []) or []
@@ -13099,7 +13104,7 @@ def _fetch_po_history(account=None):
         # upstream (mirrors _fetch_all_open_orders' backoff for the sync worker).
         return cached, cached is not None
     try:
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/po-history",
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/po-history", headers=_oo_api_headers(),
                                  params=({'account': key} if key else None), timeout=30)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
@@ -13264,7 +13269,7 @@ def _sales_resolve_customer(cust_q):
     Upstream matches codes exactly, so 'Burlington' must become 'BURL' here.
     Uses the sales summary's code list + the po-history accounts' full names.
     Returns (code, None) on success or (None, error_dict) on failure."""
-    resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", timeout=45)
+    resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(), timeout=45)
     data = resp.json()
     if not data.get('ready'):
         return None, {'error': 'sales history backfill not available yet'}
@@ -13307,7 +13312,7 @@ def _ai_tool_sales_history(params):
                 code, err = _sales_resolve_customer(cust_q)
                 if err:
                     return err
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history",
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(),
                                      params={'style': style_q}, timeout=45)
             data = resp.json()
             if not data.get('ready'):
@@ -13340,7 +13345,7 @@ def _ai_tool_sales_history(params):
                     qp['from'] = from_q
                 if to_q:
                     qp['to'] = to_q
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", params=qp, timeout=45)
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", params=qp, headers=_oo_api_headers(), timeout=45)
             data = resp.json()
             if not data.get('ready'):
                 return {'error': 'sales history backfill not available yet'}
@@ -13356,7 +13361,7 @@ def _ai_tool_sales_history(params):
                     'top_styles': (data.get('topStyles') or [])[:30],
                     'recent_pos': (data.get('posRecent') or [])[:limit],
                     'note': 'divisions: OB = bulk, DS = dropship'}
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", timeout=45)
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(), timeout=45)
         data = resp.json()
         if not data.get('ready'):
             return {'error': 'sales history backfill not available yet'}
@@ -13431,7 +13436,7 @@ def _ai_tool_build_sales_sheet(params):
     inv_pos, inv_po_set = [], set()
     if 'invoiced' in include:
         try:
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history",
+            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(),
                                      params={'account': code, 'from': lo, 'to': hi}, timeout=60)
             data = resp.json()
             if data.get('ready'):
