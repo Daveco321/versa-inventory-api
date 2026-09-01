@@ -643,6 +643,14 @@ def save_banner_rules_to_s3():
 
 
 S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL WAREHOUSE ALLOCATION.csv')
+# Ledger column-I warehouse codes -> platform codes, and the landing
+# warehouses whose productions are ADMIN-ONLY (per David, Sep 2026: NJ/AE/AW
+# landings must NEVER reach a customer catalog, view, or export — same rule
+# as NJ warehouse stock).
+_LEDGER_WH_MAP = {'JT': 'JTW', 'JTW': 'JTW', 'TR': 'TR', 'DW': 'DCW', 'DCW': 'DCW',
+                  'DC': 'DCW', 'QA': 'QA', 'NJ': 'NJ', 'AE': 'AE', 'AW': 'AW'}
+_HIDDEN_LANDING_WH = {'NJ', 'AE', 'AW'}
+
 # Production/Style Ledger — now Dropbox-only (S3 removed)
 DROPBOX_PRODUCTION_FOLDER = os.environ.get('DROPBOX_PRODUCTION_FOLDER',
     '/Versa Share Files/David - Dropbox/Style Ledger')
@@ -1067,9 +1075,13 @@ def load_production_from_dropbox():
         ws = wb[wb.sheetnames[0]]
         results = []
         row_count = 0
-        # Read through column H. Columns of interest:
+        # Read through column I. Columns of interest:
         #   A=Production#, B=PO Name, C=Style, D=Units, E=Brand,
-        #   F=ETD, G=Estimated Arrival to Port, H=Shipment #
+        #   F=ETD, G=Estimated Arrival to Port, H=Shipment #, I=Warehouse
+        # Column I (added Sep 2026) = the warehouse the goods LAND in
+        # (JT/TR/NJ/DW/QA/AE/AW on the ledger; normalized to platform codes).
+        # Productions landing in a HIDDEN warehouse (NJ/AE/AW) are admin-only:
+        # the anonymous catalog scope strips those rows and their quantities.
         # When G is present, it OVERRIDES column F's ETD entirely:
         #   - arrival = G + 10 days  (port-to-warehouse leg)
         #   - etd     = G - 27 days  (factory ship-to-port lead time)
@@ -1078,7 +1090,7 @@ def load_production_from_dropbox():
         # Column H (Shipment #) is admin-only metadata for grouping physical shipments
         # within the same Production#. Never appears in exports.
         from datetime import timedelta as _td
-        for row in ws.iter_rows(min_row=2, max_col=8, values_only=True):
+        for row in ws.iter_rows(min_row=2, max_col=9, values_only=True):
             row_count += 1
             style = str(row[2] or '').strip().upper()
             if not style:
@@ -1166,6 +1178,12 @@ def load_production_from_dropbox():
                 else:
                     shipment_no = str(row[7]).strip()
 
+            # ── Column I: landing Warehouse ──
+            warehouse = ''
+            if len(row) > 8 and row[8] is not None:
+                wr = str(row[8]).strip().upper()
+                warehouse = _LEDGER_WH_MAP.get(wr, wr)
+
             results.append({
                 'production': str(row[0] or '').strip(),
                 'poName': str(row[1] or '').strip(),
@@ -1189,7 +1207,10 @@ def load_production_from_dropbox():
                 # Shipment # — admin-only column H. Used to break a single Production#
                 # PO into physical shipments. Frontend surfaces this in a dedicated
                 # admin-only modal; deliberately excluded from all exports.
-                'shipmentNo': shipment_no
+                'shipmentNo': shipment_no,
+                # Landing warehouse — ledger column I, normalized (JT->JTW, DW->DCW).
+                # NJ/AE/AW landings are hard-hidden from every customer surface.
+                'warehouse': warehouse
             })
         wb.close()
 
@@ -4437,10 +4458,11 @@ def export_single():
         if not req or 'data' not in req:
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
-        # Anonymous catalog holders: NJ is admin-only. Scrub even client-posted
-        # rows so a stale cached page can't export NJ numbers.
+        # Anonymous catalog holders: NJ stock and hidden-landing productions are
+        # admin-only. Scrub even client-posted rows so a stale cached page can't
+        # export them.
         if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
-            data = _strip_nj_rows(data)
+            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
@@ -4488,7 +4510,7 @@ def export_pdf():
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
         if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
-            data = _strip_nj_rows(data)
+            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
         if not data:
             return jsonify({"error": "Empty data"}), 400
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -4520,7 +4542,7 @@ def export_multi():
         if getattr(g, '_catalog_scope', None) is not None and isinstance(brands_data, list):
             for _b in brands_data:
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
-                    _b['items'] = _strip_nj_rows(_b['items'])
+                    _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items']))
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
@@ -8218,7 +8240,7 @@ def _strip_nj_rows(rows):
 def _flt_inventory(data, scope):
     items = data.get('inventory')
     if isinstance(items, list):
-        kept = _strip_nj_rows([it for it in items if _scope_has_item(scope, it)])
+        kept = _strip_hidden_landing_rows(_strip_nj_rows([it for it in items if _scope_has_item(scope, it)]))
         data['inventory'] = kept
         data['item_count'] = len(kept)
     return data
@@ -8247,12 +8269,82 @@ def _flt_suppression(data, scope):
         data['overrides'] = [s for s in ov if _scope_has_style(scope, s)]
     return data
 
+def _hidden_landing_maps():
+    """({style: hidden units}, {style: True if any VISIBLE production}) from the
+    in-memory ledger. Ledger styles match inventory SKUs exactly (1:1)."""
+    with _production_lock:
+        rows = list(_production_data)
+    hidden, visible = {}, {}
+    for p in rows:
+        st = str(p.get('style') or '').upper()
+        if not st:
+            continue
+        if str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH:
+            try:
+                hidden[st] = hidden.get(st, 0) + int(p.get('units') or 0)
+            except Exception:
+                pass
+        else:
+            visible[st] = True
+    return hidden, visible
+
+def _strip_hidden_landing_rows(rows):
+    """Customer scope: remove the incoming quantity attributable to hidden-landing
+    productions. A style whose ONLY supply is a hidden-landing production drops
+    entirely (per David: TMNASU201SLS landing NJ must never appear to customers)."""
+    hidden, visible = _hidden_landing_maps()
+    if not hidden:
+        return rows
+    out = []
+    for it in rows:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        sku = str(it.get('sku') or '').upper()
+        h = hidden.get(sku, 0)
+        if h <= 0:
+            out.append(it)
+            continue
+        it = dict(it)
+        inc = int(it.get('incoming') or 0)
+        # every production hidden -> ALL overseas supply is invisible; mixed ->
+        # subtract the hidden productions' units, clamped
+        cut = inc if sku not in visible else min(inc, h)
+        if cut > 0:
+            it['incoming'] = inc - cut
+            it['total_ats'] = int(it.get('total_ats') or 0) - cut
+            if int(it.get('total_warehouse') or 0) <= 0 and it['incoming'] <= 0:
+                continue   # exists only as hidden-landing production
+        out.append(it)
+    return out
+
+def _hidden_prod_numbers():
+    with _production_lock:
+        return {str(p.get('production') or '').strip().upper() for p in _production_data
+                if p.get('production') and str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH}
+
+def _strip_hidden_prod_export_rows(rows):
+    """Customer exports: drop any posted per-delivery row that references a
+    hidden-landing production (stale-cache defense; live pages never form them)."""
+    hp = _hidden_prod_numbers()
+    if not hp:
+        return rows
+    out = []
+    for it in rows:
+        if isinstance(it, dict):
+            ref = str(it.get('production') or it.get('po_ref') or '').strip().upper()
+            if ref and ref in hp:
+                continue
+        out.append(it)
+    return out
+
 def _flt_production(data, scope):
     rows = data.get('production')
     if isinstance(rows, list):
         data['production'] = [r for r in rows
-                              if _scope_has_style(scope, r.get('style'))
-                              or _scope_has_brandstr(scope, r.get('brand'))]
+                              if str(r.get('warehouse') or '').upper() not in _HIDDEN_LANDING_WH
+                              and (_scope_has_style(scope, r.get('style'))
+                                   or _scope_has_brandstr(scope, r.get('brand')))]
     return data
 
 def _flt_apo(data, scope):
