@@ -4946,8 +4946,25 @@ _APO_DOLLAR_CUST = {   # report customer → A2000 feed customer codes
     'burlington': {'BURL'},
 }
 
+# Positional brand decode is ONLY valid on modern-format SKUs. A legacy style
+# number like LUCK2221SL would read chars 3-4 ('CK') as Cherokee otherwise —
+# that exact mislabel shipped in the Allocation Dollar Value email once.
+_APO_MODERN_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$')
+_APO_LEGACY_PREFIX = (('LUCK', 'LUCKY'), ('CHER', 'CHEROKEE'), ('NAU', 'NAUTICA'),
+                      ('DKNY', 'DKNY'), ('CHAPS', 'CHAPS'), ('USPA', 'USPA'),
+                      ('JNY', 'JNY'), ('BEENE', 'BEENE'))
+
+def _apo_style_brand_abbr(base):
+    b = str(base or '').upper().split(' ')[0].split('-')[0]
+    if _APO_MODERN_RE.match(b):
+        return SKU_BRAND_CODE_MAP.get(b[2:4], '')
+    for pre, ab in _APO_LEGACY_PREFIX:
+        if b.startswith(pre):
+            return ab
+    return ''
+
 def _apo_style_brand(base):
-    abbr = SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
+    abbr = _apo_style_brand_abbr(base)
     return _APO_BRAND_FULL.get(abbr, abbr or 'Other')
 
 def _apo_avg_price_maps():
@@ -5107,7 +5124,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
     rows = []
     for base, qty in agg.items():
         inv = inv_by_base.get(base)
-        brand_abbr = (inv and inv['brand_abbr']) or SKU_BRAND_CODE_MAP.get(base[2:4] if len(base) >= 4 else '', '')
+        brand_abbr = (inv and inv['brand_abbr']) or _apo_style_brand_abbr(base)
         brand_full = (inv and inv['brand_full']) or _APO_BRAND_FULL.get(brand_abbr, brand_abbr or 'Other')
         color = _apo_style_color(base, brand_abbr)
 
