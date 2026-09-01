@@ -2673,6 +2673,51 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     return len(data)
 
 
+_SIZED_SKU_BASE_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$')
+_SIZED_ALPHA_RE = re.compile(r'^(XS|S|M|L|XL|XXL|XXXL|[2-4]XL|ST|MT|LT|XLT|[2-3]XLT)$')
+
+def _sized_sku_label(sku):
+    """AMNASU576SLP-1515.53233 -> '15-15.5 / 32-33'. A specific-size SKU is one
+    size, so its case pack is a SOLID pack of that size, never the style's
+    mixed run. Modern bases only (legacy excluded); bare -V is a style variant,
+    not a size. Mirrors the frontend parseSizedSkuLabel."""
+    s = str(sku or '').upper().strip()
+    di = s.find('-')
+    if di < 0:
+        return None
+    base = s[:di]
+    if not _SIZED_SKU_BASE_RE.match(base):
+        return None
+    suf = s[di + 1:]
+    if suf.endswith('-FBA'):
+        suf = suf[:-4]
+    if suf.endswith('-V'):
+        suf = suf[:-2]
+    if not suf or suf in ('V', 'FBA'):
+        return None
+    def neck_ok(n):
+        try: return 13 <= float(n) <= 23
+        except Exception: return False
+    def sl_ok(n):
+        try: return 28 <= float(n) <= 40
+        except Exception: return False
+    m = re.match(r'^(\d{2})(\d{2}(?:\.\d)?)(\d{2})(\d{2})$', suf)
+    if m:
+        return (f'{m.group(1)}-{m.group(2)} / {m.group(3)}-{m.group(4)}'
+                if neck_ok(m.group(1)) and neck_ok(m.group(2)) and sl_ok(m.group(3)) and sl_ok(m.group(4)) else None)
+    m = re.match(r'^(\d{2}(?:\.\d)?)-(\d{2}(?:\.\d)?)(\d{2})/(\d{2})$', suf)
+    if m:
+        return (f'{m.group(1)}-{m.group(2)} / {m.group(3)}-{m.group(4)}'
+                if neck_ok(m.group(1)) and neck_ok(m.group(2)) and sl_ok(m.group(3)) and sl_ok(m.group(4)) else None)
+    m = re.match(r'^(\d{2}(?:\.\d)?)-(\d{2})(?:/(\d{2}))?$', suf)
+    if m:
+        if neck_ok(m.group(1)) and sl_ok(m.group(2)) and (not m.group(3) or sl_ok(m.group(3))):
+            return f'{m.group(1)} / {m.group(2)}' + (f'-{m.group(3)}' if m.group(3) else '')
+        return None
+    if _SIZED_ALPHA_RE.match(suf):
+        return suf
+    return None
+
 def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=None):
     """
     Render prepack size scale grids vertically at the bottom of the worksheet.
@@ -2693,6 +2738,8 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
     # ── Determine which rules to show ─────────────────────────────────────
     packs_to_render = []
 
+    solid_sizes = {}   # sized SKUs: size label -> master qty (solid pack)
+
     if prepack_defaults and items:
         seen_keys = {}
         for item in items:
@@ -2701,10 +2748,19 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
             cust = item.get('_export_customer', '')
             sku = item.get('sku', '').upper()
             base = sku.split('-')[0]
+            # A specific-size SKU never contributes the style's mixed grid: it
+            # rolls into one consolidated "solid size packs" grid instead.
+            sized_label = _sized_sku_label(sku)
 
             # PRIORITY A: Per-item Override Tool size pack
             override_pack = item.get('_override_size_pack')
             if override_pack and isinstance(override_pack, dict) and override_pack.get('sizes'):
+                if sized_label:
+                    try:
+                        solid_sizes[sized_label] = int(override_pack.get('master_qty') or 36)
+                    except Exception:
+                        solid_sizes[sized_label] = 36
+                    continue
                 key = ('__override__', sku)
                 if key not in seen_keys:
                     seen_keys[key] = {
@@ -2822,14 +2878,19 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
                 matched = best_rule
 
-            if matched:
+            if sized_label:
+                try:
+                    solid_sizes[sized_label] = int((matched or {}).get('master_qty') or 36)
+                except Exception:
+                    solid_sizes[sized_label] = 36
+            elif matched:
                 key = matched.get('id', id(matched))
                 if key not in seen_keys:
                     seen_keys[key] = matched
 
         # Render override grids first (sorted by SKU), then rule-based grids
-        override_packs = [(k, v) for k, v in seen_keys.items() if k[0] == '__override__']
-        rule_packs     = [(k, v) for k, v in seen_keys.items() if k[0] != '__override__']
+        override_packs = [(k, v) for k, v in seen_keys.items() if isinstance(k, tuple) and k[0] == '__override__']
+        rule_packs     = [(k, v) for k, v in seen_keys.items() if not (isinstance(k, tuple) and k[0] == '__override__')]
         packs_to_render = [v for _, v in sorted(override_packs, key=lambda x: x[0][1])] + [v for _, v in rule_packs]
 
     elif items:
@@ -2839,6 +2900,16 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
             override_pack = item.get('_override_size_pack')
             sku = item.get('sku', '').upper()
             base = sku.split('-')[0]
+            sized_label = _sized_sku_label(sku)
+            if sized_label:
+                mq = 36
+                if override_pack and isinstance(override_pack, dict):
+                    try:
+                        mq = int(override_pack.get('master_qty') or 36)
+                    except Exception:
+                        mq = 36
+                solid_sizes[sized_label] = mq
+                continue
             if override_pack and isinstance(override_pack, dict) and override_pack.get('sizes'):
                 if base not in seen_overrides:
                     seen_overrides[base] = {
@@ -2848,6 +2919,17 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                         'sizes':      override_pack.get('sizes', []),
                     }
         packs_to_render = list(seen_overrides.values())
+
+    # Consolidated solid-pack grid: one row per specific size on this tab,
+    # each shipping as its own full case of that single size.
+    if solid_sizes:
+        mqs = set(solid_sizes.values())
+        solid_master = next(iter(mqs)) if len(mqs) == 1 else '?'
+        packs_to_render.append({
+            'label': 'SOLID SIZE PACKS (each size ships as its own full case)',
+            'master_qty': solid_master, 'inner_qty': '',
+            'sizes': sorted([[k, v] for k, v in solid_sizes.items()]),
+        })
 
     # ── Fallback: hardcoded Slim + Regular ────────────────────────────────
     if not packs_to_render:
