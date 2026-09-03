@@ -5074,10 +5074,13 @@ def _norm_ledger_date(v):
     12-15-2026, 2026/12/15). Returns None when nothing parses."""
     if v is None:
         return None
-    if isinstance(v, datetime):
-        return v.strftime('%Y-%m-%d')
-    if isinstance(v, _d):
-        return v.strftime('%Y-%m-%d')
+    # datetime AND date objects (module imports only `datetime`; `_d` is a
+    # function-local alias elsewhere — do not reference it here).
+    if hasattr(v, 'strftime'):
+        try:
+            return v.strftime('%Y-%m-%d')
+        except Exception:
+            return None
     s = str(v).strip()
     if not s:
         return None
