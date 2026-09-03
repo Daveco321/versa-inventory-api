@@ -1134,7 +1134,7 @@ def load_production_from_dropbox():
                     else:
                         _f = str(row[5]).strip()
                         if re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', _f):
-                            etd_raw = _f
+                            etd_raw = _norm_ledger_date(_f) or _f
             elif row[5]:
                 if isinstance(row[5], datetime):
                     etd = row[5].strftime('%Y-%m-%d')
@@ -1158,10 +1158,13 @@ def load_production_from_dropbox():
                         fob_note = raw_etd
                         etd = None
                     else:
-                        try:
-                            etd = raw_etd
-                        except:
-                            etd = None
+                        # Ledger cells typed as text ("12/15/26", "1/15/2027") must become
+                        # ISO here — every backend date consumer parses ISO only, so an
+                        # un-normalised string silently read as "undated/TBD" (Sep 3 2026).
+                        etd = _norm_ledger_date(raw_etd)
+                        if etd is None:
+                            fob_flag = True
+                            fob_note = raw_etd
                 # Without a column-G override, the working ETD IS the raw one.
                 etd_raw = etd
 
@@ -3722,7 +3725,15 @@ def sync_inventory():
     if DROPBOX_REFRESH_TOKEN or DROPBOX_PHOTOS_TOKEN:
         if sync_from_dropbox():
             return True
-        print("  Dropbox failed, falling back to S3...")
+        # A failed or sanity-rejected Dropbox read must NOT swap in the (possibly
+        # weeks-old) manual S3 upload and stamp it as a fresh sync. The S3 fallback is
+        # for cold start only — with data already loaded, keep the previous good data.
+        with _inv_lock:
+            _have_data = bool(_inventory.get('items'))
+        if _have_data:
+            print("  Dropbox sync failed/rejected — keeping previous good data (S3 fallback is cold-start only)", flush=True)
+            return False
+        print("  Dropbox failed and no inventory loaded yet, falling back to S3...")
 
     # S3 fallback
     new_etag = s3_check_etag()
@@ -4502,7 +4513,10 @@ def export_single():
         # Anonymous catalog holders: NJ stock and hidden-landing productions are
         # admin-only. Scrub even client-posted rows so a stale cached page can't
         # export them.
-        if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
+        # ...and ANY customer-format export (catalog_mode), including staff "Customer
+        # View" exports from the admin page, which are authenticated and used to
+        # bypass this scrub (Sep 3 2026 audit).
+        if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
             data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
@@ -4552,7 +4566,7 @@ def export_pdf():
         if not req or 'data' not in req:
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
-        if getattr(g, '_catalog_scope', None) is not None and isinstance(data, list):
+        if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
             data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
         if not data:
             return jsonify({"error": "Empty data"}), 400
@@ -4582,7 +4596,7 @@ def export_multi():
         if not req or 'brands' not in req:
             return jsonify({"error": "Missing 'brands'"}), 400
         brands_data = req['brands']
-        if getattr(g, '_catalog_scope', None) is not None and isinstance(brands_data, list):
+        if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(brands_data, list):
             for _b in brands_data:
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
                     _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items']))
@@ -5044,7 +5058,36 @@ def _apo_parse_date(v):
     try:
         return datetime.fromisoformat(str(v)[:19]).date()
     except Exception:
+        pass
+    # Text dates that escaped normalisation (m/d/yy etc.) — same rule as the parser.
+    iso = _norm_ledger_date(v)
+    if iso:
+        try:
+            return datetime.fromisoformat(iso).date()
+        except Exception:
+            return None
+    return None
+
+def _norm_ledger_date(v):
+    """Normalise a ledger date cell to 'YYYY-MM-DD'. Accepts datetime/date objects and
+    the text forms the ledger actually contains (12/15/26, 1/15/2027, 2026-12-15,
+    12-15-2026, 2026/12/15). Returns None when nothing parses."""
+    if v is None:
         return None
+    if isinstance(v, datetime):
+        return v.strftime('%Y-%m-%d')
+    if isinstance(v, _d):
+        return v.strftime('%Y-%m-%d')
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.split(' ')[0].split('T')[0]
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y', '%m-%d-%Y', '%m-%d-%y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return None
 
 def _apo_fmt_date(d):
     return f'{d.strftime("%b")} {d.day}, {d.year}' if d else ''
@@ -8283,10 +8326,31 @@ def _strip_nj_rows(rows):
         out.append(it)
     return out
 
+def _anon_inventory_row(it):
+    """Catalog-link (anonymous) projection of one inventory row: lot/container strings
+    carry internal PO names, and the committed/allocated split reveals per-customer
+    allocation detail. Keep the NET effect (so client ATS math still holds) but hide
+    the breakdown (Sep 3 2026 audit)."""
+    if not isinstance(it, dict):
+        return it
+    it = dict(it)
+    try:
+        c = int(it.get('committed') or 0)
+        a = int(it.get('allocated') or 0)
+    except (TypeError, ValueError):
+        c, a = 0, 0
+    it['committed'] = c + a
+    it['allocated'] = 0
+    for k in ('lot_number', 'container'):
+        if k in it:
+            it[k] = ''
+    return it
+
 def _flt_inventory(data, scope):
     items = data.get('inventory')
     if isinstance(items, list):
         kept = _strip_hidden_landing_rows(_strip_nj_rows([it for it in items if _scope_has_item(scope, it)]))
+        kept = [_anon_inventory_row(it) for it in kept]
         data['inventory'] = kept
         data['item_count'] = len(kept)
     return data
@@ -8297,10 +8361,20 @@ def _flt_overrides(data, scope):
         data['overrides'] = {k: v for k, v in ov.items() if _scope_has_style(scope, k)}
     return data
 
+def _anon_alloc_row(r):
+    # Customers may see that units are allocated on a style, never to WHOM or on which PO.
+    if not isinstance(r, dict):
+        return r
+    r = dict(r)
+    for k in ('customer', 'customer_name', 'customerFull', 'po', 'po_name', 'poName', 'notes', 'note'):
+        if k in r:
+            r[k] = ''
+    return r
+
 def _flt_alloc(data, scope):
     rows = data.get('allocations')
     if isinstance(rows, list):
-        data['allocations'] = [r for r in rows if _scope_has_style(scope, r.get('sku'))]
+        data['allocations'] = [_anon_alloc_row(r) for r in rows if _scope_has_style(scope, r.get('sku'))]
     return data
 
 def _flt_deductions(data, scope):
@@ -8387,16 +8461,30 @@ def _strip_hidden_prod_export_rows(rows):
 def _flt_production(data, scope):
     rows = data.get('production')
     if isinstance(rows, list):
-        data['production'] = [r for r in rows
-                              if str(r.get('warehouse') or '').upper() not in _HIDDEN_LANDING_WH
-                              and (_scope_has_style(scope, r.get('style'))
-                                   or _scope_has_brandstr(scope, r.get('brand')))]
+        kept = []
+        for r in rows:
+            if str(r.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH:
+                continue
+            if not (_scope_has_style(scope, r.get('style')) or _scope_has_brandstr(scope, r.get('brand'))):
+                continue
+            # Customers see the production ref (2-letter factory prefix is derived from
+            # it client-side), units and dates — never the PO name (which names the
+            # customer the run is for), the shipment #, the FOB note or the raw ledger
+            # ETD text (Sep 3 2026 audit).
+            r = dict(r)
+            for k in ('poName', 'shipmentNo', 'fob_note'):
+                if k in r:
+                    r[k] = ''
+            if 'etd_raw' in r:
+                r['etd_raw'] = r.get('etd')
+            kept.append(r)
+        data['production'] = kept
     return data
 
 def _flt_apo(data, scope):
     rows = data.get('apo')
     if isinstance(rows, list):
-        kept = [r for r in rows if _scope_has_style(scope, r.get('style'))]
+        kept = [_anon_alloc_row(r) for r in rows if _scope_has_style(scope, r.get('style'))]
         data['apo'] = kept
         data['count'] = len(kept)
     return data
@@ -14436,15 +14524,20 @@ def _ai_tool_build_line_sheet(params):
                 arr_s = str(best[0])
                 etd_s = str(best[1].get('etd') or '')
                 po_ref = str(best[1].get('production') or '')
-            wh_names = [n for n, k in (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa'), ('NJ', 'nj')) if r[k] > 0]
+            # NJ is admin-only: a customer-view sheet never names it or counts it.
+            _wh_keys = (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa')) + ((() if customer_view else (('NJ', 'nj'),)))
+            wh_names = [n for n, k in _wh_keys if r[k] > 0]
+            _nj = int(r.get('nj', 0) or 0)
+            _tw = r['total_warehouse'] - (_nj if customer_view else 0)
+            _ta = r['total_ats'] - (_nj if customer_view else 0)
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
                     'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
                     'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
-                    'fabrication': fab, 'delivery': 'ATS' if r['total_warehouse'] > 0 else (arr_s or 'Overseas'),
-                    'total_ats': r['total_ats'], 'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
-                    'nj': r.get('nj', 0),
-                    'incoming': r['incoming'], 'total_warehouse': r['total_warehouse'],
-                    'committed': r['committed'], 'allocated': r['allocated'],
+                    'fabrication': fab, 'delivery': 'ATS' if _tw > 0 else (arr_s or 'Overseas'),
+                    'total_ats': _ta, 'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
+                    'nj': 0 if customer_view else r.get('nj', 0),
+                    'incoming': r['incoming'], 'total_warehouse': _tw,
+                    'committed': 0 if customer_view else r['committed'], 'allocated': 0 if customer_view else r['allocated'],
                     'warehouse': ', '.join(wh_names) or '—',
                     'ex_factory': etd_s, 'arrival': arr_s, 'po_ref': po_ref}
             items.append(item)
