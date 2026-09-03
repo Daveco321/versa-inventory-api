@@ -2469,7 +2469,7 @@ def _factory_label(production_ref, full_name=False):
 
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
-                     flow_mode=False, headers_override=None):
+                     flow_mode=False, headers_override=None, tjx_layout=False):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -2494,6 +2494,16 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'price_even': workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '$#,##0.00'}),
         'val_odd':    workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_odd'],  'num_format': '$#,##0'}),
         'val_even':   workbook.add_format({**base, 'bg_color': STYLE_CONFIG['row_bg_even'], 'num_format': '$#,##0'}),
+        # TJX layout — highlighted Source column (green=warehouse,
+        # amber=overseas, blue=both) and the New Fabric flag (purple)
+        'src_wh_odd':   workbook.add_format({**base, 'bg_color': '#DCFCE7', 'bold': True}),
+        'src_wh_even':  workbook.add_format({**base, 'bg_color': '#BBF7D0', 'bold': True}),
+        'src_os_odd':   workbook.add_format({**base, 'bg_color': '#FFEDD5', 'bold': True}),
+        'src_os_even':  workbook.add_format({**base, 'bg_color': '#FED7AA', 'bold': True}),
+        'src_mix_odd':  workbook.add_format({**base, 'bg_color': '#DBEAFE', 'bold': True}),
+        'src_mix_even': workbook.add_format({**base, 'bg_color': '#BFDBFE', 'bold': True}),
+        'newfab_odd':   workbook.add_format({**base, 'bg_color': '#F3E8FF', 'bold': True}),
+        'newfab_even':  workbook.add_format({**base, 'bg_color': '#E9D5FF', 'bold': True}),
     }
 
     worksheet.hide_gridlines(2)
@@ -2566,6 +2576,21 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             headers.append('Total Warehouse')
         headers.append('Total ATS')
 
+    # ── TJX layout (catalog exports carrying the TJX / TJX-with-size-UPC
+    #    customer logo). David's spec, Sep 3 2026: add Color Family + New
+    #    Fabric columns after Fabrication, a highlighted Source column before
+    #    the ATS column, drop Ex-Factory, and rename Arrival to "Arrival to
+    #    Warehouse". Catalog-mode only — admin layouts are never touched.
+    if tjx_layout and catalog_mode and headers_override is None:
+        headers = [h for h in headers if h != 'Ex-Factory']
+        headers = ['Arrival to Warehouse' if h == 'Arrival' else h for h in headers]
+        if 'Fabrication' in headers:
+            _fi = headers.index('Fabrication') + 1
+            headers[_fi:_fi] = ['Color Family', 'New Fabric']
+        _anchor = 'Overseas ATS' if 'Overseas ATS' in headers else ('Total ATS' if 'Total ATS' in headers else None)
+        if _anchor:
+            headers.insert(headers.index(_anchor), 'Source')
+
     worksheet.set_row(0, 25)
     for c, h in enumerate(headers):
         worksheet.write(0, c, h, fmt_header)
@@ -2589,6 +2614,8 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Available': 32, 'Original Arrival': 20,
         # Allocation Dollar Value Estimated report
         'Est. Price': 12, 'Est. Value': 14,
+        # TJX layout columns
+        'Color Family': 14, 'New Fabric': 12, 'Source': 16, 'Arrival to Warehouse': 16,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2651,6 +2678,11 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         # Allocation Dollar Value Estimated report
         'Est. Price': lambda item: item.get('est_price') if item.get('est_price') is not None else '—',
         'Est. Value': lambda item: item.get('est_value') if item.get('est_value') is not None else '—',
+        # TJX layout columns (values computed client-side per row)
+        'Color Family': lambda item: item.get('tjx_color_family', ''),
+        'New Fabric': lambda item: item.get('tjx_new_fabric', ''),
+        'Source': lambda item: item.get('tjx_source', ''),
+        'Arrival to Warehouse': lambda item: item.get('arrival', ''),
     }
 
     # Determine which columns are numeric for formatting
@@ -2679,6 +2711,12 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
                 fmt = pf
             elif h == 'Est. Value':
                 fmt = vf
+            elif h == 'Source' and val:
+                # TJX layout: color-coded source cell
+                _sk = 'src_wh' if val == 'Warehouse' else ('src_os' if val == 'Overseas' else 'src_mix')
+                fmt = fmts.get(_sk + ('_even' if even else '_odd'), cf)
+            elif h == 'New Fabric' and val:
+                fmt = fmts.get('newfab_even' if even else 'newfab_odd', cf)
             else:
                 fmt = nf if h in NUMERIC_HEADERS else cf
             worksheet.write(row, c, val, fmt)
@@ -3084,7 +3122,8 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
 
 def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False,
-                      catalog_mode=False, prepack_defaults=None, flow_mode=False):
+                      catalog_mode=False, prepack_defaults=None, flow_mode=False,
+                      tjx_layout=False):
     has_color = any(item.get('color') for item in items)
 
     # Auto-detect incoming_only: all items have zero warehouse stock
@@ -3118,7 +3157,8 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     print(f"  [build_brand_excel] Step 1: setup worksheet")
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                      is_order=is_order, incoming_only=incoming_only,
-                                     catalog_mode=catalog_mode, flow_mode=flow_mode)
+                                     catalog_mode=catalog_mode, flow_mode=flow_mode,
+                                     tjx_layout=tjx_layout)
     print(f"  [build_brand_excel] Step 2: download images")
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
@@ -3147,7 +3187,8 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
         ws = wb.add_worksheet(brand_name[:31])
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                          is_order=is_order, incoming_only=incoming_only,
-                                         catalog_mode=catalog_mode, flow_mode=flow_mode)
+                                         catalog_mode=catalog_mode, flow_mode=flow_mode,
+                                         tjx_layout=tjx_layout)
         imgs = download_images_for_items(items, s3_base_url, use_cache=True)
         _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers, catalog_mode=catalog_mode)
@@ -3174,7 +3215,7 @@ def _safe_multi_sheet_name(raw, seen, idx, fallback_prefix='Brand'):
     return name
 
 
-def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None, tjx_layout=False):
     # Per-tab overrides (line-sheet cart): an entry may carry its own tab_name,
     # view_mode, flow_mode and keep_order. Anything missing falls back to the
     # workbook-global arguments, so pre-existing callers behave byte-identically.
@@ -3233,7 +3274,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         ws.write = _safe_ws_write
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                          catalog_mode=catalog_mode, view_mode=_tab_view(brand),
-                                         flow_mode=_tab_flow(brand))
+                                         flow_mode=_tab_flow(brand), tjx_layout=tjx_layout)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -3266,7 +3307,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             ws = wb.add_worksheet(safe)
             fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                              catalog_mode=catalog_mode, view_mode=_tab_view(brand),
-                                             flow_mode=_tab_flow(brand))
+                                             flow_mode=_tab_flow(brand), tjx_layout=tjx_layout)
             start, count = offsets[bi]
             local_imgs = {}
             for li in range(count):
@@ -4469,6 +4510,8 @@ def export_single():
         is_order = req.get('is_order', False)
         catalog_mode = req.get('catalog_mode', False)
         flow_mode = req.get('flow_mode', False)
+        # TJX-logo catalogs get their own column layout (catalog-mode only)
+        tjx_layout = bool(req.get('tjx_layout')) and bool(catalog_mode)
         # Omitted, null, or EMPTY client rules all mean "server, use your own"
         # (reloaded from S3 so a stale worker copy can't bake old grids in).
         # The frontend can legitimately send [] during its first seconds of
@@ -4486,7 +4529,7 @@ def export_single():
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
                                      is_order=is_order, catalog_mode=catalog_mode,
                                      prepack_defaults=prepack_defaults,
-                                     flow_mode=flow_mode)
+                                     flow_mode=flow_mode, tjx_layout=tjx_layout)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -4549,6 +4592,8 @@ def export_multi():
         view_mode = req.get('view_mode', 'all')
         # 📋 flow_mode enables PO Name column in catalog overseas exports
         flow_mode = req.get('flow_mode', False)
+        # TJX-logo catalogs get their own column layout (catalog-mode only)
+        tjx_layout = bool(req.get('tjx_layout')) and bool(catalog_mode)
         # Omitted, null, or EMPTY client rules all mean "server, use your own"
         # (reloaded from S3 so a stale worker copy can't bake old grids in).
         # The frontend can legitimately send [] during its first seconds of
@@ -4564,7 +4609,8 @@ def export_multi():
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
                                            catalog_mode=catalog_mode, view_mode=view_mode,
                                            flow_mode=flow_mode,
-                                           prepack_defaults=prepack_defaults)
+                                           prepack_defaults=prepack_defaults,
+                                           tjx_layout=tjx_layout)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
