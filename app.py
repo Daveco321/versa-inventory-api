@@ -2780,6 +2780,53 @@ def _sized_sku_label(sku):
         return suf
     return None
 
+_SIZED_ROW_BASE_RE = re.compile(r'^[A-Z0-9]{2}[A-Z]{4}[A-Z0-9]{3}[A-Z]{2,4}$')
+_SIZED_ROW_ALPHA = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', '2XL', '3XL', '4XL', '5XL',
+                    'ST', 'MT', 'LT', 'XLT', 'XXLT', '2XLT', '3XLT'}
+_SIZED_ROW_TOKEN_RES = [re.compile(p) for p in (
+    r'^\d{2}(\.\d)?$',            # 15 / 15.5 / 34
+    r'^\d{4}\.\d{4,6}$',          # 1515.53233 / 1515.3435 / 1515.553435
+    r'^\d{2}(\.\d)?\d{2}/\d{2}$', # 15.532/35 (tail of 15-15.532/35)
+    r'^\d{2}/\d{2}$',             # 34/35 (sleeve range, tail of 16-34/35)
+    r'^\d{2}X\d{2}$',             # 32X30
+    r'^\d{2}W(\d{2}L)?$',         # 32W / 32W30L
+)]
+
+def _is_sized_sku(sku):
+    """True for by-size ledger rows of a Versa style (BASE-M, BASE-L-FBA,
+    BASE-1515.53233, BASE-1515.3435, BASE-15-15.532/35, BASE-1515.53233-V,
+    BASE-V-32X30). Bare -V is a style variant, not a size; legacy non-Versa keys
+    (BEN-22-38, AC-KN-001) are not sizes. Mirrors the frontend isSizedSku —
+    keep the two in sync."""
+    s = str(sku or '').upper().strip()
+    di = s.find('-')
+    if di < 0:
+        return False
+    if not _SIZED_ROW_BASE_RE.match(s[:di]):
+        return False
+    suf = s[di + 1:]
+    if suf.endswith('-FBA'):
+        suf = suf[:-4]
+    if suf.endswith('-V'):
+        suf = suf[:-2]
+    if suf.startswith('V-'):
+        suf = suf[2:]
+    if not suf or suf in ('V', 'FBA'):
+        return False
+    def tok(t):
+        return t in _SIZED_ROW_ALPHA or any(r.match(t) for r in _SIZED_ROW_TOKEN_RES)
+    if tok(suf):
+        return True
+    parts = [p for p in suf.split('-') if p]
+    return bool(parts) and all(tok(p) for p in parts)
+
+def _drop_sized_rows(rows):
+    """Staff "Customer View" spreadsheets list STYLES only — never by-size rows
+    (David, Sep 4 2026). Returns a new list."""
+    if not isinstance(rows, list):
+        return rows
+    return [r for r in rows if not (isinstance(r, dict) and _is_sized_sku(r.get('sku')))]
+
 def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=None):
     """
     Render prepack size scale grids vertically at the bottom of the worksheet.
@@ -4522,6 +4569,10 @@ def export_single():
             # overseas view — those totals are per-PO and contain no NJ.
             _vm = str(req.get('view_mode') or '').lower()
             data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
+            if getattr(g, '_catalog_scope', None) is None:
+                # Staff "Customer View" export (authenticated, no catalog scope):
+                # styles only, never by-size rows (David, Sep 4 2026).
+                data = _drop_sized_rows(data)
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
@@ -4576,6 +4627,10 @@ def export_pdf():
             # overseas view — those totals are per-PO and contain no NJ.
             _vm = str(req.get('view_mode') or '').lower()
             data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
+            if getattr(g, '_catalog_scope', None) is None:
+                # Staff "Customer View" export (authenticated, no catalog scope):
+                # styles only, never by-size rows (David, Sep 4 2026).
+                data = _drop_sized_rows(data)
         if not data:
             return jsonify({"error": "Empty data"}), 400
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -4609,6 +4664,8 @@ def export_multi():
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
                     _vm_b = str(_b.get('view_mode') or req.get('view_mode') or '').lower()
                     _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items'], lookup_nj=(_vm_b in ('all', 'ats'))))
+                    if getattr(g, '_catalog_scope', None) is None:
+                        _b['items'] = _drop_sized_rows(_b['items'])   # staff Customer View: styles only
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
