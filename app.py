@@ -1463,7 +1463,8 @@ def _py_is_blazer(sku):
         return False
     base = sku.split('-')[0].upper()
     serial = base[6:9]
-    return (len(serial) == 3 and serial[0] == 'B'
+    # Vests (V01-V99) are part of this category — "Blazers/Vests" (David, Sep 4 2026).
+    return (len(serial) == 3 and serial[0] in ('B', 'V')
             and serial[1].isdigit() and serial[2].isdigit())
 
 def _py_is_vest(sku):
@@ -14749,7 +14750,7 @@ def _ai_tool_build_line_sheet(params):
 _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
-                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers|vests), "
+                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers — blazers includes vests), "
                      "fabric_codes (2-letter SKU codes), color (color word, or buckets: solids/fancies/white/black/navy — "
                      "the navy bucket covers the whole blue family incl. blue/indigo, and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
