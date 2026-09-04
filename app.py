@@ -1417,7 +1417,9 @@ def _py_is_bottom(sku):
         return False
     base = sku.split('-')[0].upper()
     sku_brand = base[2:4] if len(base) >= 4 else ''
-    if (sku_brand in _PY_PANTS_SERIAL_BRANDS and len(base) >= 10
+    # P##X serial = dress pants for EVERY brand (Style Rules "PANTS P01-P99"); the
+    # old US/GB-only gate made EB / Nautica pants read as short sleeve (Sep 4 2026).
+    if (len(base) >= 10
             and base[6] == 'P' and base[7].isdigit() and base[8].isdigit()
             and base[9].isalpha()):
         return True
@@ -1487,8 +1489,8 @@ def _py_get_item_category(sku, brand_abbr):
     # don't use the P## convention; their pants are identified by fabric code — only
     # "(BOTTOMS)" codes from Style Rules spreadsheet count as pants (BC/BR/BH/BA),
     # handled by _py_is_pants() via _PY_SPORTSWEAR_BOTTOM_CODES.
-    if (sku_brand in _PY_PANTS_SERIAL_BRANDS
-            and len(base) >= 10 and base[6] == 'P'
+    # (Sep 4 2026) brand-agnostic: any P##X serial is pants — mirrors frontend hasPantsSerial.
+    if (len(base) >= 10 and base[6] == 'P'
             and base[7].isdigit() and base[8].isdigit() and base[9].isalpha()):
         return 'pants'
     # Sportswear by collar code
@@ -4858,7 +4860,7 @@ def _apo_format_color(raw):
 
 def _apo_has_pants_serial(base):
     """Port of frontend hasPantsSerial (US/GB brands, P## serial)."""
-    return (len(base) >= 10 and base[2:4] in _PY_PANTS_SERIAL_BRANDS and base[6] == 'P'
+    return (len(base) >= 10 and base[6] == 'P'   # brand-agnostic since Sep 4 2026 (mirrors frontend)
             and base[7].isdigit() and base[8].isdigit() and base[9].isalpha())
 
 def _apo_is_sportswear(base):
