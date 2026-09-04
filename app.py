@@ -1466,6 +1466,17 @@ def _py_is_blazer(sku):
     return (len(serial) == 3 and serial[0] == 'B'
             and serial[1].isdigit() and serial[2].isdigit())
 
+def _py_is_vest(sku):
+    """Vests — Style Rules serial range V01-V99 at base positions 6-8 (e.g.
+    BUGBRPV01SLS), the tailored sibling of B## blazers. Mirrors frontend isVest()
+    (Sep 4 2026)."""
+    if not sku:
+        return False
+    base = sku.split('-')[0].upper()
+    serial = base[6:9]
+    return (len(serial) == 3 and serial[0] == 'V'
+            and serial[1].isdigit() and serial[2].isdigit())
+
 def _py_is_big_tall(sku):
     base = sku.split('-')[0].upper()
     # Von Dutch B&T: WB/BT at positions 4-5 (the fit slot on VD's shorter SKU
@@ -1554,6 +1565,8 @@ def _py_matches_category(sku, brand_abbr, category):
         return _py_is_pants(sku, brand_abbr)
     if category == 'blazers':
         return _py_is_blazer(sku)
+    if category == 'vests':
+        return _py_is_vest(sku)
     if category == 'young_men':
         return _py_is_young_men(sku)
     if category == 'short_sleeve':
@@ -13770,6 +13783,9 @@ def _ai_agent_filter(params):
                 if category in ('blazer', 'blazers'):
                     if not _py_is_blazer(base):
                         continue
+                elif category in ('vest', 'vests'):
+                    if not _py_is_vest(base):
+                        continue
                 elif not _py_matches_category(base, r['brand_abbr'], category):
                     continue
             except Exception:
@@ -14714,7 +14730,7 @@ def _ai_tool_build_line_sheet(params):
 _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
-                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers), "
+                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers|vests), "
                      "fabric_codes (2-letter SKU codes), color (color word, or buckets: solids/fancies/white/black/navy — "
                      "the navy bucket covers the whole blue family incl. blue/indigo, and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
