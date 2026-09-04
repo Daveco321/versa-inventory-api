@@ -4517,7 +4517,11 @@ def export_single():
         # View" exports from the admin page, which are authenticated and used to
         # bypass this scrub (Sep 3 2026 audit).
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
-            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
+            # Warehouse / All-Inventory customer exports: also remove NJ by SKU lookup for
+            # rows that carry no per-warehouse fields (customer-view payloads). Never in
+            # overseas view — those totals are per-PO and contain no NJ.
+            _vm = str(req.get('view_mode') or '').lower()
+            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
@@ -4567,7 +4571,11 @@ def export_pdf():
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
-            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data))
+            # Warehouse / All-Inventory customer exports: also remove NJ by SKU lookup for
+            # rows that carry no per-warehouse fields (customer-view payloads). Never in
+            # overseas view — those totals are per-PO and contain no NJ.
+            _vm = str(req.get('view_mode') or '').lower()
+            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
         if not data:
             return jsonify({"error": "Empty data"}), 400
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -4599,7 +4607,8 @@ def export_multi():
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(brands_data, list):
             for _b in brands_data:
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
-                    _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items']))
+                    _vm_b = str(_b.get('view_mode') or req.get('view_mode') or '').lower()
+                    _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items'], lookup_nj=(_vm_b in ('all', 'ats'))))
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
         catalog_mode = req.get('catalog_mode', False)
@@ -8300,11 +8309,39 @@ def _scope_has_item(scope, it):
         return True
     return _scope_has_style(scope, it.get('sku'))
 
-def _strip_nj_rows(rows):
+def _nj_by_sku():
+    """{SKU: NJ units} from the loaded inventory — lets customer-format export rows
+    that carry no per-warehouse fields (customer-view payloads) still lose NJ."""
+    out = {}
+    try:
+        with _inv_lock:
+            items = list(_inventory.get('items') or [])
+    except Exception:
+        items = []
+    for r in items:
+        if not isinstance(r, dict):
+            continue
+        try:
+            nj = int(r.get('nj') or 0)
+        except (TypeError, ValueError):
+            nj = 0
+        if nj:
+            sku = str(r.get('sku') or '').upper()
+            if sku:
+                out[sku] = out.get(sku, 0) + nj
+    return out
+
+
+def _strip_nj_rows(rows, lookup_nj=False):
     """NJ warehouse data is ADMIN-ONLY (per David): customer catalog views and
     exports must never see it. Drops NJ-synthesized rows entirely and removes
     NJ quantities (and their share of the totals) from every other row.
+    lookup_nj=True (customer-format EXPORT payloads in warehouse/all view): rows
+    without an 'nj' field are matched to the server's own inventory by SKU, so a
+    stale or customer-view frontend that never sent per-warehouse numbers still
+    has NJ units removed — and an NJ-only style is dropped (Sep 4 2026, David).
     Returns new row dicts — never mutates the caller's list."""
+    nj_map = _nj_by_sku() if lookup_nj else None
     out = []
     for it in rows:
         if not isinstance(it, dict):
@@ -8313,6 +8350,10 @@ def _strip_nj_rows(rows):
         if it.get('_nj_synth'):
             continue
         nj = int(it.get('nj') or 0)
+        looked_up = False
+        if nj_map is not None and 'nj' not in it and 'nj_sizes' not in it:
+            nj = int(nj_map.get(str(it.get('sku') or '').upper(), 0) or 0)
+            looked_up = bool(nj)
         if nj or 'nj' in it or 'nj_sizes' in it:
             it = dict(it)
             if nj:
@@ -8325,7 +8366,17 @@ def _strip_nj_rows(rows):
         if isinstance(wh, str) and 'NJ' in wh.upper():
             it = dict(it)
             parts = [p for p in re.split(r'[,/]\s*', wh) if p.strip().upper() != 'NJ']
-            it['warehouse'] = ', '.join(p.strip() for p in parts if p.strip())
+            it['warehouse'] = ', '.join(p.strip() for p in parts if p.strip()) or '—'
+        if looked_up:
+            # NJ was this row's only stock (no other warehouse named, nothing
+            # incoming): it exists only because of NJ — drop it like _nj_synth.
+            wh2 = str(it.get('warehouse') or '').strip()
+            try:
+                inc = int(it.get('incoming') or 0)
+            except (TypeError, ValueError):
+                inc = 0
+            if (not wh2 or wh2 == '—') and inc <= 0 and int(it.get('total_ats') or 0) <= 0:
+                continue
         out.append(it)
     return out
 
