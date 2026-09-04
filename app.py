@@ -1347,8 +1347,8 @@ def get_base_style(sku):
 # can match prepack default rules without needing the frontend to send _export_* fields.
 
 _PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
-_PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE'}
-_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','WB'}  # mirrors frontend BT_FIT_CODES ('WB' was missing)
+_PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE','RB'}   # RB = Rugby (Style Rules 9-3-2026)
+_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','TB','WB'}  # mirrors frontend BT_FIT_CODES ('TB' = SS Big & Tall, Sep 3 2026 sheet)
 # Young Men / Sportswear fabric codes — mirrors frontend YOUNG_MEN_FABRIC_CODES.
 # Per Style Rules spreadsheet ("YOUNG MEN / SPORTSWEAR" section), these 18 codes belong
 # to BOTH the Young Men category AND the Sportswear category.
@@ -1356,6 +1356,7 @@ _PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','WB'}  # mirrors frontend BT_
 _PY_YM_FABRIC_CODES    = {
     'KN','WT','SD','SF','SB','SL','BC','BR','BH','BA',
     'CO','TH','PO','PW','PJ','PH','PL','HE',
+    'SN','SV','SJ','SH','SG','SS','RB',   # Style Rules 9-3-2026: new shacket fabrics + Rugby
 }
 # Sportswear Bottoms — subset of YM/Sportswear that ALSO belongs to the Dress Pants filter
 # (per "(BOTTOMS)" marker in spreadsheet: Carpenters, Ripstops, Heavy Weight, Pinstripe).
@@ -1375,7 +1376,7 @@ _PY_LONG_SLEEVE_FIT_CODES = {'SL','RF','TF','MF','BT','BB','TT','WB','BR','DB'}
 # prepack rules in export bottom grids that the product tiles never showed —
 # the "export shows a different prepack than the product" bug.
 _PY_ALL_FIT_CODES = {'BB','BR','BT','CE','CH','CR','DB','MF','RF','RR','SB',
-                     'SC','SE','SH','SF','SL','SR','SS','ST','TF','TT','WB'}
+                     'SC','SE','SH','SF','SL','SR','SS','ST','TB','TF','TT','WB'}
 
 def _py_extract_fit_code(sku):
     """Extract 2-char fit code — mirrors extractFitCode() in the frontend EXACTLY.
@@ -1435,7 +1436,7 @@ def _py_is_short_sleeve(sku):
     if _py_is_bottom(sku):
         return False
     fit = _py_extract_fit_code(sku)
-    if fit in {'SS','SR','SB','ST'}:
+    if fit in {'SS','SR','SB','ST','TB'}:   # TB = Short Sleeve Big & Tall (Sep 3 2026 sheet)
         return True
     # PARITY: the frontend has NO collar-based short-sleeve fallback for
     # unrecognized fit codes — an unknown fit is simply not short sleeve.
@@ -5004,6 +5005,17 @@ _APO_FABRIC_RULES = {  # frontend FABRIC_RULES, verbatim
     "CB": "98% Cotton / 2% Spandex (Bloomingdale)", "KN": "KNITS", "WT": "WOVEN TOPS",
     "SD": "SWEATERS", "SF": "Flannel (Shacket)", "SB": "Trucker (Shacket)",
     "CO": "Corduroy (Overshirt)", "SL": "Twill (Shacket)",
+    # Style Rules 9-3-2026 additions (mirror of the frontend FABRIC_RULES entries)
+    "SG": "CVC Twill 70% Cotton / 30% Polyester (Shacket)",
+    "SN": "Denim Twill 75% Cotton / 15% Rayon / 10% Polyester (Shacket)",
+    "SV": "Canvas 245GSM 97% Cotton / 3% Spandex (Shacket)",
+    "SJ": "Jacquard Woven 210GSM 100% Cotton (Shacket)",
+    "SH": "80% Cotton / 20% Polyester 325GSM (Shacket)",
+    "SS": "TC 77% Polyester / 20% Cotton / 3% Spandex (Shacket)",
+    "NS": "Tech Seersucker 53% Polyester / 40% Nylon / 7% Spandex",
+    "ET": "Tech Seersucker 96% Polyester / 4% Elastane",
+    "KP": "100% Polyester - Pique Knit", "LB": "60% Linen / 40% Cotton", "RB": "Rugby",
+    "RP": "80% Polyester / 20% Rayon", "RS": "88% Polyester / 10% Rayon / 2% Spandex - 230GSM",
     "YD": "65% Polyester / 35% Cotton Yarn Dye", "KS": "Knit Sport Coat",
     "LA": "8% Lyocell / 88% Polyester / 4% Spandex 120GSM",
     "NP": "78% Nylon / 22% Spandex - 180GSM Premium Nylon",
@@ -5080,7 +5092,7 @@ def _apo_fabrication(base):
 _APO_FIT_LABELS = {  # frontend fitCodeToLabel short forms
     'SL': 'Slim Fit', 'RF': 'Regular Fit', 'TF': 'Tailored Fit', 'MF': 'Modern Fit',
     'BT': 'Big & Tall', 'WB': 'Big & Tall (Von Dutch)', 'BB': 'Big Fit', 'TT': 'Tall Fit',
-    'SB': 'Short Sleeve Big', 'ST': 'Short Sleeve Tall', 'CF': 'Classic Fit',
+    'SB': 'Short Sleeve Big', 'ST': 'Short Sleeve Tall', 'TB': 'Short Sleeve Big & Tall', 'CF': 'Classic Fit',
     'AF': 'Athletic Fit', 'SS': 'Slim Fit Short Sleeve', 'SR': 'Regular Fit Short Sleeve',
     'SE': 'Slim Fit Extended Button', 'SH': 'Slim Fit Hook & Eye',
     'CE': 'Classic Fit Extended Button', 'CH': 'Classic Fit Hook & Eye',
