@@ -4581,11 +4581,9 @@ def export_single():
         # View" exports from the admin page, which are authenticated and used to
         # bypass this scrub (Sep 3 2026 audit).
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
-            # Warehouse / All-Inventory customer exports: also remove NJ by SKU lookup for
-            # rows that carry no per-warehouse fields (customer-view payloads). Never in
-            # overseas view — those totals are per-PO and contain no NJ.
-            _vm = str(req.get('view_mode') or '').lower()
-            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
+            # NJ stock + hidden-landing (NJ/AE/AW) productions out — see
+            # _customer_export_scrub for the order and the double-deduct guard.
+            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'))
             if getattr(g, '_catalog_scope', None) is None:
                 # Staff "Customer View" export (authenticated, no catalog scope):
                 # styles only, never by-size rows (David, Sep 4 2026).
@@ -4639,11 +4637,9 @@ def export_pdf():
             return jsonify({"error": "Missing 'data'"}), 400
         data = req['data']
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
-            # Warehouse / All-Inventory customer exports: also remove NJ by SKU lookup for
-            # rows that carry no per-warehouse fields (customer-view payloads). Never in
-            # overseas view — those totals are per-PO and contain no NJ.
-            _vm = str(req.get('view_mode') or '').lower()
-            data = _strip_hidden_prod_export_rows(_strip_nj_rows(data, lookup_nj=(_vm in ('all', 'ats'))))
+            # NJ stock + hidden-landing (NJ/AE/AW) productions out — see
+            # _customer_export_scrub for the order and the double-deduct guard.
+            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'))
             if getattr(g, '_catalog_scope', None) is None:
                 # Staff "Customer View" export (authenticated, no catalog scope):
                 # styles only, never by-size rows (David, Sep 4 2026).
@@ -4679,8 +4675,8 @@ def export_multi():
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(brands_data, list):
             for _b in brands_data:
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
-                    _vm_b = str(_b.get('view_mode') or req.get('view_mode') or '').lower()
-                    _b['items'] = _strip_hidden_prod_export_rows(_strip_nj_rows(_b['items'], lookup_nj=(_vm_b in ('all', 'ats'))))
+                    _b['items'] = _customer_export_scrub(_b['items'], _b.get('view_mode') or req.get('view_mode'),
+                                                         req.get('nj_stripped') or _b.get('nj_stripped'))
                     if getattr(g, '_catalog_scope', None) is None:
                         _b['items'] = _drop_sized_rows(_b['items'])   # staff Customer View: styles only
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -5420,35 +5416,54 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
 
         # Warehouse first: committed/allocated are NEGATIVE; add the line's own
         # qty back since 'allocated' already includes this allocation.
+        # NJ (Edison 3PL) stock and NJ/AE/AW-landing productions are LAST RESORT
+        # (David, Sep 4 2026): non-NJ warehouse -> visible productions FIFO ->
+        # NJ warehouse -> hidden-landing productions. Mirrors the frontend
+        # routing engine / Confirm Pre-PO pool (whFree / whFreeNj split).
         wh_names = []
-        wh_free = 0
+        wh_free = wh_free_nj = 0
         if inv:
-            wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa'] + inv.get('nj', 0)
-            wh_free = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + qty))
-            for k, nm in (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA'), ('nj', 'NJ')):
+            nj_units = max(0, int(inv.get('nj', 0) or 0))
+            wh_total = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa'] + nj_units
+            free_all = max(0, min(wh_total, wh_total + inv['committed'] + inv['allocated'] + qty))
+            wh_free_nj = min(free_all, nj_units)
+            wh_free = free_all - wh_free_nj
+            for k, nm in (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA')):
                 if inv[k] > 0:
                     wh_names.append(nm)
         take_wh = min(qty, wh_free)
         remaining = qty - take_wh
 
         pants = _py_is_bottom(base)
-        plist = sorted(prod_by_base.get(base, []),
-                       key=lambda p: (_apo_prod_arrival(p, pants) is None,
-                                      _apo_prod_arrival(p, pants) or datetime.max.date()))
+        _is_hidden_p = lambda p: str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH
+        _arr_key = lambda p: (_apo_prod_arrival(p, pants) is None,
+                              _apo_prod_arrival(p, pants) or datetime.max.date())
+        _base_prods = prod_by_base.get(base, [])
+        plist = sorted([p for p in _base_prods if not _is_hidden_p(p)], key=_arr_key)
+        plist_hidden = sorted([p for p in _base_prods if _is_hidden_p(p)], key=_arr_key)
         pulls, gate, tbd = [], None, False
-        for p in plist:
-            if remaining <= 0:
-                break
-            take = min(remaining, int(p.get('units') or 0))
-            if take <= 0:
-                continue
-            remaining -= take
-            pulls.append(str(p.get('production') or '—'))
-            ad = _apo_prod_arrival(p, pants)
-            if ad is None:
-                tbd = True
-            elif gate is None or ad > gate:
-                gate = ad
+        take_nj = 0
+        for _pass, _plist in enumerate((plist, plist_hidden)):
+            if _pass == 1 and remaining > 0 and wh_free_nj > 0:
+                # Every non-NJ option is exhausted: NJ warehouse before NJ-landing batches.
+                take_nj = min(remaining, wh_free_nj)
+                remaining -= take_nj
+            for p in _plist:
+                if remaining <= 0:
+                    break
+                take = min(remaining, int(p.get('units') or 0))
+                if take <= 0:
+                    continue
+                remaining -= take
+                pulls.append(str(p.get('production') or '—'))
+                ad = _apo_prod_arrival(p, pants)
+                if ad is None:
+                    tbd = True
+                elif gate is None or ad > gate:
+                    gate = ad
+        _wh_used = list(wh_names) if take_wh > 0 else []
+        if take_nj > 0:
+            _wh_used.append('NJ')
 
         row = {
             'sku': base, 'brand_abbr': brand_abbr, 'brand_full': brand_full,
@@ -5457,7 +5472,7 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
             'fabrication': _apo_fabrication(base),
             'production': ', '.join(dict.fromkeys(pulls)),
             'arrival': ('TBD' if tbd else _apo_fmt_date(gate)) if pulls else '',
-            'warehouse': (', '.join(wh_names) or '—') if take_wh > 0 else '',
+            'warehouse': (', '.join(_wh_used) or '—') if (take_wh + take_nj) > 0 else '',
             'units_ship': qty,
             'shortfall': remaining,
             '_bucket': _apo_classify_color(color, brand_abbr),
@@ -8440,10 +8455,14 @@ def _strip_nj_rows(rows, lookup_nj=False):
     """NJ warehouse data is ADMIN-ONLY (per David): customer catalog views and
     exports must never see it. Drops NJ-synthesized rows entirely and removes
     NJ quantities (and their share of the totals) from every other row.
-    lookup_nj=True (customer-format EXPORT payloads in warehouse/all view): rows
+    lookup_nj=True (customer-format EXPORT payloads in warehouse/all view from a
+    frontend that did NOT strip NJ itself — see _customer_export_scrub): rows
     without an 'nj' field are matched to the server's own inventory by SKU, so a
-    stale or customer-view frontend that never sent per-warehouse numbers still
-    has NJ units removed — and an NJ-only style is dropped (Sep 4 2026, David).
+    stale frontend that never sent per-warehouse numbers still has NJ units
+    removed. NEVER pass lookup_nj for rows that are already NJ-free (anonymous
+    catalog feeds, nj_stripped payloads): that subtracts NJ twice.
+    A style whose ONLY stock was NJ (nothing else in any warehouse, nothing
+    incoming, no ATS left) is dropped like _nj_synth (Sep 4 2026, David).
     Returns new row dicts — never mutates the caller's list."""
     nj_map = _nj_by_sku() if lookup_nj else None
     out = []
@@ -8471,15 +8490,20 @@ def _strip_nj_rows(rows, lookup_nj=False):
             it = dict(it)
             parts = [p for p in re.split(r'[,/]\s*', wh) if p.strip().upper() != 'NJ']
             it['warehouse'] = ', '.join(p.strip() for p in parts if p.strip()) or '—'
-        if looked_up:
-            # NJ was this row's only stock (no other warehouse named, nothing
-            # incoming): it exists only because of NJ — drop it like _nj_synth.
+        if nj:
+            # NJ was this row's only stock (no other warehouse, nothing incoming,
+            # no ATS left): it exists only because of NJ — drop it like _nj_synth.
+            # Applies whether NJ came from the row itself or from the lookup.
             wh2 = str(it.get('warehouse') or '').strip()
             try:
                 inc = int(it.get('incoming') or 0)
             except (TypeError, ValueError):
                 inc = 0
-            if (not wh2 or wh2 == '—') and inc <= 0 and int(it.get('total_ats') or 0) <= 0:
+            try:
+                tw = int(it.get('total_warehouse') or 0)
+            except (TypeError, ValueError):
+                tw = 0
+            if (not wh2 or wh2 == '—') and tw <= 0 and inc <= 0 and int(it.get('total_ats') or 0) <= 0:
                 continue
         out.append(it)
     return out
@@ -8591,7 +8615,13 @@ def _strip_hidden_landing_rows(rows):
         if cut > 0:
             it['incoming'] = inc - cut
             it['total_ats'] = int(it.get('total_ats') or 0) - cut
-            if int(it.get('total_warehouse') or 0) <= 0 and it['incoming'] <= 0:
+            # Customer-view EXPORT rows carry warehouse NAMES, not total_warehouse —
+            # treat a named warehouse as stock so a style with real warehouse units
+            # is never dropped just because its only production lands in NJ.
+            _wh_names = it.get('warehouse')
+            _has_wh = (int(it.get('total_warehouse') or 0) > 0
+                       or (isinstance(_wh_names, str) and _wh_names.strip() not in ('', '—')))
+            if not _has_wh and it['incoming'] <= 0:
                 continue   # exists only as hidden-landing production
         out.append(it)
     return out
@@ -8601,20 +8631,89 @@ def _hidden_prod_numbers():
         return {str(p.get('production') or '').strip().upper() for p in _production_data
                 if p.get('production') and str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH}
 
-def _strip_hidden_prod_export_rows(rows):
-    """Customer exports: drop any posted per-delivery row that references a
-    hidden-landing production (stale-cache defense; live pages never form them)."""
+def _next_visible_prod_by_style():
+    """{style: {'ref', 'etd_str', 'arrival_str'}} for the earliest-arriving VISIBLE
+    (non NJ/AE/AW-landing) production per style. Used to re-point customer style
+    rows whose client-chosen "nearest" production is hidden. Date text matches the
+    frontend's formatDateShort ('Oct 15, 2026')."""
+    with _production_lock:
+        rows = list(_production_data)
+    best = {}
+    for p in rows:
+        st = str(p.get('style') or '').upper()
+        if not st or str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH:
+            continue
+        try:
+            if int(p.get('units') or 0) <= 0:
+                continue
+        except Exception:
+            continue
+        ad = _apo_prod_arrival(p, _py_is_bottom(st))
+        key = (ad is None, ad or datetime.max.date())
+        cur = best.get(st)
+        if cur is None or key < cur[0]:
+            ed = _apo_parse_date(p.get('etd'))
+            best[st] = (key, {'ref': str(p.get('production') or '').strip(),
+                              'etd_str': _apo_fmt_date(ed) if ed else '',
+                              'arrival_str': _apo_fmt_date(ad) if ad else ''})
+    return {k: v[1] for k, v in best.items()}
+
+def _strip_hidden_prod_export_rows(rows, style_rows=False):
+    """Customer exports: any posted row that references a hidden-landing
+    (NJ/AE/AW) production is scrubbed (stale-cache / phone defense; live pages
+    never form them).
+    - per-delivery rows (overseas view, or any row carrying 'production'): DROPPED
+    - style_rows=True (All Inventory view): a style row whose nearest-production
+      PO Ref # / dates point at a hidden production is RE-POINTED to the next
+      visible production (or blanked) instead of losing the whole style — its
+      visible stock still belongs on the customer sheet (Sep 4 2026)."""
     hp = _hidden_prod_numbers()
     if not hp:
         return rows
+    nxt = _next_visible_prod_by_style() if style_rows else {}
     out = []
     for it in rows:
         if isinstance(it, dict):
             ref = str(it.get('production') or it.get('po_ref') or '').strip().upper()
             if ref and ref in hp:
-                continue
+                if not style_rows or it.get('_flow') or it.get('production'):
+                    continue
+                it = dict(it)
+                v = nxt.get(str(it.get('sku') or '').upper()) or {}
+                if v.get('ref'):
+                    it['po_ref'] = v['ref']
+                else:
+                    it.pop('po_ref', None)
+                if 'ex_factory' in it:
+                    it['ex_factory'] = v.get('etd_str') or '—'
+                if 'arrival' in it:
+                    it['arrival'] = v.get('arrival_str') or '—'
+                if str(it.get('delivery') or '') not in ('', 'ATS'):
+                    it['delivery'] = v.get('arrival_str') or 'Overseas'
         out.append(it)
     return out
+
+def _customer_export_scrub(rows, view_mode, nj_stripped):
+    """Every customer-format export payload (anonymous catalog links AND staff /
+    phone Customer View) passes through here before the workbook / PDF is built.
+    1. NJ warehouse stock out (_strip_nj_rows). The by-SKU NJ lookup runs ONLY
+       for authenticated payloads that did NOT already strip NJ client-side
+       (nj_stripped flag, sent by current desktop + phone builds). Anonymous
+       catalog rows come from NJ-free feeds and current builds strip before
+       posting — looking those up subtracted NJ a SECOND time and printed
+       understated / negative Total ATS (Sep 4 2026 audit).
+    2. Hidden-landing productions (NJ/AE/AW): per-PO rows dropped; All Inventory
+       style rows re-pointed to the next visible production, then the hidden
+       units cut from incoming + Total ATS (_strip_hidden_landing_rows)."""
+    vm = str(view_mode or '').lower()
+    lookup = (vm in ('all', 'ats')
+              and getattr(g, '_catalog_scope', None) is None
+              and not bool(nj_stripped))
+    rows = _strip_nj_rows(rows, lookup_nj=lookup)
+    rows = _strip_hidden_prod_export_rows(rows, style_rows=(vm == 'all'))
+    if vm == 'all':
+        rows = _strip_hidden_landing_rows(rows)
+    return rows
 
 def _flt_production(data, scope):
     rows = data.get('production')
@@ -12765,6 +12864,10 @@ def factory_view():
             'port_dated': bool(row.get('port_dated')),
             'fob_flag': bool(row.get('fob_flag')),
             'fob_note': row.get('fob_note', ''),
+            # Ledger column-I landing. NJ/AE/AW-landing batches are LAST-RESORT
+            # supply in the routing engine (David, Sep 4 2026): consumers must
+            # route to them only when no other supply exists for the style.
+            'landing': str(row.get('warehouse') or '').strip().upper(),
         })
 
     # ── External supply (single-factory mode only) ──
@@ -12794,6 +12897,7 @@ def factory_view():
                 'arrival': row.get('arrival'),
                 'port_dated': bool(row.get('port_dated')),
                 'fob_flag': bool(row.get('fob_flag')),
+                'landing': str(row.get('warehouse') or '').strip().upper(),
             })
 
     # ── Open orders (exact-SKU uppercase match on the style field) ──
@@ -14613,6 +14717,9 @@ def _ai_tool_build_line_sheet(params):
     if not isinstance(tabs_in, list) or not tabs_in:
         return {'error': 'tabs required: a list of filter objects, one per tab'}
     customer_view = bool(params.get('customer_view'))
+    # Customer view: NJ/AE/AW-landing productions are admin-only — their units
+    # come out of incoming / Total ATS below (Sep 4 2026).
+    _hl_hidden, _hl_visible = _hidden_landing_maps() if customer_view else ({}, {})
     tabs_out = []
     summary = []
     with _production_lock:
@@ -14691,13 +14798,22 @@ def _ai_tool_build_line_sheet(params):
             _nj = int(r.get('nj', 0) or 0)
             _tw = r['total_warehouse'] - (_nj if customer_view else 0)
             _ta = r['total_ats'] - (_nj if customer_view else 0)
+            _inc = int(r.get('incoming') or 0)
+            if customer_view:
+                _hid = int(_hl_hidden.get(base, 0) or 0)
+                if _hid:
+                    _cut = min(_inc, _hid) if base in _hl_visible else _inc
+                    _inc -= _cut
+                    _ta -= _cut
+                    if _tw <= 0 and _inc <= 0:
+                        continue   # only supply is a hidden-landing production
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
                     'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
                     'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
                     'fabrication': fab, 'delivery': 'ATS' if _tw > 0 else (arr_s or 'Overseas'),
                     'total_ats': _ta, 'jtw': r['jtw'], 'tr': r['tr'], 'dcw': r['dcw'], 'qa': r['qa'],
                     'nj': 0 if customer_view else r.get('nj', 0),
-                    'incoming': r['incoming'], 'total_warehouse': _tw,
+                    'incoming': _inc, 'total_warehouse': _tw,
                     'committed': 0 if customer_view else r['committed'], 'allocated': 0 if customer_view else r['allocated'],
                     'warehouse': ', '.join(wh_names) or '—',
                     'ex_factory': etd_s, 'arrival': arr_s, 'po_ref': po_ref}
