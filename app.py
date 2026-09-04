@@ -7099,6 +7099,19 @@ COLOR_SYNC_SOURCES = [
         'key_namespace': 'blazer',       # GB_001 → GB_B01 (B## serial range)
         'approved': True,
     },
+    # VEST tab (found Sep 4 2026): same bare GB_NNN numbering as the blazers
+    # tab — BUGBRPV01SLS (serial V01) reads GB_V01 ← row GB_001. Frontend
+    # isVest() + styleColorFallbackKeys try GB_V## first, then the bare key.
+    {
+        'label': 'Geoffrey Beene — Vests',
+        'path': '/Versa Share Files/New Style Numbers/GEOFFREY BEENE NEW STYLE NUMBERS 3.24.2023.xlsx',
+        'sheet': 'VEST',
+        'key_col': 'STYLE #',
+        'color_col': 'DESCRIPTION',
+        'header_row': 2,
+        'key_namespace': 'vest',         # GB_001 → GB_V01 (V## serial range)
+        'approved': True,
+    },
     # Von Dutch: SHIRTS and SHACKET tabs REUSE the same VD_NNN numbers for
     # different products, and the master's bare VD rows are currently a MIX
     # (77 shirt + 32 shacket values). Shackets (CO/SL/SF young-men fabrics)
@@ -7410,6 +7423,12 @@ def _apply_key_namespace(key, namespace):
         if m and int(m.group(2)) <= 99:
             return f"{m.group(1)}_P{int(m.group(2)):02d}"
         return key if re.match(r'^[A-Z0-9]{2}_P\d\d$', key) else ''
+    if namespace == 'vest':
+        # vest: GB_001 → GB_V01 (V## serial range, Style Rules "Vest V01-V99");
+        # native GB_V## keys pass through. Frontend isVest() + color keys (Sep 4 2026).
+        if m and int(m.group(2)) <= 99:
+            return f"{m.group(1)}_V{int(m.group(2)):02d}"
+        return key if re.match(r'^[A-Z0-9]{2}_V\d\d$', key) else ''
     return ''
 
 
@@ -7499,7 +7518,7 @@ def _parse_color_source(src, data):
             if key:
                 if src.get('key_namespace'):
                     key = _apply_key_namespace(key, src.get('key_namespace'))
-                elif re.match(r'^[A-Z0-9]{2}_(SW_\d{3}|[BP]\d\d)$', key):
+                elif re.match(r'^[A-Z0-9]{2}_(SW_\d{3}|[BPV]\d\d)$', key):
                     # A namespaced-form key on a PLAIN tab is a stray row from a
                     # category tab — writing it would poison the frontend's
                     # first-priority lookup slot. Reject and report instead.
