@@ -340,9 +340,12 @@ def parse_master_rows(rows, day):
             'po_name': str(r.get('poName') or '').strip(),
             'po_units': to_int(r.get('units'), LINE_UNITS_CAP),
             'brand': str(r.get('brand') or '').strip(),
-            'shipment': str(r.get('shipmentNo') or '').strip(),
+            # keyed exactly like the tracker's copies ((ref, style), no shipment) so an own
+            # copy filling a missed tracker day continues the same timeline
+            'shipment': '',
+            'shipment_no': str(r.get('shipmentNo') or '').strip(),
             'etd': to_date(r.get('etd_raw')) or to_date(r.get('etd')),
-            'placed': day,
+            'placed': None,
         })
         lines.append(l)
     return {'lines': lines, 'prods': []}
@@ -352,63 +355,100 @@ def parse_master_rows(rows, day):
 # Engine
 # ─────────────────────────────────────────────────────────────────────────────
 def _line_key(l):
-    return (l['ref'], l['style'], l['shipment'])
+    return (l['ref'], l['style'])
+
+
+def _fold_rows(rows):
+    """Several rows of one (ref, style) on one day (split shipments in a factory file, batches
+    in the ledger) -> one observation: earliest ETD, latest corroborated ATD, units summed."""
+    if len(rows) == 1:
+        return dict(rows[0])
+    base = dict(rows[0])
+    etds = [r['etd'] for r in rows if r['etd']]
+    base['etd'] = min(etds) if etds else None
+    base['po_units'] = sum(r['po_units'] for r in rows)
+    base['ship_units'] = sum(r['ship_units'] for r in rows)
+    base['accept'] = any(r['accept'] for r in rows)
+    atds = [r['atd'] for r in rows if r['atd']]
+    base['atd'] = max(atds) if atds else None
+    base['shipment'] = ', '.join(sorted({r['shipment'] for r in rows if r['shipment']}))[:60]
+    base['po_name'] = base['po_name'] or next((r['po_name'] for r in rows if r['po_name']), '')
+    base['note'] = base.get('note') or next((r.get('note') for r in rows if r.get('note')), '')
+    placed = [r['placed'] for r in rows if r.get('placed')]
+    base['placed'] = min(placed) if placed else None
+    return base
 
 
 def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
     """snapshots: list of {'source': 'master'|'factory', 'factory': code|None, 'date': date,
-    'lines': [...], 'prods': [...]}. Rows are routed to factories by production-ref prefix.
-    Returns the scorecard dataset (JSON-safe) with a 'lines' index."""
+    'lines': [...], 'prods': [...]}. Rows are routed to factories by production-ref prefix and
+    folded to ONE observation per (ref, style) per source per day. Returns the scorecard
+    dataset (JSON-safe) with a 'lines' index."""
     today = today or _et_today()
-    by_fac = defaultdict(lambda: defaultdict(lambda: {'lines': {}, 'prods': {}, 'sources': set()}))
+    # series[fac][day] = {'master': {key: row}, 'factory': {key: row}, 'prods': {ref: prod}}
+    series = defaultdict(lambda: defaultdict(lambda: {'master': {}, 'factory': {}, 'prods': {}}))
     for snap in snapshots:
         d = snap['date']
-        src = snap.get('source') or 'factory'
+        src = 'master' if (snap.get('source') or 'factory') == 'master' else 'factory'
+        groups = defaultdict(list)
         for l in snap['lines']:
             f = l['factory'] or snap.get('factory')
-            if not f:
-                continue
-            l = dict(l); l['source'] = src
-            store = by_fac[f][d]['lines']
-            k = _line_key(l)
-            kk = k; n = 0
-            while kk in store:
-                if store[kk]['source'] != src:      # other source already holds this key for the day
-                    kk = None; break
-                n += 1; kk = k + (n,)
-            if kk is not None:
-                store[kk] = l
-            by_fac[f][d]['sources'].add(src)
+            if f:
+                groups[(f, _line_key(l))].append(l)
+        for (f, k), rows in groups.items():
+            row = _fold_rows(rows)
+            row['source'] = src
+            series[f][d][src][k] = row
         for p in snap['prods']:
             f = p['factory'] or snap.get('factory')
             if f:
-                by_fac[f][d]['prods'].setdefault(p['ref'], p)
+                series[f][d]['prods'].setdefault(p['ref'], p)
+
+    # ── master copies that are not a real ledger (e.g. the tracker's first, one-row-per-PO
+    #    copy on 2026-04-15) would fake entries and exits: drop any day whose rows collapse
+    #    to (almost) a single style ──
+    master_days_all = sorted({d for f in series for d in series[f] if series[f][d]['master']})
+    for d in master_days_all:
+        rows = [r for f in series for r in series[f][d]['master'].values()]
+        styles = {r['style'] for r in rows}
+        if len(rows) >= 20 and len(styles) <= max(1, int(len(rows) * 0.05)):
+            for f in series:
+                series[f][d]['master'] = {}
+    all_master = sorted({d for f in series for d in series[f] if series[f][d]['master']})
+    hist_start = all_master[0] if all_master else None
+    last_master = all_master[-1] if all_master else None
+    prev_master = {all_master[i]: all_master[i - 1] for i in range(1, len(all_master))}
 
     out = {'generated_at': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z', 'today': today.isoformat(),
-           'recent_days': recent_days, 'factories': [], 'lines': []}
-    for fac in sorted(by_fac):
-        dates = sorted(by_fac[fac])
-        series = by_fac[fac]
-        m_dates = [d for d in dates if 'master' in series[d]['sources']]
-        f_dates = [d for d in dates if 'factory' in series[d]['sources']]
+           'recent_days': recent_days, 'factories': [], 'lines': [],
+           'history_start': hist_start.isoformat() if hist_start else None,
+           'history_end': last_master.isoformat() if last_master else None}
+    for fac in sorted(series):
+        fs = series[fac]
+        dates = sorted(d for d in fs if fs[d]['master'] or fs[d]['factory'] or fs[d]['prods'])
+        if not dates:
+            continue
+        m_dates = [d for d in dates if fs[d]['master']]
+        f_dates = [d for d in dates if fs[d]['factory']]
         hist = defaultdict(list)
         for d in dates:
-            for k, l in series[d]['lines'].items():
-                hist[k[:3]].append((d, l))
+            for src in ('master', 'factory'):
+                for k, row in fs[d][src].items():
+                    hist[k].append((d, row))
         prod_hist = defaultdict(list)
         for d in dates:
-            for ref, p in series[d]['prods'].items():
+            for ref, p in fs[d]['prods'].items():
                 prod_hist[ref].append((d, p))
 
         # ── per line timeline ──
         line_rows = []
         etd_changes = []
         for k, seq in hist.items():
-            ref, style, shipment = k
-            seq.sort(key=lambda x: x[0])
+            ref, style = k
+            seq.sort(key=lambda x: (x[0], 0 if x[1]['source'] == 'master' else 1))
             first_d, last_d = seq[0][0], seq[-1][0]
             m_seq = [(d, l) for d, l in seq if l['source'] == 'master']
-            f_seq = [(d, l) for d, l in seq if l['source'] != 'master']
+            f_seq = [(d, l) for d, l in seq if l['source'] == 'factory']
             # ETD promises: the office's master ledger (daily) when we have it, else the factory's file
             e_seq = m_seq if (len(m_seq) >= 2 or not f_seq) else f_seq
             last_l = (m_seq[-1][1] if m_seq else f_seq[-1][1])
@@ -432,10 +472,39 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                     etd_changes.append({**ch, 'ref': ref, 'style': style, 'po_name': l['po_name'] or last_l['po_name']})
                 prev = l
             placed = next((l['placed'] for _, l in seq if l.get('placed')), None) or first_d
+            # ── ENTRY -> EXIT on the master ledger (David's core metric, Sep 9 2026) ──
+            # entry = the first daily copy the line appears in, entry_etd = the ETD it carried
+            # then; exit = the last copy it appears in, final_etd = the ETD it carried on that
+            # last day. shift = final - entry. 'tracked' = the entry itself was observed: the
+            # previous ledger copy is close (no gap) and the tracker did not know the line
+            # before the history began.
+            entry_d = entry_etd = exit_d = final_etd = None
+            shift = None
+            outcome = None
+            tracked = False
+            entry_etd_late = False
+            if m_seq:
+                entry_d, exit_d = m_seq[0][0], m_seq[-1][0]
+                entry_etd = m_seq[0][1]['etd']
+                if not entry_etd:
+                    entry_etd = next((l['etd'] for _, l in m_seq if l['etd']), None)
+                    entry_etd_late = entry_etd is not None
+                final_etd = next((l['etd'] for _, l in reversed(m_seq) if l['etd']), None)
+                pm = prev_master.get(entry_d)
+                m_placed = next((l['placed'] for _, l in m_seq if l.get('placed')), None)
+                tracked = bool(pm) and (entry_d - pm).days <= 10 and (not m_placed or not hist_start or m_placed > hist_start)
+                if exit_d == last_master:
+                    outcome = 'open'
+                elif final_etd and final_etd <= exit_d + dt.timedelta(days=21):
+                    outcome = 'completed'      # fell off the ledger around its ETD: shipped
+                else:
+                    outcome = 'removed'        # fell off with the ETD still out: cancelled or moved
+                if entry_etd and final_etd:
+                    shift = max(-120, min(400, (final_etd - entry_etd).days))
             ship_units = f_last['ship_units'] if f_last else 0
-            units = last_l['po_units'] or (f_last['po_units'] if f_last else 0)
+            units = (m_seq[-1][1]['po_units'] if m_seq else 0) or (f_last['po_units'] if f_last else 0)
             shipped = bool(atd) or (f_last is not None and ship_units > 0 and ship_units >= max(1, int((f_last['po_units'] or 1) * 0.9)))
-            gone = bool((m_seq and m_seq[-1][0] < m_dates[-1]) or (not m_seq and f_seq and f_seq[-1][0] < f_dates[-1]))
+            gone = bool((m_seq and exit_d < last_master) or (not m_seq and f_seq and f_seq[-1][0] < f_dates[-1]))
             observed = bool(first_etd) and (not atd or first_d <= atd)
             slip = None
             if first_etd:
@@ -454,7 +523,8 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             else:
                 status = 'open'
             line_rows.append({
-                'factory': fac, 'ref': ref, 'style': style, 'shipment': shipment,
+                'factory': fac, 'ref': ref, 'style': style,
+                'shipment': (f_last['shipment'] if f_last else '') or (m_seq[-1][1].get('shipment_no') if m_seq else '') or '',
                 'po_name': last_l['po_name'] or (f_last['po_name'] if f_last else ''),
                 'brand': last_l['brand'] or (f_last['brand'] if f_last else ''),
                 'units': units, 'ship_units': ship_units,
@@ -462,6 +532,9 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'first_etd': _iso(first_etd), 'latest_etd': _iso(latest_etd), 'atd': _iso(atd),
                 'slip_days': slip, 'etd_changes': len(changes), 'changes': changes[-8:],
                 'status': status, 'observed': observed, 'src': 'master' if m_seq else 'factory',
+                'entry_date': _iso(entry_d), 'entry_etd': _iso(entry_etd), 'exit_date': _iso(exit_d), 'final_etd': _iso(final_etd),
+                'entry_etd_late': entry_etd_late,
+                'shift_days': shift, 'outcome': outcome, 'tracked': tracked,
             })
 
         # ── style moves between production orders: consecutive copies of the SAME source ──
@@ -471,12 +544,10 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             for i in range(1, len(stream)):
                 d0, d1 = stream[i - 1], stream[i]
                 prev_by_style, cur_by_style = defaultdict(set), defaultdict(set)
-                for k, l in series[d0]['lines'].items():
-                    if l['source'] == src:
-                        prev_by_style[k[1]].add(k[0])
-                for k, l in series[d1]['lines'].items():
-                    if l['source'] == src:
-                        cur_by_style[k[1]].add(k[0])
+                for (r0, s0) in fs[d0][src]:
+                    prev_by_style[s0].add(r0)
+                for (r1, s1) in fs[d1][src]:
+                    cur_by_style[s1].add(r1)
                 for style, prev_refs in prev_by_style.items():
                     cur_refs = cur_by_style.get(style, set())
                     gone_refs, new_refs = prev_refs - cur_refs, cur_refs - prev_refs
@@ -484,8 +555,8 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                         continue
                     for a in sorted(gone_refs):
                         for b in sorted(new_refs):
-                            old_l = next((l for k, l in series[d0]['lines'].items() if k[0] == a and k[1] == style and l['source'] == src), None)
-                            new_l = next((l for k, l in series[d1]['lines'].items() if k[0] == b and k[1] == style and l['source'] == src), None)
+                            old_l = fs[d0][src].get((a, style))
+                            new_l = fs[d1][src].get((b, style))
                             if not old_l or not new_l or old_l['atd']:
                                 continue
                             sig = (style, a, b, d1.isoformat()[:7])
@@ -530,7 +601,26 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             else:
                 status = 'open'
             slips = [r['slip_days'] for r in lr if r['slip_days'] is not None]
+            # entry -> exit view of the PO, from the lines whose entry was observed; a PO that
+            # was already on the ledger when the history began is flagged instead of dated
+            m_lines = [r for r in lr if r['entry_date']]
+            tr_all = [r for r in m_lines if r['tracked']]
+            src_lines = tr_all or m_lines
+            tr = [r for r in tr_all if r['shift_days'] is not None and r['outcome'] in ('completed', 'open')]
+            entered = min([r['entry_date'] for r in src_lines] or [None])
+            entry_etds = [r['entry_etd'] for r in src_lines if r['entry_etd']]
+            final_etds = [r['final_etd'] for r in src_lines if r['final_etd']]
+            n_open_l = sum(1 for r in lr if r['outcome'] == 'open')
+            n_comp_l = sum(1 for r in lr if r['outcome'] == 'completed')
+            n_rem_l = sum(1 for r in lr if r['outcome'] == 'removed')
             pos.append({
+                'entered': entered, 'entry_etd': min(entry_etds) if entry_etds else None,
+                'final_etd': max(final_etds) if final_etds else None,
+                'shift_days': round(sum(r['shift_days'] for r in tr) / len(tr), 1) if tr else None,
+                'shift_lines': len(tr), 'lines_open': n_open_l, 'lines_completed': n_comp_l, 'lines_removed': n_rem_l,
+                'ledger_status': 'open' if n_open_l else ('off' if (n_comp_l or n_rem_l) else 'none'),
+                'tracked': bool(tr_all), 'on_ledger_at_start': bool(m_lines) and not tr_all,
+                'last_exit': max([r['exit_date'] for r in lr if r['exit_date']] or [None]),
                 'ref': ref, 'po_name': (p_last or {}).get('po_name') or (lr[0]['po_name'] if lr else ''),
                 'brand': (p_last or {}).get('brand') or (lr[0]['brand'] if lr else ''),
                 'received': _iso(received), 'first_etd': _iso(first_etd), 'latest_etd': _iso(latest_etd), 'atd': _iso(last_atd),
@@ -545,18 +635,18 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
         # ── volume carried: units on the ledger per copy (master preferred: it lists open work only) ──
         load_series = []
         for d in dates:
-            if 'master' in series[d]['sources']:
-                units_open = sum(l['po_units'] for l in series[d]['lines'].values() if l['source'] == 'master')
-                n_pos = len({k[0] for k, l in series[d]['lines'].items() if l['source'] == 'master'})
+            if fs[d]['master']:
+                units_open = sum(l['po_units'] for l in fs[d]['master'].values())
+                n_pos = len({k[0] for k in fs[d]['master']})
             else:
                 units_open, n_pos = 0, 0
-                for ref, p in series[d]['prods'].items():
+                for ref, p in fs[d]['prods'].items():
                     if p['received'] and p['received'] <= d and (not p['etd'] or p['etd'] >= d - dt.timedelta(days=14)):
                         left = max(0, p['total_units'] - p['units_shipped']) if p['total_units'] else 0
                         if left > 0:
                             units_open += left; n_pos += 1
             load_series.append({'date': d.isoformat(), 'open_units': units_open, 'open_pos': n_pos,
-                                'src': 'master' if 'master' in series[d]['sources'] else 'factory'})
+                                'src': 'master' if fs[d]['master'] else 'factory'})
         by_date_load = {x['date']: x['open_units'] for x in load_series}
         for po in pos:
             po['load_at_receipt'] = None
@@ -565,10 +655,10 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 if snap_d and (snap_d - dt.date.fromisoformat(po['received'])).days <= 45:
                     po['load_at_receipt'] = by_date_load.get(snap_d.isoformat())
 
-        # ── current state (latest master copy when we have one) ──
-        if m_dates:
-            cur_lines = [l for l in series[m_dates[-1]]['lines'].values() if l['source'] == 'master']
-            current = {'as_of': m_dates[-1].isoformat(), 'pos': len({l['ref'] for l in cur_lines}),
+        # ── current state (the latest master copy, shared by every factory) ──
+        if last_master:
+            cur_lines = list(fs[last_master]['master'].values()) if last_master in fs else []
+            current = {'as_of': last_master.isoformat(), 'pos': len({l['ref'] for l in cur_lines}),
                        'lines': len(cur_lines), 'units': sum(l['po_units'] for l in cur_lines),
                        'late_lines': sum(1 for l in cur_lines if l['etd'] and l['etd'] < today),
                        'late_units': sum(l['po_units'] for l in cur_lines if l['etd'] and l['etd'] < today)}
@@ -601,7 +691,54 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'median_push_days': median([c['days'] for c in later]),
                 'style_moves': len(mv),
             }
+        # ── entry -> exit shift (the headline): tracked master-ledger lines only ──
+        def shift_stats(rows):
+            comp = [r for r in rows if r['tracked'] and r['outcome'] == 'completed' and r['shift_days'] is not None]
+            opn = [r for r in rows if r['tracked'] and r['outcome'] == 'open' and r['shift_days'] is not None]
+            rem = [r for r in rows if r['tracked'] and r['outcome'] == 'removed']
+            n = len(comp)
+            later_n = sum(1 for r in comp if r['shift_days'] > 0)
+            return {
+                'completed': {
+                    'n': n, 'units': sum(r['units'] for r in comp),
+                    'avg': round(sum(r['shift_days'] for r in comp) / n, 1) if n else None,
+                    'median': median([r['shift_days'] for r in comp]),
+                    'later_pct': round(100.0 * later_n / n, 1) if n else None,
+                    'same_pct': round(100.0 * sum(1 for r in comp if r['shift_days'] == 0) / n, 1) if n else None,
+                    'earlier_pct': round(100.0 * sum(1 for r in comp if r['shift_days'] < 0) / n, 1) if n else None,
+                    'avg_changes': round(sum(r['etd_changes'] for r in comp) / n, 2) if n else None,
+                    'avg_later_days': round(sum(r['shift_days'] for r in comp if r['shift_days'] > 0) / later_n, 1) if later_n else None,
+                },
+                'open': {
+                    'n': len(opn), 'units': sum(r['units'] for r in opn),
+                    'avg_so_far': round(sum(r['shift_days'] for r in opn) / len(opn), 1) if opn else None,
+                    'later_pct': round(100.0 * sum(1 for r in opn if r['shift_days'] > 0) / len(opn), 1) if opn else None,
+                },
+                'removed': {'n': len(rem), 'units': sum(r['units'] for r in rem)},
+            }
         cutoff = (today - dt.timedelta(days=recent_days)).isoformat()
+        shift_all = shift_stats(line_rows)
+        shift_recent = shift_stats([r for r in line_rows if r['outcome'] == 'open' or (r['exit_date'] and r['exit_date'] >= cutoff)])
+        untracked_n = sum(1 for r in line_rows if r['src'] == 'master' and not r['tracked'])
+        by_entry = defaultdict(lambda: {'entered': 0, 'units': 0, 'completed': 0, 'shifts': [], 'later': 0, 'open': 0, 'removed': 0})
+        for r in line_rows:
+            if not (r['tracked'] and r['entry_date']):
+                continue
+            b = by_entry[r['entry_date'][:7]]
+            b['entered'] += 1; b['units'] += r['units']
+            if r['outcome'] == 'completed' and r['shift_days'] is not None:
+                b['completed'] += 1; b['shifts'].append(r['shift_days'])
+                if r['shift_days'] > 0:
+                    b['later'] += 1
+            elif r['outcome'] == 'open':
+                b['open'] += 1
+            elif r['outcome'] == 'removed':
+                b['removed'] += 1
+        monthly_entry_rows = [{'month': m, 'entered': v['entered'], 'units': v['units'], 'completed': v['completed'], 'open': v['open'], 'removed': v['removed'],
+                               'avg_shift': round(sum(v['shifts']) / len(v['shifts']), 1) if v['shifts'] else None,
+                               'median_shift': median(v['shifts']),
+                               'later_pct': round(100.0 * v['later'] / v['completed'], 1) if v['completed'] else None}
+                              for m, v in sorted(by_entry.items())]
         recent_rows = [r for r in line_rows if (r['atd'] and r['atd'] >= cutoff) or r['status'] in ('open', 'late')]
         recent_changes = [c for c in etd_changes if c['date'] >= cutoff]
         recent_moves = [m for m in moves if m['date'] >= cutoff]
@@ -611,6 +748,8 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             'lines': len(line_rows), 'pos': len(pos),
             'late_open_pos': sum(1 for p in pos if p['status'] == 'late'),
             'current': current,
+            'shift': shift_all, 'shift_recent': shift_recent, 'untracked_lines': untracked_n,
+            'history_start': hist_start.isoformat() if hist_start else None,
             'all': kpis_for(line_rows, etd_changes, moves, 'all'),
             'recent': kpis_for(recent_rows, recent_changes, recent_moves, f'{recent_days}d'),
         }
@@ -640,8 +779,9 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                                     'late_pct': round(100.0 * late / len(part), 1), 'median_slip': median([p['slip_days'] for p in part])})
         out['factories'].append({
             'code': fac, 'name': FACTORY_NAMES.get(fac, fac), 'kpis': kpis, 'monthly': monthly_rows,
+            'monthly_entry': monthly_entry_rows,
             'load_series': load_series[-200:], 'load_buckets': buckets,
-            'pos': sorted(pos, key=lambda p: (p['received'] or p['first_seen'] or ''), reverse=True),
+            'pos': sorted(pos, key=lambda p: (p['entered'] or p['received'] or p['first_seen'] or ''), reverse=True),
             'moves': sorted(moves, key=lambda m: m['date'], reverse=True)[:300],
             'changes': sorted(etd_changes, key=lambda c: c['date'], reverse=True)[:400],
         })
@@ -865,15 +1005,18 @@ def factory_files():
             mod_day = _et_day_of(mod)
         except Exception:
             continue
-        out.append({'path': e.get('path_lower'), 'name': name, 'rev': e.get('rev') or '', 'modified': mod_day,
-                    'code': code, 'size': e.get('size') or 0})
+        pl = e.get('path_lower') or ''
+        out.append({'path': pl, 'name': name, 'rev': e.get('rev') or '', 'modified': mod_day,
+                    'code': code, 'size': e.get('size') or 0,
+                    # the live workbook in a factory's folder root changes in place: never cached
+                    'live': ('/archive/' not in pl and '/backup/' not in pl)})
     return out
 
 
 def factory_file_parsed(entry, use_cache=True):
     """Parsed workbook for one Dropbox copy, cached under SC_PREFIX factory/<rev>.json."""
     key = f"{SC_PREFIX}factory/{entry['rev'] or re.sub(r'[^A-Za-z0-9]+', '_', entry['path'])}.json"
-    if use_cache:
+    if use_cache and not entry.get('live'):
         cached = _s3_get_json(key)
         if cached is not None:
             return _fat_parsed(cached) if cached.get('lines') else None
@@ -887,8 +1030,9 @@ def factory_file_parsed(entry, use_cache=True):
     except Exception as e:
         _s3_put_json(key, {'lines': [], 'prods': [], 'error': str(e)[:200], 'name': entry['name']})
         return None
-    slim = _slim_parsed(parsed); slim['name'] = entry['name']; slim['modified'] = entry['modified'].isoformat()
-    _s3_put_json(key, slim)
+    if not entry.get('live'):
+        slim = _slim_parsed(parsed); slim['name'] = entry['name']; slim['modified'] = entry['modified'].isoformat()
+        _s3_put_json(key, slim)
     return parsed if parsed['lines'] else None
 
 
@@ -903,6 +1047,7 @@ def collect_snapshots(use_cache=True):
     own = own_snapshot_days()
     today = _et_today().isoformat()
     total = len(days)
+    days_with_lines = set()
     for i, day in enumerate(sorted(days)):
         try:
             parsed = master_day_lines(day, days[day]['version_id'], use_cache=use_cache)
@@ -912,11 +1057,12 @@ def collect_snapshots(use_cache=True):
         if parsed and parsed['lines']:
             snaps.append({'source': 'master', 'factory': None, 'date': dt.date.fromisoformat(day), **parsed})
             counts['master_days'] += 1
+            days_with_lines.add(day)
         if i % 20 == 0:
             _set_progress(f'master ledger copies {i + 1}/{total}')
-    # our own daily copies fill any day the tracker missed
+    # our own daily copies fill any day the tracker missed (or produced nothing)
     for day, key in sorted(own.items()):
-        if day in days or day == today:
+        if day in days_with_lines or day == today:
             continue
         try:
             slim = _s3_get_json(key)
@@ -969,6 +1115,8 @@ def rebuild(trigger='manual', use_cache=True):
         with _state_lock:
             _state.update(running=False, finished=dt.datetime.utcnow().isoformat() + 'Z', progress='done',
                           last_run_day=_et_today().isoformat(), counts=counts, generated_at=sc['generated_at'])
+            if trigger == 'daily':
+                _state['last_daily_day'] = _et_today().isoformat()
         _persist_state(force=True)
         print(f"[Scorecard] rebuilt: {counts}", flush=True)
         return True
@@ -1010,13 +1158,14 @@ def _daily_loop():
                 target = target + dt.timedelta(days=1)
             time.sleep(max(60, (target - now).total_seconds()))
             today = _et_today().isoformat()
-            st = _s3_get_json(f'{SC_PREFIX}status.json') or {}
-            if st.get('last_run_day') == today and st.get('progress') == 'done':
-                continue        # another worker already ran today
+            # the day's own ledger copy is always refreshed, even when a manual rebuild ran earlier
             try:
                 write_own_snapshot()
             except Exception as e:
                 print(f'[Scorecard] own snapshot failed: {e}', flush=True)
+            st = _s3_get_json(f'{SC_PREFIX}status.json') or {}
+            if st.get('last_daily_day') == today:
+                continue        # another worker already ran today's daily rebuild
             rebuild(trigger='daily')
         except Exception as e:
             print(f'[Scorecard] daily loop error: {e}', flush=True)
