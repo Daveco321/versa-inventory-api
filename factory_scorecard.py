@@ -724,10 +724,31 @@ def _fat_parsed(slim):
     return {'lines': [_dates_from_iso(l) for l in slim.get('lines', [])], 'prods': [_dates_from_iso(p) for p in slim.get('prods', [])]}
 
 
+_progress_written_at = 0.0
+
+
+def _persist_state(force=False):
+    """Mirror the build state to S3 (throttled) so every gunicorn worker, not just the
+    one running the build, can answer /factory-scorecard/status truthfully."""
+    global _progress_written_at
+    now = time.time()
+    if not force and now - _progress_written_at < 8:
+        return
+    _progress_written_at = now
+    try:
+        with _state_lock:
+            snap = dict(_state)
+        snap['persisted_at'] = dt.datetime.utcnow().isoformat() + 'Z'
+        _s3_put_json(f'{SC_PREFIX}status.json', snap)
+    except Exception as e:
+        print(f'[Scorecard] status persist failed: {e}', flush=True)
+
+
 def _set_progress(msg):
     with _state_lock:
         _state['progress'] = msg
     print(f'[Scorecard] {msg}', flush=True)
+    _persist_state()
 
 
 # ── the tracker's hourly copies (one per Eastern day) ──
@@ -932,6 +953,7 @@ def rebuild(trigger='manual', use_cache=True):
             return False
         _state.update(running=True, started=dt.datetime.utcnow().isoformat() + 'Z', finished=None,
                       progress='starting', last_error=None, trigger=trigger)
+    _persist_state(force=True)
     try:
         snaps, counts = collect_snapshots(use_cache=use_cache)
         _set_progress(f"building from {len(snaps)} copies")
@@ -946,8 +968,8 @@ def rebuild(trigger='manual', use_cache=True):
         _mem['lines'] = {'generated_at': sc['generated_at'], 'lines': lines}
         with _state_lock:
             _state.update(running=False, finished=dt.datetime.utcnow().isoformat() + 'Z', progress='done',
-                          last_run_day=_et_today().isoformat(), counts=counts)
-        _s3_put_json(f'{SC_PREFIX}status.json', dict(_state))
+                          last_run_day=_et_today().isoformat(), counts=counts, generated_at=sc['generated_at'])
+        _persist_state(force=True)
         print(f"[Scorecard] rebuilt: {counts}", flush=True)
         return True
     except Exception as e:
@@ -955,16 +977,22 @@ def rebuild(trigger='manual', use_cache=True):
         with _state_lock:
             _state.update(running=False, finished=dt.datetime.utcnow().isoformat() + 'Z',
                           progress='failed', last_error=str(e)[:300])
-        try:
-            _s3_put_json(f'{SC_PREFIX}status.json', dict(_state))
-        except Exception:
-            pass
+        _persist_state(force=True)
         return False
 
 
 def _load_blob(name):
-    if _mem.get(name) is not None:
-        return _mem[name]
+    """scorecard.json / lines.json, memoised per worker but refreshed whenever the S3
+    status shows a newer build (another worker, or the daily job, may have rebuilt)."""
+    latest = None
+    try:
+        st = _s3_get_json(f'{SC_PREFIX}status.json') or {}
+        latest = st.get('generated_at')
+    except Exception:
+        pass
+    cached = _mem.get(name)
+    if cached is not None and (not latest or cached.get('generated_at') == latest):
+        return cached
     obj = _s3_get_json(f'{SC_PREFIX}{name}.json')
     if obj is not None:
         _mem[name] = obj
@@ -1062,11 +1090,14 @@ def register_scorecard_routes(app, get_s3, s3_bucket, get_dropbox_token, caller_
             return err
         with _state_lock:
             st = dict(_state)
-        if not st.get('last_run_day'):
+        if not st.get('running'):
+            # The build may be running in ANOTHER gunicorn worker: the S3 copy is the
+            # shared truth whenever this worker is idle.
             try:
                 persisted = _s3_get_json(f'{SC_PREFIX}status.json')
                 if persisted:
-                    st['persisted'] = persisted
+                    persisted['worker_idle'] = True
+                    return jsonify(persisted)
             except Exception:
                 pass
         return jsonify(st)
