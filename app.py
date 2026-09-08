@@ -1554,6 +1554,25 @@ def _py_is_long_sleeve_shirt(sku):
         return False
     return _py_extract_fit_code(sku) in _PY_LONG_SLEEVE_FIT_CODES
 
+_PY_BUTTON_DOWN_COLLARS = {'B', 'D', 'H', 'L', 'W', 'X'}
+def _py_is_button_down(sku, brand_abbr=''):
+    """Port of the frontend isButtonDown (boss via David, Sep 8 2026): Style Rules
+    collar letters B/D/H/L/W/X on a DRESS SHIRT with a valid fit code. Shirts
+    only — pants, sportswear and blazers reuse the letters for other things."""
+    if not sku:
+        return False
+    base = str(sku).split('-')[0].upper()
+    if len(base) < 11 or base[-1] not in _PY_BUTTON_DOWN_COLLARS:
+        return False
+    if _py_extract_fit_code(sku) not in _PY_ALL_FIT_CODES:
+        return False
+    if _py_is_pants(sku, brand_abbr) or _py_is_sportswear(sku, brand_abbr) or _py_is_blazer(sku):
+        return False
+    # _py_get_item_category mirrors the frontend's getDetailedCategory (it never
+    # returns 'shirts'): a dress shirt is anything left that is not a bottom,
+    # sportswear or an accessory (long/short sleeve, big & tall).
+    return _py_get_item_category(sku, brand_abbr) not in ('pants', 'sportswear', 'accessories')
+
 def _py_matches_category(sku, brand_abbr, category):
     """Inclusive category matcher. One SKU can match multiple categories
     (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men';
@@ -1574,6 +1593,8 @@ def _py_matches_category(sku, brand_abbr, category):
         return _py_is_short_sleeve(sku)
     if category == 'long_sleeve':
         return _py_is_long_sleeve_shirt(sku)
+    if category == 'button_down':
+        return _py_is_button_down(sku, brand_abbr)
     # Non-overlapping categories fall through to the primary-category equality check
     return _py_get_item_category(sku, brand_abbr) == category
 
@@ -4854,7 +4875,8 @@ def _apo_color_map():
         print(f'[APO Export] color map load failed: {e}')
         return _apo_color_map_cache['map'] or {}
 
-_APO_COLOR_ABBR = {'BLK': 'Black', 'WHT': 'White', 'BLU': 'Blue', 'NVY': 'Navy', 'GRY': 'Grey'}
+_APO_COLOR_ABBR = {'BLK': 'Black', 'WHT': 'White', 'BLU': 'Blue', 'NVY': 'Navy', 'GRY': 'Grey',
+                   'SRNTY': 'Serenity', 'TRQ': 'Turquoise'}   # blue shades the map abbreviates (Sep 8 2026)
 
 def _apo_format_color(raw):
     """Port of frontend formatColorName."""
@@ -4927,7 +4949,18 @@ def _apo_style_color(base, brand_abbr):
         return (_apo_format_color(parts[0]) + ' ' + _apo_format_color(parts[1])).strip()
     return _apo_format_color(raw)
 
-_APO_BLUE_FAMILY = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b')
+# "All Shades of Blue" (boss via David, Sep 8 2026) — mirrors the desktop/phone
+# _BLUE_FAMILY: every blue SHADE word, chambray excluded (a fabric, not a colour).
+_APO_BLUE_FAMILY = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b|\bteal\b|\btanzine\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b')
+# Denim doubles as a wash word ("Denim Grey Solid" is a grey shirt): it only counts
+# as blue when no other colour word leads the phrase (mirrors the frontend _isBlueLead).
+_APO_NON_BLUE_WORDS = re.compile(r'\b(?:grey|gray|black|white|red|pink|green|brown|tan|khaki|olive|burgundy|wine|purple|plum|orange|yellow|gold|silver|charcoal|ivory|cream|beige|camel|rust|coral|lilac|lavender|mint|sage)\b')
+def _apo_is_blue_lead(s):
+    if not _APO_BLUE_FAMILY.search(s):
+        return False
+    if re.search(r'\bdenim\b', s) and not re.search(r'\bnavy\b|\bblue\b|\bindigo\b', s) and _APO_NON_BLUE_WORDS.search(s):
+        return False
+    return True
 _APO_PRINT_RE = re.compile(r'\bprint\b|\bprnt\b|\bgrnd\b|\bstripe\b|\bstripes\b|\bgeo\b|\bcheck\b')
 
 def _apo_classify_color(color_display, brand_abbr):
@@ -4950,11 +4983,11 @@ def _apo_classify_color(color_display, brand_abbr):
             return 'white'
         if re.search(r'\bblack\b', c):
             return 'black'
-        if _APO_BLUE_FAMILY.search(c):
+        if _apo_is_blue_lead(c):
             return 'navy'
         return 'other_solids'
     m = re.match(r'^(.*?)\s*\bs(?:olid|ld)\b', c)
-    if not has_print and m and _APO_BLUE_FAMILY.search(m.group(1)):
+    if not has_print and m and _apo_is_blue_lead(m.group(1)):
         return 'navy'
     m2 = re.match(r'^(\S+)\s+s(?:olid|ld)$', c)
     if m2 and not has_print:
@@ -14866,9 +14899,11 @@ def _ai_tool_build_line_sheet(params):
 _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
-                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers — blazers includes vests), "
+                     "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers|button_down — blazers includes vests; "
+                     "button_down = dress shirts whose collar letter is a button-down style), "
                      "fabric_codes (2-letter SKU codes), color (color word, or buckets: solids/fancies/white/black/navy — "
-                     "the navy bucket covers the whole blue family incl. blue/indigo, and any color name containing "
+                     "the navy bucket is 'All Shades of Blue': navy, blue, indigo, serenity, periwinkle, turquoise, aqua, teal, "
+                     "tanzine, cobalt, blueberry, seaspray, deep sea, denim, cerulean, sapphire, azure, cyan; and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
                      "search (substring of style #), stock (any|warehouse|overseas), min_units, "
                      "arrive_before/arrive_after (YYYY-MM-DD, filters styles with production arriving in that window and "
