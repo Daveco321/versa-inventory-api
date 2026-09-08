@@ -354,6 +354,13 @@ def parse_master_rows(rows, day):
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine
 # ─────────────────────────────────────────────────────────────────────────────
+def collections_counter(it):
+    c = {}
+    for x in it:
+        c[x] = c.get(x, 0) + 1
+    return c
+
+
 def _line_key(l):
     return (l['ref'], l['style'])
 
@@ -423,6 +430,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
            'recent_days': recent_days, 'factories': [], 'lines': [],
            'history_start': hist_start.isoformat() if hist_start else None,
            'history_end': last_master.isoformat() if last_master else None}
+    _fac_state = {}
     for fac in sorted(series):
         fs = series[fac]
         dates = sorted(d for d in fs if fs[d]['master'] or fs[d]['factory'] or fs[d]['prods'])
@@ -553,9 +561,17 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'entry_date': _iso(entry_d), 'entry_etd': _iso(entry_etd), 'exit_date': _iso(exit_d), 'final_etd': _iso(final_etd),
                 'entry_etd_late': entry_etd_late, 'entry_etd_date': _iso(entry_etd_date),
                 'shift_days': shift, 'outcome': outcome, 'tracked': tracked, 'at_start': at_start,
-                'etd_typos': etd_typos, 'moved_to': None, 'moved_from': None,
+                'etd_typos': etd_typos, 'moved_to': None, 'moved_from': None, 'reissued_to': None,
             })
 
+        _fac_state[fac] = dict(fs=fs, dates=dates, m_dates=m_dates, f_dates=f_dates, line_rows=line_rows,
+                               etd_changes=etd_changes, prod_hist=prod_hist)
+
+    # phase B: moves, re-issues to other factories, PO roll-ups and KPIs (needs every factory's lines)
+    for fac in sorted(_fac_state):
+        st = _fac_state[fac]
+        fs, dates, m_dates, f_dates = st['fs'], st['dates'], st['m_dates'], st['f_dates']
+        line_rows, etd_changes, prod_hist = st['line_rows'], st['etd_changes'], st['prod_hist']
         # ── styles moved to another production order (master ledger) ──
         # A line that fell off with its ETD still out and whose style shows up under a
         # different PO of the same factory within 21 days was MOVED, not cancelled: the
@@ -622,6 +638,27 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                                           'from_etd': _iso(old_l['etd']), 'to_etd': _iso(new_l['etd']),
                                           'days': days, 'units': new_l['po_units'], 'po_name': new_l['po_name'] or old_l['po_name']})
 
+        # ── re-issued to ANOTHER factory: a removed line whose style shows up under a different
+        #    factory's PO within 120 days was taken away from this factory and given to that one.
+        #    Never a shift for this factory; the other factory sees a fresh entry.
+        other_by_style = defaultdict(list)
+        for ofac, ost in _fac_state.items():
+            if ofac == fac:
+                continue
+            for o in ost['line_rows']:
+                if o['src'] == 'master' and o['entry_date']:
+                    other_by_style[o['style']].append(o)
+        for r in line_rows:
+            if r['src'] != 'master' or r['outcome'] != 'removed' or not r['exit_date']:
+                continue
+            ex = dt.date.fromisoformat(r['exit_date'])
+            cands = [o for o in other_by_style.get(r['style'], [])
+                     if ex - dt.timedelta(days=1) <= dt.date.fromisoformat(o['entry_date']) <= ex + dt.timedelta(days=120)]
+            if cands:
+                o = min(cands, key=lambda x: x['entry_date'])
+                r['outcome'] = 'reissued'
+                r['reissued_to'] = o['ref']
+
         # ── production orders (customer PO level) ──
         pos = []
         line_by_ref = defaultdict(list)
@@ -675,6 +712,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'ledger_status': 'open' if n_open_l else ('off' if (n_comp_l or n_rem_l) else 'none'),
                 'tracked': bool(m_lines), 'on_ledger_at_start': bool(m_lines) and all(r['at_start'] for r in m_lines),
                 'lines_moved': sum(1 for r in lr if r['outcome'] == 'moved'),
+                'lines_reissued': sum(1 for r in lr if r['outcome'] == 'reissued'),
                 'last_exit': max([r['exit_date'] for r in lr if r['exit_date']] or [None]),
                 'ref': ref, 'po_name': (p_last or {}).get('po_name') or (lr[0]['po_name'] if lr else ''),
                 'brand': (p_last or {}).get('brand') or (lr[0]['brand'] if lr else ''),
@@ -755,6 +793,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             opn = [r for r in rows if r['outcome'] == 'open' and r['shift_days'] is not None and r['src'] == 'master']
             rem = [r for r in rows if r['outcome'] == 'removed' and r['src'] == 'master']
             mv = [r for r in rows if r['outcome'] == 'moved' and r['src'] == 'master']
+            rei = [r for r in rows if r['outcome'] == 'reissued' and r['src'] == 'master']
             n = len(comp)
             later_n = sum(1 for r in comp if r['shift_days'] > 0)
             return {
@@ -779,6 +818,8 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                     'later_pct': round(100.0 * sum(1 for r in opn if r['shift_days'] > 0) / len(opn), 1) if opn else None,
                 },
                 'removed': {'n': len(rem), 'units': sum(r['units'] for r in rem)},
+                'reissued': {'n': len(rei), 'units': sum(r['units'] for r in rei),
+                             'to': sorted(collections_counter(r['reissued_to'][:2] for r in rei).items(), key=lambda x: -x[1])[:3]},
             }
         cutoff = (today - dt.timedelta(days=recent_days)).isoformat()
         shift_all = shift_stats(line_rows)
@@ -796,7 +837,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                     b['later'] += 1
             elif r['outcome'] == 'open':
                 b['open'] += 1
-            elif r['outcome'] == 'removed':
+            elif r['outcome'] in ('removed', 'reissued'):
                 b['removed'] += 1
         monthly_entry_rows = [{'month': m, 'entered': v['entered'], 'units': v['units'], 'completed': v['completed'], 'open': v['open'], 'removed': v['removed'],
                                'avg_shift': round(sum(v['shifts']) / len(v['shifts']), 1) if v['shifts'] else None,
