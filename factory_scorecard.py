@@ -453,8 +453,22 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             e_seq = m_seq if (len(m_seq) >= 2 or not f_seq) else f_seq
             last_l = (m_seq[-1][1] if m_seq else f_seq[-1][1])
             f_last = f_seq[-1][1] if f_seq else None
-            first_etd = next((l['etd'] for _, l in e_seq if l['etd']), None)
-            latest_etd = next((l['etd'] for _, l in reversed(e_seq) if l['etd']), None)
+            # An ETD is only believed when it is plausible for the day it was written:
+            # not more than 45 days in the past and not more than 14 months out. Typos
+            # like 10/30/2011 or a 2025 year on a 2026 line are skipped, not scored.
+            etd_typos = 0
+            def vetd(l, d):
+                nonlocal etd_typos
+                e = l['etd']
+                if not e:
+                    return None
+                if e < d - dt.timedelta(days=45) or e > d + dt.timedelta(days=420):
+                    etd_typos += 1
+                    return None
+                return e
+            e_obs = [(d, l, vetd(l, d)) for d, l in e_seq]
+            first_etd = next((e for _, _, e in e_obs if e), None)
+            latest_etd = next((e for _, _, e in reversed(e_obs) if e), None)
             # actual departure: factory files only. An ATD counts when it is not later than
             # the copy that carries it AND the row shows shipped units / accepted / a shipment
             # number (David Peng types the planned date into ATD: a plan, not a departure).
@@ -463,14 +477,15 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 if l['atd'] and l['atd'] <= d and (l['ship_units'] > 0 or l['accept'] or l['shipment']):
                     atd = l['atd']; break
             changes = []
-            prev = None
-            for d, l in e_seq:
-                if l['etd'] and prev and prev['etd'] and l['etd'] != prev['etd']:
-                    days = (l['etd'] - prev['etd']).days
-                    ch = {'date': d.isoformat(), 'from': prev['etd'].isoformat(), 'to': l['etd'].isoformat(), 'days': days}
+            prev_e = None
+            for d, l, e in e_obs:
+                if e and prev_e and e != prev_e:
+                    days = (e - prev_e).days
+                    ch = {'date': d.isoformat(), 'from': prev_e.isoformat(), 'to': e.isoformat(), 'days': days}
                     changes.append(ch)
                     etd_changes.append({**ch, 'ref': ref, 'style': style, 'po_name': l['po_name'] or last_l['po_name']})
-                prev = l
+                if e:
+                    prev_e = e
             placed = next((l['placed'] for _, l in seq if l.get('placed')), None) or first_d
             # ── ENTRY -> EXIT on the master ledger (David's core metric, Sep 9 2026) ──
             # entry = the first daily copy the line appears in, entry_etd = the ETD it carried
@@ -478,27 +493,30 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             # last day. shift = final - entry. 'tracked' = the entry itself was observed: the
             # previous ledger copy is close (no gap) and the tracker did not know the line
             # before the history began.
-            entry_d = entry_etd = exit_d = final_etd = None
+            entry_d = entry_etd = exit_d = final_etd = entry_etd_date = None
             shift = None
             outcome = None
             tracked = False
+            at_start = False
             entry_etd_late = False
             if m_seq:
+                m_obs = [(d, l, vetd(l, d)) for d, l in m_seq]
                 entry_d, exit_d = m_seq[0][0], m_seq[-1][0]
-                entry_etd = m_seq[0][1]['etd']
-                if not entry_etd:
-                    entry_etd = next((l['etd'] for _, l in m_seq if l['etd']), None)
-                    entry_etd_late = entry_etd is not None
-                final_etd = next((l['etd'] for _, l in reversed(m_seq) if l['etd']), None)
+                first_valid = next(((d, e) for d, _, e in m_obs if e), None)
+                if first_valid:
+                    entry_etd_date, entry_etd = first_valid
+                    entry_etd_late = entry_etd_date > entry_d      # the row was added first, the date came later
+                final_etd = next((e for _, _, e in reversed(m_obs) if e), None)
                 pm = prev_master.get(entry_d)
                 m_placed = next((l['placed'] for _, l in m_seq if l.get('placed')), None)
+                at_start = bool(hist_start) and entry_d == hist_start
                 tracked = bool(pm) and (entry_d - pm).days <= 10 and (not m_placed or not hist_start or m_placed > hist_start)
                 if exit_d == last_master:
                     outcome = 'open'
                 elif final_etd and final_etd <= exit_d + dt.timedelta(days=21):
                     outcome = 'completed'      # fell off the ledger around its ETD: shipped
                 else:
-                    outcome = 'removed'        # fell off with the ETD still out: cancelled or moved
+                    outcome = 'removed'        # fell off with the ETD still out: moved or cancelled (linked below)
                 if entry_etd and final_etd:
                     shift = max(-120, min(400, (final_etd - entry_etd).days))
             ship_units = f_last['ship_units'] if f_last else 0
@@ -533,14 +551,50 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'slip_days': slip, 'etd_changes': len(changes), 'changes': changes[-8:],
                 'status': status, 'observed': observed, 'src': 'master' if m_seq else 'factory',
                 'entry_date': _iso(entry_d), 'entry_etd': _iso(entry_etd), 'exit_date': _iso(exit_d), 'final_etd': _iso(final_etd),
-                'entry_etd_late': entry_etd_late,
-                'shift_days': shift, 'outcome': outcome, 'tracked': tracked,
+                'entry_etd_late': entry_etd_late, 'entry_etd_date': _iso(entry_etd_date),
+                'shift_days': shift, 'outcome': outcome, 'tracked': tracked, 'at_start': at_start,
+                'etd_typos': etd_typos, 'moved_to': None, 'moved_from': None,
             })
 
-        # ── style moves between production orders: consecutive copies of the SAME source ──
+        # ── styles moved to another production order (master ledger) ──
+        # A line that fell off with its ETD still out and whose style shows up under a
+        # different PO of the same factory within 21 days was MOVED, not cancelled: the
+        # promise continues on the new line, so the new line inherits the entry ETD and
+        # the old line stops counting as removed.
         moves = []
+        by_style_rows = defaultdict(list)
+        for r in line_rows:
+            if r['src'] == 'master':
+                by_style_rows[r['style']].append(r)
+        for r in sorted(line_rows, key=lambda x: x['exit_date'] or ''):
+            if r['src'] != 'master' or r['outcome'] != 'removed' or not r['exit_date']:
+                continue
+            ex = dt.date.fromisoformat(r['exit_date'])
+            cands = [o for o in by_style_rows[r['style']] if o['ref'] != r['ref'] and o['entry_date'] and not o['moved_from']
+                     and ex - dt.timedelta(days=1) <= dt.date.fromisoformat(o['entry_date']) <= ex + dt.timedelta(days=21)]
+            if not cands:
+                continue
+            new = min(cands, key=lambda o: o['entry_date'])
+            r['outcome'] = 'moved'
+            r['moved_to'] = new['ref']
+            new['moved_from'] = r['ref']
+            # inherit the original promise: entry date / entry ETD from the old line
+            if r['entry_etd'] and (r['moved_from'] is None or True):
+                new['entry_date'] = r['entry_date']
+                new['entry_etd'] = r['entry_etd']
+                new['entry_etd_date'] = r['entry_etd_date']
+                new['at_start'] = r['at_start']
+                new['tracked'] = r['tracked'] or new['tracked']
+                if new['final_etd']:
+                    new['shift_days'] = max(-120, min(400, (dt.date.fromisoformat(new['final_etd']) - dt.date.fromisoformat(r['entry_etd'])).days))
+            moves.append({'date': new['entry_date'] if not r['entry_etd'] else r['exit_date'], 'style': r['style'], 'from': r['ref'], 'to': new['ref'],
+                          'from_etd': r['final_etd'], 'to_etd': new['final_etd'] if new['outcome'] != 'open' else new['latest_etd'],
+                          'days': ((dt.date.fromisoformat(new['final_etd'] or new['latest_etd']) - dt.date.fromisoformat(r['final_etd'])).days
+                                   if (r['final_etd'] and (new['final_etd'] or new['latest_etd'])) else None),
+                          'units': new['units'], 'po_name': new['po_name'] or r['po_name']})
+        # factory-file history (before the master copies begin): consecutive copies of the factory's own file
         seen_moves = set()
-        for stream, src in ((m_dates, 'master'), (f_dates, 'factory')):
+        for stream, src in ((f_dates, 'factory'),):
             for i in range(1, len(stream)):
                 d0, d1 = stream[i - 1], stream[i]
                 prev_by_style, cur_by_style = defaultdict(set), defaultdict(set)
@@ -603,10 +657,10 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             slips = [r['slip_days'] for r in lr if r['slip_days'] is not None]
             # entry -> exit view of the PO, from the lines whose entry was observed; a PO that
             # was already on the ledger when the history began is flagged instead of dated
-            m_lines = [r for r in lr if r['entry_date']]
+            m_lines = [r for r in lr if r['entry_date'] and r['src'] == 'master' and r['outcome'] != 'moved']
             tr_all = [r for r in m_lines if r['tracked']]
-            src_lines = tr_all or m_lines
-            tr = [r for r in tr_all if r['shift_days'] is not None and r['outcome'] in ('completed', 'open')]
+            src_lines = m_lines
+            tr = [r for r in m_lines if r['shift_days'] is not None and r['outcome'] in ('completed', 'open')]
             entered = min([r['entry_date'] for r in src_lines] or [None])
             entry_etds = [r['entry_etd'] for r in src_lines if r['entry_etd']]
             final_etds = [r['final_etd'] for r in src_lines if r['final_etd']]
@@ -619,7 +673,8 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
                 'shift_days': round(sum(r['shift_days'] for r in tr) / len(tr), 1) if tr else None,
                 'shift_lines': len(tr), 'lines_open': n_open_l, 'lines_completed': n_comp_l, 'lines_removed': n_rem_l,
                 'ledger_status': 'open' if n_open_l else ('off' if (n_comp_l or n_rem_l) else 'none'),
-                'tracked': bool(tr_all), 'on_ledger_at_start': bool(m_lines) and not tr_all,
+                'tracked': bool(m_lines), 'on_ledger_at_start': bool(m_lines) and all(r['at_start'] for r in m_lines),
+                'lines_moved': sum(1 for r in lr if r['outcome'] == 'moved'),
                 'last_exit': max([r['exit_date'] for r in lr if r['exit_date']] or [None]),
                 'ref': ref, 'po_name': (p_last or {}).get('po_name') or (lr[0]['po_name'] if lr else ''),
                 'brand': (p_last or {}).get('brand') or (lr[0]['brand'] if lr else ''),
@@ -693,14 +748,23 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             }
         # ── entry -> exit shift (the headline): tracked master-ledger lines only ──
         def shift_stats(rows):
-            comp = [r for r in rows if r['tracked'] and r['outcome'] == 'completed' and r['shift_days'] is not None]
-            opn = [r for r in rows if r['tracked'] and r['outcome'] == 'open' and r['shift_days'] is not None]
-            rem = [r for r in rows if r['tracked'] and r['outcome'] == 'removed']
+            # every master line with a believable entry ETD counts; lines that were already on
+            # the ledger when the history began are included and counted (at_start_n) so the
+            # reader knows their entry ETD is "the first one we saw", not the very first promise
+            comp = [r for r in rows if r['outcome'] == 'completed' and r['shift_days'] is not None and r['src'] == 'master']
+            opn = [r for r in rows if r['outcome'] == 'open' and r['shift_days'] is not None and r['src'] == 'master']
+            rem = [r for r in rows if r['outcome'] == 'removed' and r['src'] == 'master']
+            mv = [r for r in rows if r['outcome'] == 'moved' and r['src'] == 'master']
             n = len(comp)
             later_n = sum(1 for r in comp if r['shift_days'] > 0)
             return {
+                'moved': {'n': len(mv), 'units': sum(r['units'] for r in mv)},
                 'completed': {
                     'n': n, 'units': sum(r['units'] for r in comp),
+                    'at_start_n': sum(1 for r in comp if r['at_start']),
+                    'tracked_n': sum(1 for r in comp if r['tracked']),
+                    'tracked_avg': (round(sum(r['shift_days'] for r in comp if r['tracked']) / max(1, sum(1 for r in comp if r['tracked'])), 1)
+                                    if any(r['tracked'] for r in comp) else None),
                     'avg': round(sum(r['shift_days'] for r in comp) / n, 1) if n else None,
                     'median': median([r['shift_days'] for r in comp]),
                     'later_pct': round(100.0 * later_n / n, 1) if n else None,
@@ -719,10 +783,10 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
         cutoff = (today - dt.timedelta(days=recent_days)).isoformat()
         shift_all = shift_stats(line_rows)
         shift_recent = shift_stats([r for r in line_rows if r['outcome'] == 'open' or (r['exit_date'] and r['exit_date'] >= cutoff)])
-        untracked_n = sum(1 for r in line_rows if r['src'] == 'master' and not r['tracked'])
+        at_start_n = sum(1 for r in line_rows if r['src'] == 'master' and r['at_start'])
         by_entry = defaultdict(lambda: {'entered': 0, 'units': 0, 'completed': 0, 'shifts': [], 'later': 0, 'open': 0, 'removed': 0})
         for r in line_rows:
-            if not (r['tracked'] and r['entry_date']):
+            if not (r['entry_date'] and r['src'] == 'master') or r['outcome'] == 'moved':
                 continue
             b = by_entry[r['entry_date'][:7]]
             b['entered'] += 1; b['units'] += r['units']
@@ -748,7 +812,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             'lines': len(line_rows), 'pos': len(pos),
             'late_open_pos': sum(1 for p in pos if p['status'] == 'late'),
             'current': current,
-            'shift': shift_all, 'shift_recent': shift_recent, 'untracked_lines': untracked_n,
+            'shift': shift_all, 'shift_recent': shift_recent, 'at_start_lines': at_start_n,
             'history_start': hist_start.isoformat() if hist_start else None,
             'all': kpis_for(line_rows, etd_changes, moves, 'all'),
             'recent': kpis_for(recent_rows, recent_changes, recent_moves, f'{recent_days}d'),
