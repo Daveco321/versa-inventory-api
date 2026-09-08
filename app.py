@@ -8233,6 +8233,7 @@ _AUTHZ_OPEN_EXACT = {'/', '/health', '/favicon.ico',
                      # trigger) is NOT covered and stays staff-only
                      '/dropbox-photos', '/sportswear-photos'}
 _AUTHZ_OPEN_PREFIXES = ('/image/', '/mcp', '/factory-view', '/factory-report',
+                        '/factory-scorecard',   # inline auth: Versa-Docs admin or machine key (factory_scorecard.py)
                         '/sportswear-match/', '/catalog/')
 # GET endpoints a customer catalog page needs. Anonymous access requires a valid
 # catalog_slug and the response is scoped; staff/machine/oo tiers get them full.
@@ -12799,7 +12800,7 @@ def _caller_identity(token):
             return None
         p = http_requests.get(
             f'{VERSA_DOCS_SUPABASE_URL}/rest/v1/profiles'
-            f'?select=role,factory_prefix&id=eq.{uid}',
+            f'?select=role,factory_prefix,is_admin&id=eq.{uid}',
             headers=hdr, timeout=10)
         if p.status_code != 200:
             return None
@@ -12807,7 +12808,9 @@ def _caller_identity(token):
         if not rows:
             return None
         prof = {'role': (rows[0].get('role') or '').strip().lower(),
-                'factory_prefix': (rows[0].get('factory_prefix') or '').strip().upper()}
+                'factory_prefix': (rows[0].get('factory_prefix') or '').strip().upper(),
+                # Versa-Docs admin flag (profiles.is_admin) — the factory scorecard is admin-only
+                'is_admin': rows[0].get('is_admin') is True}
         with _identity_lock:
             _identity_cache[token] = (now + _IDENTITY_TTL, prof)
             if len(_identity_cache) > 500:      # bound the cache
@@ -15210,6 +15213,16 @@ def mcp_endpoint(token=None):
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
 register_swatch_routes(app, get_s3, S3_BUCKET)
+
+# Factory scorecard (Versa-Docs admin page): /factory-scorecard[/lines|/status|/rebuild]
+# Inline auth (Versa-Docs admin session or the machine key); the prefix is in
+# _AUTHZ_OPEN_PREFIXES so the global gate steps aside. Daily rebuild thread inside.
+from factory_scorecard import register_scorecard_routes
+register_scorecard_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
+                          get_dropbox_token=get_dropbox_token,
+                          caller_identity=_caller_identity,
+                          machine_key=INVENTORY_API_KEY,
+                          load_master=load_production_from_dropbox)
 
 
 if __name__ == '__main__':
