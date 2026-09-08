@@ -703,7 +703,7 @@ def build_scorecard(snapshots, today=None, recent_days=SC_RECENT_DAYS):
             final_etds = [r['final_etd'] for r in src_lines if r['final_etd']]
             n_open_l = sum(1 for r in lr if r['outcome'] == 'open')
             n_comp_l = sum(1 for r in lr if r['outcome'] == 'completed')
-            n_rem_l = sum(1 for r in lr if r['outcome'] == 'removed')
+            n_rem_l = sum(1 for r in lr if r['outcome'] in ('removed', 'reissued', 'moved'))   # off the ledger either way
             pos.append({
                 'entered': entered, 'entry_etd': min(entry_etds) if entry_etds else None,
                 'final_etd': max(final_etds) if final_etds else None,
