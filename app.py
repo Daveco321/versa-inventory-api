@@ -8316,7 +8316,10 @@ def _request_identity():
                 if prof:
                     role = (prof.get('role') or '').lower()
                     ident = {'tier': 'staff' if role == 'staff' else 'factory',
-                             'prefix': prof.get('factory_prefix') or ''}
+                             'prefix': prof.get('factory_prefix') or '',
+                             # Versa-Docs profiles.is_admin: the platform chat only
+                             # gets the Past Orders tools for admins (Sep 9 2026)
+                             'is_admin': prof.get('is_admin') is True}
             elif token and token.count('.') == 1:
                 # open-orders HMAC token shape (b64payload.signature)
                 if _oo_token_valid(token):
@@ -15004,6 +15007,11 @@ _AI_AGENT_TOOLS = [
          'required': ['tabs']}},
 ]
 
+# Tools that read the Past Orders / sales-history data. The platform chat
+# (/api/ai-agent) hands them only to Versa-Docs admins; the MCP connector keeps
+# them for every caller of its own token (David, Sep 9 2026).
+_AI_AGENT_ADMIN_TOOLS = {'past_orders_lookup', 'sales_history_lookup', 'build_sales_sheet'}
+
 _AI_AGENT_TOOL_FNS = {
     'query_inventory': _ai_tool_query_inventory,
     'style_detail': _ai_tool_style_detail,
@@ -15048,6 +15056,15 @@ def api_ai_agent():
         convo.pop(0)
     if not convo:
         return jsonify({'error': 'messages required'}), 400
+    # Past Orders data is ADMIN ONLY (David, Sep 9 2026). The history tools call
+    # the open-orders service with the machine key, which that service trusts,
+    # so the platform chat must do the admin check itself: only a signed-in
+    # Versa-Docs profile with is_admin gets those tools. The MCP connector
+    # (/mcp/<token>, its own credential) keeps the full table.
+    _ident = _request_identity() or {}
+    admin_ok = _ident.get('tier') == 'staff' and _ident.get('is_admin') is True
+    agent_tools = _AI_AGENT_TOOLS if admin_ok else [t for t in _AI_AGENT_TOOLS
+                                                    if t['name'] not in _AI_AGENT_ADMIN_TOOLS]
     model = body.get('model') or AI_AGENT_MODEL
     max_tokens = min(int(body.get('max_tokens') or 8192), 16000)
     system_static = str(body.get('system_static') or '')
@@ -15074,7 +15091,7 @@ def api_ai_agent():
                 kwargs['tool_choice'] = {'type': 'none'}
             resp = client.with_options(timeout=90.0).messages.create(
                 model=model, max_tokens=max_tokens, system=system, messages=convo,
-                tools=_AI_AGENT_TOOLS, output_config={'effort': AI_AGENT_EFFORT}, **kwargs)
+                tools=agent_tools, output_config={'effort': AI_AGENT_EFFORT}, **kwargs)
             u = getattr(resp, 'usage', None)
             if u:
                 for k in usage_tot:
@@ -15097,6 +15114,8 @@ def api_ai_agent():
                 try:
                     if fn is None:
                         raise ValueError(f'unknown tool {tu.name}')
+                    if tu.name in _AI_AGENT_ADMIN_TOOLS and not admin_ok:
+                        raise PermissionError('Past Orders and sales history are available to admins only')
                     out = fn(tu.input or {})
                     content = json.dumps(out, default=str)
                     if len(content) > 60000:
