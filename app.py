@@ -2384,7 +2384,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         if is_order:
             headers.append('Qty Selected')
         if not incoming_only:
-            headers.extend(['JTW', 'TR', 'DCW', 'QA', 'NJ'])
+            headers.extend(['JTW', 'TR', 'DCW', 'QA', 'NJ', 'ABFI'])   # admin layout only: NJ/ABFI never reach customer exports
         headers.append('Incoming')
         if not incoming_only:
             headers.append('Total Warehouse')
@@ -2414,7 +2414,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
         'Production #': 16, 'PO Name': 30, 'PO Ref #': 22, 'Factory': 14,
-        'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'NJ': 12, 'Incoming': 12,
+        'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'NJ': 12, 'ABFI': 12, 'Incoming': 12,
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
         'Warehouse': 18,
