@@ -2264,7 +2264,7 @@ FACTORY_NAMES = {
 }
 
 
-# TJX "Landing in" prints only real landing warehouses plus the two ledger
+# "Landing in" prints only real landing warehouses plus the two ledger
 # location codes that name no customer: FOB (ships straight from the factory)
 # and CAN (lands in Canada). Anything else typed in column I, e.g. WALM, which
 # names another customer, prints blank; hidden landings never print (Sep 10 2026).
@@ -2303,8 +2303,10 @@ def _landing_index():
 
 
 def _landing_in_label(item, idx, catalog_mode=True):
-    """TJX layout "Landing in" column (David, Sep 10 2026): where the goods land,
-    straight from the style ledger (column I).
+    """"Landing in" column on every Overseas and All Inventory export, customer
+    and admin, plus the Overseas Summary (David, Sep 10 2026; TJX catalogs first,
+    then everywhere the same day): where the goods land, straight from the style
+    ledger (column I). Admin sheets (catalog_mode False) print every code.
     - A row that names a delivery (PO Ref # / Production #: per-PO rows, cart
       rows, All Inventory rows with overseas stock, which the page stamps with
       their nearest production) shows THAT delivery's landing, matched on
@@ -2347,6 +2349,10 @@ def _landing_in_label(item, idx, catalog_mode=True):
         hit = [wh for a, wh in lots if arr and a == arr]
         if hit:
             return _join(hit)
+    # An order line picked from warehouse stock (Delivery 'ATS', no delivery named)
+    # ships from the warehouse, so nothing lands: blank, like any warehouse-only row.
+    if not ref and 'quantity_ordered' in item and str(item.get('delivery') or '').strip().upper() == 'ATS':
+        return ''
     try:
         inc = int(float(item.get('incoming') or 0))
     except Exception:
@@ -2497,10 +2503,17 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         _anchor = 'Overseas ATS' if 'Overseas ATS' in headers else ('Total ATS' if 'Total ATS' in headers else None)
         if _anchor:
             headers.insert(headers.index(_anchor), 'Source')
-        # "Landing in" (David, Sep 10 2026): the landing warehouse from the style
-        # ledger, right after the arrival date, on overseas AND all-inventory tabs.
-        if 'Arrival to Warehouse' in headers:
-            headers.insert(headers.index('Arrival to Warehouse') + 1, 'Landing in')
+
+    # "Landing in" (David, Sep 10 2026): the warehouse the goods land in, from the
+    # style ledger (column I). Every Overseas and All Inventory export gets it,
+    # customer and admin: staff Customer View, every catalog link (TJX layout or
+    # not) and the admin exports. It sits right after the arrival date; the admin
+    # All Inventory layout has no date column, so there it follows Incoming.
+    # Warehouse tabs and caller-defined column sets (ship plans) are untouched.
+    if headers_override is None and 'Landing in' not in headers and view_mode in ('incoming', 'all'):
+        _anchor_col = next((h for h in ('Arrival to Warehouse', 'Arrival', 'Incoming') if h in headers), None)
+        if _anchor_col:
+            headers.insert(headers.index(_anchor_col) + 1, 'Landing in')
 
     worksheet.set_row(0, 25)
     for c, h in enumerate(headers):
@@ -2540,7 +2553,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     """Write data rows using headers list to determine column layout."""
     if not headers:
         headers = []
-    # TJX layout "Landing in": ledger lookup index, built once per sheet
+    # "Landing in" (every Overseas / All Inventory export): ledger lookup index, built once per sheet
     _landing_idx = _landing_index() if 'Landing in' in headers else None
 
     # Map header names to data field getters
@@ -4363,7 +4376,9 @@ def export_overseas_summary():
         if not data:
             return jsonify({"error": "Empty data"}), 400
 
-        xl_bytes = build_overseas_summary_excel(fname, data, s3_url)
+        # A catalog-scoped or customer-format request gets customer rules on Landing in
+        _cust = getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))
+        xl_bytes = build_overseas_summary_excel(fname, data, s3_url, catalog_mode=_cust)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -4373,7 +4388,7 @@ def export_overseas_summary():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
-def build_overseas_summary_excel(title, items, s3_base_url):
+def build_overseas_summary_excel(title, items, s3_base_url, catalog_mode=False):
     """Build a formatted overseas summary Excel with images, date banners, brand separators."""
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
@@ -4418,9 +4433,11 @@ def build_overseas_summary_excel(title, items, s3_base_url):
 
     # ── Headers ──
     headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
-               'Production', 'Factory', 'PO', 'Ex-Factory', 'Arrival',
+               'Production', 'Factory', 'PO', 'Ex-Factory', 'Arrival', 'Landing in',
                'Produced', 'Deducted', 'Flow ATS']
-    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 14, 22, 14, 14, 12, 12, 12]
+    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 14, 22, 14, 14, 14, 12, 12, 12]
+    # "Landing in" (Sep 10 2026): each production's landing warehouse from the ledger
+    _landing_idx = _landing_index()
 
     ws.hide_gridlines(2)
     ws.freeze_panes(1, 0)
@@ -4498,10 +4515,13 @@ def build_overseas_summary_excel(title, items, s3_base_url):
         ws.write(row, 8, item.get('po', ''), cf)
         ws.write(row, 9, item.get('ex_factory', ''), cf)
         ws.write(row, 10, item.get('arrival', ''), cf)
-        ws.write(row, 11, item.get('produced', 0), nf)
+        ws.write(row, 11, _landing_in_label({'sku': item.get('sku'), 'production': item.get('production'),
+                                             'arrival': item.get('arrival'), 'incoming': item.get('produced') or 0},
+                                            _landing_idx, catalog_mode), cf)
+        ws.write(row, 12, item.get('produced', 0), nf)
         deducted = item.get('deducted', 0)
-        ws.write(row, 12, deducted, deducted_fmt if deducted else nf)
-        ws.write(row, 13, item.get('flow_ats', 0), ats_fmt)
+        ws.write(row, 13, deducted, deducted_fmt if deducted else nf)
+        ws.write(row, 14, item.get('flow_ats', 0), ats_fmt)
 
         row += 1
         data_row_idx += 1
