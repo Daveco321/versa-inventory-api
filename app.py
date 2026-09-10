@@ -6552,6 +6552,81 @@ def save_banner_rules_route():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Banner rule upsert (Sep 10 2026, David: add "DKNY - Knit" as a New Fabric) ─
+# POST /banner-rules replaces the WHOLE list and needs a staff session. This
+# maintenance route adds or replaces ONE rule by id on the server, after a full
+# backup of the current list, so nothing else in the list can change. The
+# machine key may call it. Body: {"rule": {...}} (add "dry_run": true to preview).
+_BANNER_RULE_KEYS = {'id', 'text', 'brands', 'fabrics', 'category', 'customers', 'fits',
+                     'skus', 'alsoSkus', 'bgColor', 'textColor', 'position', 'visibility'}
+_BANNER_RULE_LISTS = ('brands', 'fabrics', 'customers', 'fits', 'skus', 'alsoSkus')
+
+
+def _banner_rule_problem(rule):
+    """None when the rule is well formed, else a short reason."""
+    if not isinstance(rule, dict):
+        return 'rule must be an object'
+    if not str(rule.get('id') or '').strip() or not str(rule.get('text') or '').strip():
+        return 'rule needs an id and a text'
+    unknown = sorted(set(rule) - _BANNER_RULE_KEYS)
+    if unknown:
+        return 'unknown rule fields: ' + ', '.join(unknown)
+    for f in _BANNER_RULE_LISTS:
+        if f in rule and not isinstance(rule[f], list):
+            return f + ' must be a list'
+    return None
+
+
+def _banner_upsert_list(current, rule):
+    """(new list, 'added' | 'replaced'). Every other rule is kept as-is, in order."""
+    rid = str(rule['id']).strip()
+    out = list(current)
+    for i, r in enumerate(out):
+        if isinstance(r, dict) and str(r.get('id')) == rid:
+            out[i] = rule
+            return out, 'replaced'
+    out.append(rule)
+    return out, 'added'
+
+
+@app.route('/admin/banner-rules/upsert', methods=['POST', 'OPTIONS'])
+def admin_banner_rule_upsert():
+    if request.method == 'OPTIONS':
+        return '', 204
+    global _banner_rules
+    body = request.get_json(silent=True) or {}
+    rule = body.get('rule')
+    problem = _banner_rule_problem(rule)
+    if problem:
+        return jsonify({'error': problem}), 400
+    try:
+        s3 = get_s3()
+        raw = s3.get_object(Bucket=S3_BUCKET, Key=S3_BANNER_RULES_KEY)['Body'].read()
+        current = json.loads(raw.decode('utf-8'))
+        if not isinstance(current, list):
+            return jsonify({'error': 'banner rules file is not a list - nothing changed'}), 500
+        updated, action = _banner_upsert_list(current, rule)
+        if body.get('dry_run'):
+            return jsonify({'ok': True, 'dry_run': True, 'action': action,
+                            'count_before': len(current), 'count_after': len(updated)})
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        backup_key = f"inventory/banner_rules_backups/banner_rules_{ts}.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=backup_key, Body=raw, ContentType='application/json')
+        with _banner_rules_lock:
+            _banner_rules = updated
+        if not save_banner_rules_to_s3():
+            return jsonify({'error': 'saving banner rules failed - canonical file unchanged',
+                            'backup': backup_key}), 500
+        print(f"  OK banner rule {action}: {rule.get('id')} ({rule.get('text')}), "
+              f"{len(current)} -> {len(updated)} rules, backup {backup_key}", flush=True)
+        return jsonify({'ok': True, 'action': action, 'count_before': len(current),
+                        'count': len(updated), 'backup': backup_key})
+    except ClientError as e:
+        return jsonify({'error': 'could not read banner rules: ' + str(e)[:200]}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)[:300]}), 500
+
+
 @app.route('/manual-allocations', methods=['GET', 'OPTIONS'])
 def get_manual_allocations():
     if request.method == 'OPTIONS':
@@ -9063,7 +9138,10 @@ def authz_gate():
                 return None
             # POST /admin/override-images/move = the override photo maintenance
             # job (plan / upload / status / strip), Sep 10 2026.
-            if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move'):
+            # POST /admin/banner-rules/upsert = add or replace ONE banner rule
+            # with a server-side backup (Sep 10 2026).
+            if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
+                                             '/admin/banner-rules/upsert'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
