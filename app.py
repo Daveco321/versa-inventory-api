@@ -2271,6 +2271,60 @@ FACTORY_NAMES = {
 _LANDING_IN_SHOWN = frozenset((set(_LEDGER_WH_MAP.values()) - _HIDDEN_LANDING_WH) | {'FOB', 'CAN'})
 
 
+# Style ledger access for the customer-safety filters and the Landing in column
+# (Sep 10 2026). A cold worker (just deployed or woken from sleep) starts with an
+# empty ledger and fills it in the background startup sync, but /inventory can
+# answer a catalog before that finishes. So an empty ledger is loaded right here,
+# with the same call GET /production makes (it returns the cache when fresh). A
+# failed load is not retried for 60 seconds, so a Dropbox outage cannot stall
+# every request; the callers on customer paths fail closed meanwhile.
+_ledger_retry_after = 0.0
+
+
+def _ledger_rows():
+    global _ledger_retry_after
+    with _production_lock:
+        rows = list(_production_data)
+    if rows or time.time() < _ledger_retry_after:
+        return rows
+    try:
+        rows = list(load_production_from_dropbox() or [])
+    except Exception as e:
+        print(f"  [ledger] style ledger load failed: {e}")
+        rows = []
+    if not rows:
+        _ledger_retry_after = time.time() + 60
+    return rows
+
+
+# Fail-closed stand-ins, used ONLY by the customer-path helpers below when the
+# ledger cannot be loaded at all: every style counts as hidden-landing supply and
+# every production number as a hidden one (NJ/AE/AW/ABFI never reach a customer).
+_ALL_HIDDEN_UNITS = 10 ** 12
+
+
+class _AllStylesHidden(dict):
+    def get(self, key, default=None):
+        return _ALL_HIDDEN_UNITS
+
+    def __getitem__(self, key):
+        return _ALL_HIDDEN_UNITS
+
+    def __contains__(self, key):
+        return True
+
+    def __bool__(self):
+        return True
+
+
+class _AllProductionsHidden(frozenset):
+    def __contains__(self, key):
+        return bool(key)
+
+    def __bool__(self):
+        return True
+
+
 def _landing_index():
     """Landing warehouses from the in-memory style ledger (column I, normalized),
     built once per export sheet:
@@ -2283,17 +2337,7 @@ def _landing_index():
     warehouses (DP26014 on TJDKPK022SLS: a JTW lot and a TR lot), so a ref is
     never looked up on its own. Arrival text follows the page's rule and format
     (ledger arrival, else ETD + 45 / 55 for pants; e.g. 'Sep 24, 2026')."""
-    with _production_lock:
-        rows = list(_production_data)
-    if not rows:
-        # Cold worker (just deployed or woken from sleep): the startup sync may not
-        # have loaded the ledger yet, and every landing would print blank. Load it
-        # now with the same call GET /production makes (cached once loaded).
-        try:
-            rows = list(load_production_from_dropbox() or [])
-        except Exception as e:
-            print(f"  [landing-in] style ledger load failed: {e}")
-            rows = []
+    rows = _ledger_rows()   # loads the ledger on a cold worker
     by_ref, by_style = {}, {}
     by_ref_b, by_style_b = {}, {}
     for p in rows:
@@ -8726,7 +8770,7 @@ def _catalog_scope_for_slug(slug):
         po_filter.update(p.strip().upper() for p in str(q.get(key) or '').split(',') if p.strip())
     if po_filter:
         try:
-            for row in (_production_data or []):
+            for row in _ledger_rows():   # loads the ledger on a cold worker
                 if (str(row.get('production') or '').strip().upper() in po_filter or
                         str(row.get('poName') or '').strip().upper() in po_filter):
                     st = str(row.get('style') or '').strip().upper()
@@ -8977,9 +9021,12 @@ def _flt_suppression(data, scope):
 
 def _hidden_landing_maps():
     """({style: hidden units}, {style: True if any VISIBLE production}) from the
-    in-memory ledger. Ledger styles match inventory SKUs exactly (1:1)."""
-    with _production_lock:
-        rows = list(_production_data)
+    style ledger. Ledger styles match inventory SKUs exactly (1:1). Customer paths
+    only. When the ledger cannot be loaded at all this FAILS CLOSED: every style
+    counts as hidden-landing supply, so customers see warehouse stock only."""
+    rows = _ledger_rows()
+    if not rows:
+        return _AllStylesHidden(), {}
     hidden, visible = {}, {}
     for p in rows:
         st = str(p.get('style') or '').upper()
@@ -9031,17 +9078,21 @@ def _strip_hidden_landing_rows(rows):
     return out
 
 def _hidden_prod_numbers():
-    with _production_lock:
-        return {str(p.get('production') or '').strip().upper() for p in _production_data
-                if p.get('production') and str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH}
+    """Production numbers that land in a hidden warehouse (NJ/AE/AW/ABFI). Customer
+    paths only. When the ledger cannot be loaded no production can be verified, so
+    every one counts as hidden (fail closed)."""
+    rows = _ledger_rows()
+    if not rows:
+        return _AllProductionsHidden()
+    return {str(p.get('production') or '').strip().upper() for p in rows
+            if p.get('production') and str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH}
 
 def _next_visible_prod_by_style():
     """{style: {'ref', 'etd_str', 'arrival_str'}} for the earliest-arriving VISIBLE
     (non NJ/AE/AW-landing) production per style. Used to re-point customer style
     rows whose client-chosen "nearest" production is hidden. Date text matches the
     frontend's formatDateShort ('Oct 15, 2026')."""
-    with _production_lock:
-        rows = list(_production_data)
+    rows = _ledger_rows()
     best = {}
     for p in rows:
         st = str(p.get('style') or '').upper()
@@ -9118,6 +9169,10 @@ def _customer_export_scrub(rows, view_mode, nj_stripped, abfi_stripped=None):
                           lookup_abfi=authed_customer_view and not bool(abfi_stripped))
     rows = _strip_hidden_prod_export_rows(rows, style_rows=(vm == 'all'))
     if vm == 'all':
+        rows = _strip_hidden_landing_rows(rows)
+    elif vm == 'incoming' and not _ledger_rows():
+        # Ledger unavailable: hidden-landing units cannot be told apart from
+        # visible ones, so an overseas sheet fails closed too (Sep 10 2026).
         rows = _strip_hidden_landing_rows(rows)
     return rows
 
