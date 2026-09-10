@@ -2264,6 +2264,62 @@ FACTORY_NAMES = {
 }
 
 
+def _landing_index():
+    """({production ref: landing warehouse}, {style: [(sort key, warehouse)]}) from
+    the in-memory style ledger (column I, normalized). Built once per export."""
+    with _production_lock:
+        rows = list(_production_data)
+    by_ref, by_style = {}, {}
+    for p in rows:
+        ref = str(p.get('production') or '').strip().upper()
+        st = str(p.get('style') or '').strip().upper()
+        wh = str(p.get('warehouse') or '').strip().upper()
+        if not wh:
+            continue
+        if ref and ref not in by_ref:
+            by_ref[ref] = wh
+        try:
+            units = int(p.get('units') or 0)
+        except Exception:
+            units = 0
+        if st and units > 0:
+            ad = _apo_prod_arrival(p, _py_is_bottom(st))
+            by_style.setdefault(st, []).append(((ad is None, ad or datetime.max.date()), wh))
+    return by_ref, by_style
+
+
+def _landing_in_label(item, idx, catalog_mode=True):
+    """TJX layout "Landing in" column (David, Sep 10 2026): the warehouse the
+    goods land in, straight from the style ledger (column I). A per-delivery
+    row (PO Ref # / Production #) shows its own production's landing; a style
+    row with overseas supply lists every landing warehouse of the style's open
+    productions, soonest arrival first. Customer exports never name a hidden
+    landing (NJ/AE/AW/ABFI). Always computed here from the live ledger; a
+    posted landing value is never trusted."""
+    if not idx:
+        return ''
+    by_ref, by_style = idx
+    hidden = _HIDDEN_LANDING_WH if catalog_mode else set()
+    ref = str(item.get('production') or item.get('po_ref') or '').strip().upper()
+    if ref and ref in by_ref:
+        wh = by_ref[ref]
+        return '' if wh in hidden else wh
+    try:
+        inc = int(float(item.get('incoming') or 0))
+    except Exception:
+        inc = 0
+    if not (ref or inc > 0 or item.get('_flow')):
+        return ''
+    st = str(item.get('sku') or '').strip().upper()
+    lots = by_style.get(st) or by_style.get(st.split('-')[0]) or []
+    out = []
+    for _k, wh in sorted(lots, key=lambda x: x[0]):
+        if wh in hidden or wh in out:
+            continue
+        out.append(wh)
+    return ', '.join(out)
+
+
 def _factory_label(production_ref, full_name=False):
     """Derive the factory from a production reference number.
 
@@ -2404,6 +2460,10 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         _anchor = 'Overseas ATS' if 'Overseas ATS' in headers else ('Total ATS' if 'Total ATS' in headers else None)
         if _anchor:
             headers.insert(headers.index(_anchor), 'Source')
+        # "Landing in" (David, Sep 10 2026): the landing warehouse from the style
+        # ledger, right after the arrival date, on overseas AND all-inventory tabs.
+        if 'Arrival to Warehouse' in headers:
+            headers.insert(headers.index('Arrival to Warehouse') + 1, 'Landing in')
 
     worksheet.set_row(0, 25)
     for c, h in enumerate(headers):
@@ -2429,7 +2489,7 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         # Allocation Dollar Value Estimated report
         'Est. Price': 12, 'Est. Value': 14,
         # TJX layout columns
-        'Color Family': 14, 'New Fabric': 12, 'Source': 16, 'Arrival to Warehouse': 16,
+        'Color Family': 14, 'New Fabric': 12, 'Source': 16, 'Arrival to Warehouse': 16, 'Landing in': 14,
     }
     for c, h in enumerate(headers):
         worksheet.set_column(c, c, col_widths.get(h, 12))
@@ -2443,6 +2503,8 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     """Write data rows using headers list to determine column layout."""
     if not headers:
         headers = []
+    # TJX layout "Landing in": ledger lookup index, built once per sheet
+    _landing_idx = _landing_index() if 'Landing in' in headers else None
 
     # Map header names to data field getters
     FIELD_MAP = {
@@ -2498,6 +2560,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'New Fabric': lambda item: item.get('tjx_new_fabric', ''),
         'Source': lambda item: item.get('tjx_source', ''),
         'Arrival to Warehouse': lambda item: item.get('arrival', ''),
+        'Landing in': lambda item: _landing_in_label(item, _landing_idx, catalog_mode),
     }
 
     # Determine which columns are numeric for formatting
