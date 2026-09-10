@@ -15950,6 +15950,23 @@ def _pres_customer_short(typed, label):
     return label[i:j]
 
 
+_PRES_VIEW_WORDS = {'warehouse': ['Warehouse ATS', 'Warehouse', 'in stock', 'ATS'],
+                    'overseas': ['Overseas ATS', 'Overseas', 'incoming', 'ATS'],
+                    'all': ['Warehouse + Overseas ATS', 'Warehouse', 'Overseas', 'ATS']}
+
+
+def _pres_title_core(title, drop=()):
+    """The subject part of a caller's title ('Big & Tall'): HTML entities decoded and the
+    words the deck adds itself (customer, view, 'on order', 'presentation') taken out, so
+    'Ross - Big &amp; Tall On Order' never turns into 'Ross Ross - Big &amp Tall On Order On Order'."""
+    from html import unescape
+    t = unescape(unescape(str(title or ''))).strip()
+    for d in sorted({str(x).strip() for x in list(drop) + ['on order', 'presentation', 'deck'] if str(x or '').strip()},
+                    key=len, reverse=True):
+        t = re.sub(r'(?i)(?<![A-Za-z0-9])' + re.escape(d) + r'(?![A-Za-z0-9])', ' ', t)
+    return re.sub(r'\s{2,}', ' ', re.sub(r'^[\s\-·:,|/]+|[\s\-·:,|/]+$', '', t)).strip()
+
+
 def _pres_parallel(fn, items, size=12):
     """Map fn over items concurrently (gevent pool when the worker is patched)."""
     items = list(items)
@@ -16650,22 +16667,25 @@ def _ai_tool_build_presentation(params):
         groups[-1]['cards'].append(cd)
     now = _pres_now_et()
     date_label = _apo_fmt_date(now)
-    title = str(params.get('title') or '').strip() or _PRES_CATEGORY_TITLES.get(cat or '', '')
+    cat_title = _PRES_CATEGORY_TITLES.get(cat or '', '')
     custs = res.get('customers') or {}
     cust_label = ''
     if src == 'open_orders':
         ranked = sorted(custs, key=custs.get, reverse=True)
         cust_label = ' + '.join(ranked) if ranked else str(params.get('customer') or '').strip()
+        short = _pres_customer_short(params.get('customer'), cust_label)
+        title = _pres_title_core(params.get('title'), ranked + [short, str(params.get('customer') or '')]) or cat_title
         headline = ' · '.join(x for x in ('Versa Group', cust_label,
                                           (title + ' on order') if title else 'On order') if x)
-        stem = (f"{_pres_customer_short(params.get('customer'), cust_label)} "
-                f"{title + ' ' if title else ''}On Order Presentation")
+        stem = f"{short} {title + ' ' if title else ''}On Order Presentation"
     else:
         view = _PRES_VIEW_LABELS[src]
+        title = _pres_title_core(params.get('title'), _PRES_VIEW_WORDS[src]) or cat_title
         headline = ' · '.join(x for x in ('Versa Group', title, view,
                                           '' if customer_view else 'Internal view') if x)
         stem = f"{title + ' ' if title else ''}{view} Presentation"
-    fname = str(params.get('filename') or '').strip() or stem
+    from html import unescape
+    fname = unescape(unescape(str(params.get('filename') or ''))).strip() or stem
     if fname.lower().endswith('.pdf'):
         fname = fname[:-4]
     fname = re.sub(r'\s{2,}', ' ', re.sub(r'[^A-Za-z0-9 &_.()-]+', '', fname)).strip() or 'Presentation'
@@ -16853,7 +16873,10 @@ _AI_AGENT_TOOLS = [
          'customer_view': {'type': 'boolean'},
          'cards_per_page': {'type': 'integer', 'enum': [4, 6, 8, 10]},
          'show_cost': {'type': 'boolean'},
-         'title': {'type': 'string'}, 'filename': {'type': 'string'}},
+         'title': {'type': 'string', 'description': ("Optional short plain-text subject such as 'Big & Tall'. "
+                                                     "The customer, the view and the word Presentation are added "
+                                                     "automatically, so leave them out. No HTML.")},
+         'filename': {'type': 'string', 'description': 'Optional. Leave empty to get the standard name.'}},
          'required': ['source']}},
 ]
 
