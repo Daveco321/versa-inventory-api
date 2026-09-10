@@ -2290,8 +2290,9 @@ def _landing_index():
             continue
         ad = _apo_prod_arrival(p, _py_is_bottom(st))
         ref = str(p.get('production') or '').strip().upper()
-        if ref:
-            by_ref.setdefault((ref, st), []).append((_apo_fmt_date(ad) if ad else '', wh))
+        # Lots with no production number are indexed under ref '' so a delivery row
+        # that has no PO Ref # can still be pinned to its own lot by style + arrival.
+        by_ref.setdefault((ref, st), []).append((_apo_fmt_date(ad) if ad else '', wh))
         try:
             units = int(p.get('units') or 0)
         except Exception:
@@ -2339,6 +2340,13 @@ def _landing_in_label(item, idx, catalog_mode=True):
             arr = str(item.get('arrival') or '').strip()
             hit = [wh for a, wh in lots if arr and a == arr]
             return _join(hit or [wh for _a, wh in lots])
+    else:
+        # delivery row from a ledger lot that has no production number
+        arr = str(item.get('arrival') or '').strip()
+        lots = by_ref.get(('', st)) or by_ref.get(('', base)) or []
+        hit = [wh for a, wh in lots if arr and a == arr]
+        if hit:
+            return _join(hit)
     try:
         inc = int(float(item.get('incoming') or 0))
     except Exception:
