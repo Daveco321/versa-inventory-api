@@ -2279,6 +2279,9 @@ _LANDING_IN_SHOWN = frozenset((set(_LEDGER_WH_MAP.values()) - _HIDDEN_LANDING_WH
 # failed load is not retried for 60 seconds, so a Dropbox outage cannot stall
 # every request; the callers on customer paths fail closed meanwhile.
 _ledger_retry_after = 0.0
+# One ledger download at a time, shared with the startup sync: a request that finds
+# a load already running waits for it (bounded) instead of starting a second one.
+_ledger_load_lock = threading.Lock()
 
 
 def _ledger_rows():
@@ -2287,14 +2290,23 @@ def _ledger_rows():
         rows = list(_production_data)
     if rows or time.time() < _ledger_retry_after:
         return rows
+    if not _ledger_load_lock.acquire(timeout=45):
+        return []   # another load is still running: fail closed for this call
     try:
-        rows = list(load_production_from_dropbox() or [])
-    except Exception as e:
-        print(f"  [ledger] style ledger load failed: {e}")
-        rows = []
-    if not rows:
-        _ledger_retry_after = time.time() + 60
-    return rows
+        with _production_lock:
+            rows = list(_production_data)
+        if rows or time.time() < _ledger_retry_after:
+            return rows
+        try:
+            rows = list(load_production_from_dropbox() or [])
+        except Exception as e:
+            print(f"  [ledger] style ledger load failed: {e}")
+            rows = []
+        if not rows:
+            _ledger_retry_after = time.time() + 60
+        return rows
+    finally:
+        _ledger_load_lock.release()
 
 
 # Fail-closed stand-ins, used ONLY by the customer-path helpers below when the
@@ -6336,6 +6348,61 @@ def _ovr_move_strip():
             'entries_after': len(current), 'kept': kept, 'json_mb': size_mb, 'backup': backup_key}, 200
 
 
+_OVR_DEDUPE_EXTS = ('png', 'PNG', 'JPG', 'jpeg', 'JPEG')
+
+
+def _ovr_dedupe(files, dry_run=True):
+    """Remove OLDER duplicate override photos (David, Sep 10 2026: "delete the prior
+    override image that was already there and only use the new one"). A named file
+    <stem>.png / .PNG / .JPG / .jpeg / .JPEG is removed only when <stem>.jpg exists in
+    STYLE OVERRIDES and is NEWER. The bucket is versioned, so the delete leaves a
+    delete marker: the old photo stays in version history and can be restored.
+    dry_run (the default) only reports. A real run saves its result, with every
+    version id, to inventory/overrides_backups/image_dedupe_<ts>.json."""
+    s3 = get_s3()
+    done, skipped = [], []
+    for f in (files or [])[:500]:
+        name = str(f or '').strip()
+        stem, dot, ext = name.rpartition('.')
+        if not name or not dot or not stem or '..' in name or name.startswith('/'):
+            skipped.append({'file': name, 'why': 'bad name'})
+            continue
+        if ext not in _OVR_DEDUPE_EXTS:
+            skipped.append({'file': name, 'why': 'only .png, .PNG, .JPG, .jpeg or .JPEG copies can be removed'})
+            continue
+        try:
+            old = s3.head_object(Bucket=S3_BUCKET, Key=_OVR_IMG_PREFIX + name)
+        except Exception:
+            skipped.append({'file': name, 'why': 'not found'})
+            continue
+        try:
+            new = s3.head_object(Bucket=S3_BUCKET, Key=_OVR_IMG_PREFIX + stem + '.jpg')
+        except Exception:
+            skipped.append({'file': name, 'why': 'no .jpg of the same style to keep'})
+            continue
+        if not new['LastModified'] > old['LastModified']:
+            skipped.append({'file': name, 'why': 'the .jpg is not newer'})
+            continue
+        row = {'file': name, 'kept': stem + '.jpg', 'old_version_id': old.get('VersionId'),
+               'old_modified': old['LastModified'].isoformat(), 'old_bytes': old.get('ContentLength'),
+               'kept_modified': new['LastModified'].isoformat()}
+        if not dry_run:
+            r = s3.delete_object(Bucket=S3_BUCKET, Key=_OVR_IMG_PREFIX + name)
+            row['delete_marker_version_id'] = r.get('VersionId')
+        done.append(row)
+    res = {'ok': True, 'phase': 'dedupe', 'dry_run': dry_run,
+           ('would_remove' if dry_run else 'removed'): done, 'skipped': skipped}
+    if not dry_run and done:
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        key = f"inventory/overrides_backups/image_dedupe_{ts}.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(res, indent=1).encode('utf-8'),
+                      ContentType='application/json')
+        res['result_key'] = key
+        paths = ['/' + (_OVR_IMG_PREFIX + d['file']).replace(' ', '+') for d in done]
+        threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+    return res, 200
+
+
 @app.route('/admin/override-images/move', methods=['POST', 'OPTIONS'])
 def admin_override_images_move():
     if request.method == 'OPTIONS':
@@ -6372,7 +6439,10 @@ def admin_override_images_move():
         if phase == 'strip':
             res, code = _ovr_move_strip()
             return jsonify(res), code
-        return jsonify({'error': 'phase must be plan, upload, status or strip'}), 400
+        if phase == 'dedupe':
+            res, code = _ovr_dedupe(body.get('files') or [], body.get('dry_run', True) is not False)
+            return jsonify(res), code
+        return jsonify({'error': 'phase must be plan, upload, status, strip or dedupe'}), 400
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -7183,6 +7253,22 @@ _web_img_cache = {}   # base_style → (content_bytes, content_type)
 _web_img_lock = threading.Lock()
 
 
+def _fetch_override_file(name):
+    """(bytes, content type) of STYLE OVERRIDES/<name>.jpg|.png|.jpeg, S3 direct (always
+    the current file), or (None, None). name may be a full SKU with a suffix."""
+    from urllib.parse import quote
+    base = f"{S3_OVERRIDES_IMG_URL}/{quote(str(name), safe='/.-_')}"
+    for ext in ('.jpg', '.png', '.jpeg'):
+        try:
+            resp = http_requests.get(base + ext, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            ct = resp.headers.get('Content-Type', '').lower()
+            if resp.status_code == 200 and 'image' in ct:
+                return resp.content, ct
+        except Exception:
+            continue
+    return None, None
+
+
 def _fetch_raw_image(base_style, brand_abbr):
     """Download raw image bytes: base64 override → S3 override → Dropbox → S3 brand folder"""
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -7304,6 +7390,27 @@ def proxy_image(base_style):
         return '', 204
 
     base_style = base_style.upper().split('.')[0]  # strip extension if present
+
+    # Variant / size photo (Sep 10 2026): the phone asks by BASE style, so a photo
+    # saved under the FULL SKU (BUCHPT309SLS-V.jpg, 1PDKTS125SLS-LT.jpg) was never
+    # found and the base style's photo showed instead. With ?sku=<full SKU> that
+    # file wins first, the same order the desktop and the exports already use.
+    full_sku = str(request.args.get('sku') or '').strip().upper()
+    if full_sku and full_sku != base_style and full_sku.split('-')[0] == base_style:
+        _ck = '__full__:' + full_sku
+        with _web_img_lock:
+            _hit = _web_img_cache.get(_ck, 'MISS')
+        if _hit == 'MISS':
+            _raw, _ct = _fetch_override_file(full_sku)
+            _hit = (_raw, _ct) if _raw else None
+            with _web_img_lock:
+                _web_img_cache[_ck] = _hit
+        if _hit:
+            resp = make_response(_hit[0])
+            resp.headers['Content-Type'] = _hit[1]
+            resp.headers['Cache-Control'] = 'public, max-age=86400'
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            return resp
 
     # Check web image cache first
     with _web_img_lock:
@@ -8769,6 +8876,7 @@ def _catalog_scope_for_slug(slug):
     for key in ('pos', 'wh_pos', 'os_pos'):
         po_filter.update(p.strip().upper() for p in str(q.get(key) or '').split(',') if p.strip())
     if po_filter:
+        _po_hits = 0
         try:
             for row in _ledger_rows():   # loads the ledger on a cold worker
                 if (str(row.get('production') or '').strip().upper() in po_filter or
@@ -8776,8 +8884,14 @@ def _catalog_scope_for_slug(slug):
                     st = str(row.get('style') or '').strip().upper()
                     if st:
                         scope['styles'].add(get_base_style(st))
+                        _po_hits += 1
         except Exception:
             pass
+        if not _po_hits and not scope['brands'] and not scope['styles']:
+            # No ledger row matched (ledger not loaded yet, or every PO has left it).
+            # Keep this PO-only link CLOSED: the degenerate branch below would serve
+            # it unscoped, i.e. every brand (Sep 10 2026 NJ review).
+            scope['styles'].add('__NO_LEDGER_MATCH__')
     for b in list(scope['brands']):
         try:
             scope['brands_norm'].add(_normalize_brand(b).upper())
@@ -9543,7 +9657,8 @@ def startup_sync():
 
     # Load Style Ledger (production data) from Dropbox
     try:
-        load_production_from_dropbox()
+        with _ledger_load_lock:   # single flight with the request path (_ledger_rows)
+            load_production_from_dropbox()
     except Exception as e:
         print(f"  ⚠ Production startup load failed: {e}")
 
