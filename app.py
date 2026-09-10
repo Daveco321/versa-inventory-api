@@ -2303,10 +2303,16 @@ def _ledger_rows():
             print(f"  [ledger] style ledger load failed: {e}")
             rows = []
         if not rows:
-            _ledger_retry_after = time.time() + 60
+            _ledger_mark_failed()
         return rows
     finally:
         _ledger_load_lock.release()
+
+
+def _ledger_mark_failed():
+    """A ledger load just failed: callers fail closed for 60 s instead of retrying."""
+    global _ledger_retry_after
+    _ledger_retry_after = time.time() + 60
 
 
 # Fail-closed stand-ins, used ONLY by the customer-path helpers below when the
@@ -5958,6 +5964,7 @@ def save_overrides():
                     for s in changed_styles:
                         _web_img_cache.pop(str(s).upper(), None)
                         _web_img_cache.pop(get_base_style(s), None)
+                _ovr_names_reset()
                 print(f"  ✓ Cleared _img_cache for {len(changed_styles)} changed override styles")
 
             # ── Trigger background regen of pre-built exports ──
@@ -6269,6 +6276,7 @@ def _run_ovr_move_upload(ts):
             for n in names:
                 _web_img_cache.pop(n.upper(), None)
                 _web_img_cache.pop(get_base_style(n), None)
+        _ovr_names_reset()   # the phone's full-SKU lookup sees the new files at once
         paths = ['/' + (_OVR_IMG_PREFIX + w['file']).replace(' ', '+') for w in done]
         if paths:
             threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
@@ -6387,17 +6395,25 @@ def _ovr_dedupe(files, dry_run=True):
                'old_modified': old['LastModified'].isoformat(), 'old_bytes': old.get('ContentLength'),
                'kept_modified': new['LastModified'].isoformat()}
         if not dry_run:
-            r = s3.delete_object(Bucket=S3_BUCKET, Key=_OVR_IMG_PREFIX + name)
-            row['delete_marker_version_id'] = r.get('VersionId')
+            try:
+                r = s3.delete_object(Bucket=S3_BUCKET, Key=_OVR_IMG_PREFIX + name)
+                row['delete_marker_version_id'] = r.get('VersionId')
+            except Exception as e:
+                skipped.append({'file': name, 'why': f'delete failed: {str(e)[:120]}'})
+                continue
         done.append(row)
     res = {'ok': True, 'phase': 'dedupe', 'dry_run': dry_run,
            ('would_remove' if dry_run else 'removed'): done, 'skipped': skipped}
     if not dry_run and done:
+        _ovr_names_reset()
         ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         key = f"inventory/overrides_backups/image_dedupe_{ts}.json"
-        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(res, indent=1).encode('utf-8'),
-                      ContentType='application/json')
-        res['result_key'] = key
+        try:
+            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(res, indent=1).encode('utf-8'),
+                          ContentType='application/json')
+            res['result_key'] = key
+        except Exception as e:
+            res['result_write_error'] = str(e)[:200]
         paths = ['/' + (_OVR_IMG_PREFIX + d['file']).replace(' ', '+') for d in done]
         threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
     return res, 200
@@ -7253,12 +7269,71 @@ _web_img_cache = {}   # base_style → (content_bytes, content_type)
 _web_img_lock = threading.Lock()
 
 
-def _fetch_override_file(name):
-    """(bytes, content type) of STYLE OVERRIDES/<name>.jpg|.png|.jpeg, S3 direct (always
-    the current file), or (None, None). name may be a full SKU with a suffix."""
+_SKU_PARAM_OK = re.compile(r'^[A-Z0-9][A-Z0-9 ._/-]*$')
+_ovr_names = {'map': None, 'at': 0.0}      # STYLE OVERRIDES listing {file name: (etag, size)}
+_ovr_names_lock = threading.Lock()
+_web_full_cache = {}                        # '<file name>:<etag>' -> (bytes, content type)
+_WEB_FULL_CACHE_MAX = 300
+
+
+def _ovr_names_map(max_age=600):
+    """{file name: (etag, size)} for STYLE OVERRIDES, listed at most every 10 minutes
+    (and at once after a photo move, cleanup or override save). Returns the last good
+    listing, or None if the folder has never been listed on this worker."""
+    with _ovr_names_lock:
+        m, at = _ovr_names['map'], _ovr_names['at']
+    if m is not None and time.time() - at < max_age:
+        return m
+    try:
+        fresh = _ovr_folder_listing(get_s3())
+    except Exception as e:
+        print(f"  [image] STYLE OVERRIDES listing failed: {e}")
+        return m
+    with _ovr_names_lock:
+        _ovr_names['map'], _ovr_names['at'] = fresh, time.time()
+    return fresh
+
+
+def _ovr_names_reset():
+    """Photos were written or removed: list STYLE OVERRIDES again on the next request."""
+    with _ovr_names_lock:
+        _ovr_names['at'] = 0.0
+
+
+def _full_sku_override_photo(full_sku):
+    """(bytes, content type) of the STYLE OVERRIDES photo saved under this exact full
+    SKU, or None. Only names in the folder listing are fetched, so SKUs with no such
+    file cost nothing and '..' aliases can never create cache entries. Cached by name
+    + ETag (a replaced photo shows at once); a failed fetch is never cached."""
+    names = _ovr_names_map()
+    if names is None:
+        raw, ct = _fetch_override_file(full_sku)   # listing unavailable: probe, never cache
+        return (raw, ct) if raw else None
+    name = next((full_sku + e for e in ('.jpg', '.png', '.jpeg') if full_sku + e in names), None)
+    if not name:
+        return None
+    ck = f"{name}:{names[name][0]}"
+    with _web_img_lock:
+        hit = _web_full_cache.get(ck)
+    if hit:
+        return hit
+    raw, ct = _fetch_override_file(full_sku, (name[len(full_sku):],))
+    if not raw:
+        return None
+    with _web_img_lock:
+        if len(_web_full_cache) >= _WEB_FULL_CACHE_MAX:
+            for k in list(_web_full_cache)[:50]:
+                _web_full_cache.pop(k, None)
+        _web_full_cache[ck] = (raw, ct)
+    return raw, ct
+
+
+def _fetch_override_file(name, exts=('.jpg', '.png', '.jpeg')):
+    """(bytes, content type) of STYLE OVERRIDES/<name><ext>, S3 direct (always the
+    current file), or (None, None). name may be a full SKU with a suffix."""
     from urllib.parse import quote
     base = f"{S3_OVERRIDES_IMG_URL}/{quote(str(name), safe='/.-_')}"
-    for ext in ('.jpg', '.png', '.jpeg'):
+    for ext in exts:
         try:
             resp = http_requests.get(base + ext, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             ct = resp.headers.get('Content-Type', '').lower()
@@ -7395,16 +7470,13 @@ def proxy_image(base_style):
     # saved under the FULL SKU (BUCHPT309SLS-V.jpg, 1PDKTS125SLS-LT.jpg) was never
     # found and the base style's photo showed instead. With ?sku=<full SKU> that
     # file wins first, the same order the desktop and the exports already use.
+    # Only real file names are fetched (see _full_sku_override_photo) and the sku must
+    # look like a real SKU, so path tricks such as '..' cannot alias other objects.
     full_sku = str(request.args.get('sku') or '').strip().upper()
-    if full_sku and full_sku != base_style and full_sku.split('-')[0] == base_style:
-        _ck = '__full__:' + full_sku
-        with _web_img_lock:
-            _hit = _web_img_cache.get(_ck, 'MISS')
-        if _hit == 'MISS':
-            _raw, _ct = _fetch_override_file(full_sku)
-            _hit = (_raw, _ct) if _raw else None
-            with _web_img_lock:
-                _web_img_cache[_ck] = _hit
+    if (full_sku and full_sku != base_style and full_sku.split('-')[0] == base_style
+            and _SKU_PARAM_OK.match(full_sku) and '..' not in full_sku
+            and '//' not in full_sku and '/./' not in full_sku):
+        _hit = _full_sku_override_photo(full_sku)
         if _hit:
             resp = make_response(_hit[0])
             resp.headers['Content-Type'] = _hit[1]
@@ -9658,7 +9730,8 @@ def startup_sync():
     # Load Style Ledger (production data) from Dropbox
     try:
         with _ledger_load_lock:   # single flight with the request path (_ledger_rows)
-            load_production_from_dropbox()
+            if not load_production_from_dropbox():
+                _ledger_mark_failed()   # waiting requests fail closed at once, no second try
     except Exception as e:
         print(f"  ⚠ Production startup load failed: {e}")
 
