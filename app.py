@@ -15545,6 +15545,1173 @@ def _ai_tool_build_line_sheet(params):
             'note': 'give the user this link as a clickable download'}
 
 
+# ============================================================
+# PRESENTATIONS: print-ready photo-card decks (build_presentation)
+# ============================================================
+# "Presentation format" always means the platform's Presentation Mode photo
+# cards, never an Excel line sheet (David, Sep 10 2026, after the AI answered a
+# presentation request with a line sheet). This renders that deck on the server
+# for the AI chat and the MCP connector: US Letter landscape, brand logo header,
+# two rows of photo cards (8 per page by default), every brand on a new page.
+# Stock decks follow the Customer View rules unless customer_view is false: no
+# NJ/ABFI stock, no NJ/AE/AW/ABFI-landing lots, no by-size rows. Quantities are
+# the desktop's own: manual + virtual allocations join committed, deduction
+# assignments win, lots that already landed (within 14 days, 10%) are
+# suppressed, and the split between warehouse and overseas comes from SMART
+# ROUTING (_pres_route_sku, a port of the desktop _routeSku: David, Sep 10 2026,
+# "everything uses smart routing"; only APO/VW bookings and pre-picks go FIFO,
+# inside the engine). Warehouse-first FIFO is used only where the desktop falls
+# back to it too (demand does not reconcile with the ATS deduction). Open-order
+# decks show one customer's current POs per style (PO #, units, cost, ship
+# window), never arrival or ex-factory dates.
+
+_PRES_TILE_BASE = 'https://nauticaslimfit.s3.us-east-2.amazonaws.com/ALL+INVENTORY+Photos/Brand+Logos/Tiles/'
+_PRES_TILE_KEYS = {'NAUTICA', 'DKNY', 'EB', 'REEBOK', 'VINCE', 'BEN', 'USPA', 'CHAPS', 'LUCKY', 'JNY',
+                   'BEENE', 'NICOLE', 'SHAQ', 'TAYION', 'STRAHAN', 'VD', 'CHEROKEE', 'AMERICA', 'BLO',
+                   'KL', 'NE', 'RG', 'DH'}
+_PRES_LOGO_URLS = {
+    'VERSA': 'https://nauticaslimfit.s3.us-east-2.amazonaws.com/ALL+INVENTORY+Photos/Brand+Logos/VERSA-logo-1280x720.png',
+    'BLACK': 'https://nauticaslimfit.s3.us-east-2.amazonaws.com/ALL+INVENTORY+Photos/Brand+Logos/black-label-logo.png',
+    'DN': 'https://nauticaslimfit.s3.us-east-2.amazonaws.com/ALL+INVENTORY+Photos/Brand+Logos/Divine9-logo-spaced-1280x720.png',
+}
+_PRES_BRAND_EXTRA = {'DH': 'Daniel Hechter', 'NW': 'Nine West', 'HC': 'Henri Christian', 'MP': 'Modern People',
+                     'ZY': 'Zylos', 'CE': 'Chuck English', 'CL': 'Christian Lacroix'}
+_PRES_CATEGORY_ALIASES = {'big & tall': 'big_tall', 'big and tall': 'big_tall', 'b&t': 'big_tall', 'bt': 'big_tall',
+                          'big tall': 'big_tall', 'bigtall': 'big_tall', 'big_and_tall': 'big_tall',
+                          'short sleeve': 'short_sleeve', 'long sleeve': 'long_sleeve', 'young men': 'young_men',
+                          'button down': 'button_down', 'blazer': 'blazers', 'vest': 'vests'}
+_PRES_CATEGORY_TITLES = {'big_tall': 'Big & Tall', 'short_sleeve': 'Short Sleeve', 'long_sleeve': 'Long Sleeve',
+                         'pants': 'Pants', 'sportswear': 'Sportswear', 'young_men': 'Young Men',
+                         'accessories': 'Accessories', 'blazers': 'Blazers', 'vests': 'Vests',
+                         'button_down': 'Button Down'}
+_PRES_VIEW_LABELS = {'warehouse': 'Warehouse ATS', 'overseas': 'Overseas ATS', 'all': 'Warehouse + Overseas ATS'}
+_PRES_MAX_CARDS = 240
+_PRES_SUPPRESS_SECONDS = 14 * 24 * 3600   # desktop _SUPPRESS_WINDOW_MS
+_PRES_SUPPRESS_TOL = 0.10                 # desktop _SUPPRESS_TOLERANCE
+_PRES_LANDED_WINDOW_DAYS = 30             # desktop _LANDED_WINDOW_DAYS
+# Desktop FOB_CUSTOMER_CODES (overseas pickup accounts; matched by open-orders code).
+_PRES_FOB_CUSTOMERS = {'CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1'}
+# Desktop OPEN_ORDERS_CUSTOMER_MAP (the engine's name fallback, used for the pre-pick test).
+_PRES_OO_CUSTOMER_MAP = {
+    'BEAL': 'Bealls', 'BEAL1': 'Bealls', 'BJS': "BJ's Wholesale", 'CENT': 'Centric Brands', 'CENT1': 'Centric Brands',
+    'COST': 'Costco', 'COST1': 'Costco', 'MULT': 'Multi Brands', 'MULT1': 'Multi Brands', 'VETE': 'Veterans Canteen',
+    'WINN': 'Winners/TJX Canada', 'AAFE': 'AAFES/Military', 'AMAZ': 'Amazon', 'BELK': 'Belk', 'BFL': 'Brands for Less',
+    'BLOO': "Bloomingdale's", 'BOSC': 'Boscovs', 'BURL': 'Burlington', 'CITI': 'Citi Trends', 'COPP': 'Coppel',
+    'DDS': "DD's Discounts", 'GLOB': 'BBZ (Global)', 'HALF': 'Half Price', 'HAMR': 'Hamricks', 'HUCK': 'Huckberry',
+    'JCP01': 'JCPenney', 'KOHL': "Kohl's", 'MACY': "Macy's", 'MACY1': "Macy's", 'MARS': 'Marshalls',
+    'NORD': 'Nordstrom', 'PEER': 'Peerless', 'RED': 'Red Apple', 'ROSS': 'Ross Stores', 'RUEN': 'Rue 21',
+    'SEAR': 'Sears', 'TJMA': 'TJ Maxx', 'TJXAU': 'TJX Australia', 'TJXUK': 'TJX UK/TK Maxx',
+    'VARI': 'Variety Wholesalers', 'WALM1': 'Walmart'}
+_pres_logo_cache = {}
+_pres_logo_lock = threading.Lock()
+
+
+def _pres_now_et():
+    """Naive Eastern-time now: the desktop's 'today' is the office's local day."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/New_York')).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+
+def _pres_int(v):
+    """parseInt(v) || 0 for feed quantities (numbers or numeric strings)."""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pres_route_sku(q, lots, orders, apos, vws, today):
+    """Port of the desktop smart routing engine (_routeSku) for ONE exact SKU.
+    q: merged quantities (jtw/tr/dcw/qa/nj/abfi, committed incl. manual + virtual
+    allocations, allocated). lots: this SKU's ledger rows (units, arr, etd, fob_flag,
+    hidden = lands NJ/AE/AW/ABFI, sup = arrival-suppressed). Returns the units the
+    warehouse slots and the production slots give ({'wh', 'os', 'os_visible'}) or
+    None where the desktop falls back to FIFO (no deduction, no supply, no claims,
+    or demand that does not reconcile with the ATS deduction)."""
+    wh_total = q['jtw'] + q['tr'] + q['dcw'] + q['qa'] + q['nj'] + q['abfi']
+    total_ded = abs(q['committed']) + abs(q['allocated'])
+    if total_ded == 0:
+        return None
+    far = datetime(2099, 1, 1).date()
+    prods = [l for l in lots if not l['sup']]
+    prods.sort(key=lambda l: l['arr'] or l['etd'] or far)
+
+    def prod_slot(l):
+        return {'type': 'production', 'units': l['units'], 'arrival': l['arr'] or l['etd'], 'etd': l['etd'],
+                'fob_flag': bool(l.get('fob_flag')), 'nj': l['hidden'], 'used': 0}
+    slots = [prod_slot(l) for l in prods if l['units'] > 0 and (l['arr'] or l['etd'])
+             and (l['arr'] or l['etd']) <= today]
+    nj_u, abfi_u = max(0, q['nj']), max(0, q['abfi'])
+    other = wh_total - nj_u - abfi_u
+    for units, restricted in ((other, False), (nj_u, True), (abfi_u, True)):
+        if units > 0:
+            slots.append({'type': 'warehouse', 'units': units, 'arrival': today, 'etd': None,
+                          'fob_flag': False, 'nj': restricted, 'used': 0})
+    slots += [prod_slot(l) for l in prods if l['units'] > 0 and (not (l['arr'] or l['etd'])
+                                                                 or (l['arr'] or l['etd']) > today)]
+    if not slots:
+        return None
+    # Reconciliation gate: demand must match the ATS deduction within max(100, 10%).
+    total_demand = (sum(_pres_int(o.get('openQty')) + _pres_int(o.get('pickQty')) for o in orders)
+                    + sum(_pres_int(a.get('qty')) for a in apos) + sum(_pres_int(v.get('qty')) for v in vws))
+    if abs(total_demand - total_ded) > max(100, total_ded * 0.10):
+        return None
+    claims = []
+    for o in orders:
+        qty = _pres_int(o.get('openQty')) + _pres_int(o.get('pickQty'))
+        if qty <= 0:
+            continue
+        cancel = _apo_parse_date(o.get('cancelDate'))
+        start = _apo_parse_date(o.get('startDate'))
+        code = str(o.get('customer') or '').upper().strip()
+        name = (o.get('customerFull') or _PRES_OO_CUSTOMER_MAP.get(code) or o.get('shipToName')
+                or code or 'Order')
+        claims.append({'qty': qty, 'source': 'order', 'name': str(name), 'start': start, 'cancel': cancel,
+                       'latest': cancel or start or far, 'fob': code in _PRES_FOB_CUSTOMERS})
+    for src_rows, src in ((apos, 'apo'), (vws, 'vw')):
+        for a in src_rows:
+            qty = _pres_int(a.get('qty'))
+            if qty > 0:
+                claims.append({'qty': qty, 'source': src, 'name': str(a.get('customer') or src.upper()),
+                               'start': None, 'cancel': None, 'latest': far, 'fob': False})
+    if not claims:
+        return None
+    prepick = [c for c in claims if c['source'] == 'order' and 'pick' in c['name'].lower()]
+    dated = [c for c in claims if c['source'] == 'order' and 'pick' not in c['name'].lower()]
+    apovw = [c for c in claims if c['source'] in ('apo', 'vw')]
+    dated.sort(key=lambda c: c['start'] or c['cancel'] or c['latest'])
+    landed_cutoff = today - timedelta(days=_PRES_LANDED_WINDOW_DAYS)
+    wh_idx, landed_idx, fut_idx, stale_idx, nj_idx = [], [], [], [], []
+    for i, sl in enumerate(slots):
+        if sl['nj']:
+            nj_idx.append(i)
+        elif sl['type'] == 'warehouse':
+            wh_idx.append(i)
+        elif sl['arrival'] and sl['arrival'] <= today:
+            (landed_idx if sl['arrival'] >= landed_cutoff else stale_idx).append(i)
+        else:
+            fut_idx.append(i)
+    has_non_nj = any(not sl['nj'] and sl['units'] > 0 for sl in slots)
+    landed_set = set(landed_idx)
+
+    def arr_desc(idx_list):   # latest arrival first, ties on the higher slot index
+        return sorted(idx_list, key=lambda i: ((-slots[i]['arrival'].toordinal()) if slots[i]['arrival']
+                                               else float('inf'), -i))
+    fifo_order = wh_idx + landed_idx + fut_idx + stale_idx + nj_idx
+    lf_order = arr_desc(fut_idx) + wh_idx + arr_desc(landed_idx) + arr_desc(stale_idx) + nj_idx
+
+    def take(sl, remaining):
+        t = min(remaining, sl['units'])
+        sl['units'] -= t
+        sl['used'] += t
+        return remaining - t
+
+    def allocate_fifo(claim):
+        remaining = claim['qty']
+        for i in fifo_order:
+            if remaining <= 0:
+                break
+            if slots[i]['units'] > 0:
+                remaining = take(slots[i], remaining)
+        return remaining
+
+    def allocate_latest_feasible(claim):
+        remaining = claim['qty']
+        fob = claim['fob']
+        start = claim['start']
+        cancel = claim['cancel'] or claim['latest']
+        if fob:   # pass 0: FOB accounts drain FOB-flagged batches first
+            for sl in slots:
+                if remaining <= 0:
+                    break
+                if sl['fob_flag'] and sl['type'] == 'production' and sl['units'] > 0:
+                    remaining = take(sl, remaining)
+        for i in lf_order:
+            if remaining <= 0:
+                break
+            sl = slots[i]
+            if sl['units'] <= 0:
+                continue
+            if sl['nj'] and has_non_nj:
+                continue   # NJ only when it is the style's ONLY supply
+            if sl['type'] == 'warehouse':
+                if fob:
+                    continue
+            elif sl['fob_flag']:
+                continue
+            elif not fob and i in landed_set:
+                pass       # landed goods are in hand for any ship window
+            else:
+                slot_date = (sl['etd'] or sl['arrival']) if fob else sl['arrival']
+                if not slot_date and (start or cancel):
+                    continue
+                if start and slot_date and slot_date > start:
+                    continue
+                if cancel and slot_date and slot_date > cancel:
+                    continue
+            remaining = take(sl, remaining)
+        if remaining > 0:
+            if fob:
+                fwd = sorted([i for i, sl in enumerate(slots) if sl['type'] == 'production' and sl['units'] > 0],
+                             key=lambda i: (1 if slots[i]['nj'] else 0, slots[i]['etd'] or slots[i]['arrival'] or far))
+                for i in fwd:
+                    if remaining <= 0:
+                        break
+                    if slots[i]['units'] > 0:
+                        remaining = take(slots[i], remaining)
+                for sl in slots:
+                    if remaining <= 0:
+                        break
+                    if sl['type'] == 'warehouse' and sl['units'] > 0:
+                        remaining = take(sl, remaining)
+            else:
+                remaining = allocate_fifo(dict(claim, qty=remaining))
+        return remaining
+
+    for c in prepick:
+        allocate_fifo(c)
+    for c in dated:
+        allocate_latest_feasible(c)
+    for c in apovw:
+        allocate_fifo(c)
+    return {'wh': sum(sl['used'] for sl in slots if sl['type'] == 'warehouse'),
+            'os': sum(sl['used'] for sl in slots if sl['type'] == 'production'),
+            'os_visible': sum(sl['used'] for sl in slots if sl['type'] == 'production' and not sl['nj'])}
+
+
+def _pres_brand_name(key):
+    return (BRAND_FULL_NAMES or {}).get(key) or _PRES_BRAND_EXTRA.get(key) or key or 'Other'
+
+
+def _pres_brand_keys(values):
+    """Brand keys (NAUTICA, DKNY, VD...) for any mix of keys, full names or SKU codes."""
+    names = dict(_PRES_BRAND_EXTRA)
+    names.update(BRAND_FULL_NAMES or {})
+    keys = set()
+    for v in values or []:
+        vu = str(v or '').strip().upper()
+        if not vu:
+            continue
+        keys.add(vu)
+        full = _BRAND_NAME_ALIASES.get(vu) or _BRAND_NAME_ALIASES.get(re.sub(r"[.'\-]", '', vu))
+        for abbr, nm in names.items():
+            if str(nm).upper() == vu or (full and nm == full):
+                keys.add(str(abbr).upper())
+        if vu in SKU_BRAND_CODE_MAP:
+            keys.add(SKU_BRAND_CODE_MAP[vu])
+    return keys
+
+
+def _pres_card_brand(sku, feed_brand=''):
+    """Brand key the way the desktop settles it: style override, LUCK/VP prefixes,
+    the feed brand when it is a known brand, else the SKU's brand code."""
+    base = _ai_agent_base(sku)
+    ov = _style_overrides.get(sku) or _style_overrides.get(base) or {}
+    if isinstance(ov, dict) and ov.get('brand'):
+        return str(ov['brand']).strip().upper()
+    if base.startswith('LUCK'):
+        return 'LUCKY'
+    if base.startswith('VP'):
+        return 'VERSA'
+    ab = str(feed_brand or '').strip().upper()
+    ab = {'NM': 'NICOLE'}.get(ab, ab)
+    if ab in (BRAND_FULL_NAMES or {}) or ab in _PRES_BRAND_EXTRA:
+        return ab
+    return _apo_style_brand_abbr(base) or ab or 'OTHER'
+
+
+def _pres_fit_line(base):
+    """'Big & Tall · Long Sleeve': the fit label plus the sleeve, like the desktop card."""
+    try:
+        label = _apo_fit_label(base) or ''
+    except Exception:
+        label = ''
+    sleeve = ''
+    try:
+        if not _py_is_bottom(base):
+            if _py_is_short_sleeve(base):
+                sleeve = 'Short Sleeve'
+            elif _py_is_long_sleeve_shirt(base):
+                sleeve = 'Long Sleeve'
+    except Exception:
+        pass
+    fit_only = re.sub(r'\s{2,}', ' ', re.sub(r'(Long|Short)\s+Sleeve', '', label, flags=re.I)).strip()
+    return ' · '.join(x for x in (fit_only, sleeve) if x)
+
+
+def _pres_details(sku, base, brand):
+    """(color, fit line, fabrication); a variant's own override (BASE-V) wins."""
+    ov = (_style_overrides.get(sku) if sku != base else None) or {}
+    ov = ov if isinstance(ov, dict) else {}
+    try:
+        color = str(ov.get('color') or '') or _apo_style_color(base, brand) or ''
+    except Exception:
+        color = ''
+    try:
+        fab = str(ov.get('fabrication') or ov.get('fabric') or '') or _apo_fabrication(base) or ''
+    except Exception:
+        fab = ''
+    fit = str(ov.get('fit') or '') or _pres_fit_line(base)
+    return color, fit, fab
+
+
+def _pres_color_ok(color, brand, color_q):
+    """Same colour rule as query_inventory (buckets, All Shades of Blue, words)."""
+    if not color_q:
+        return True
+    try:
+        bucket = _apo_classify_color(color, brand)
+    except Exception:
+        bucket = ''
+    if color_q in ('solid', 'solids'):
+        return bucket != 'fancies'
+    if color_q in ('fancy', 'fancies'):
+        return bucket == 'fancies'
+    if color_q in ('blue', 'indigo', 'navy/blue', 'navy blue') and bucket == 'navy':
+        return True
+    return color_q in (color or '').lower() or color_q == bucket
+
+
+def _pres_filter_spec(params):
+    skus = [str(s or '').strip().upper() for s in (params.get('skus') or []) if str(s or '').strip()]
+    return {
+        'brands': _pres_brand_keys(params.get('brands') or ([params['brand']] if params.get('brand') else [])),
+        'exclude': _pres_brand_keys(params.get('exclude_brands')),
+        'category': params.get('category') or None,
+        'fabric_codes': {str(f).strip().upper() for f in (params.get('fabric_codes') or []) if str(f).strip()},
+        'search': (params.get('search') or '').strip().upper() or None,
+        'color': (params.get('color') or '').strip().lower() or None,
+        'skus': skus,
+        'sku_set': set(skus),
+    }
+
+
+def _pres_passes(spec, sku, base, brand):
+    if spec['brands'] and brand not in spec['brands']:
+        return False
+    if brand in spec['exclude']:
+        return False
+    if spec['sku_set'] and sku not in spec['sku_set'] and base not in spec['sku_set']:
+        return False
+    if spec['search'] and spec['search'] not in sku:
+        return False
+    if spec['fabric_codes'] and (len(base) < 6 or base[4:6] not in spec['fabric_codes']):
+        return False
+    cat = spec['category']
+    if cat:
+        try:
+            if cat == 'big_tall':
+                # The desktop B&T test (isBigAndTall: fit code at base[9:11], or VD WB/BT)
+                # AND the platform's own fit reading (extractFitCode, what the card prints)
+                # must agree: ROBLCH004WB reads as B&T by position but the platform labels
+                # it Slim Fit, and David's approved deck left it out (Sep 10 2026).
+                if not (_py_is_big_tall(base) and _py_extract_fit_code(base) in _PY_BT_FIT_CODES):
+                    return False
+            elif cat == 'blazers':
+                if not _py_is_blazer(base):
+                    return False
+            elif cat == 'vests':
+                if not _py_is_vest(base):
+                    return False
+            elif not _py_matches_category(base, brand, cat):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _pres_window(a, b):
+    """Ship window text: 'Nov 6-10, 2026', 'Oct 28-Nov 3, 2026' or one date."""
+    da, db = _apo_parse_date(a), _apo_parse_date(b)
+    if not da:
+        return ''
+    if not db or db == da:
+        return _apo_fmt_date(da)
+    fb = str(db.day) if (da.year, da.month) == (db.year, db.month) else f"{db.strftime('%b')} {db.day}"
+    return f"{da.strftime('%b')} {da.day}-{fb}, {db.year}"
+
+
+def _pres_customer_short(typed, label):
+    """The customer's name as the file name uses it: the typed text widened to the
+    label's whole words ('ross' in 'Ross Stores' -> 'Ross', 'burl' -> 'Burlington')."""
+    t = str(typed or '').strip()
+    label = str(label or '')
+    i = label.lower().find(t.lower()) if t else -1
+    if i < 0:
+        return label or t
+    j = i + len(t)
+    while j < len(label) and label[j].isalnum():
+        j += 1
+    while i > 0 and label[i - 1].isalnum():
+        i -= 1
+    return label[i:j]
+
+
+def _pres_parallel(fn, items, size=12):
+    """Map fn over items concurrently (gevent pool when the worker is patched)."""
+    items = list(items)
+    if not items:
+        return []
+    try:
+        from gevent import monkey as _gmonkey
+        if _gmonkey.is_module_patched('socket'):
+            import gevent.pool
+            return list(gevent.pool.Pool(size=size).map(fn, items))
+    except Exception:
+        pass
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(size, 8)) as ex:
+        return list(ex.map(fn, items))
+
+
+def _pres_photo_fetch(sku, brand):
+    """The photo /image/<base>?sku=<full> serves (full-SKU override first, then the
+    style's own chain), shrunk to print size (700 px JPEG) so the PDF stays small."""
+    base = sku.split('-')[0]
+    raw = None
+    try:
+        if (sku != base and _SKU_PARAM_OK.match(sku) and '..' not in sku and '//' not in sku
+                and '/./' not in sku):
+            hit = _full_sku_override_photo(sku)
+            if hit:
+                raw = hit[0]
+        if raw is None:
+            with _web_img_lock:
+                cached = _web_img_cache.get(base, 'MISS')
+            if cached is None:
+                return None
+            if cached != 'MISS':
+                raw = cached[0]
+            else:
+                raw, _ct = _fetch_raw_image(base, brand)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        with PilImage.open(BytesIO(raw)) as im0:
+            try:
+                im0.draft('RGB', (1400, 1400))   # JPEG: decode at a reduced scale, never full size
+            except Exception:
+                pass
+            im = ImageOps.exif_transpose(im0)
+            if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+                im = im.convert('RGBA')
+                bg = PilImage.new('RGB', im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != 'RGB':
+                im = im.convert('RGB')
+            im.thumbnail((700, 700))
+            out = BytesIO()
+            im.save(out, 'JPEG', quality=82, optimize=True)
+            return out.getvalue()
+    except Exception:
+        return None
+
+
+_PRES_PHOTO_TTL = 900        # a replaced photo reaches the decks within 15 minutes
+_PRES_PHOTO_MISS_TTL = 120   # a miss (or a failed fetch) is retried after 2 minutes
+_PRES_PHOTO_MAX = 300
+_pres_photo_cache = {}
+_pres_photo_lock = threading.Lock()
+
+
+def _pres_photo_jpeg(sku, brand):
+    """_pres_photo_fetch, cached as print-size bytes so repeat decks do not download and
+    decode every photo again."""
+    key = (sku, str(brand or ''))
+    now = time.time()
+    with _pres_photo_lock:
+        hit = _pres_photo_cache.get(key)
+    if hit and now - hit[0] < (_PRES_PHOTO_TTL if hit[1] else _PRES_PHOTO_MISS_TTL):
+        return hit[1]
+    data = _pres_photo_fetch(sku, brand)
+    with _pres_photo_lock:
+        if len(_pres_photo_cache) >= _PRES_PHOTO_MAX:
+            for k in sorted(_pres_photo_cache, key=lambda k: _pres_photo_cache[k][0])[:50]:
+                _pres_photo_cache.pop(k, None)
+        _pres_photo_cache[key] = (now, data)
+    return data
+
+
+def _pres_logo_png(key):
+    """The brand's logo tile (the platform's own Brand Logos/Tiles set), cached."""
+    url = _PRES_LOGO_URLS.get(key) or (_PRES_TILE_BASE + key + '.png?v=2' if key in _PRES_TILE_KEYS else None)
+    if not url:
+        return None
+    with _pres_logo_lock:
+        if key in _pres_logo_cache:
+            return _pres_logo_cache[key]
+    data = None
+    try:
+        r = http_requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code == 200 and 'image' in (r.headers.get('Content-Type') or '').lower():
+            with PilImage.open(BytesIO(r.content)) as im0:
+                im = im0.convert('RGBA')
+                im.thumbnail((480, 200))
+                out = BytesIO()
+                im.save(out, 'PNG', optimize=True)
+                data = out.getvalue()
+    except Exception:
+        data = None
+    if data:
+        with _pres_logo_lock:
+            _pres_logo_cache[key] = data
+    return data
+
+
+def _pres_stock_cards(source, customer_view, spec, params):
+    """One card per inventory SKU (never a by-size row) with the number the desktop
+    shows in that view and its chip ('In Warehouse · JTW' / 'Arrives Sep 22, 2026')."""
+    # This worker's copies can be stale (several workers); each is one small S3 read.
+    for loader in (load_manual_allocations_from_s3, load_deduction_assignments_from_s3,
+                   load_suppression_overrides_from_s3):
+        try:
+            loader()
+        except Exception:
+            pass
+    try:
+        virtual_rows = load_allocation_from_s3() or []
+    except Exception:
+        virtual_rows = []
+    with _manual_alloc_lock:
+        manual_rows = list(_manual_allocations)
+    virt, vw_by_sku = {}, {}
+    for a in list(virtual_rows) + manual_rows:
+        s = str((a or {}).get('sku') or '').strip().upper()
+        if s:
+            virt[s] = virt.get(s, 0) + _pres_int(a.get('qty'))
+    for a in virtual_rows:   # the engine's VW demand is the sheet only (desktop _s3Allocations)
+        s = str((a or {}).get('sku') or '').strip().upper()
+        if s:
+            vw_by_sku.setdefault(s, []).append(a)
+    with _deduction_assign_lock:
+        assign = dict(_deduction_assignments or {})
+    with _suppression_overrides_lock:
+        no_suppress = {str(s).strip().upper() for s in (_suppression_overrides or [])}
+    ledger = _ledger_rows()
+    lots_by_sku = {}
+    for p in ledger:
+        st = str(p.get('style') or '').strip().upper()
+        if st:
+            lots_by_sku.setdefault(st, []).append(p)
+    orders, orders_ok = _fetch_all_open_orders()
+    orders_by_sku = {}
+    for o in orders or []:
+        st = str(o.get('style') or '').strip().upper()
+        if st:
+            orders_by_sku.setdefault(st, []).append(o)
+    with _apo_lock:
+        apo_rows = list(_apo_data or [])
+    apo_by_sku = {}
+    for a in apo_rows:
+        st = str((a or {}).get('style') or '').strip().upper()
+        if st:
+            apo_by_sku.setdefault(st, []).append(a)
+    # One row per exact SKU: physical stock sums, committed/allocated keep the largest
+    # magnitude (the feed can repeat a SKU; desktop engine merge, BUGBSA002SLS).
+    with _inv_lock:
+        raw_items = list(_inventory.get('items') or [])
+    merged, order = {}, []
+    for it in raw_items:
+        sku = str(it.get('sku') or '').strip().upper()
+        if not sku:
+            continue
+        m = merged.get(sku)
+        if m is None:
+            m = {'brand': it.get('brand_abbr') or it.get('brand'), 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0,
+                 'abfi': 0, 'incoming': 0, 'committed': 0, 'allocated': 0}
+            merged[sku] = m
+            order.append(sku)
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming'):
+            m[k] += _pres_int(it.get(k))
+        for k in ('committed', 'allocated'):
+            v = _pres_int(it.get(k))
+            if abs(v) > abs(m[k]):
+                m[k] = v
+    now = _pres_now_et()
+    today = now.date()
+    d_before = _apo_parse_date(params.get('arrive_before')) if params.get('arrive_before') else None
+    d_after = _apo_parse_date(params.get('arrive_after')) if params.get('arrive_after') else None
+    windowed = source != 'warehouse' and bool(d_before or d_after)
+    min_units = _pres_int(params.get('min_units'))
+    stats = {'size_rows_skipped': 0, 'smart_routed': 0, 'fifo_fallback': 0, 'assigned': 0,
+             'orders_feed_ok': bool(orders_ok)}
+    cards = []
+    for sku in order:
+        if _is_sized_sku(sku):
+            stats['size_rows_skipped'] += 1
+            continue
+        m = merged[sku]
+        base = sku.split('-')[0]
+        brand = _pres_card_brand(sku, m['brand'])
+        if not _pres_passes(spec, sku, base, brand):
+            continue
+        q = dict(m)
+        q['committed'] = m['committed'] - virt.get(sku, 0)   # desktop applyManualAllocationsToInventory
+        nj, abfi = q['nj'], q['abfi']
+        wh_all = q['jtw'] + q['tr'] + q['dcw'] + q['qa'] + nj + abfi
+        wh_view = wh_all - ((nj + abfi) if customer_view else 0)
+        inc = q['incoming']
+        if wh_view <= 0 and inc <= 0:
+            continue
+        deductions = abs(q['committed']) + abs(q['allocated'])
+        try:
+            pants = bool(_py_is_bottom(base))
+        except Exception:
+            pants = False
+        lots = []
+        for p in lots_by_sku.get(sku, []):
+            units = _pres_int(p.get('units'))
+            try:
+                arr = _apo_prod_arrival(p, pants)
+            except Exception:
+                arr = None
+            landing = str(p.get('warehouse') or '').strip().upper()
+            hidden = landing in _HIDDEN_LANDING_WH
+            sup = False
+            if sku not in no_suppress and arr and units > 0:
+                gap = abs((now - datetime(arr.year, arr.month, arr.day)).total_seconds())
+                if gap <= _PRES_SUPPRESS_SECONDS:
+                    # A batch that lands into NJ / ABFI compares with that stock; any other
+                    # batch with the factory-served warehouses (desktop _isProductionSuppressed).
+                    twin = (nj if landing == 'NJ' else abfi) if hidden else max(0, wh_all - nj - abfi)
+                    sup = abs(twin - units) / units <= _PRES_SUPPRESS_TOL
+            lots.append({'units': units, 'arr': arr, 'etd': _apo_parse_date(p.get('etd')),
+                         'fob_flag': bool(p.get('fob_flag')), 'hidden': hidden, 'sup': sup})
+        adj_inc = max(0, inc - sum(l['units'] for l in lots if l['sup']))
+        vis_inc = adj_inc
+        if customer_view and adj_inc > 0:
+            if not ledger:
+                vis_inc = 0   # ledger unavailable: fail closed, warehouse stock only
+            else:
+                hid = sum(l['units'] for l in lots if l['hidden'] and not l['sup'])
+                if hid > 0:
+                    vis_inc = 0 if not any(not l['hidden'] for l in lots) else adj_inc - min(adj_inc, hid)
+        a = assign.get(sku)
+        smart = None
+        if source != 'all' and deductions > 0 and a not in ('warehouse', 'overseas') \
+                and (source == 'overseas' or inc > 0):
+            smart = _pres_route_sku(q, lots, orders_by_sku.get(sku, []), apo_by_sku.get(sku, []),
+                                    vw_by_sku.get(sku, []), today)
+        if source == 'warehouse':
+            if wh_view <= 0:
+                continue
+            if a == 'overseas':
+                applied = 0
+            elif a == 'warehouse':
+                applied = deductions
+            elif smart is not None and inc > 0:
+                applied = smart['wh']
+            elif inc > 0:
+                applied = min(deductions, wh_all)
+            else:
+                applied = deductions
+            # Customer View takes the restricted stock out after the view is built,
+            # exactly like the Customer View export (_strip_nj_rows).
+            number = wh_all - applied - ((nj + abfi) if customer_view else 0)
+        elif source == 'overseas':
+            if inc <= 0 or adj_inc <= 0:
+                continue
+            if a == 'overseas':
+                od = od_vis = deductions
+            elif a == 'warehouse':
+                od = od_vis = 0
+            elif smart is not None:
+                od, od_vis = smart['os'], smart['os_visible']
+            else:
+                od = od_vis = max(0, deductions - min(deductions, wh_all))
+            number = (vis_inc - od_vis) if customer_view else (adj_inc - od)
+        else:
+            number = (wh_view + vis_inc - deductions) if customer_view else (wh_all + adj_inc - deductions)
+        if deductions > 0 and source != 'all':
+            stats['assigned' if a in ('warehouse', 'overseas') else
+                  ('smart_routed' if smart is not None else 'fifo_fallback')] += 1
+        chip_lots = lots
+        if windowed:
+            # The desktop's arrival-window rule (applyCatalogFilters / applySegmentFilters):
+            # only lots arriving inside the window count, undated lots pass, a style with no
+            # qualifying lot drops, and a partial match scales the number by the qualifying
+            # share of the style's production units. Customer View never counts hidden lots.
+            pool = [l for l in lots if not (customer_view and l['hidden'])]
+            if pool and any(l['arr'] or l['etd'] for l in pool):
+                chip_lots = [l for l in pool if not (l['arr'] and ((d_before and l['arr'] > d_before)
+                                                                   or (d_after and l['arr'] < d_after)))]
+                if not chip_lots:
+                    continue
+                if len(chip_lots) < len(pool):
+                    tot = sum(l['units'] for l in pool)
+                    if tot > 0:
+                        number = int(number * sum(l['units'] for l in chip_lots) / tot + 0.5)
+        if number <= 0 or number < min_units:
+            continue
+        pick = [l for l in chip_lots if l['units'] > 0 and l['arr'] and not l['sup']
+                and not (customer_view and l['hidden'])]
+        first_arr = min((l['arr'] for l in pick), default=None)
+        wh_cols = (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa'))
+        if not customer_view:
+            wh_cols += (('NJ', 'nj'), ('ABFI', 'abfi'))
+        wh_names = [n for n, k in wh_cols if q[k] > 0]
+        if source == 'overseas' or (source == 'all' and wh_view <= 0):
+            chip = ('Arrives ' + _apo_fmt_date(first_arr) if first_arr else 'Arrival TBD', 'arr')
+        else:
+            chip = ('In Warehouse · ' + ', '.join(wh_names), 'wh') if wh_names else None
+        color, fit, fab = _pres_details(sku, base, brand)
+        if not _pres_color_ok(color, brand, spec['color']):
+            continue
+        cards.append({'sku': sku, 'base': base, 'brand': brand, 'color': color, 'fab': fab, 'fit': fit,
+                      'number': int(number), 'chip': chip})
+    return {'cards': cards, 'stats': stats}
+
+
+def _pres_order_cards(params, spec):
+    """One card per style on the customer's open POs, a row per PO (PO #, units, cost,
+    ship window). Bulks (pipeline) stay out unless include_bulks."""
+    cust_q = str(params.get('customer') or '').strip().lower()
+    if not cust_q:
+        return {'error': "customer is required for source 'open_orders' (for example 'Ross')"}
+    orders, _ok = _fetch_all_open_orders()
+    if not orders:
+        return {'error': 'open orders feed unavailable right now'}
+    include_bulks = bool(params.get('include_bulks'))
+    min_units = _pres_int(params.get('min_units'))
+
+    def names(o):
+        return (str(o.get('customer') or '').strip().lower(),
+                str(o.get('customerFull') or o.get('customer') or '').strip())
+    # Which account: an exact code or name wins ('Ross' = ROSS, 'Costco' = COST + COST1).
+    # A partial name must point at ONE customer, so 'TJX' (TJX UK, TJX Australia,
+    # Winners/TJX Canada) never merges several accounts' POs into one deck.
+    wanted = {n.lower() for code, n in map(names, orders) if cust_q in (code, n.lower())}
+    if not wanted:
+        partial = {}
+        for code, n in map(names, orders):
+            if cust_q in code or cust_q in n.lower():
+                partial.setdefault(n.lower(), f"{n} ({code.upper()})" if code else n)
+        if len(partial) > 1 and not params.get('combine_customers'):
+            return {'error': 'several customers match that name', 'customers_matched': sorted(partial.values()),
+                    'hint': ('call again with one exact name or code from customers_matched, or set '
+                             'combine_customers true for one combined deck')}
+        wanted = set(partial)
+    stats = {'customer_lines': 0, 'bulk_lines_skipped': 0}
+    by_sku, custs = {}, {}
+    for o in orders:
+        units = _pres_int(o.get('openQty')) + _pres_int(o.get('pickQty'))
+        if units <= 0:
+            continue
+        code, cust = names(o)
+        if cust.lower() not in wanted:
+            continue
+        stats['customer_lines'] += 1
+        if o.get('isPipeline') and not include_bulks:
+            stats['bulk_lines_skipped'] += 1
+            continue
+        sku = str(o.get('style') or o.get('baseStyle') or '').strip().upper()
+        if not sku:
+            continue
+        base = sku.split('-')[0]
+        brand = _pres_card_brand(sku)
+        if not _pres_passes(spec, sku, base, brand):
+            continue
+        try:
+            cost = round(float(o.get('salesPrice') or 0), 2)
+        except (TypeError, ValueError):
+            cost = 0.0
+        po = str(o.get('orderNo') or '').strip()
+        start, cancel = str(o.get('startDate') or '')[:10], str(o.get('cancelDate') or '')[:10]
+        card = by_sku.setdefault(sku, {'sku': sku, 'base': base, 'brand': brand, 'lines': {}})
+        ln = card['lines'].setdefault((po, cost, start, cancel),
+                                      {'po': po, 'units': 0, 'cost': cost, 'start': start, 'cancel': cancel})
+        ln['units'] += units
+        custs[cust] = custs.get(cust, 0) + units
+    cards = []
+    for card in by_sku.values():
+        lines = sorted(card['lines'].values(), key=lambda x: (x['start'] or '9999', x['po']))
+        total = sum(x['units'] for x in lines)
+        if total < min_units:
+            continue
+        color, fit, fab = _pres_details(card['sku'], card['base'], card['brand'])
+        if not _pres_color_ok(color, card['brand'], spec['color']):
+            continue
+        cards.append({'sku': card['sku'], 'base': card['base'], 'brand': card['brand'], 'color': color,
+                      'fab': fab, 'fit': fit, 'number': total, 'lines': lines,
+                      'first': lines[0]['start'] or '9999'})
+    return {'cards': cards, 'stats': stats, 'customers': custs}
+
+
+def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_cost=True, doc_title='Presentation'):
+    """Draw the deck (the platform's Presentation Mode layout, in points: 1 CSS px of
+    the HTML deck = 0.75 pt). Returns (pdf bytes, page count)."""
+    from reportlab.lib.pagesizes import landscape
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.lib.utils import simpleSplit
+    PW, PH = landscape(letter)
+    M = 25.2                                   # 0.35 in page margin
+    X0, X1, YT, YB = M, PW - M, PH - M, M
+    cols = max(2, density // 2)
+    s = {4: 1.3, 6: 1.12, 8: 1.0, 10: 0.9}.get(density, 1.0)
+    INK, MUTED, FAINT = HexColor('#16181d'), HexColor('#475569'), HexColor('#94a3b8')
+    LINE, LINE2, IMG_BG = HexColor('#e2e8f0'), HexColor('#f1f5f9'), HexColor('#f8fafc')
+    PURPLE, GREEN, NAVY, HDR = HexColor('#7c3aed'), HexColor('#16a34a'), HexColor('#1e3a8a'), HexColor('#64748b')
+    CHIP = {'wh': (HexColor('#ecfdf5'), HexColor('#047857'), HexColor('#a7f3d0')),
+            'arr': (HexColor('#fffbeb'), HexColor('#b45309'), HexColor('#fde68a'))}
+
+    def fit_text(text, font, size, width):
+        text = str(text or '')
+        if stringWidth(text, font, size) <= width:
+            return text
+        while text and stringWidth(text + '…', font, size) > width:
+            text = text[:-1]
+        return text.rstrip() + '…'
+
+    def wrap(text, font, size, width, max_lines):
+        lines = simpleSplit(str(text or ''), font, size, width) or []
+        if len(lines) > max_lines:
+            lines = lines[:max_lines - 1] + [' '.join(lines[max_lines - 1:])]
+        return [fit_text(ln, font, size, width) for ln in lines]
+
+    def reader(data):
+        if not data:
+            return None
+        try:
+            return ImageReader(BytesIO(data))
+        except Exception:
+            return None
+
+    def draw_card(cd, x, y, w, h):
+        px, pt, pb = 6.75, 3.75, 5.25
+        iw = w - 2 * px
+        f_sku, f_txt, f_num, f_chip, f_tab = 9.4 * s, 7.1 * s, 10.1 * s, 6.75 * s, 6.4 * s
+        rows = [('text', (fit_text(cd['sku'], 'Courier-Bold', f_sku, iw), 'Courier-Bold', f_sku, INK), f_sku * 1.25)]
+        for ln in wrap(cd.get('color'), 'Helvetica-Bold', f_txt, iw, 2):
+            rows.append(('text', (ln, 'Helvetica-Bold', f_txt, PURPLE), f_txt * 1.3))
+        for ln in wrap(cd.get('fab'), 'Helvetica', f_txt, iw, 2):
+            rows.append(('text', (ln, 'Helvetica', f_txt, MUTED), f_txt * 1.3))
+        if cd.get('fit'):
+            rows.append(('text', (fit_text(cd['fit'], 'Helvetica-Bold', f_txt, iw), 'Helvetica-Bold', f_txt, MUTED),
+                         f_txt * 1.3))
+        if not orders_mode:
+            num = f"{int(cd['number']):,}"
+            nw = stringWidth(num, 'Helvetica-Bold', f_num)
+            ch_h = f_chip + 4.2
+            chip = None
+            if cd.get('chip'):
+                ctext = fit_text(cd['chip'][0], 'Helvetica-Bold', f_chip, iw - 10.5)
+                chip = (ctext, stringWidth(ctext, 'Helvetica-Bold', f_chip) + 10.5, cd['chip'][1])
+            same = not chip or nw + 5.25 + chip[1] <= iw
+            ht = 3 + (max(f_num * 1.25, ch_h if chip else 0) if same else f_num * 1.25 + 2 + ch_h)
+            rows.append(('stat', (num, nw, chip, same, ch_h), ht))
+        else:
+            hdr = ['PO #', 'Units'] + (['Cost'] if show_cost else []) + ['Ship window']
+            fonts = ['Courier-Bold'] + ['Helvetica'] * (len(hdr) - 1)
+            body = []
+            for ln in cd['lines']:
+                row = [ln['po'], f"{ln['units']:,}"]
+                if show_cost:
+                    row.append(f"${ln['cost']:,.2f}" if ln['cost'] else '')
+                row.append(_pres_window(ln['start'], ln['cancel']))
+                body.append(row)
+            fs, gapc = f_tab, 4.0
+            widths = []
+            for _ in range(8):
+                widths = [max([stringWidth(hdr[i], 'Helvetica-Bold', fs)] +
+                              [stringWidth(r[i], fonts[i], fs) for r in body]) for i in range(len(hdr))]
+                if sum(widths) + gapc * (len(hdr) - 1) <= iw or fs <= f_tab * 0.7:
+                    break
+                fs *= 0.93
+            extra = max(0.0, iw - sum(widths) - gapc * (len(hdr) - 1)) / len(hdr)
+            xs, acc = [], 0.0
+            for wdt in widths:
+                xs.append(acc)
+                acc += wdt + extra + gapc
+            hdr_h, row_h = fs * 1.55, fs * 1.6
+            tot_h = (f_chip * 1.45 + 2) if len(body) > 1 else 0
+            base_h = pt + pb + sum(r[2] for r in rows)
+            room = h - h * 0.40 - base_h - 3 - hdr_h - tot_h
+            max_rows = max(1, int(room // row_h))
+            shown = body if len(body) <= max_rows else body[:max(1, max_rows - 1)]
+            n_more = len(body) - len(shown)
+            more_units = sum(ln['units'] for ln in cd['lines'][len(shown):])
+            ht = 3 + hdr_h + row_h * (len(shown) + (1 if n_more else 0)) + tot_h
+            rows.append(('table', (hdr, fonts, shown, n_more, more_units, xs, fs, hdr_h, row_h,
+                                   sum(ln['units'] for ln in cd['lines']), len(body) > 1), ht))
+        info_h = pt + pb + sum(r[2] for r in rows)
+        img_h = max(10.0, h - info_h)
+        # photo area and white info block, clipped to the card's rounded shape
+        c.saveState()
+        path = c.beginPath()
+        path.roundRect(x, y, w, h, 7.5)
+        c.clipPath(path, stroke=0, fill=0)
+        c.setFillColor(IMG_BG)
+        c.rect(x, y + info_h, w, img_h, stroke=0, fill=1)
+        c.setFillColor(HexColor('#ffffff'))
+        c.rect(x, y, w, info_h, stroke=0, fill=1)
+        ph = reader(cd.get('photo'))
+        if ph:
+            ow, oh = ph.getSize()
+            sc = min(w / float(ow), img_h / float(oh))
+            dw, dh = ow * sc, oh * sc
+            c.drawImage(ph, x + (w - dw) / 2, y + info_h + (img_h - dh) / 2, dw, dh)
+        else:
+            c.setFillColor(FAINT)
+            c.setFont('Helvetica-Bold', 7.5)
+            c.drawCentredString(x + w / 2, y + info_h + img_h / 2 - 2.5, 'Photo coming soon')
+        c.restoreState()
+        c.setStrokeColor(LINE2)
+        c.setLineWidth(0.75)
+        c.line(x, y + info_h, x + w, y + info_h)
+        c.setStrokeColor(LINE)
+        c.setLineWidth(1.1)
+        c.roundRect(x, y, w, h, 7.5, stroke=1, fill=0)
+        cur = y + info_h - pt
+        tx = x + px
+        for kind, pl, ht in rows:
+            if kind == 'text':
+                t, font, size, col = pl
+                c.setFont(font, size)
+                c.setFillColor(col)
+                c.drawString(tx, cur - ht / 2 - size * 0.34, t)
+            elif kind == 'stat':
+                num, nw, chip, same, ch_h = pl
+                top = cur - 3
+                line_h = max(f_num * 1.25, ch_h if chip else 0) if same else f_num * 1.25
+                mid = top - line_h / 2
+                c.setFont('Helvetica-Bold', f_num)
+                c.setFillColor(GREEN)
+                c.drawString(tx, mid - f_num * 0.34, num)
+                if chip:
+                    ctext, cwid, cls = chip
+                    fill, fg, border = CHIP.get(cls, CHIP['wh'])
+                    cx0, cmid = (tx + nw + 5.25, mid) if same else (tx, top - f_num * 1.25 - 2 - ch_h / 2)
+                    c.setFillColor(fill)
+                    c.setStrokeColor(border)
+                    c.setLineWidth(0.75)
+                    c.roundRect(cx0, cmid - ch_h / 2, cwid, ch_h, 4.5, stroke=1, fill=1)
+                    c.setFillColor(fg)
+                    c.setFont('Helvetica-Bold', f_chip)
+                    c.drawString(cx0 + 5.25, cmid - f_chip * 0.34, ctext)
+            else:
+                hdr, fonts, shown, n_more, more_units, xs, fs, hdr_h, row_h, total_units, show_total = pl
+                top = cur - 3
+                c.setFont('Helvetica-Bold', fs)
+                c.setFillColor(HDR)
+                for i, t in enumerate(hdr):
+                    c.drawString(tx + xs[i], top - hdr_h / 2 - fs * 0.34, t)
+                c.setStrokeColor(LINE)
+                c.setLineWidth(0.75)
+                c.line(tx, top - hdr_h, tx + iw, top - hdr_h)
+                ry = top - hdr_h
+                for r in shown:
+                    for i, t in enumerate(r):
+                        c.setFont(fonts[i], fs)
+                        c.setFillColor(NAVY if i == 0 else INK)
+                        c.drawString(tx + xs[i], ry - row_h / 2 - fs * 0.34, t)
+                    ry -= row_h
+                    c.setStrokeColor(LINE2)
+                    c.setLineWidth(0.6)
+                    c.line(tx, ry, tx + iw, ry)
+                if n_more:
+                    c.setFont('Helvetica-Oblique', fs)
+                    c.setFillColor(MUTED)
+                    c.drawString(tx, ry - row_h / 2 - fs * 0.34,
+                                 f"+ {n_more} more PO{'s' if n_more != 1 else ''} ({more_units:,} units)")
+                    ry -= row_h
+                if show_total:
+                    c.setFont('Helvetica-Bold', f_chip)
+                    c.setFillColor(GREEN)
+                    c.drawString(tx, ry - 2 - (f_chip * 1.45) / 2 - f_chip * 0.34,
+                                 f"Total on order: {total_units:,} units")
+            cur -= ht
+
+    pages = []
+    for g in groups:
+        n = len(g['cards'])
+        parts = (n + density - 1) // density
+        for i in range(parts):
+            pages.append((g, g['cards'][i * density:(i + 1) * density], i + 1, parts))
+    buf = BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=(PW, PH))
+    c.setTitle(doc_title)
+    c.setAuthor('Versa Group')
+    total = len(pages)
+    for pi, (g, chunk, part, parts) in enumerate(pages):
+        if pi:
+            c.showPage()
+        lh = 30.0
+        hy = YT - lh
+        xx = X0
+        lg = reader(g.get('logo'))
+        if lg:
+            lw, lhh = lg.getSize()
+            dw = min(112.5, lw * lh / float(lhh))
+            dh = dw * lhh / float(lw)
+            c.drawImage(lg, xx, hy + (lh - dh) / 2, dw, dh, mask='auto')
+            xx += dw + 9
+        c.setFillColor(INK)
+        c.setFont('Helvetica-Bold', 15)
+        c.drawString(xx, hy + lh / 2 - 5.2, fit_text(g['name'], 'Helvetica-Bold', 15, max(60.0, X1 - xx - 270)),
+                     charSpace=0.4)
+        n = len(g['cards'])
+        units = sum(int(cd['number']) for cd in g['cards'])
+        meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · {units:,} units"
+        if orders_mode:
+            npo = len({ln['po'] for cd in g['cards'] for ln in cd['lines']})
+            meta += f" · {npo} PO{'s' if npo != 1 else ''}"
+        if parts > 1:
+            meta += f" · {part} of {parts}"
+        c.setFillColor(MUTED)
+        c.setFont('Helvetica-Bold', 7.1)
+        c.drawRightString(X1, hy + lh / 2 + 2.2, fit_text(headline, 'Helvetica-Bold', 7.1, 262))
+        c.setFont('Helvetica', 7.1)
+        c.drawRightString(X1, hy + lh / 2 - 8.1, meta)
+        rule_y = hy - 4.5
+        c.setStrokeColor(INK)
+        c.setLineWidth(2.25)
+        c.line(X0, rule_y, X1, rule_y)
+        c.setStrokeColor(LINE)
+        c.setLineWidth(0.75)
+        c.line(X0, YB + 10.5, X1, YB + 10.5)
+        c.setFont('Helvetica', 6.4)
+        c.setFillColor(FAINT)
+        c.drawString(X0, YB + 3, 'Versa Group LLC · Original Brands')
+        c.drawRightString(X1, YB + 3, f'{date_label} · Page {pi + 1} of {total}')
+        gtop, gbot, gap = rule_y - 1.2 - 7.5, YB + 10.5 + 6, 7.5
+        cw = (X1 - X0 - gap * (cols - 1)) / cols
+        chh = (gtop - gbot - gap) / 2
+        for idx, cd in enumerate(chunk):
+            r, k = divmod(idx, cols)
+            draw_card(cd, X0 + k * (cw + gap), gtop - r * (chh + gap) - chh, cw, chh)
+    c.save()
+    return buf.getvalue(), total
+
+
+def _ai_tool_build_presentation(params):
+    params = dict(params or {})
+    if not HAS_REPORTLAB:
+        return {'error': 'PDF rendering is unavailable on this server'}
+    src = str(params.get('source') or '').strip().lower().replace(' ', '_')
+    src = {'stock': 'warehouse', 'wh': 'warehouse', 'ats': 'warehouse', 'in_stock': 'warehouse',
+           'incoming': 'overseas', 'on_order': 'open_orders', 'orders': 'open_orders',
+           'customer_orders': 'open_orders', 'open_order': 'open_orders', 'any': 'all'}.get(src, src)
+    if src not in ('warehouse', 'overseas', 'all', 'open_orders'):
+        return {'error': "source must be 'warehouse', 'overseas', 'all' or 'open_orders'"}
+    want = _pres_int(params.get('cards_per_page')) or 8
+    density = min((4, 6, 8, 10), key=lambda d: (abs(d - want), d))
+    cat = str(params.get('category') or '').strip().lower()
+    cat = _PRES_CATEGORY_ALIASES.get(cat, cat) or None
+    params['category'] = cat
+    spec = _pres_filter_spec(params)
+    cv_raw = params.get('customer_view')
+    customer_view = not (cv_raw is False or str(cv_raw).strip().lower() in ('false', '0', 'no'))
+    for k in ('arrive_before', 'arrive_after'):
+        if params.get(k) and not _apo_parse_date(params.get(k)):
+            return {'error': f"{k} must be a date like 2026-10-01 (got {params.get(k)!r})"}
+    if src == 'open_orders':
+        res = _pres_order_cards(params, spec)
+    else:
+        res = _pres_stock_cards(src, customer_view, spec, params)
+    if res.get('error'):
+        return res
+    cards = res['cards']
+    if not cards:
+        out = {'error': 'no styles matched these filters', 'source': src}
+        out.update(res.get('stats') or {})
+        if src == 'open_orders':
+            out['customers_matched'] = sorted(res.get('customers') or {})
+            out['hint'] = ('the customer has open orders, but none match the other filters'
+                           if res['stats']['customer_lines'] else
+                           'no open orders for that customer name; check it with open_orders_lookup')
+        return out
+    order_idx = {}
+    for i, sk in enumerate(spec['skus']):
+        order_idx.setdefault(sk, i)
+
+    def within(cd):
+        if spec['skus']:
+            return (order_idx.get(cd['sku'], order_idx.get(cd['base'], 10 ** 6)), cd['sku'])
+        if src == 'open_orders':
+            return (cd['first'], cd['sku'])
+        return (-cd['number'], cd['sku'])
+    cards.sort(key=lambda cd: (_pres_brand_name(cd['brand']).upper(), cd['brand'], within(cd)))
+    dropped = cards[_PRES_MAX_CARDS:]
+    cards = cards[:_PRES_MAX_CARDS]
+    photos = dict(_pres_parallel(lambda cd: (cd['sku'], _pres_photo_jpeg(cd['sku'], cd['brand'])), cards, 12))
+    logos = dict(_pres_parallel(lambda k: (k, _pres_logo_png(k)), sorted({cd['brand'] for cd in cards}), 6))
+    groups = []
+    for cd in cards:
+        cd['photo'] = photos.get(cd['sku'])
+        if not groups or groups[-1]['key'] != cd['brand']:
+            groups.append({'key': cd['brand'], 'name': _pres_brand_name(cd['brand']),
+                           'logo': logos.get(cd['brand']), 'cards': []})
+        groups[-1]['cards'].append(cd)
+    now = _pres_now_et()
+    date_label = _apo_fmt_date(now)
+    title = str(params.get('title') or '').strip() or _PRES_CATEGORY_TITLES.get(cat or '', '')
+    custs = res.get('customers') or {}
+    cust_label = ''
+    if src == 'open_orders':
+        ranked = sorted(custs, key=custs.get, reverse=True)
+        cust_label = ' + '.join(ranked) if ranked else str(params.get('customer') or '').strip()
+        headline = ' · '.join(x for x in ('Versa Group', cust_label,
+                                          (title + ' on order') if title else 'On order') if x)
+        stem = (f"{_pres_customer_short(params.get('customer'), cust_label)} "
+                f"{title + ' ' if title else ''}On Order Presentation")
+    else:
+        view = _PRES_VIEW_LABELS[src]
+        headline = ' · '.join(x for x in ('Versa Group', title, view,
+                                          '' if customer_view else 'Internal view') if x)
+        stem = f"{title + ' ' if title else ''}{view} Presentation"
+    fname = str(params.get('filename') or '').strip() or stem
+    if fname.lower().endswith('.pdf'):
+        fname = fname[:-4]
+    fname = re.sub(r'\s{2,}', ' ', re.sub(r'[^A-Za-z0-9 &_.()-]+', '', fname)).strip() or 'Presentation'
+    pdf, page_count = _pres_render_pdf(groups, headline, date_label, density, src == 'open_orders',
+                                       show_cost=params.get('show_cost') is not False, doc_title=fname)
+    key = f"claude uploaded/{fname} {now.strftime('%m.%d.%y %H%M%S')}.pdf"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=pdf, ContentType='application/pdf')
+    from urllib.parse import quote
+    url = f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}"
+    out = {'download_url': url, 'format': 'PDF presentation (photo cards)', 'source': src,
+           'cards_per_page': density, 'pages': page_count, 'styles': len(cards),
+           'units': sum(cd['number'] for cd in cards),
+           'brands': [{'brand': g['name'], 'styles': len(g['cards']),
+                       'units': sum(cd['number'] for cd in g['cards']),
+                       'pages': (len(g['cards']) + density - 1) // density} for g in groups],
+           'missing_photos': [cd['sku'] for cd in cards if not cd.get('photo')][:40],
+           'note': ('Give the user this link as a clickable download. It is a print-ready PDF '
+                    'presentation of photo cards, not a line sheet.')}
+    if dropped:
+        out['truncated'] = True
+        out['styles_dropped_over_cap'] = len(dropped)
+        out['brands_cut'] = sorted({_pres_brand_name(cd['brand']) for cd in dropped})
+    if src == 'open_orders':
+        out['customer'] = cust_label
+        out['customers_matched'] = sorted(custs)
+        out['pos'] = len({ln['po'] for cd in cards for ln in cd['lines']})
+        out['bulk_lines_skipped'] = res['stats']['bulk_lines_skipped']
+        out['card_shows'] = 'style details plus PO #, units, cost and ship window per PO (no arrival or ex-factory dates)'
+    else:
+        st = res['stats']
+        out['customer_view'] = customer_view
+        out['size_rows_skipped'] = st['size_rows_skipped']
+        out['routing'] = {'smart_routed': st['smart_routed'], 'fifo_fallback': st['fifo_fallback'],
+                          'deduction_assigned': st['assigned']}
+        out['quantity_basis'] = ('the platform number for this view: smart routing splits committed/allocated '
+                                 'between warehouse and overseas (APO/VW bookings and pre-picks FIFO inside the '
+                                 'engine), manual and virtual allocations deducted, deduction assignments honoured, '
+                                 'landed lots suppressed' + ('; NJ/ABFI stock and NJ/AE/AW/ABFI-landing lots excluded'
+                                                             if customer_view else ''))
+        if not st['orders_feed_ok']:
+            out['routing_warning'] = 'open orders feed was unavailable, so styles with orders fell back to FIFO'
+        if src == 'warehouse' and (params.get('arrive_before') or params.get('arrive_after')):
+            out['date_filter_ignored'] = 'arrival dates only apply to overseas and all decks'
+    return out
+
+
 _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
@@ -15630,13 +16797,14 @@ _AI_AGENT_TOOLS = [
          'filename': {'type': 'string'}},
          'required': ['customer']}},
     {'name': 'build_line_sheet',
-     'description': ('Build a real multi-tab Excel line sheet with embedded photos and return a download URL. '
+     'description': ('Build a real multi-tab EXCEL line sheet (a spreadsheet) with embedded photos and return a download URL. '
                      'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
                      'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
                      'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
                      'Max 4 tabs, 300 styles per tab. Takes up to a minute. Present the returned download_url '
-                     'to the user as a clickable link.'),
+                     'to the user as a clickable link. Excel only: when the user asks for a presentation, '
+                     'deck, print-out or photo cards, use build_presentation instead.'),
      'input_schema': {'type': 'object', 'properties': {
          'tabs': {'type': 'array', 'items': {'type': 'object', 'properties': {
              'title': {'type': 'string'}, 'brand': {'type': 'string'},
@@ -15648,6 +16816,45 @@ _AI_AGENT_TOOLS = [
              'limit': {'type': 'integer'}}}},
          'customer_view': {'type': 'boolean'}, 'filename': {'type': 'string'}},
          'required': ['tabs']}},
+    {'name': 'build_presentation',
+     'description': ("Build a print-ready PRESENTATION: a PDF deck of product photo cards, returned as download_url. "
+                     "Use this whenever the user asks for a presentation, presentation format, deck, print-out, "
+                     "lookbook, photo cards or 'N tiles per page'. NEVER answer those with build_line_sheet, which "
+                     "only makes Excel files. Layout: US Letter landscape, the brand logo on top, two rows of photo "
+                     "cards (cards_per_page 8 by default = 2 x 4), and every brand starts on a new page. "
+                     "source 'warehouse' = stock on hand now; each card shows its warehouse ATS and which warehouse. "
+                     "source 'overseas' = on production; each card shows its overseas ATS and 'Arrives <date>'. "
+                     "source 'all' = both in one deck. Stock numbers are the platform's own (smart routing, "
+                     "allocations, landed-lot suppression). source 'open_orders' = ONE customer's current open POs "
+                     "(customer required, e.g. 'Ross'; a partial name that matches several accounts, like 'TJX', "
+                     "returns customers_matched so you can pick one or pass combine_customers true): one card per "
+                     "style with the shirt details and a row per PO "
+                     "showing PO #, units, cost and ship window; never arrival or ex-factory dates; bulks excluded "
+                     "unless include_bulks. Filters work like query_inventory: brands, exclude_brands ('everything "
+                     "except Shaq' = exclude_brands ['SHAQ']), category, fabric_codes, color, search, skus (an exact "
+                     "curated list), min_units, arrive_before/arrive_after (YYYY-MM-DD, overseas and all). category 'big_tall' keeps "
+                     "ONLY Big & Tall fits: use it whenever the user says big & tall or B&T, including on open_orders "
+                     "(a big account like Ross has many orders that are not B&T). customer_view defaults to true "
+                     "(Customer View rules: NJ/ABFI stock and NJ/AE/AW/ABFI-landing lots never appear); set it false "
+                     "only when the user explicitly wants an internal deck. When the user wants a warehouse deck AND an "
+                     "overseas deck, call this tool twice (one deck each) unless they ask for one combined deck "
+                     "(source 'all'). Takes up to a minute or two. Reply with the link and a short per-brand summary "
+                     "(styles, units, pages) from the result."),
+     'input_schema': {'type': 'object', 'properties': {
+         'source': {'type': 'string', 'enum': ['warehouse', 'overseas', 'all', 'open_orders']},
+         'customer': {'type': 'string'}, 'include_bulks': {'type': 'boolean'},
+         'combine_customers': {'type': 'boolean'},
+         'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'exclude_brands': {'type': 'array', 'items': {'type': 'string'}},
+         'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
+         'color': {'type': 'string'}, 'search': {'type': 'string'},
+         'skus': {'type': 'array', 'items': {'type': 'string'}},
+         'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
+         'customer_view': {'type': 'boolean'},
+         'cards_per_page': {'type': 'integer', 'enum': [4, 6, 8, 10]},
+         'show_cost': {'type': 'boolean'},
+         'title': {'type': 'string'}, 'filename': {'type': 'string'}},
+         'required': ['source']}},
 ]
 
 # Tools that read the Past Orders / sales-history data. The platform chat
@@ -15664,12 +16871,14 @@ _AI_AGENT_TOOL_FNS = {
     'sales_history_lookup': _ai_tool_sales_history,
     'build_sales_sheet': _ai_tool_build_sales_sheet,
     'build_line_sheet': _ai_tool_build_line_sheet,
+    'build_presentation': _ai_tool_build_presentation,
 }
 
 _AI_AGENT_TOOL_GUIDANCE = """
 LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
+PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "lookbook", "photo cards" or "N tiles/cards per page" ALWAYS means build_presentation (a print-ready PDF of photo cards), never build_line_sheet and never a spreadsheet. Map the request straight onto its parameters. Example: "B&T in stock and incoming for everything but Shaq, one for warehouse and one for overseas, 8 tiles per page" = two calls, {source:'warehouse', category:'big_tall', exclude_brands:['SHAQ']} and {source:'overseas', category:'big_tall', exclude_brands:['SHAQ']}. Example: "Ross's big and tall styles on order with PO #, units, cost and ship window" = {source:'open_orders', customer:'Ross', category:'big_tall'}. Put each link in your final message as <a href="URL" target="_blank">Download the presentation</a>.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus, or the saveLineSheetViews action's skus param. Never ask the user to paste style numbers you can look up.
 UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. Never emit a queryInventory action — it is retired; its output rendered only in the user's browser and never came back to you. After your tools finish, respond in the required JSON format.
 The message field renders as raw HTML in the chat bubble. Format with HTML only: <b>, <br>, &bull; lists, <a> links. NEVER markdown (**bold**, ##, tables) — it shows as literal asterisks.
@@ -15800,7 +17009,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA/NJ). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute)."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute). build_presentation produces a print-ready PDF PRESENTATION of photo cards (brand logo on top, 8 cards per page, a new page per brand) for warehouse stock, overseas stock or one customer's open orders; it also returns a download URL and takes up to a minute or two. Whenever the user says presentation, presentation format, deck, print-out or photo cards, use build_presentation, never build_line_sheet."""
 
 
 def _mcp_rpc_result(rid, result):
