@@ -2276,30 +2276,50 @@ def _landing_index():
     built once per export sheet:
       by_ref   {(production ref, style): [(arrival text, warehouse)]}
       by_style {style: [(sort key, warehouse)]}   (open lots only)
+      by_ref_b / by_style_b: the same keyed on the ledger style's BASE, for
+      per-size or variant ledger lines (1P prepacks: 1PDKTS001SLS-S); used only
+      when an export row's exact style has no entry of its own
     One production number covers many styles AND can land one style in two
     warehouses (DP26014 on TJDKPK022SLS: a JTW lot and a TR lot), so a ref is
     never looked up on its own. Arrival text follows the page's rule and format
     (ledger arrival, else ETD + 45 / 55 for pants; e.g. 'Sep 24, 2026')."""
     with _production_lock:
         rows = list(_production_data)
+    if not rows:
+        # Cold worker (just deployed or woken from sleep): the startup sync may not
+        # have loaded the ledger yet, and every landing would print blank. Load it
+        # now with the same call GET /production makes (cached once loaded).
+        try:
+            rows = list(load_production_from_dropbox() or [])
+        except Exception as e:
+            print(f"  [landing-in] style ledger load failed: {e}")
+            rows = []
     by_ref, by_style = {}, {}
+    by_ref_b, by_style_b = {}, {}
     for p in rows:
         st = str(p.get('style') or '').strip().upper()
         wh = str(p.get('warehouse') or '').strip().upper()
         if not st or not wh:
             continue
+        bst = st.split('-')[0]
         ad = _apo_prod_arrival(p, _py_is_bottom(st))
         ref = str(p.get('production') or '').strip().upper()
         # Lots with no production number are indexed under ref '' so a delivery row
         # that has no PO Ref # can still be pinned to its own lot by style + arrival.
-        by_ref.setdefault((ref, st), []).append((_apo_fmt_date(ad) if ad else '', wh))
+        lot = (_apo_fmt_date(ad) if ad else '', wh)
+        by_ref.setdefault((ref, st), []).append(lot)
+        if bst != st:
+            by_ref_b.setdefault((ref, bst), []).append(lot)
         try:
             units = int(p.get('units') or 0)
         except Exception:
             units = 0
         if units > 0:
-            by_style.setdefault(st, []).append(((ad is None, ad or datetime.max.date()), wh))
-    return by_ref, by_style
+            key = ((ad is None, ad or datetime.max.date()), wh)
+            by_style.setdefault(st, []).append(key)
+            if bst != st:
+                by_style_b.setdefault(bst, []).append(key)
+    return by_ref, by_style, by_ref_b, by_style_b
 
 
 def _landing_in_label(item, idx, catalog_mode=True):
@@ -2315,13 +2335,17 @@ def _landing_in_label(item, idx, catalog_mode=True):
       with the row's PO Ref # and Arrival to Warehouse cells.
     - A row with overseas stock but no known delivery lists every landing of
       the style's open productions, soonest arrival first.
-    - Warehouse-only rows stay blank.
+    - Warehouse-only rows stay blank, and so does an order line picked from
+      warehouse stock (Delivery 'ATS', no arrival), even when the page stamped
+      it with the style's nearest production.
+    - A row on the undated delivery ('No Date') shows its undated lots' landing.
     Customer exports print only codes in _LANDING_IN_SHOWN (never NJ/AE/AW/ABFI,
     never a customer code such as WALM). Always computed from the live ledger;
     a posted landing value is never trusted."""
     if not idx:
         return ''
-    by_ref, by_style = idx
+    by_ref, by_style = idx[0], idx[1]
+    by_ref_b, by_style_b = (idx[2], idx[3]) if len(idx) > 3 else ({}, {})
 
     def _join(whs):
         out = []
@@ -2336,30 +2360,36 @@ def _landing_in_label(item, idx, catalog_mode=True):
     st = str(item.get('sku') or '').strip().upper()
     base = st.split('-')[0]
     ref = str(item.get('production') or item.get('po_ref') or '').strip().upper()
+    arr = str(item.get('arrival') or '').strip()
+    # An order line picked from warehouse stock (Delivery 'ATS', no arrival) ships
+    # from the warehouse, so nothing lands: blank, like any warehouse-only row. The
+    # page may still stamp it with the style's nearest production (All Inventory has
+    # no delivery picker), so this runs BEFORE the production lookup.
+    if 'quantity_ordered' in item and str(item.get('delivery') or '').strip().upper() == 'ATS' and not arr:
+        return ''
     if ref:
-        lots = by_ref.get((ref, st)) or by_ref.get((ref, base))
+        lots = by_ref.get((ref, st)) or by_ref.get((ref, base)) or by_ref_b.get((ref, base))
         if lots:
-            arr = str(item.get('arrival') or '').strip()
             hit = [wh for a, wh in lots if arr and a == arr]
             return _join(hit or [wh for _a, wh in lots])
     else:
         # delivery row from a ledger lot that has no production number
-        arr = str(item.get('arrival') or '').strip()
-        lots = by_ref.get(('', st)) or by_ref.get(('', base)) or []
+        lots = by_ref.get(('', st)) or by_ref.get(('', base)) or by_ref_b.get(('', base)) or []
         hit = [wh for a, wh in lots if arr and a == arr]
         if hit:
             return _join(hit)
-    # An order line picked from warehouse stock (Delivery 'ATS', no delivery named)
-    # ships from the warehouse, so nothing lands: blank, like any warehouse-only row.
-    if not ref and 'quantity_ordered' in item and str(item.get('delivery') or '').strip().upper() == 'ATS':
-        return ''
     try:
         inc = int(float(item.get('incoming') or 0))
     except Exception:
         inc = 0
     if not (ref or inc > 0):
         return ''
-    lots = by_style.get(st) or by_style.get(base) or []
+    lots = by_style.get(st) or by_style.get(base) or by_style_b.get(base) or []
+    # A row on the undated delivery ('No Date' / dash) shows only the undated lots
+    if arr.upper() in ('NO DATE', '\u2014', '-'):
+        und = [wh for k, wh in lots if k[0]]
+        if und:
+            return _join(und)
     return _join(wh for _k, wh in sorted(lots, key=lambda x: x[0]))
 
 
@@ -2554,7 +2584,12 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     if not headers:
         headers = []
     # "Landing in" (every Overseas / All Inventory export): ledger lookup index, built once per sheet
-    _landing_idx = _landing_index() if 'Landing in' in headers else None
+    _landing_idx = None
+    if 'Landing in' in headers:
+        try:
+            _landing_idx = _landing_index()
+        except Exception as e:   # a ledger surprise must never break the whole export
+            print(f"  [landing-in] ledger index failed, column left blank: {e}")
 
     # Map header names to data field getters
     FIELD_MAP = {
@@ -4437,7 +4472,11 @@ def build_overseas_summary_excel(title, items, s3_base_url, catalog_mode=False):
                'Produced', 'Deducted', 'Flow ATS']
     col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 14, 22, 14, 14, 14, 12, 12, 12]
     # "Landing in" (Sep 10 2026): each production's landing warehouse from the ledger
-    _landing_idx = _landing_index()
+    try:
+        _landing_idx = _landing_index()
+    except Exception as e:   # a ledger surprise must never break the export
+        print(f"  [landing-in] ledger index failed, column left blank: {e}")
+        _landing_idx = None
 
     ws.hide_gridlines(2)
     ws.freeze_panes(1, 0)
@@ -4557,7 +4596,9 @@ def export_single():
         fname = req.get('filename', 'Export')
         view_mode = req.get('view_mode', 'all')
         is_order = req.get('is_order', False)
-        catalog_mode = req.get('catalog_mode', False)
+        # A catalog-link (scoped) request is ALWAYS customer format: the layout and the
+        # Landing in filter never trust a client-sent catalog_mode:false (Sep 10 2026).
+        catalog_mode = bool(req.get('catalog_mode')) or getattr(g, '_catalog_scope', None) is not None
         flow_mode = req.get('flow_mode', False)
         # TJX-logo catalogs get their own column layout (catalog-mode only)
         tjx_layout = bool(req.get('tjx_layout')) and bool(catalog_mode)
@@ -4647,7 +4688,9 @@ def export_multi():
                         _b['items'] = _drop_sized_rows(_b['items'])   # staff Customer View: styles only
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
         fname = req.get('filename', 'Multi_Brand')
-        catalog_mode = req.get('catalog_mode', False)
+        # A catalog-link (scoped) request is ALWAYS customer format: the layout and the
+        # Landing in filter never trust a client-sent catalog_mode:false (Sep 10 2026).
+        catalog_mode = bool(req.get('catalog_mode')) or getattr(g, '_catalog_scope', None) is not None
         view_mode = req.get('view_mode', 'all')
         # 📋 flow_mode enables PO Name column in catalog overseas exports
         flow_mode = req.get('flow_mode', False)
@@ -15163,6 +15206,17 @@ def _ai_tool_build_line_sheet(params):
             etd_s = arr_s = po_ref = ''
             best = None
             for p in prod_by_base.get(base, []):
+                # Customer view never names a lot that lands in a restricted warehouse
+                # (NJ/AE/AW/ABFI) or an empty lot, so the dates, PO Ref # and Landing
+                # in all describe a delivery the customer can see (Sep 10 2026).
+                if customer_view:
+                    if str(p.get('warehouse') or '').strip().upper() in _HIDDEN_LANDING_WH:
+                        continue
+                    try:
+                        if int(p.get('units') or 0) <= 0:
+                            continue
+                    except Exception:
+                        pass
                 try:
                     arr = _apo_prod_arrival(p, _py_is_bottom(base))
                 except Exception:
@@ -15170,8 +15224,11 @@ def _ai_tool_build_line_sheet(params):
                 if arr and (best is None or arr < best[0]):
                     best = (arr, p)
             if best:
-                arr_s = str(best[0])
-                etd_s = str(best[1].get('etd') or '')
+                # Same date text as every other export ('Sep 24, 2026'), so Landing in
+                # can pin a production that lands one style in two warehouses.
+                arr_s = _apo_fmt_date(best[0])
+                _etd = _apo_parse_date(best[1].get('etd'))
+                etd_s = _apo_fmt_date(_etd) if _etd else str(best[1].get('etd') or '')
                 po_ref = str(best[1].get('production') or '')
             # NJ and ABFI are admin-only: a customer-view sheet never names or counts them.
             _wh_keys = (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa')) + ((() if customer_view else (('NJ', 'nj'), ('ABFI', 'abfi'))))
