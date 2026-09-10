@@ -5993,6 +5993,277 @@ def extract_override_images_status():
         return jsonify({k: v for k, v in _extract_state.items()})
 
 
+# ── Override photo move (Sep 10 2026, David) ─────────────────────────────
+# Moves every photo embedded in style_overrides.json (data:image base64) into
+# S3 "ALL INVENTORY Photos/STYLE OVERRIDES/<EXACT KEY>.jpg". The desktop looks
+# an override photo up by the item's FULL sku, exports try the full sku then
+# the base, and the phone / /image proxy use the base, so each photo is saved
+# under its exact key, plus one base-style copy when a size-variant-only style
+# has no base file yet. Three phases, so nothing leaves the JSON until every
+# photo is confirmed in S3:
+#   plan   - read-only: what would be written, overwritten or kept
+#   upload - background: full JSON backup first, then put + read-back verify
+#            (S3 ETag == md5 of the bytes) for every photo; result file in S3
+#   strip  - rewrite the JSON without every embedded photo whose EXACT bytes
+#            are in the folder under its exact key (listing ETag == md5);
+#            anything unconfirmed stays embedded. Pre-strip backup first;
+#            aborts if another save landed while it worked (ETag check).
+# The machine key may call it (maintenance channel, like /admin/claude-uploads).
+_OVR_IMG_PREFIX = 'ALL INVENTORY Photos/STYLE OVERRIDES/'
+_OVR_NAME_OK = re.compile(r'^[A-Z0-9][A-Z0-9._/-]*$')
+_ovr_move_lock = threading.Lock()
+_ovr_move_state = {'running': False, 'done': False, 'error': None, 'started_at': None,
+                   'total': 0, 'verified': 0, 'failed': [], 'backup': None, 'result_key': None}
+
+
+def _ovr_img_bytes(data_uri):
+    """Bytes of a data:image URI. JPEG is stored as-is (lossless); anything else
+    is converted to JPEG q90 the same way the older extractor did."""
+    import base64 as _b64
+    head, b64 = data_uri.split(',', 1)
+    mime = head[5:].split(';')[0].lower()
+    raw = _b64.b64decode(b64)
+    if mime in ('image/jpeg', 'image/jpg'):
+        return raw
+    with PilImage.open(BytesIO(raw)) as im:
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ('RGBA', 'LA', 'P'):
+            rgba = im.convert('RGBA')
+            bg = PilImage.new('RGB', rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            im = bg
+        elif im.mode != 'RGB':
+            im = im.convert('RGB')
+        out = BytesIO()
+        im.save(out, format='JPEG', quality=90)
+        return out.getvalue()
+
+
+def _ovr_folder_listing(s3):
+    """{name relative to STYLE OVERRIDES/: (etag, size)} for every object."""
+    out, token = {}, None
+    while True:
+        kw = {'Bucket': S3_BUCKET, 'Prefix': _OVR_IMG_PREFIX, 'MaxKeys': 1000}
+        if token:
+            kw['ContinuationToken'] = token
+        resp = s3.list_objects_v2(**kw)
+        for o in resp.get('Contents', []) or []:
+            out[o['Key'][len(_OVR_IMG_PREFIX):]] = (str(o.get('ETag', '')).strip('"'), int(o.get('Size') or 0))
+        if not resp.get('IsTruncated'):
+            break
+        token = resp.get('NextContinuationToken')
+    return out
+
+
+def _ovr_is_embedded(v):
+    return isinstance(v, dict) and isinstance(v.get('image'), str) and v['image'].startswith('data:image/')
+
+
+def _ovr_move_plan(overrides, folder):
+    """Deterministic move plan for the given overrides dict + folder listing.
+    Returns (plan, data) where data = {key: (bytes, md5)}."""
+    import hashlib
+    writes, kept, data = [], [], {}
+    embedded = [k for k, v in overrides.items() if _ovr_is_embedded(v)]
+    for k in embedded:
+        name = str(k).upper().strip()
+        if name != k or not _OVR_NAME_OK.match(name) or name.endswith('-'):
+            kept.append({'key': k, 'reason': 'key cannot be used as a file name'})
+            continue
+        try:
+            b = _ovr_img_bytes(overrides[k]['image'])
+        except Exception as e:
+            kept.append({'key': k, 'reason': 'photo could not be decoded: ' + str(e)[:80]})
+            continue
+        m = hashlib.md5(b).hexdigest()
+        data[k] = (b, m)
+        fn = name + '.jpg'
+        cur = folder.get(fn)
+        if cur and cur[0] == m:
+            continue   # identical file already there
+        writes.append({'file': fn, 'key': k, 'md5': m, 'bytes': len(b),
+                       'action': 'overwrite' if cur else 'new'})
+    # base-style copy for size-variant-only styles that have no base file
+    by_base = {}
+    for k in data:
+        by_base.setdefault(get_base_style(k), []).append(k)
+    for b, ks in sorted(by_base.items()):
+        if any(str(k).upper().strip() == b for k in ks) or (b + '.jpg') in folder or not _OVR_NAME_OK.match(b):
+            continue
+        cnt = {}
+        for k in ks:
+            cnt[data[k][1]] = cnt.get(data[k][1], 0) + 1
+        top = max(cnt.values())
+        src = sorted([k for k in ks if cnt[data[k][1]] == top], key=lambda kk: (-len(data[kk][0]), kk))[0]
+        writes.append({'file': b + '.jpg', 'key': src, 'md5': data[src][1], 'bytes': len(data[src][0]),
+                       'action': 'base copy'})
+    return {'embedded': len(embedded), 'writes': writes, 'kept': kept}, data
+
+
+def _run_ovr_move_upload(ts):
+    try:
+        load_overrides_from_s3()
+        with _overrides_lock:
+            snap_json = json.dumps(_style_overrides)
+            etag = _s3_overrides_etag
+        snapshot = json.loads(snap_json)
+        s3 = get_s3()
+        backup_key = f"inventory/overrides_backups/style_overrides_pre_image_move_{ts}.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=backup_key, Body=snap_json.encode('utf-8'),
+                      ContentType='application/json')
+        folder = _ovr_folder_listing(s3)
+        plan, data = _ovr_move_plan(snapshot, folder)
+        with _ovr_move_lock:
+            _ovr_move_state.update(total=len(plan['writes']), backup=backup_key)
+        done, failed = [], []
+        for w in plan['writes']:
+            b = data[w['key']][0]
+            key = _OVR_IMG_PREFIX + w['file']
+            try:
+                s3.put_object(Bucket=S3_BUCKET, Key=key, Body=b, ContentType='image/jpeg')
+                h = s3.head_object(Bucket=S3_BUCKET, Key=key)
+                ok = (str(h.get('ETag', '')).strip('"') == w['md5']
+                      and int(h.get('ContentLength') or 0) == len(b))
+                if ok:
+                    done.append(w)
+                else:
+                    failed.append({**w, 'error': 'read-back did not match'})
+            except Exception as e:
+                failed.append({**w, 'error': str(e)[:160]})
+            with _ovr_move_lock:
+                _ovr_move_state.update(verified=len(done), failed=list(failed))
+        # new / replaced files must show at once on every worker
+        names = [w['file'][:-4] for w in done]
+        with _img_lock:
+            for n in names:
+                _img_cache.pop(n, None)
+                _img_cache.pop(get_base_style(n), None)
+        with _web_img_lock:
+            for n in names:
+                _web_img_cache.pop(n.upper(), None)
+                _web_img_cache.pop(get_base_style(n), None)
+        paths = ['/' + (_OVR_IMG_PREFIX + w['file']).replace(' ', '+') for w in done]
+        if paths:
+            threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+        result = {'phase': 'upload', 'finished_at': datetime.utcnow().isoformat() + 'Z',
+                  'backup': backup_key, 'overrides_etag': etag, 'embedded': plan['embedded'],
+                  'planned': len(plan['writes']), 'verified': len(done), 'failed': failed,
+                  'kept': plan['kept'], 'writes': done}
+        result_key = f"inventory/overrides_backups/image_move_upload_{ts}.json"
+        s3.put_object(Bucket=S3_BUCKET, Key=result_key, Body=json.dumps(result).encode('utf-8'),
+                      ContentType='application/json')
+        with _ovr_move_lock:
+            _ovr_move_state.update(running=False, done=True, error=None, result_key=result_key)
+        print(f"  OK override photo move upload: {len(done)}/{len(plan['writes'])} verified, "
+              f"{len(failed)} failed, backup {backup_key}", flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        with _ovr_move_lock:
+            _ovr_move_state.update(running=False, done=True, error=str(e)[:300])
+
+
+def _ovr_move_strip():
+    """Rewrite style_overrides.json without every embedded photo that is
+    confirmed in S3 (exact key file, listing ETag == md5 of its bytes)."""
+    global _style_overrides, _overrides_last_saved
+    import hashlib
+    load_overrides_from_s3()
+    with _overrides_lock:
+        original_json = json.dumps(_style_overrides)
+        loaded_etag = _s3_overrides_etag
+    current = json.loads(original_json)
+    if not current or not loaded_etag:
+        return {'error': 'overrides not loaded from S3 - nothing changed, retry'}, 503
+    s3 = get_s3()
+    folder = _ovr_folder_listing(s3)
+    stripped, removed, kept = 0, 0, []
+    for k in list(current.keys()):
+        v = current[k]
+        if not _ovr_is_embedded(v):
+            continue
+        name = str(k).upper().strip()
+        try:
+            m = hashlib.md5(_ovr_img_bytes(v['image'])).hexdigest()
+        except Exception:
+            kept.append({'key': k, 'reason': 'photo could not be decoded'})
+            continue
+        cur = folder.get(name + '.jpg')
+        if name == k and cur and cur[0] == m:
+            v.pop('image', None)
+            stripped += 1
+            if not v:
+                current.pop(k, None)
+                removed += 1
+        else:
+            kept.append({'key': k, 'reason': 'not confirmed in S3 under its exact name'})
+    if not stripped:
+        return {'ok': True, 'phase': 'strip', 'stripped': 0, 'kept': kept,
+                'note': 'nothing confirmed to strip - JSON unchanged'}, 200
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    backup_key = f"inventory/overrides_backups/style_overrides_pre_image_strip_{ts}.json"
+    s3.put_object(Bucket=S3_BUCKET, Key=backup_key, Body=original_json.encode('utf-8'),
+                  ContentType='application/json')
+    head = s3.head_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
+    if str(head.get('ETag', '')).strip('"') != loaded_etag:
+        return {'error': 'someone saved overrides while this ran - nothing changed, run strip again',
+                'backup': backup_key}, 409
+    with _overrides_lock:
+        _style_overrides = current
+    _overrides_last_saved = time.time()
+    if not save_overrides_to_s3():
+        return {'error': 'saving the new JSON failed - canonical file unchanged', 'backup': backup_key}, 500
+    trigger_background_generation()
+    size_mb = round(len(json.dumps(current)) / 1e6, 3)
+    print(f"  OK override photo move strip: {stripped} photos removed from JSON, {removed} empty entries "
+          f"dropped, {len(kept)} kept, JSON now {size_mb}MB, backup {backup_key}", flush=True)
+    return {'ok': True, 'phase': 'strip', 'stripped': stripped, 'entries_removed': removed,
+            'entries_after': len(current), 'kept': kept, 'json_mb': size_mb, 'backup': backup_key}, 200
+
+
+@app.route('/admin/override-images/move', methods=['POST', 'OPTIONS'])
+def admin_override_images_move():
+    if request.method == 'OPTIONS':
+        return '', 204
+    body = request.get_json(silent=True) or {}
+    phase = str(body.get('phase') or request.args.get('phase') or '').strip().lower()
+    try:
+        if phase == 'plan':
+            load_overrides_from_s3()
+            with _overrides_lock:
+                snap = json.loads(json.dumps(_style_overrides))
+            folder = _ovr_folder_listing(get_s3())
+            plan, _data = _ovr_move_plan(snap, folder)
+            by_action = {}
+            for w in plan['writes']:
+                by_action[w['action']] = by_action.get(w['action'], 0) + 1
+            return jsonify({'ok': True, 'phase': 'plan', 'entries': len(snap), 'embedded': plan['embedded'],
+                            'uploads': len(plan['writes']), 'by_action': by_action, 'kept': plan['kept'],
+                            'folder_objects': len(folder), 'writes': plan['writes']})
+        if phase == 'upload':
+            with _ovr_move_lock:
+                if _ovr_move_state['running']:
+                    return jsonify({'ok': True, 'already_running': True, **_ovr_move_state})
+                ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                _ovr_move_state.update(running=True, done=False, error=None, total=0, verified=0, failed=[],
+                                       backup=None, started_at=datetime.utcnow().isoformat() + 'Z',
+                                       result_key=f"inventory/overrides_backups/image_move_upload_{ts}.json")
+                result_key = _ovr_move_state['result_key']
+            threading.Thread(target=_run_ovr_move_upload, args=(ts,), daemon=True).start()
+            return jsonify({'ok': True, 'phase': 'upload', 'started': True, 'result_key': result_key})
+        if phase == 'status':
+            with _ovr_move_lock:
+                return jsonify(dict(_ovr_move_state))
+        if phase == 'strip':
+            res, code = _ovr_move_strip()
+            return jsonify(res), code
+        return jsonify({'error': 'phase must be plan, upload, status or strip'}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)[:300]}), 500
+
+
 # ── CONFIRM PRE-PO: saved check history (S3-backed snapshots) ───────────
 # A saved check is a SNAPSHOT of a Confirm Pre-PO run (verdict, per-line
 # pulls, ship plan) plus the inputs needed to re-run it live. List GET
@@ -8790,7 +9061,9 @@ def authz_gate():
                                     or path in _AUTHZ_MACHINE_EXTRA
                                     or path.startswith('/download/')):
                 return None
-            if method == 'POST' and path == '/admin/claude-uploads':
+            # POST /admin/override-images/move = the override photo maintenance
+            # job (plan / upload / status / strip), Sep 10 2026.
+            if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
