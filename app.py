@@ -2265,59 +2265,76 @@ FACTORY_NAMES = {
 
 
 def _landing_index():
-    """({production ref: landing warehouse}, {style: [(sort key, warehouse)]}) from
-    the in-memory style ledger (column I, normalized). Built once per export."""
+    """Landing warehouses from the in-memory style ledger (column I, normalized),
+    built once per export sheet:
+      by_ref   {(production ref, style): [(arrival text, warehouse)]}
+      by_style {style: [(sort key, warehouse)]}   (open lots only)
+    One production number covers many styles AND can land one style in two
+    warehouses (DP26014 on TJDKPK022SLS: a JTW lot and a TR lot), so a ref is
+    never looked up on its own. Arrival text follows the page's rule and format
+    (ledger arrival, else ETD + 45 / 55 for pants; e.g. 'Sep 24, 2026')."""
     with _production_lock:
         rows = list(_production_data)
     by_ref, by_style = {}, {}
     for p in rows:
-        ref = str(p.get('production') or '').strip().upper()
         st = str(p.get('style') or '').strip().upper()
         wh = str(p.get('warehouse') or '').strip().upper()
-        if not wh:
+        if not st or not wh:
             continue
-        if ref and ref not in by_ref:
-            by_ref[ref] = wh
+        ad = _apo_prod_arrival(p, _py_is_bottom(st))
+        ref = str(p.get('production') or '').strip().upper()
+        if ref:
+            by_ref.setdefault((ref, st), []).append((_apo_fmt_date(ad) if ad else '', wh))
         try:
             units = int(p.get('units') or 0)
         except Exception:
             units = 0
-        if st and units > 0:
-            ad = _apo_prod_arrival(p, _py_is_bottom(st))
+        if units > 0:
             by_style.setdefault(st, []).append(((ad is None, ad or datetime.max.date()), wh))
     return by_ref, by_style
 
 
 def _landing_in_label(item, idx, catalog_mode=True):
-    """TJX layout "Landing in" column (David, Sep 10 2026): the warehouse the
-    goods land in, straight from the style ledger (column I). A per-delivery
-    row (PO Ref # / Production #) shows its own production's landing; a style
-    row with overseas supply lists every landing warehouse of the style's open
-    productions, soonest arrival first. Customer exports never name a hidden
-    landing (NJ/AE/AW/ABFI). Always computed here from the live ledger; a
-    posted landing value is never trusted."""
+    """TJX layout "Landing in" column (David, Sep 10 2026): where the goods land,
+    straight from the style ledger (column I).
+    - A row that names a delivery (PO Ref # / Production #: per-PO rows, cart
+      rows, All Inventory rows with overseas stock) shows THAT delivery's
+      landing, matched on production number + style, and on the row's own
+      arrival date when one production lands the style in two warehouses.
+    - A row with overseas stock but no delivery named lists every landing of
+      the style's open productions, soonest arrival first.
+    - Warehouse-only rows stay blank.
+    Customer exports never name a hidden landing (NJ/AE/AW/ABFI). Always
+    computed from the live ledger; a posted landing value is never trusted."""
     if not idx:
         return ''
     by_ref, by_style = idx
     hidden = _HIDDEN_LANDING_WH if catalog_mode else set()
+
+    def _join(whs):
+        out = []
+        for wh in whs:
+            if wh and wh not in hidden and wh not in out:
+                out.append(wh)
+        return ', '.join(out)
+
+    st = str(item.get('sku') or '').strip().upper()
+    base = st.split('-')[0]
     ref = str(item.get('production') or item.get('po_ref') or '').strip().upper()
-    if ref and ref in by_ref:
-        wh = by_ref[ref]
-        return '' if wh in hidden else wh
+    if ref:
+        lots = by_ref.get((ref, st)) or by_ref.get((ref, base))
+        if lots:
+            arr = str(item.get('arrival') or '').strip()
+            hit = [wh for a, wh in lots if arr and a == arr]
+            return _join(hit or [wh for _a, wh in lots])
     try:
         inc = int(float(item.get('incoming') or 0))
     except Exception:
         inc = 0
     if not (ref or inc > 0 or item.get('_flow')):
         return ''
-    st = str(item.get('sku') or '').strip().upper()
-    lots = by_style.get(st) or by_style.get(st.split('-')[0]) or []
-    out = []
-    for _k, wh in sorted(lots, key=lambda x: x[0]):
-        if wh in hidden or wh in out:
-            continue
-        out.append(wh)
-    return ', '.join(out)
+    lots = by_style.get(st) or by_style.get(base) or []
+    return _join(wh for _k, wh in sorted(lots, key=lambda x: x[0]))
 
 
 def _factory_label(production_ref, full_name=False):
