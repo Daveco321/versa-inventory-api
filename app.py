@@ -2264,6 +2264,13 @@ FACTORY_NAMES = {
 }
 
 
+# TJX "Landing in" prints only real landing warehouses plus the two ledger
+# location codes that name no customer: FOB (ships straight from the factory)
+# and CAN (lands in Canada). Anything else typed in column I, e.g. WALM, which
+# names another customer, prints blank; hidden landings never print (Sep 10 2026).
+_LANDING_IN_SHOWN = frozenset((set(_LEDGER_WH_MAP.values()) - _HIDDEN_LANDING_WH) | {'FOB', 'CAN'})
+
+
 def _landing_index():
     """Landing warehouses from the in-memory style ledger (column I, normalized),
     built once per export sheet:
@@ -2298,24 +2305,29 @@ def _landing_in_label(item, idx, catalog_mode=True):
     """TJX layout "Landing in" column (David, Sep 10 2026): where the goods land,
     straight from the style ledger (column I).
     - A row that names a delivery (PO Ref # / Production #: per-PO rows, cart
-      rows, All Inventory rows with overseas stock) shows THAT delivery's
-      landing, matched on production number + style, and on the row's own
-      arrival date when one production lands the style in two warehouses.
-    - A row with overseas stock but no delivery named lists every landing of
+      rows, All Inventory rows with overseas stock, which the page stamps with
+      their nearest production) shows THAT delivery's landing, matched on
+      production number + style, and on the row's own arrival date when one
+      production lands the style in two warehouses. It therefore always agrees
+      with the row's PO Ref # and Arrival to Warehouse cells.
+    - A row with overseas stock but no known delivery lists every landing of
       the style's open productions, soonest arrival first.
     - Warehouse-only rows stay blank.
-    Customer exports never name a hidden landing (NJ/AE/AW/ABFI). Always
-    computed from the live ledger; a posted landing value is never trusted."""
+    Customer exports print only codes in _LANDING_IN_SHOWN (never NJ/AE/AW/ABFI,
+    never a customer code such as WALM). Always computed from the live ledger;
+    a posted landing value is never trusted."""
     if not idx:
         return ''
     by_ref, by_style = idx
-    hidden = _HIDDEN_LANDING_WH if catalog_mode else set()
 
     def _join(whs):
         out = []
         for wh in whs:
-            if wh and wh not in hidden and wh not in out:
-                out.append(wh)
+            if not wh or wh in out:
+                continue
+            if catalog_mode and (wh in _HIDDEN_LANDING_WH or wh not in _LANDING_IN_SHOWN):
+                continue
+            out.append(wh)
         return ', '.join(out)
 
     st = str(item.get('sku') or '').strip().upper()
@@ -2331,7 +2343,7 @@ def _landing_in_label(item, idx, catalog_mode=True):
         inc = int(float(item.get('incoming') or 0))
     except Exception:
         inc = 0
-    if not (ref or inc > 0 or item.get('_flow')):
+    if not (ref or inc > 0):
         return ''
     lots = by_style.get(st) or by_style.get(base) or []
     return _join(wh for _k, wh in sorted(lots, key=lambda x: x[0]))
