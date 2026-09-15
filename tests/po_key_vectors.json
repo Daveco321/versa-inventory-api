@@ -1,0 +1,199 @@
+{
+ "about": "Canonical PO key test vectors (v2 rule). Every implementation must return exactly these. All values are synthetic.",
+ "rule": [
+  "1. s = str(raw); null/None -> ''. Replace every run of whitespace, U+00A0 and U+FEFF with one space; trim spaces; upper-case.",
+  "2. s == ''  -> key '', kind 'blank'.",
+  "3. s matches ^[0-9](\\.[0-9]+)?E\\+[0-9]{1,3}$  -> key '', kind 'mangled' (Excel scientific notation; the real number is lost).",
+  "4. s matches ^[0-9]+$  -> key = s without leading zeros ('0' if nothing is left), kind 'num'.",
+  "5. s has no digit at all  -> key '~' + s, kind 'name' (a program name used as a PO number).",
+  "6. otherwise  -> key = s unchanged (dashes, slashes, letters and leading zeros kept), kind 'code'."
+ ],
+ "join_key": "CUSTOMER_CODE.strip().upper() + '|' + key, only when kind is 'num' or 'code'. blank, mangled and name never join across stores.",
+ "cases": [
+  {
+   "raw": "0012345678",
+   "key": "12345678",
+   "kind": "num"
+  },
+  {
+   "raw": "12345678",
+   "key": "12345678",
+   "kind": "num"
+  },
+  {
+   "raw": "000123",
+   "key": "123",
+   "kind": "num"
+  },
+  {
+   "raw": "0",
+   "key": "0",
+   "kind": "num"
+  },
+  {
+   "raw": "0000",
+   "key": "0",
+   "kind": "num"
+  },
+  {
+   "raw": "  0045 ",
+   "key": "45",
+   "kind": "num"
+  },
+  {
+   "raw": "\u00a00045\ufeff",
+   "key": "45",
+   "kind": "num"
+  },
+  {
+   "raw": 24681357902,
+   "key": "24681357902",
+   "kind": "num"
+  },
+  {
+   "raw": 0,
+   "key": "0",
+   "kind": "num"
+  },
+  {
+   "raw": "01-234567",
+   "key": "01-234567",
+   "kind": "code"
+  },
+  {
+   "raw": " 55-123456 ",
+   "key": "55-123456",
+   "kind": "code"
+  },
+  {
+   "raw": "012345-1",
+   "key": "012345-1",
+   "kind": "code"
+  },
+  {
+   "raw": "10-424242",
+   "key": "10-424242",
+   "kind": "code"
+  },
+  {
+   "raw": "10424242",
+   "key": "10424242",
+   "kind": "num"
+  },
+  {
+   "raw": "abc12xyz",
+   "key": "ABC12XYZ",
+   "kind": "code"
+  },
+  {
+   "raw": "9TESTPO9",
+   "key": "9TESTPO9",
+   "kind": "code"
+  },
+  {
+   "raw": "12E45678",
+   "key": "12E45678",
+   "kind": "code"
+  },
+  {
+   "raw": "Q12345",
+   "key": "Q12345",
+   "kind": "code"
+  },
+  {
+   "raw": "12345R",
+   "key": "12345R",
+   "kind": "code"
+  },
+  {
+   "raw": "01/234567*A",
+   "key": "01/234567*A",
+   "kind": "code"
+  },
+  {
+   "raw": "1234 56",
+   "key": "1234 56",
+   "kind": "code"
+  },
+  {
+   "raw": "1234   56",
+   "key": "1234 56",
+   "kind": "code"
+  },
+  {
+   "raw": "1234\t56",
+   "key": "1234 56",
+   "kind": "code"
+  },
+  {
+   "raw": "SAMPLE PROGRAM",
+   "key": "~SAMPLE PROGRAM",
+   "kind": "name"
+  },
+  {
+   "raw": "sample  program",
+   "key": "~SAMPLE PROGRAM",
+   "kind": "name"
+  },
+  {
+   "raw": "SHIRT (NEED PO)",
+   "key": "~SHIRT (NEED PO)",
+   "kind": "name"
+  },
+  {
+   "raw": "",
+   "key": "",
+   "kind": "blank"
+  },
+  {
+   "raw": "   ",
+   "key": "",
+   "kind": "blank"
+  },
+  {
+   "raw": null,
+   "key": "",
+   "kind": "blank"
+  },
+  {
+   "raw": "6.00E+11",
+   "key": "",
+   "kind": "mangled"
+  },
+  {
+   "raw": "6.00004E+11",
+   "key": "",
+   "kind": "mangled"
+  },
+  {
+   "raw": "1.2e+05",
+   "key": "",
+   "kind": "mangled"
+  },
+  {
+   "raw": "6E+11",
+   "key": "",
+   "kind": "mangled"
+  },
+  {
+   "raw": "7E10",
+   "key": "7E10",
+   "kind": "code"
+  },
+  {
+   "raw": "1.5E-03",
+   "key": "1.5E-03",
+   "kind": "code"
+  },
+  {
+   "raw": "12E",
+   "key": "12E",
+   "kind": "code"
+  },
+  {
+   "raw": "1.5",
+   "key": "1.5",
+   "kind": "code"
+  }
+ ]
+}

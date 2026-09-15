@@ -14786,307 +14786,18 @@ def _ai_tool_open_orders(params):
             'rows': rows, 'truncated': matched > len(rows)}
 
 
-# ── Past orders (received-PO history) — proxied from the open-orders service ──
+# ── Past orders and invoiced sales, proxied from the open-orders service ──
 # The open-orders API snapshots the order book daily (since 2026-06-03) and
 # rolls every PO that leaves the book into a per-customer archive
-# (/api/po-history). This lets the AI agent + MCP connector query that history.
-_po_hist_proxy_cache = {'summary': None, 'summary_at': 0.0, 'accounts': {}, 'accounts_at': {},
-                        'fail_until': {}}
-_po_hist_proxy_lock = threading.Lock()
-_PO_HIST_PROXY_TTL = 900       # 15 min — the archive gains at most one new day per day
-_PO_HIST_FAIL_BACKOFF = 120    # after a failed fetch, don't re-hit that key for 2 min
-
-
-def _fetch_po_history(account=None):
-    """Fetch the received-PO archive (summary, or one account's POs) from the
-    open-orders service, cached module-level. Returns (payload_or_None, ok)."""
-    now = time.time()
-    key = (str(account).strip().upper() if account else None) or None
-    with _po_hist_proxy_lock:
-        if key is None:
-            cached, at = _po_hist_proxy_cache['summary'], _po_hist_proxy_cache['summary_at']
-        else:
-            cached = _po_hist_proxy_cache['accounts'].get(key)
-            at = _po_hist_proxy_cache['accounts_at'].get(key, 0.0)
-        fail_until = _po_hist_proxy_cache['fail_until'].get(key or '__summary__', 0.0)
-    if cached is not None and now - at < _PO_HIST_PROXY_TTL:
-        return cached, True
-    if now < fail_until:
-        # Recent failure — serve whatever we have without re-hitting a dead
-        # upstream (mirrors _fetch_all_open_orders' backoff for the sync worker).
-        return cached, cached is not None
-    try:
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/po-history", headers=_oo_api_headers(),
-                                 params=({'account': key} if key else None), timeout=30)
-        if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code}")
-        data = resp.json()
-        if not data.get('ready'):
-            return data, False   # index still building server-side — don't cache
-        with _po_hist_proxy_lock:
-            if key is None:
-                _po_hist_proxy_cache['summary'] = data
-                _po_hist_proxy_cache['summary_at'] = time.time()
-            else:
-                _po_hist_proxy_cache['accounts'][key] = data
-                _po_hist_proxy_cache['accounts_at'][key] = time.time()
-        return data, True
-    except Exception as e:
-        print(f"[PastOrders] po-history fetch failed ({key or 'summary'}): {e}", flush=True)
-        with _po_hist_proxy_lock:
-            _po_hist_proxy_cache['fail_until'][key or '__summary__'] = time.time() + _PO_HIST_FAIL_BACKOFF
-        return cached, cached is not None
-
-
-def _past_po_row(p, include_lines=True):
-    row = {'customer': p.get('customer'), 'customer_full': p.get('customerFull'),
-           'order_no': p.get('orderNo'),
-           'status': 'shipped' if p.get('shipped') else 'cancelled_or_pulled',
-           'ship_start': p.get('start') or None, 'cancel': p.get('cancel') or None,
-           'left_book': p.get('lastSeen') or None,
-           'units': p.get('units'), 'value': p.get('value'),
-           # peak booked state — a partially-shipped PO's true size (the plain
-           # units/value fields hold only the last-day residual)
-           'units_peak': p.get('unitsPeak'), 'value_peak': p.get('valuePeak')}
-    if include_lines:
-        row['lines'] = [{'style': l.get('style'), 'qty': l.get('qty'),
-                         'price': l.get('price'), 'value': l.get('value')}
-                        for l in (p.get('lines') or [])]
-    return row
-
-
-def _ai_tool_past_orders(params):
-    summary, ok = _fetch_po_history()
-    if summary is None:
-        return {'error': 'past-orders archive unavailable right now'}
-    if not summary.get('ready'):
-        prog = summary.get('progress') or {}
-        return {'building': True,
-                'note': (f"the archive index is still building "
-                         f"({prog.get('done', 0)}/{prog.get('total', 0)} days) — retry in a minute")}
-    accounts = [a for a in (summary.get('accounts') or [])
-                if (a.get('poCount') or 0) > 0 or (a.get('cancelledCount') or 0) > 0]
-    cust_q = (params.get('customer') or '').strip() or None
-    style_q = (params.get('style') or '').strip().upper() or None
-    status_q = (params.get('status') or 'all').strip().lower()
-    after_q = (params.get('received_after') or '').strip() or None
-    before_q = (params.get('received_before') or '').strip() or None
-    limit = max(1, min(int(params.get('limit') or 30), 200))
-
-    def _keep(p):
-        if status_q == 'shipped' and not p.get('shipped'):
-            return False
-        if status_q in ('cancelled', 'pulled', 'cancelled_or_pulled') and p.get('shipped'):
-            return False
-        seen = p.get('lastSeen') or ''
-        if after_q and seen < after_q:
-            return False
-        if before_q and seen > before_q:
-            return False
-        return True
-
-    # ── No filters: per-customer summary ──
-    if not cust_q and not style_q:
-        ignored = [k for k, v in (('status', status_q != 'all'), ('received_after', bool(after_q)),
-                                  ('received_before', bool(before_q))) if v]
-        extra = {'filters_ignored': ignored, 'note2': 'status/date filters apply only with a customer or style'} if ignored else {}
-        return {**extra, 'history_start': '2026-06-03', 'latest_date': summary.get('latestDate'),
-                'note': ("'received' = the day a PO left the open-order book (shipped-out approximation, "
-                         "accurate to ~1 day). cancelled/pulled = left before its ship window opened."),
-                'totals': summary.get('totals'),
-                'customers': [{'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
-                               'received_pos': a.get('poCount'), 'units': a.get('units'),
-                               'value': a.get('value'),
-                               'cancelled_pos': a.get('cancelledCount'),
-                               'cancelled_value': a.get('cancelledValue'),
-                               'first_received': a.get('firstReceived') or None,
-                               'last_received': a.get('lastReceived') or None}
-                              for a in accounts]}
-
-    # ── Customer filter: resolve to ONE account code ──
-    if cust_q:
-        cl = cust_q.lower()
-        matches = [a for a in accounts
-                   if cl == str(a.get('customer') or '').lower()
-                   or cl in str(a.get('customerFull') or '').lower()]
-        if not matches:
-            return {'error': f"no past-order customer matches '{cust_q}'",
-                    'customers': [a.get('customerFull') or a.get('customer') for a in accounts]}
-        if len(matches) > 1 and not any(cl == str(a.get('customer') or '').lower() for a in matches):
-            return {'ambiguous_customer': [{'customer': a.get('customer'),
-                                            'customer_full': a.get('customerFull')} for a in matches]}
-        acct = next((a for a in matches if cl == str(a.get('customer') or '').lower()), matches[0])
-        if not acct.get('customer'):
-            return {'error': 'that account has no customer code in the archive'}
-        data, _ok = _fetch_po_history(acct.get('customer'))
-        if data is None or not data.get('ready'):
-            return {'error': f"couldn't load history for {acct.get('customer')} right now"}
-        pos = [p for p in (data.get('pos') or []) if _keep(p)]
-        if style_q:
-            pos = [p for p in pos
-                   if any(style_q in str(l.get('style') or '').upper() for l in (p.get('lines') or []))]
-        pos.sort(key=lambda p: str(p.get('lastSeen') or ''), reverse=True)
-        if style_q:
-            # Totals count only the MATCHING style lines, not whole POs.
-            tot_units = sum(l.get('qty') or 0 for p in pos for l in (p.get('lines') or [])
-                            if style_q in str(l.get('style') or '').upper())
-            tot_val = round(sum(l.get('value') or 0 for p in pos for l in (p.get('lines') or [])
-                                if style_q in str(l.get('style') or '').upper()), 2)
-        else:
-            # Shipped POs count at their PEAK booked size (the last-day residual
-            # understates partial shipments); pulled POs keep their final state.
-            tot_units = sum(((p.get('unitsPeak') or p.get('units') or 0) if p.get('shipped')
-                             else (p.get('units') or 0)) for p in pos)
-            tot_val = round(sum(((p.get('valuePeak') or p.get('value') or 0) if p.get('shipped')
-                                 else (p.get('value') or 0)) for p in pos), 2)
-        out = {'customer': acct.get('customer'), 'customer_full': acct.get('customerFull'),
-               'matched_pos': len(pos), 'total_units': tot_units, 'total_value': tot_val,
-               'rows': [_past_po_row(p) for p in pos[:limit]],
-               'truncated': len(pos) > limit}
-        if style_q:
-            out['note'] = f"total_units/total_value count only lines matching '{style_q}'; rows show full POs"
-        return out
-
-    # ── Style search across every customer ──
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        fetched = list(ex.map(lambda a: _fetch_po_history(a.get('customer')), accounts))
-    hits = []
-    partial = False
-    for a, (data, _ok) in zip(accounts, fetched):
-        if data is None or not data.get('ready'):
-            partial = True
-            continue
-        for p in (data.get('pos') or []):
-            if not _keep(p):
-                continue
-            for l in (p.get('lines') or []):
-                if style_q in str(l.get('style') or '').upper():
-                    hits.append({'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
-                                 'order_no': p.get('orderNo'),
-                                 'status': 'shipped' if p.get('shipped') else 'cancelled_or_pulled',
-                                 'left_book': p.get('lastSeen') or None, 'style': l.get('style'),
-                                 'qty': l.get('qty'), 'price': l.get('price'), 'value': l.get('value')})
-    hits.sort(key=lambda h: str(h.get('left_book') or ''), reverse=True)
-    tot_qty = sum(h.get('qty') or 0 for h in hits)
-    tot_val = round(sum(h.get('value') or 0 for h in hits), 2)
-    out = {'style_query': style_q, 'matched_lines': len(hits), 'total_units': tot_qty,
-           'total_value': tot_val, 'rows': hits[:limit], 'truncated': len(hits) > limit}
-    if partial:
-        out['note'] = 'some customers failed to load — results may be partial'
-    return out
-
-
-def _sales_resolve_customer(cust_q):
-    """Resolve a customer NAME or code to the exact invoice account code.
-    Upstream matches codes exactly, so 'Burlington' must become 'BURL' here.
-    Uses the sales summary's code list + the po-history accounts' full names.
-    Returns (code, None) on success or (None, error_dict) on failure."""
-    resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(), timeout=45)
-    data = resp.json()
-    if not data.get('ready'):
-        return None, {'error': 'sales history backfill not available yet'}
-    codes = [str(c.get('customer') or '') for c in (data.get('customers') or [])]
-    cu = cust_q.strip().upper()
-    if cu in codes:
-        return cu, None
-    # full-name resolution via the po-history account directory
-    name_map = {}
-    hist, _ok = _fetch_po_history()
-    for a in ((hist or {}).get('accounts') or []):
-        name_map[str(a.get('customer') or '').upper()] = str(a.get('customerFull') or '')
-    matches = [c for c in codes
-               if cu in c.upper() or (name_map.get(c.upper()) and cu in name_map[c.upper()].upper())]
-    if not matches:
-        return None, {'error': f"no invoiced customer matches '{cust_q}'",
-                      'customers': [(name_map.get(c.upper()) and f"{c} ({name_map[c.upper()]})") or c
-                                    for c in codes]}
-    if len(matches) > 1:
-        return None, {'ambiguous_customer': [{'customer': c,
-                                              'customer_full': name_map.get(c.upper()) or c}
-                                             for c in matches]}
-    return matches[0], None
-
-
-def _ai_tool_sales_history(params):
-    """Invoice-level sales history (A2000 InvoiceReport backfill on the
-    open-orders service): real invoice dates + shipped quantities, Nov 2019 →
-    the last ingest. Proxied live; the upstream serves prebuilt aggregates."""
-    cust_q = (params.get('customer') or '').strip()
-    style_q = (params.get('style') or '').strip()
-    month_q = (params.get('month') or '').strip()
-    from_q = (params.get('from') or '').strip()
-    to_q = (params.get('to') or '').strip()
-    limit = max(1, min(int(params.get('limit') or 30), 200))
-    try:
-        if style_q:
-            code = None
-            if cust_q:
-                code, err = _sales_resolve_customer(cust_q)
-                if err:
-                    return err
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(),
-                                     params={'style': style_q}, timeout=45)
-            data = resp.json()
-            if not data.get('ready'):
-                return {'error': 'sales history backfill not available yet'}
-            rows = data.get('rows') or []
-            out = {'style_query': data.get('style_query')}
-            if code:
-                rows = [r for r in rows if str(r.get('customer') or '').upper() == code]
-                out['customer'] = code
-                out['matched_qty'] = sum(r.get('qty') or 0 for r in rows)
-                out['matched_value'] = round(sum(r.get('value') or 0 for r in rows), 2)
-                if data.get('truncated'):
-                    out['note'] = ('upstream capped the search at its newest 500 lines — older matches '
-                                   'for this customer may be missing; totals cover the returned lines only')
-            else:
-                out['matched_qty'] = data.get('matched_qty')
-                out['matched_value'] = data.get('matched_value')
-            out['rows'] = rows[:limit]
-            out['truncated'] = bool(data.get('truncated')) or len(rows) > limit
-            return out
-        if cust_q:
-            code, err = _sales_resolve_customer(cust_q)
-            if err:
-                return err
-            qp = {'account': code}
-            if month_q:
-                qp['month'] = month_q
-            elif from_q or to_q:
-                if from_q:
-                    qp['from'] = from_q
-                if to_q:
-                    qp['to'] = to_q
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", params=qp, headers=_oo_api_headers(), timeout=45)
-            data = resp.json()
-            if not data.get('ready'):
-                return {'error': 'sales history backfill not available yet'}
-            if 'pos' in data:   # ranged query → PO rollups with style lines
-                pos = data.get('pos') or []
-                return {'customer': data.get('account'), 'from': data.get('from'), 'to': data.get('to'),
-                        'po_count': data.get('poCount'), 'units': data.get('units'),
-                        'value': data.get('value'), 'rows': pos[:limit],
-                        'truncated': bool(data.get('truncated')) or len(pos) > limit}
-            return {'customer': data.get('account'), 'invoice_row_count': data.get('rows'),
-                    'po_count': data.get('poCount'), 'years': data.get('years'),
-                    'months': data.get('months'), 'divisions': data.get('divisions'),
-                    'top_styles': (data.get('topStyles') or [])[:30],
-                    'recent_pos': (data.get('posRecent') or [])[:limit],
-                    'note': 'divisions: OB = bulk, DS = dropship'}
-        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(), timeout=45)
-        data = resp.json()
-        if not data.get('ready'):
-            return {'error': 'sales history backfill not available yet'}
-        return {'source': data.get('source'), 'totals': data.get('totals'),
-                'years': data.get('years'),
-                'customers': [{'customer': c.get('customer'), 'units': c.get('units'),
-                               'value': c.get('value'), 'invoices': c.get('invoiceCount'),
-                               'first': c.get('firstInv'), 'last': c.get('lastInv')}
-                              for c in (data.get('customers') or [])[:60]],
-                'note': ('invoice ground truth (real invoice dates + shipped quantities). '
-                         'Use past_orders_lookup for POs newer than source.to (book-tracked).')}
-    except Exception as e:
-        return {'error': f'sales history unavailable: {e}'}
+# (/api/po-history). The A2000 invoice history sits beside it
+# (/api/sales-history). Newer open-orders builds join the two on the server:
+# every archive PO then carries a status, a bucket and a counted flag, and
+# every answer carries a `history` block (invoice cut-off per division and a
+# plain label). Older builds send only the book's `shipped` flag. Every
+# reader below works with both answers, so the deploy order can never break
+# it. Rules kept everywhere: an estimate is never shown as an invoice, the
+# invoice cut-off travels with every answer, and a failure is reported,
+# never cached and never read as "no data".
 
 
 def _sisc(v):
@@ -15103,24 +14814,1172 @@ def _sfsc(v):
         return 0.0
 
 
+# ── Canonical PO key (same rule as the open-orders service and the desktop) ──
+_PO_KEY_WS = re.compile(r'[\s\u00a0\ufeff]+')
+_PO_KEY_DIGITS = re.compile(r'[0-9]+')
+_PO_KEY_HAS_DIGIT = re.compile(r'[0-9]')
+_PO_KEY_EXCEL = re.compile(r'[0-9](\.[0-9]+)?E\+[0-9]{1,3}')
+
+
+def _po_key(raw):
+    """Canonical PO key. Returns (key, kind):
+      blank    nothing usable; key ''
+      mangled  Excel scientific notation (6.00E+11): the real number is lost; key ''
+      num      all digits; leading zeros dropped, so 00123 and 123 are one PO
+      name     no digit at all (a program name used as a PO); key '~' + text
+      code     anything else, kept as typed: dashes, slashes, letters and
+               leading zeros stay, so 10-123 and 10123 never meet
+    Runs of whitespace (tabs, no-break spaces, BOMs) become one space; the
+    text is trimmed and upper-cased first. Punctuation is never stripped."""
+    s = _PO_KEY_WS.sub(' ', '' if raw is None else str(raw)).strip(' ').upper()
+    if not s:
+        return '', 'blank'
+    if _PO_KEY_EXCEL.fullmatch(s):
+        return '', 'mangled'
+    if _PO_KEY_DIGITS.fullmatch(s):
+        return (s.lstrip('0') or '0'), 'num'
+    if not _PO_KEY_HAS_DIGIT.search(s):
+        return '~' + s, 'name'
+    return s, 'code'
+
+
+def _po_join_key(customer, raw):
+    """Customer-scoped join key 'CUSTOMER|key', or None when the PO kind never
+    joins (blank, mangled, name). The customer code is matched exactly: code
+    families are never merged for matching."""
+    key, kind = _po_key(raw)
+    if kind not in ('num', 'code'):
+        return None
+    return str(customer or '').strip().upper() + '|' + key
+
+
+def _po_lookup_spellings(raw):
+    """Spellings to send to an older open-orders build, which matches exact
+    text only: the PO as written and, for all-digit POs, the zero-stripped form."""
+    s = str('' if raw is None else raw).strip()
+    key, kind = _po_key(raw)
+    out = [s] if s else []
+    if kind == 'num' and key not in out:
+        out.append(key)
+    return out
+
+
+# ── Invoice cut-off and plain labels ──
+_HIST_ARCHIVE_START = '2026-06-03'
+_HIST_DROPSHIP_NOTE = ('Dropship orders never appear on the order book, so this archive never has them. '
+                       'Dropship sales are only in the invoices (sales_history_lookup).')
+_HIST_AWAITING_NOTE = ('Awaiting invoice means the PO left the order book and shipped, but no invoice is on '
+                       'file yet. Its quantity is an estimate from the order book, not an invoice.')
+
+
+def _hist_date_text(d):
+    try:
+        x = datetime.strptime(str(d)[:10], '%Y-%m-%d')
+    except (TypeError, ValueError):
+        return str(d or '')
+    return f"{x:%b} {x.day}, {x.year}"
+
+
+def _hist_block(*payloads):
+    for p in payloads:
+        if isinstance(p, dict) and isinstance(p.get('history'), dict):
+            return p['history']
+    return None
+
+
+def _weekdays_after(d, today):
+    """Weekdays after date d, up to and including today (holidays not removed)."""
+    try:
+        x = datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    n = 0
+    while x < today:
+        x += timedelta(days=1)
+        if x.weekday() < 5:
+            n += 1
+    return n
+
+
+def _history_info(*payloads, sales_summary=None):
+    """invoices_through {wholesale, dropship} and history_label for one answer.
+    Newer open-orders builds send a `history` block; older builds only the
+    invoice summary's source dates, and then the dropship date is unknown."""
+    hist = _hist_block(*payloads) or {}
+    thru = hist.get('invoicesThrough') if isinstance(hist.get('invoicesThrough'), dict) else {}
+    wholesale = thru.get('OB') or None
+    dropship = thru.get('DS') or None
+    label = str(hist.get('label') or '').strip()
+    src = sales_summary.get('source') if isinstance(sales_summary, dict) else None
+    src = src if isinstance(src, dict) else {}
+    by_div = src.get('byDiv') if isinstance(src.get('byDiv'), dict) else {}
+    if not wholesale:
+        wholesale = (by_div.get('OB') or {}).get('to') or src.get('to') or None
+    if not dropship:
+        dropship = (by_div.get('DS') or {}).get('to') or None
+    if not label:
+        if wholesale and dropship:
+            label = (f"Invoices through {_hist_date_text(wholesale)}. Dropship invoices through "
+                     f"{_hist_date_text(dropship)}. Shipments after that are estimates from the order book.")
+        elif wholesale:
+            label = f"Invoices through {_hist_date_text(wholesale)}. Dropship end date not reported."
+        else:
+            label = 'The invoice cut-off date could not be read right now.'
+    out = {'invoices_through': {'wholesale': wholesale, 'dropship': dropship}, 'history_label': label}
+    behind = _weekdays_after(wholesale, _pres_now_et().date()) if wholesale else None
+    if behind is not None and behind > 3:
+        out['invoices_behind'] = f'Invoices are {behind} business days behind.'
+    return out
+
+
+# ── One checked call to the open-orders service ──
+def _oo_json(method, path, params=None, body=None, timeout=45):
+    """Call the open-orders service. Returns (data, None) or (None, error_dict).
+    Every non-200 answer is an error: a 401 or a 500 is never read as
+    'not ready yet' or as 'no data'."""
+    url = f"{OPEN_ORDERS_API_URL}{path}"
+    try:
+        if method == 'POST':
+            resp = http_requests.post(url, headers=_oo_api_headers(), json=body, timeout=timeout)
+        else:
+            resp = http_requests.get(url, headers=_oo_api_headers(), params=params, timeout=timeout)
+    except Exception as e:
+        return None, {'error': f'The order history service did not answer ({type(e).__name__}). '
+                               'Try again in a minute.'}
+    code = resp.status_code
+    if code != 200:
+        msg = ''
+        try:
+            j = resp.json()
+            if isinstance(j, dict):
+                msg = str(j.get('error') or j.get('note') or j.get('message') or '').strip()
+        except Exception:
+            pass
+        if code in (401, 403):
+            text = (f'The order history service refused this request (HTTP {code}). '
+                    'The server key may be missing or wrong.')
+        elif code == 503:
+            text = msg or 'Past orders are temporarily unavailable. Try again in a minute.'
+        else:
+            text = f'The order history service failed (HTTP {code}).' + (f' {msg}' if msg else '')
+        return None, {'error': text, 'http_status': code}
+    try:
+        data = resp.json()
+    except Exception:
+        return None, {'error': 'The order history service sent an unreadable answer.'}
+    if not isinstance(data, dict):
+        return None, {'error': 'The order history service sent an unexpected answer.'}
+    return data, None
+
+
+# ── Archive proxy cache ──
+_po_hist_proxy_cache = {'summary': None, 'summary_at': 0.0, 'accounts': {}, 'accounts_at': {},
+                        'fail_until': {}, 'errors': {}}
+_po_hist_proxy_lock = threading.Lock()
+_PO_HIST_PROXY_TTL = 900       # 15 min: the archive gains at most one new day per day
+_PO_HIST_FAIL_BACKOFF = 120    # after a failed fetch, don't re-hit that key for 2 min
+
+
+def _po_hist_uncacheable(data, previous, account):
+    """Why a fresh po-history answer must not be cached ('' when it may be)."""
+    if not data.get('ready'):
+        return 'not ready'
+    hist = data.get('history') if isinstance(data.get('history'), dict) else None
+    if hist is not None:
+        if hist.get('viewReady') is False:
+            return 'the invoice match is still loading on the server'
+        if (hist.get('flags') or {}).get('degraded'):
+            return 'the server kept an older archive (degraded)'
+    if account is None:
+        if not (data.get('accounts') or []) and (previous or {}).get('accounts'):
+            return 'empty-after-full'
+    elif not (data.get('pos') or []) and (previous or {}).get('pos'):
+        return 'empty-after-full'
+    return ''
+
+
+def _po_hist_error(account=None):
+    key = (str(account).strip().upper() if account else None) or '__summary__'
+    with _po_hist_proxy_lock:
+        return _po_hist_proxy_cache['errors'].get(key)
+
+
+def _fetch_po_history(account=None):
+    """Fetch the received-PO archive (summary, or one account's POs) from the
+    open-orders service, cached module-level. Returns (payload_or_None, ok);
+    ok is False when the payload is not a fresh, complete answer (still
+    building, or the last good copy served after an error). Never cached: a
+    failure, a 'still building' answer, an answer whose invoice match is still
+    loading (history.viewReady false), a degraded answer, and an empty list
+    that follows a non-empty one (the last good copy is served instead)."""
+    now = time.time()
+    key = (str(account).strip().upper() if account else None) or None
+    ck = key or '__summary__'
+    with _po_hist_proxy_lock:
+        if key is None:
+            cached, at = _po_hist_proxy_cache['summary'], _po_hist_proxy_cache['summary_at']
+        else:
+            cached = _po_hist_proxy_cache['accounts'].get(key)
+            at = _po_hist_proxy_cache['accounts_at'].get(key, 0.0)
+        fail_until = _po_hist_proxy_cache['fail_until'].get(ck, 0.0)
+    if cached is not None and now - at < _PO_HIST_PROXY_TTL:
+        return cached, True
+    if now < fail_until:
+        # Recent failure: serve the last good copy without re-hitting a dead
+        # upstream (mirrors _fetch_all_open_orders' backoff), flagged not fresh.
+        return cached, False
+    data, err = _oo_json('GET', '/api/po-history', params=({'account': key} if key else None), timeout=30)
+    if err:
+        print(f"[PastOrders] po-history fetch failed ({key or 'summary'}): {err.get('error')}", flush=True)
+        with _po_hist_proxy_lock:
+            _po_hist_proxy_cache['fail_until'][ck] = time.time() + _PO_HIST_FAIL_BACKOFF
+            _po_hist_proxy_cache['errors'][ck] = err.get('error')
+        return cached, False
+    why = _po_hist_uncacheable(data, cached, key)
+    if why == 'empty-after-full':
+        print(f"[PastOrders] po-history {key or 'summary'}: empty list after a full one; "
+              "kept the last good copy", flush=True)
+        with _po_hist_proxy_lock:
+            _po_hist_proxy_cache['errors'][ck] = 'The archive answered with an empty list. Showing the last good copy.'
+        return cached, False
+    if why == 'not ready':
+        return data, False   # index still building server-side
+    if why:
+        print(f"[PastOrders] po-history {key or 'summary'} not cached: {why}", flush=True)
+        return data, True
+    with _po_hist_proxy_lock:
+        if key is None:
+            old_view = ((_po_hist_proxy_cache['summary'] or {}).get('history') or {}).get('viewKey')
+            new_view = (data.get('history') or {}).get('viewKey')
+            if old_view and new_view and old_view != new_view:
+                # A new server view (for example after an invoice upload): drop
+                # per-account copies so every answer comes from the same view.
+                _po_hist_proxy_cache['accounts'].clear()
+                _po_hist_proxy_cache['accounts_at'].clear()
+            _po_hist_proxy_cache['summary'] = data
+            _po_hist_proxy_cache['summary_at'] = time.time()
+        else:
+            _po_hist_proxy_cache['accounts'][key] = data
+            _po_hist_proxy_cache['accounts_at'][key] = time.time()
+        _po_hist_proxy_cache['fail_until'].pop(ck, None)
+        _po_hist_proxy_cache['errors'].pop(ck, None)
+    return data, True
+
+
+# ── Invoice summary cache (customer codes, lifetime totals, cut-off dates) ──
+_sales_sum_cache = {'data': None, 'at': 0.0, 'fail_until': 0.0, 'error': None}
+_sales_sum_lock = threading.Lock()
+_SALES_SUM_TTL = 300
+_SALES_SUM_FAIL_BACKOFF = 60
+
+
+def _fetch_sales_summary():
+    """The invoice summary, cached briefly for the customer resolver and the
+    cut-off dates. Returns (data_or_None, error_or_None). A failure serves the
+    last good copy when there is one. Never cached: failures, 'not ready'
+    answers, and answers whose server-side invoice match is still loading."""
+    now = time.time()
+    with _sales_sum_lock:
+        cached, at = _sales_sum_cache['data'], _sales_sum_cache['at']
+        fail_until, last_err = _sales_sum_cache['fail_until'], _sales_sum_cache['error']
+    if cached is not None and now - at < _SALES_SUM_TTL:
+        return cached, None
+    if now < fail_until:
+        if cached is not None:
+            return cached, None
+        return None, dict(last_err or {'error': 'Invoice history is unavailable right now.'})
+    data, err = _oo_json('GET', '/api/sales-history', timeout=45)
+    if err:
+        with _sales_sum_lock:
+            _sales_sum_cache['fail_until'] = time.time() + _SALES_SUM_FAIL_BACKOFF
+            _sales_sum_cache['error'] = err
+        return (cached, None) if cached is not None else (None, err)
+    if not data.get('ready'):
+        return data, None
+    hist = data.get('history')
+    if not (isinstance(hist, dict) and hist.get('viewReady') is False):
+        with _sales_sum_lock:
+            _sales_sum_cache['data'] = data
+            _sales_sum_cache['at'] = time.time()
+            _sales_sum_cache['error'] = None
+    return data, None
+
+
+def _sales_summary_quiet():
+    data, _err = _fetch_sales_summary()
+    return data if isinstance(data, dict) and data.get('ready') else None
+
+
+# ── Invoice truth for archive POs, matched by the canonical key ──
+_PO_LOOKUP_ITEMS_PER_CALL = 700    # at most 1,400 spellings; the server caps a call at 1,500
+
+
+def _po_invoice_lookup(items):
+    """Invoice truth for archive POs, matched by the canonical key inside the
+    same customer. items = [(customer_code, raw_po), ...]. Returns
+    (matches, error_or_None); matches maps (CUSTOMER, raw_po) to
+    {qty, value, firstInv, lastInv, invoices, lines, pos}. All or nothing: on
+    any failed call the matches are empty and the error says why, so a caller
+    never de-duplicates against half an answer.
+    Newer open-orders builds match by key themselves (they read `account` and
+    `items` and answer with each entry's customer). Older builds match exact
+    text, so the PO as written and its zero-stripped form are both sent and
+    mapped back here by key. Entries that name another customer are dropped."""
+    todo, seen = [], set()
+    for cust, raw in items:
+        cu = str(cust or '').strip().upper()
+        if _po_join_key(cu, raw) is None or (cu, raw) in seen:
+            continue
+        seen.add((cu, raw))
+        todo.append((cu, raw))
+    matches = {}
+    for i in range(0, len(todo), _PO_LOOKUP_ITEMS_PER_CALL):
+        chunk = todo[i:i + _PO_LOOKUP_ITEMS_PER_CALL]
+        spell = []
+        for _cu, raw in chunk:
+            for s in _po_lookup_spellings(raw):
+                if s not in spell:
+                    spell.append(s)
+        body = {'pos': spell, 'items': [{'customer': cu, 'po': raw} for cu, raw in chunk]}
+        custs = {cu for cu, _raw in chunk}
+        if len(custs) == 1:
+            body['account'] = next(iter(custs))
+        data, err = _oo_json('POST', '/api/sales-history/po-lookup', body=body, timeout=60)
+        if err:
+            return {}, err
+        if not data.get('ready'):
+            return {}, {'error': 'Invoice data is not loaded on the server yet.'}
+        found = data.get('found') if isinstance(data.get('found'), dict) else {}
+        for cu, raw in chunk:
+            hits = []
+            for s in _po_lookup_spellings(raw):
+                e = found.get(s)
+                if not isinstance(e, dict):
+                    continue
+                if e.get('customer') and str(e.get('customer')).strip().upper() != cu:
+                    continue          # the same number under another customer
+                hits.append((s, e))
+            if not hits:
+                continue
+            if any(('poKey' in e) or ('matchedBy' in e) for _s, e in hits):
+                s, e = hits[0]        # newer build: every spelling maps to one rollup
+                m = dict(e)
+                m['pos'] = list(e.get('pos') or [s])
+            else:                      # older build: distinct spellings are distinct rows
+                m = {'qty': 0, 'value': 0.0, 'firstInv': '', 'lastInv': '', 'invoices': 0,
+                     'lines': [], 'pos': []}
+                for s, e in hits:
+                    m['qty'] += _sisc(e.get('qty'))
+                    m['value'] = round(m['value'] + _sfsc(e.get('value')), 2)
+                    m['invoices'] += _sisc(e.get('invoices'))
+                    fi, la = str(e.get('firstInv') or ''), str(e.get('lastInv') or '')
+                    if fi and (not m['firstInv'] or fi < m['firstInv']):
+                        m['firstInv'] = fi
+                    if la > m['lastInv']:
+                        m['lastInv'] = la
+                    m['lines'].extend(e.get('lines') or [])
+                    m['pos'].append(s)
+            matches[(cu, raw)] = m
+    return matches, None
+
+
+# ── One PO's status, count and units, for both server versions ──
+_PAST_BUCKETS = {'awaiting': 'awaiting_invoice', 'awaiting_invoice': 'awaiting_invoice',
+                 'invoiced': 'invoiced', 'pending': 'pending', 'not_counted': 'not_counted'}
+_PAST_LABEL_OLD_SHIPPED = 'Left the book after its ship window opened. Awaiting invoice (estimate)'
+_PAST_LABEL_OLD_SHIPPED_UNCHECKED = ('Left the book after its ship window opened. '
+                                     'Not checked against invoices (estimate)')
+_PAST_LABEL_OLD_EARLY = 'Left the book before its ship window. No invoice found'
+_PAST_LABEL_OLD_EARLY_UNCHECKED = 'Left the book before its ship window. Not checked against invoices'
+_PAST_OLD_SERVER_NOTE = ('This server version cannot see early shipments that are not invoiced yet, or '
+                         'orders renumbered to a new PO. Treat the awaiting-invoice numbers as rough estimates.')
+
+
+def _past_view_ready_payload(payload):
+    """True when a newer open-orders build says its invoice match is ready."""
+    hist = _hist_block(payload)
+    return bool(hist and hist.get('viewReady') is True)
+
+
+def _past_rows_final(payload):
+    """True when the server already joined invoices for these rows."""
+    if not _past_view_ready_payload(payload):
+        return False
+    return any(isinstance(p.get('status'), str) for p in (payload.get('pos') or []))
+
+
+def _past_po_state(p, inv=None, inv_checked=False, final=False, estimate_rule=None):
+    """Status, bucket, counted flag and units (with their basis) for one PO.
+    final=True: the server joined invoices (rows carry status and bucket and
+    history.viewReady is true), so its answer is used as is. Otherwise an
+    invoice found here by key (older builds) wins; a book status from a newer
+    build is kept for the rest; an older build's rows map shipped to
+    shipped_awaiting_invoice and everything else to left_before_window_no_invoice.
+    Units: invoice quantity when invoiced, else the order-book estimate, else
+    the peak booked size. Rows that do not count keep their last-day size."""
+    status = p.get('status') if isinstance(p.get('status'), str) and p.get('status') else None
+    invoice = p.get('invoice') if isinstance(p.get('invoice'), dict) else None
+    if status and (final or status == 'invoiced'):
+        bucket = _PAST_BUCKETS.get(str(p.get('bucket') or ''))
+        if 'counted' in p:
+            counted = bool(p.get('counted'))
+        else:
+            counted = bucket in ('invoiced', 'awaiting_invoice') or status == 'invoiced'
+        if bucket is None:
+            bucket = 'invoiced' if status == 'invoiced' else ('awaiting_invoice' if counted else 'not_counted')
+        label = str(p.get('statusLabel') or '') or status
+    elif inv:
+        status, bucket, counted, invoice = 'invoiced', 'invoiced', True, inv
+        label = f"Invoiced {_hist_date_text(inv.get('lastInv'))}" if inv.get('lastInv') else 'Invoiced'
+    elif status:
+        # A newer build whose invoice match is still loading: its book status
+        # stands, but nothing here proves an invoice.
+        counted = bool(p.get('counted')) if 'counted' in p else bool(p.get('shipped'))
+        bucket = _PAST_BUCKETS.get(str(p.get('bucket') or ''))
+        if bucket in (None, 'invoiced'):
+            bucket = 'awaiting_invoice' if counted else 'not_counted'
+        if bucket == 'awaiting_invoice' and not counted:
+            bucket = 'not_counted'
+        label = str(p.get('statusLabel') or '') or status
+        invoice = None
+    elif p.get('shipped'):
+        status, bucket, counted = 'shipped_awaiting_invoice', 'awaiting_invoice', True
+        label = _PAST_LABEL_OLD_SHIPPED if inv_checked else _PAST_LABEL_OLD_SHIPPED_UNCHECKED
+    else:
+        status, bucket, counted = 'left_before_window_no_invoice', 'not_counted', False
+        label = _PAST_LABEL_OLD_EARLY if inv_checked else _PAST_LABEL_OLD_EARLY_UNCHECKED
+    est_basis = 'peak booked (estimate)' if estimate_rule == 'peak' else 'estimate'
+    if bucket == 'invoiced' and invoice and invoice.get('qty') is not None:
+        units, value, basis = _sisc(invoice.get('qty')), round(_sfsc(invoice.get('value')), 2), 'invoice'
+    elif counted and p.get('estUnits') is not None:
+        units, value, basis = _sisc(p.get('estUnits')), round(_sfsc(p.get('estValue')), 2), est_basis
+    elif counted and final and p.get('countUnits') is not None:
+        units, value = _sisc(p.get('countUnits')), round(_sfsc(p.get('countValue')), 2)
+        basis = 'invoice' if p.get('countBasis') == 'invoice' else est_basis
+    elif counted:
+        units = _sisc(p.get('unitsPeak') or p.get('units'))
+        value = round(_sfsc(p.get('valuePeak') or p.get('value')), 2)
+        basis = 'peak booked (estimate)'
+    else:
+        units, value, basis = _sisc(p.get('units')), round(_sfsc(p.get('value')), 2), 'booked (not counted)'
+    remainder = None
+    ace = p.get('afterCutoffEstimate')
+    if counted and isinstance(ace, dict) and (ace.get('units') or ace.get('value')):
+        remainder = {'units': _sisc(ace.get('units')), 'value': round(_sfsc(ace.get('value')), 2),
+                     'ship_date_est': ace.get('estShipDate') or None}
+    if basis == 'invoice' and invoice and invoice.get('lines'):
+        lines, lines_basis = invoice.get('lines') or [], 'invoice'
+    elif basis != 'invoice' and counted and p.get('estLines'):
+        lines, lines_basis = p.get('estLines') or [], 'estimate'
+    else:
+        lines, lines_basis = (p.get('linesPeak') or p.get('lines') or []), 'booked'
+    if invoice and invoice.get('lastInv'):
+        count_date = invoice.get('lastInv')
+    else:
+        count_date = p.get('estShipDate') or p.get('lastSeen') or None
+    return {'status': status, 'status_label': label, 'bucket': bucket, 'counted': counted,
+            'units': units, 'value': value, 'units_basis': basis, 'invoice': invoice,
+            'remainder': remainder, 'lines': lines, 'lines_basis': lines_basis,
+            'count_date': count_date, 'join_key': _po_join_key(p.get('customer'), p.get('orderNo'))}
+
+
+def _past_line_out(l):
+    q = _sisc(l.get('qty'))
+    v = round(_sfsc(l.get('value')), 2)
+    price = l.get('price')
+    if price is None:
+        price = round(v / q, 2) if q else None
+    return {'style': l.get('style'), 'qty': q, 'price': price, 'value': v}
+
+
+def _past_po_row(p, include_lines=True, state=None):
+    st = state or _past_po_state(p)
+    row = {'customer': p.get('customer'), 'customer_full': p.get('customerFull'),
+           'order_no': p.get('orderNo'),
+           'status': st['status'], 'status_label': st['status_label'], 'counted': st['counted'],
+           'ship_start': p.get('start') or None, 'cancel': p.get('cancel') or None,
+           # the last day the PO was on the order book (not an invoice date)
+           'left_book': p.get('lastSeen') or None,
+           'units': st['units'], 'value': st['value'], 'units_basis': st['units_basis'],
+           # peak booked size, kept for reference (never a total by itself)
+           'units_peak': p.get('unitsPeak'), 'value_peak': p.get('valuePeak')}
+    inv = st['invoice']
+    if inv:
+        row['invoice'] = {'qty': inv.get('qty'), 'value': inv.get('value'),
+                          'first': inv.get('firstInv') or None, 'last': inv.get('lastInv') or None,
+                          'invoices': inv.get('invoices'),
+                          'po_as_invoiced': inv.get('rawPos') or inv.get('pos') or None}
+    if p.get('estShipDate'):
+        row['ship_date_est'] = p.get('estShipDate')
+    lb = p.get('leftBook')
+    if isinstance(lb, (list, tuple)) and lb:
+        row['left_book_range'] = [lb[0], lb[-1]]
+    if p.get('movedTo'):
+        row['moved_to'] = p.get('movedTo')
+    if p.get('confirmedOn'):
+        row['confirmed_on'] = p.get('confirmedOn')
+    if st['remainder']:
+        row['after_cutoff_estimate'] = st['remainder']
+    if include_lines:
+        row['lines'] = [_past_line_out(l) for l in (st['lines'] or [])]
+        row['lines_basis'] = st['lines_basis']
+    return row
+
+
+# Status filter values. The old values keep working: shipped means counted,
+# cancelled and pulled mean not counted.
+_PAST_STATUS_FILTERS = {'all': 'all', 'invoiced': 'invoiced', 'awaiting_invoice': 'awaiting_invoice',
+                        'awaiting': 'awaiting_invoice', 'not_counted': 'not_counted',
+                        'pending': 'pending', 'counted': 'counted', 'shipped': 'counted',
+                        'cancelled': 'not_counted', 'pulled': 'not_counted',
+                        'cancelled_or_pulled': 'not_counted'}
+
+
+def _past_status_ok(st, status_f):
+    if status_f == 'all':
+        return True
+    if status_f == 'counted':
+        return st['counted']
+    if status_f == 'awaiting_invoice':
+        return st['bucket'] == 'awaiting_invoice' or bool(st['remainder'])
+    return st['bucket'] == status_f
+
+
+def _past_breakdown(items):
+    """items = [(p, state)]. Counted POs only in the unit and dollar totals;
+    each invoice counts once per join key; split remainders add to awaiting."""
+    b = {'invoiced': {'pos': 0, 'units': 0, 'value': 0.0},
+         'awaiting_invoice': {'pos': 0, 'units': 0, 'value': 0.0},
+         'pending': {'pos': 0, 'value': 0.0},
+         'not_counted': {'pos': 0, 'value': 0.0}}
+    seen_inv = set()
+    for p, st in items:
+        bk = st['bucket']
+        if bk == 'invoiced':
+            jk = st['join_key'] or ('#', id(p))
+            if jk not in seen_inv:
+                seen_inv.add(jk)
+                b['invoiced']['pos'] += 1
+                b['invoiced']['units'] += st['units']
+                b['invoiced']['value'] += st['value']
+        elif bk == 'awaiting_invoice':
+            b['awaiting_invoice']['pos'] += 1
+            b['awaiting_invoice']['units'] += st['units']
+            b['awaiting_invoice']['value'] += st['value']
+        elif bk == 'pending':
+            b['pending']['pos'] += 1
+            b['pending']['value'] += st['value']
+        else:
+            b['not_counted']['pos'] += 1
+            b['not_counted']['value'] += st['value']
+        if st['remainder']:
+            b['awaiting_invoice']['units'] += st['remainder']['units']
+            b['awaiting_invoice']['value'] += st['remainder']['value']
+            b['awaiting_invoice']['remainder_pos'] = b['awaiting_invoice'].get('remainder_pos', 0) + 1
+    for v in b.values():
+        v['value'] = round(v['value'], 2)
+    return b
+
+
+def _past_acct_breakdown(a):
+    """The server's per-account numbers (newer builds), or None."""
+    if not isinstance(a, dict) or 'invoicedUnits' not in a:
+        return None
+    return {'invoiced': {'pos': a.get('invoicedPos'), 'units': a.get('invoicedUnits'),
+                         'value': a.get('invoicedValue')},
+            'awaiting_invoice': {'pos': a.get('awaitingPos'), 'units': a.get('awaitingUnits'),
+                                 'value': a.get('awaitingValue')},
+            'pending': {'pos': a.get('pendingPos'), 'value': a.get('pendingValue')},
+            'not_counted': {'pos': a.get('notCountedPos'), 'value': a.get('notCountedValue')}}
+
+
+def _past_acct_summary(a):
+    row = {'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
+           'counted_pos': a.get('poCount'), 'units': a.get('units'), 'value': a.get('value'),
+           'first_received': a.get('firstReceived') or None,
+           'last_received': a.get('lastReceived') or None}
+    bd = _past_acct_breakdown(a)
+    if bd:
+        row.update(bd)
+        row['units_basis'] = 'invoice where invoiced, order-book estimate for the rest'
+    else:
+        row['units_basis'] = 'last day on the book (this server version does not check invoices here)'
+        row['left_before_window'] = {'pos': a.get('cancelledCount'), 'value': a.get('cancelledValue')}
+    return row
+
+
+def _past_totals_summary(t, accounts):
+    t = t if isinstance(t, dict) else {}
+    out = {'accounts': t.get('accounts'), 'counted_pos': t.get('pos'), 'units': t.get('units'),
+           'value': t.get('value')}
+    if 'invoicedUnits' in t:
+        out.update(_past_acct_breakdown(t))
+    elif accounts and all('invoicedUnits' in a for a in accounts):
+        agg = {'invoiced': {'pos': 0, 'units': 0, 'value': 0.0},
+               'awaiting_invoice': {'pos': 0, 'units': 0, 'value': 0.0},
+               'pending': {'pos': 0, 'value': 0.0}, 'not_counted': {'pos': 0, 'value': 0.0}}
+        for a in accounts:
+            for k, v in _past_acct_breakdown(a).items():
+                for f in v:
+                    agg[k][f] = (agg[k][f] or 0) + (v[f] or 0)
+        for v in agg.values():
+            v['value'] = round(v['value'], 2)
+        out.update(agg)
+    else:
+        out['left_before_window_pos'] = t.get('cancelled')
+    return out
+
+
+def _past_customer_pick(accounts, cust_q):
+    """Resolve a customer name or code to one archive account.
+    Returns (account, error_dict_or_None)."""
+    cl = cust_q.lower()
+    matches = [a for a in accounts
+               if cl == str(a.get('customer') or '').lower()
+               or cl in str(a.get('customerFull') or '').lower()]
+    if not matches:
+        return None, {'error': (f"no past-order customer matches '{cust_q}'. Dropship accounts are never in "
+                                "this archive: use sales_history_lookup for them."),
+                      'customers': [a.get('customerFull') or a.get('customer') for a in accounts]}
+    if len(matches) > 1 and not any(cl == str(a.get('customer') or '').lower() for a in matches):
+        return None, {'ambiguous_customer': [{'customer': a.get('customer'),
+                                              'customer_full': a.get('customerFull')} for a in matches]}
+    acct = next((a for a in matches if cl == str(a.get('customer') or '').lower()), matches[0])
+    if not acct.get('customer'):
+        return None, {'error': 'that account has no customer code in the archive'}
+    return acct, None
+
+
+def _ai_tool_past_orders(params):
+    summary, _ok = _fetch_po_history()
+    if summary is None:
+        why = _po_hist_error() or 'no answer from the order history service'
+        return {'error': f'The past-orders archive is unavailable right now ({why}). Try again in a minute.'}
+    if not summary.get('ready'):
+        prog = summary.get('progress') or {}
+        return {'building': True,
+                'note': (f"The archive index is still building ({prog.get('done', 0)} of "
+                         f"{prog.get('total', 0)} days). Try again in a minute.")}
+    hist_sum = _hist_block(summary) or {}
+    est_rule = hist_sum.get('estimateRule')
+    meta = {**_history_info(summary, sales_summary=_sales_summary_quiet()),
+            'dropship_note': _HIST_DROPSHIP_NOTE,
+            'history_start': ((hist_sum.get('archive') or {}).get('from') or _HIST_ARCHIVE_START),
+            'latest_date': summary.get('latestDate')}
+    if not _ok:
+        meta['stale_note'] = ('The archive could not be refreshed just now. These numbers come from the '
+                              'last good copy.')
+    if (hist_sum.get('flags') or {}).get('degraded'):
+        meta['degraded_note'] = ('The server could not refresh the archive and is showing its last good '
+                                 'copy. Recent exits may be missing.')
+    accounts = [a for a in (summary.get('accounts') or [])
+                if any((a.get(k) or 0) > 0 for k in ('poCount', 'cancelledCount', 'pendingPos',
+                                                     'notCountedPos', 'invoicedPos', 'awaitingPos'))]
+    cust_q = (params.get('customer') or '').strip() or None
+    style_q = (params.get('style') or '').strip().upper() or None
+    status_raw = (params.get('status') or 'all').strip().lower()
+    status_f = _PAST_STATUS_FILTERS.get(status_raw)
+    if status_f is None:
+        return {'error': (f"unknown status '{status_raw}'. Use all, invoiced, awaiting_invoice, "
+                          "not_counted or pending."), **meta}
+    after_q = (params.get('received_after') or '').strip() or None
+    before_q = (params.get('received_before') or '').strip() or None
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+
+    def _date_ok(p):
+        seen = p.get('lastSeen') or ''
+        if after_q and seen < after_q:
+            return False
+        if before_q and seen > before_q:
+            return False
+        return True
+
+    # ── No filters: per-customer summary ──
+    if not cust_q and not style_q:
+        ignored = [k for k, v in (('status', status_f != 'all'), ('received_after', bool(after_q)),
+                                  ('received_before', bool(before_q))) if v]
+        extra = ({'filters_ignored': ignored, 'note2': 'status and date filters apply only with a customer or style'}
+                 if ignored else {})
+        new_numbers = bool(accounts) and all('invoicedUnits' in a for a in accounts)
+        note = ("left_book is the last day a PO was on the order book, not its invoice date. "
+                "Counted POs are those that shipped: invoiced ones at invoice quantity, the rest at an "
+                "order-book estimate until the invoice arrives. POs that left the book without shipping, "
+                "moved to another PO, or are not confirmed yet are not counted.")
+        if not new_numbers:
+            note = ("left_book is the last day a PO was on the order book, not its invoice date. This "
+                    "server version counts a PO as shipped when it left the book after its ship window "
+                    "opened, at its last-day size, without checking invoices. Ask with a customer for "
+                    "invoice-checked numbers.")
+        return {**extra, **meta, 'note': note,
+                'totals': _past_totals_summary(summary.get('totals'), accounts),
+                'customers': [_past_acct_summary(a) for a in accounts]}
+
+    # ── Customer filter: resolve to ONE account code ──
+    if cust_q:
+        acct, err = _past_customer_pick(accounts, cust_q)
+        if err:
+            return {**err, **meta}
+        code = str(acct.get('customer')).strip().upper()
+        data, dok = _fetch_po_history(code)
+        if data is None or not data.get('ready'):
+            why = _po_hist_error(code) or 'the archive is still building'
+            return {'error': f"Could not load the archive for {code} right now ({why}).", **meta}
+        if not dok:
+            meta['stale_note'] = ('The archive could not be refreshed just now. These numbers come from the '
+                                  'last good copy.')
+        rows_all = data.get('pos') or []
+        final = _past_rows_final(data)
+        est_rule = (_hist_block(data) or {}).get('estimateRule') or est_rule
+        inv_map, inv_err = {}, None
+        if not final:
+            inv_map, inv_err = _po_invoice_lookup([(code, p.get('orderNo')) for p in rows_all])
+        elif style_q:
+            want = [(code, p.get('orderNo')) for p in rows_all if p.get('status') == 'invoiced'
+                    and any(style_q in str(l.get('style') or '').upper() for l in (p.get('linesPeak') or p.get('lines') or []))]
+            if want:
+                inv_map, inv_err = _po_invoice_lookup(want)
+        items = []
+        for p in rows_all:
+            if final:
+                st = _past_po_state(p, final=True, estimate_rule=est_rule)
+                inv = inv_map.get((code, p.get('orderNo')))
+                if st['bucket'] == 'invoiced' and inv and inv.get('lines'):
+                    st = dict(st, lines=inv['lines'], lines_basis='invoice')
+            else:
+                st = _past_po_state(p, inv=inv_map.get((code, p.get('orderNo'))),
+                                    inv_checked=inv_err is None, estimate_rule=est_rule)
+            items.append((p, st))
+        sel = [(p, st) for p, st in items if _past_status_ok(st, status_f) and _date_ok(p)]
+        if style_q:
+            sel = [(p, st) for p, st in sel
+                   if any(style_q in str(l.get('style') or '').upper()
+                          for l in ((st['lines'] or []) + (p.get('linesPeak') or p.get('lines') or [])))]
+        sel.sort(key=lambda x: str(x[0].get('lastSeen') or ''), reverse=True)
+        bd = _past_breakdown(sel)
+        filtered = bool(style_q or status_f != 'all' or after_q or before_q)
+        def _countable(st):
+            if not st['counted']:
+                return False
+            if status_f == 'invoiced':
+                return st['bucket'] == 'invoiced'
+            if status_f == 'awaiting_invoice':
+                return st['bucket'] == 'awaiting_invoice'
+            return True
+
+        if style_q:
+            # Totals count only the MATCHING style lines of counted POs.
+            tot_units = sum(_sisc(l.get('qty')) for p, st in sel if _countable(st)
+                            for l in (st['lines'] or []) if style_q in str(l.get('style') or '').upper())
+            tot_val = round(sum(_sfsc(l.get('value')) for p, st in sel if _countable(st)
+                                for l in (st['lines'] or []) if style_q in str(l.get('style') or '').upper()), 2)
+        else:
+            server_bd = None if filtered else _past_acct_breakdown(acct)
+            if server_bd and final:
+                bd = server_bd          # the server's own numbers: every reader shows the same total
+                tot_units = _sisc(acct.get('units'))
+                tot_val = round(_sfsc(acct.get('value')), 2)
+            else:
+                parts = {'invoiced': ('invoiced',), 'awaiting_invoice': ('awaiting_invoice',),
+                         'pending': (), 'not_counted': ()}.get(status_f, ('invoiced', 'awaiting_invoice'))
+                tot_units = sum(bd[k]['units'] for k in parts)
+                tot_val = round(sum(bd[k]['value'] for k in parts), 2)
+        ss = _sales_summary_quiet()
+        life = None
+        if ss is not None:
+            c = next((c for c in (ss.get('customers') or [])
+                      if str(c.get('customer') or '').upper() == code), None)
+            life = ({'units': c.get('units'), 'value': c.get('value'), 'invoices': c.get('invoiceCount'),
+                     'first': c.get('firstInv'), 'last': c.get('lastInv')} if c else
+                    {'units': 0, 'value': 0.0, 'invoices': 0, 'note': 'No invoices on file for this customer code.'})
+            life['note2'] = ('All invoices for this customer code since Nov 2019, up to the cut-off. It already '
+                             'includes the invoiced POs in this archive, so never add the two.')
+        else:
+            life = {'error': 'The invoice summary could not be read right now.'}
+        awaiting = dict(bd['awaiting_invoice'])
+        awaiting['basis'] = 'estimate from the order book until the invoice arrives'
+        out = {'customer': acct.get('customer'), 'customer_full': acct.get('customerFull'),
+               'matched_pos': len(sel), 'counted_pos': sum(1 for _p, st in sel if st['counted']),
+               'total_units': tot_units, 'total_value': tot_val,
+               'totals_rule': ('Counted POs only: invoiced POs at invoice quantity and value, the rest at the '
+                               'order-book estimate until the invoice arrives. POs that left the book without '
+                               'shipping are listed but never counted.'),
+               'by_status': bd, 'awaiting_invoice': awaiting, 'invoiced_lifetime': life,
+               'rows': [_past_po_row(p, state=st) for p, st in sel[:limit]],
+               'truncated': len(sel) > limit, **meta}
+        if not final and inv_err is not None:
+            out['awaiting_invoice'] = None
+            out['invoice_check_note'] = (f"Could not match these POs to invoices ({inv_err.get('error')}). "
+                                         'Every count here is an order-book estimate, and some of these POs are '
+                                         'already invoiced. Do not add these totals to invoiced sales.')
+        elif not final and _hist_block(data):
+            out['invoice_check_note'] = ('The server is still matching invoices. These POs were matched to '
+                                         'invoices here instead.')
+        if not final and not any(isinstance(p.get('status'), str) for p in rows_all):
+            out['server_note'] = _PAST_OLD_SERVER_NOTE
+        if style_q:
+            out['note'] = f"total_units and total_value count only counted lines matching '{style_q}'. Rows show full POs."
+        return out
+
+    # ── Style search across every customer ──
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        fetched = list(ex.map(lambda a: _fetch_po_history(a.get('customer')), accounts))
+    partial, stale = [], False
+    hit_pos = []
+    for a, (data, dok) in zip(accounts, fetched):
+        if data is None or not data.get('ready'):
+            partial.append(a.get('customer'))
+            continue
+        stale = stale or not dok
+        final = _past_rows_final(data)
+        rule = (_hist_block(data) or {}).get('estimateRule') or est_rule
+        for p in (data.get('pos') or []):
+            if not _date_ok(p):
+                continue
+            lines = (p.get('linesPeak') or []) + (p.get('lines') or []) + (p.get('estLines') or [])
+            if any(style_q in str(l.get('style') or '').upper() for l in lines):
+                hit_pos.append((a, p, final, rule))
+    need = [(str(a.get('customer') or '').upper(), p.get('orderNo')) for a, p, final, _r in hit_pos
+            if not final or p.get('status') == 'invoiced']
+    inv_map, inv_err = _po_invoice_lookup(need) if need else ({}, None)
+    hits, tot_qty, tot_val = [], 0, 0.0
+    for a, p, final, rule in hit_pos:
+        cu = str(a.get('customer') or '').upper()
+        inv = inv_map.get((cu, p.get('orderNo')))
+        if final:
+            st = _past_po_state(p, final=True, estimate_rule=rule)
+            if st['bucket'] == 'invoiced' and inv and inv.get('lines'):
+                st = dict(st, lines=inv['lines'], lines_basis='invoice')
+        else:
+            st = _past_po_state(p, inv=inv, inv_checked=inv_err is None, estimate_rule=rule)
+        if not _past_status_ok(st, status_f):
+            continue
+        for l in (st['lines'] or []):
+            if style_q not in str(l.get('style') or '').upper():
+                continue
+            lo_ = _past_line_out(l)
+            hits.append({'customer': a.get('customer'), 'customer_full': a.get('customerFull'),
+                         'order_no': p.get('orderNo'), 'status': st['status'],
+                         'status_label': st['status_label'], 'counted': st['counted'],
+                         'left_book': p.get('lastSeen') or None, 'qty_basis': st['lines_basis'],
+                         **lo_})
+            if st['counted']:
+                tot_qty += lo_['qty']
+                tot_val += lo_['value']
+    hits.sort(key=lambda h: str(h.get('left_book') or ''), reverse=True)
+    out = {'style_query': style_q, 'matched_lines': len(hits),
+           'counted_lines': sum(1 for h in hits if h['counted']),
+           'total_units': tot_qty, 'total_value': round(tot_val, 2),
+           'totals_rule': ('Counted POs only. Invoiced POs use invoice lines when they could be loaded; '
+                           'the rest use order-book estimates.'),
+           'rows': hits[:limit], 'truncated': len(hits) > limit, **meta}
+    notes = []
+    if partial:
+        notes.append(f"{len(partial)} customers failed to load, so results may be partial.")
+    if stale:
+        notes.append('Some customers came from the last good copy because a refresh failed.')
+    if inv_err is not None:
+        notes.append(f"Could not match POs to invoices ({inv_err.get('error')}). Quantities are order-book "
+                     'estimates and some of these POs may already be invoiced.')
+    if notes:
+        out['note'] = ' '.join(notes)
+    return out
+
+
+def _sales_customer_directory():
+    """Every customer code the two stores know: invoice customers (the sales
+    summary) and archive accounts (po-history, with full names). Returns
+    (directory {CODE: {full, invoices, archive}}, sales_error_or_None)."""
+    ss, ss_err = _fetch_sales_summary()
+    hist, _ok = _fetch_po_history()
+    d = {}
+    if isinstance(ss, dict) and ss.get('ready'):
+        for c in (ss.get('customers') or []):
+            code = str(c.get('customer') or '').strip().upper()
+            if code:
+                d.setdefault(code, {'full': '', 'invoices': False, 'archive': False})['invoices'] = True
+    if isinstance(hist, dict) and hist.get('ready'):
+        for a in (hist.get('accounts') or []):
+            code = str(a.get('customer') or '').strip().upper()
+            if not code or code == '\u2014':
+                continue
+            e = d.setdefault(code, {'full': '', 'invoices': False, 'archive': False})
+            e['archive'] = True
+            e['full'] = str(a.get('customerFull') or '') or e['full']
+    return d, ss_err
+
+
+def _sales_resolve_customer_ex(cust_q):
+    """Resolve a customer NAME or code to one exact customer code, looking in
+    both stores, so customers found only in the order-book archive resolve
+    too. Returns (code, None, entry) or (None, error_dict, None)."""
+    d, ss_err = _sales_customer_directory()
+    cu = cust_q.strip().upper()
+    if cu in d:
+        return cu, None, d[cu]
+    matches = [c for c, e in d.items()
+               if cu in c or (e['full'] and cu in e['full'].upper())]
+    if not matches:
+        if ss_err:
+            return None, dict(ss_err), None
+        return None, {'error': f"no customer matches '{cust_q}' in the invoices or the order-book archive",
+                      'customers': [f"{c} ({e['full']})" if e['full'] else c for c, e in sorted(d.items())]}, None
+    if len(matches) > 1:
+        return None, {'ambiguous_customer': [{'customer': c, 'customer_full': d[c]['full'] or c}
+                                             for c in sorted(matches)]}, None
+    return matches[0], None, d[matches[0]]
+
+
+def _sales_resolve_customer(cust_q):
+    """Resolve a customer NAME or code to the exact customer code.
+    Returns (code, None) on success or (None, error_dict) on failure."""
+    code, err, _entry = _sales_resolve_customer_ex(cust_q)
+    return code, err
+
+
+def _pend_units_value(r):
+    """(units, value) of one awaiting row from the server, whatever its mode."""
+    ace = r.get('afterCutoffEstimate') if isinstance(r.get('afterCutoffEstimate'), dict) else None
+    if ace and (r.get('status') == 'invoiced' or r.get('bucket') == 'invoiced'):
+        return _sisc(ace.get('units')), round(_sfsc(ace.get('value')), 2)
+    for uk, vk in (('estUnits', 'estValue'), ('countUnits', 'countValue'), ('units', 'value'),
+                   ('qty', 'value'), ('estQty', 'estValue')):
+        if r.get(uk) is not None:
+            return _sisc(r.get(uk)), round(_sfsc(r.get(vk)), 2)
+    return 0, 0.0
+
+
+def _sales_pending_out(rows, totals=None, limit=30, customer=None):
+    """The server's awaiting-invoice estimate (newer builds) in one shape."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)
+            and (not customer or str(r.get('customer') or customer).upper() == customer)]
+    out_rows = []
+    for r in rows:
+        u, v = _pend_units_value(r)
+        o = {'customer': r.get('customer'), 'po': r.get('orderNo') or r.get('po'),
+             'status': r.get('status'), 'status_label': r.get('statusLabel'),
+             'units': u, 'value': v,
+             'ship_date_est': r.get('estShipDate') or ((r.get('afterCutoffEstimate') or {}).get('estShipDate')
+                                                       if isinstance(r.get('afterCutoffEstimate'), dict) else None),
+             'left_book': r.get('lastSeen')}
+        if r.get('style'):
+            o['style'] = r.get('style')
+        out_rows.append(o)
+    t = totals if isinstance(totals, dict) else {}
+    if t.get('units') is not None and not customer:
+        pos, units, value = t.get('pos'), t.get('units'), t.get('value')
+    else:
+        pos = len({(o['customer'], o['po']) for o in out_rows})
+        units = sum(o['units'] for o in out_rows)
+        value = round(sum(o['value'] for o in out_rows), 2)
+    return {'basis': 'estimate', 'note': _HIST_AWAITING_NOTE, 'pos': pos, 'units': units, 'value': value,
+            'rows': out_rows[:limit], 'truncated': len(out_rows) > limit}
+
+
+def _sales_style_search(style_q, code, limit):
+    params = {'style': style_q}
+    if code:
+        params['limit'] = 2000
+    data, err = _oo_json('GET', '/api/sales-history', params=params, timeout=45)
+    if err:
+        return err
+    if not data.get('ready'):
+        return {'error': data.get('note') or 'No invoice data is loaded on the server yet.'}
+    rows = data.get('rows') or []
+    matched = data.get('matched_rows') if isinstance(data.get('matched_rows'), int) else len(rows)
+    pages_ok = ('offset' in data) or ('limit' in data)
+    out = {'style_query': data.get('style_query') or style_q.upper()}
+    notes = []
+    if code:
+        all_rows = list(rows)
+        capped = bool(data.get('truncated'))
+        if capped and pages_ok:
+            off, pages = len(all_rows), 1
+            while off < matched and pages < 10:
+                d2, e2 = _oo_json('GET', '/api/sales-history',
+                                  params={'style': style_q, 'offset': off, 'limit': 2000}, timeout=45)
+                if e2:
+                    return e2
+                got = d2.get('rows') or []
+                if not got:
+                    break
+                all_rows.extend(got)
+                off += len(got)
+                pages += 1
+            capped = off < matched
+        mine = [r for r in all_rows if str(r.get('customer') or '').upper() == code]
+        out['customer'] = code
+        out['matched_rows'] = len(mine)
+        out['matched_qty'] = sum(_sisc(r.get('qty')) for r in mine)
+        out['matched_value'] = round(sum(_sfsc(r.get('value')) for r in mine), 2)
+        if capped:
+            notes.append(f"The server returned only the newest {len(all_rows):,} of {matched:,} matching "
+                         'invoice lines. Totals for this customer cover those lines only, so older lines '
+                         'may be missing.')
+        shown = mine
+        truncated = len(mine) > limit or capped
+        out['totals_complete'] = not capped
+    else:
+        out['matched_rows'] = matched
+        out['matched_qty'] = data.get('matched_qty')
+        out['matched_value'] = data.get('matched_value')
+        if data.get('truncated'):
+            notes.append(f"Showing the newest {len(rows):,} of {matched:,} invoice lines. "
+                         f"Totals use all {matched:,}.")
+        shown = rows
+        truncated = len(rows) > limit or bool(data.get('truncated'))
+    out['rows'] = shown[:limit]
+    out['truncated'] = truncated
+    if isinstance(data.get('pendingRows'), list):
+        out['awaiting_invoice'] = _sales_pending_out(data['pendingRows'], limit=limit, customer=code)
+    if notes:
+        out['note'] = ' '.join(notes)
+    out.update(_history_info(data, sales_summary=_sales_summary_quiet()))
+    return out
+
+
+def _ai_tool_sales_history(params):
+    """Invoice-level sales history (the A2000 invoice history on the
+    open-orders service): real invoice dates and shipped quantities, Nov 2019
+    up to the invoice cut-off. Every call checks the HTTP status. Newer
+    builds add an awaiting-invoice estimate for shipments after the cut-off,
+    always labelled as an estimate."""
+    cust_q = (params.get('customer') or '').strip()
+    style_q = (params.get('style') or '').strip()
+    month_q = (params.get('month') or '').strip()
+    from_q = (params.get('from') or '').strip()
+    to_q = (params.get('to') or '').strip()
+    limit = max(1, min(int(params.get('limit') or 30), 200))
+    try:
+        code = None
+        if cust_q:
+            code, err = _sales_resolve_customer(cust_q)
+            if err:
+                return err
+        if style_q:
+            return _sales_style_search(style_q, code, limit)
+        if code:
+            qp = {'account': code}
+            if month_q:
+                qp['month'] = month_q
+            elif from_q or to_q:
+                if from_q:
+                    qp['from'] = from_q
+                if to_q:
+                    qp['to'] = to_q
+            data, err = _oo_json('GET', '/api/sales-history', params=qp, timeout=45)
+            if err:
+                return err
+            if not data.get('ready'):
+                return {'error': data.get('note') or 'No invoice data is loaded on the server yet.'}
+            meta = _history_info(data, sales_summary=_sales_summary_quiet())
+            pend = data.get('pending') if isinstance(data.get('pending'), dict) else None
+            if 'pos' in data:   # ranged query: PO rollups with style lines
+                pos = data.get('pos') or []
+                out = {'customer': data.get('account'), 'from': data.get('from'), 'to': data.get('to'),
+                       'po_count': data.get('poCount'), 'units': data.get('units'),
+                       'value': data.get('value'), 'rows': pos[:limit],
+                       'truncated': bool(data.get('truncated')) or len(pos) > limit, **meta}
+                if pend is not None:
+                    out['awaiting_invoice'] = _sales_pending_out(pend.get('rows') or [], totals=pend, limit=limit)
+                return out
+            out = {'customer': data.get('account'), 'invoice_row_count': data.get('rows'),
+                   'po_count': data.get('poCount'), 'years': data.get('years'),
+                   'months': data.get('months'), 'divisions': data.get('divisions'),
+                   'top_styles': (data.get('topStyles') or [])[:30],
+                   'recent_pos': (data.get('posRecent') or [])[:limit],
+                   'note': 'divisions: OB = wholesale, DS = dropship', **meta}
+            if not data.get('rows'):
+                out['note2'] = ('No invoices on file for this customer code. past_orders_lookup shows its '
+                                'order-book archive.')
+            if pend is not None:
+                aw = _sales_pending_out(pend.get('rows') or [], totals=pend, limit=limit)
+                if pend.get('months') is not None:
+                    aw['months'] = pend.get('months')
+                out['awaiting_invoice'] = aw
+            if isinstance(data.get('excluded'), dict):
+                out['left_book_not_counted'] = data.get('excluded')
+            return out
+        data, err = _oo_json('GET', '/api/sales-history', timeout=45)
+        if err:
+            return err
+        if not data.get('ready'):
+            return {'error': data.get('note') or 'No invoice data is loaded on the server yet.'}
+        out = {'source': data.get('source'), 'totals': data.get('totals'),
+               'years': data.get('years'),
+               'customers': [{'customer': c.get('customer'), 'units': c.get('units'),
+                              'value': c.get('value'), 'invoices': c.get('invoiceCount'),
+                              'first': c.get('firstInv'), 'last': c.get('lastInv')}
+                             for c in (data.get('customers') or [])[:60]],
+               'note': ('Invoice ground truth: real invoice dates and shipped quantities, up to the cut-off '
+                        'in history_label. Shipments after the cut-off are only estimates: see '
+                        'awaiting_invoice here or past_orders_lookup. Dropship is only in invoices.'),
+               **_history_info(data, sales_summary=data)}
+        pend = data.get('pending') if isinstance(data.get('pending'), dict) else None
+        if pend is not None and pend.get('ready') is not False:
+            aw = {'basis': 'estimate', 'note': _HIST_AWAITING_NOTE, 'totals': pend.get('totals'),
+                  'by_month': pend.get('byMonth')}
+            out['awaiting_invoice'] = aw
+        return out
+    except Exception as e:
+        return {'error': f'sales history unavailable: {e}'}
+
+
+def _sheet_pending_rows(pend_list, source):
+    """Flatten awaiting-invoice POs into sheet lines.
+    source 'server': rows from the server (newer builds, invoices joined by key
+    over all dates). source 'archive': (p, state) pairs matched here."""
+    rows = []
+    for item in pend_list:
+        if source == 'server':
+            p, st = item, None
+        else:
+            p, st = item
+        ace = p.get('afterCutoffEstimate') if isinstance(p.get('afterCutoffEstimate'), dict) else None
+        split = bool(ace) and (p.get('status') == 'invoiced' or p.get('bucket') == 'invoiced')
+        label = str(p.get('statusLabel') or (st or {}).get('status_label') or '')
+        lb = p.get('leftBook')
+        left = (f"{lb[0]} to {lb[-1]}" if isinstance(lb, (list, tuple)) and lb and lb[0] != lb[-1]
+                else (lb[0] if isinstance(lb, (list, tuple)) and lb else (p.get('lastSeen') or '')))
+        if split:
+            est = ace.get('estShipDate') or ''
+            lines = ace.get('lines') if isinstance(ace.get('lines'), list) and ace.get('lines') else [
+                {'style': '', 'qty': ace.get('units'), 'value': ace.get('value')}]
+            # The invoiced part is on the Invoiced tab; this line is only the rest.
+            label = 'Rest of an invoiced PO. Shipped after the invoice cut-off (estimate)'
+        else:
+            est = p.get('estShipDate') or ''
+            if st is not None:
+                lines = st['lines']
+            else:
+                lines = p.get('estLines') or p.get('lines') or p.get('linesPeak') or []
+                if not lines:
+                    u, v = _pend_units_value(p)
+                    lines = [{'style': '', 'qty': u, 'value': v}]
+        for l in lines:
+            q = _sisc(l.get('qty'))
+            v = _sfsc(l.get('value'))
+            rows.append({'style': l.get('style') or '', 'color': '',
+                         'po': p.get('orderNo') or p.get('po') or '', 'div': '',
+                         'status': label, 'first': left, 'last': est, 'invs': '',
+                         'qty': q, 'price': round(v / q, 2) if q else _sfsc(l.get('price')),
+                         'value': round(v, 2)})
+    rows.sort(key=lambda r: (r['last'] or r['first'], r['po']), reverse=True)
+    return rows
+
+
 def _ai_tool_build_sales_sheet(params):
     """Build a downloadable Excel SALES SHEET with photos for one customer:
-    invoiced shipments (real invoice dates), book-tracked shipped-awaiting-
-    invoice POs (peak sizes), and current open hard POs. Uploaded to S3 like
-    build_line_sheet; returns a public download_url."""
+    invoiced shipments (real invoice dates), POs that shipped but have no
+    invoice yet (order-book estimates, early shipments included), and current
+    open hard POs. Uploaded to S3 like build_line_sheet; returns a public
+    download_url."""
     cust_q = (params.get('customer') or '').strip()
     if not cust_q:
         return {'error': 'customer required'}
-    code, err = _sales_resolve_customer(cust_q)
+    code, err, entry = _sales_resolve_customer_ex(cust_q)
     if err:
         return err
-    # full display name from the po-history directory
-    full_name = code
-    hist_sum, _ok = _fetch_po_history()
-    for a in ((hist_sum or {}).get('accounts') or []):
-        if str(a.get('customer') or '').upper() == code:
-            full_name = a.get('customerFull') or code
-            break
+    full_name = (entry or {}).get('full') or code
 
     # ── date bounds: from/to win; year / month are conveniences ──
     from_q = (params.get('from') or '').strip()
@@ -15134,47 +15993,86 @@ def _ai_tool_build_sales_sheet(params):
             from_q, to_q = year_q + '-01-01', year_q + '-12-31'
     lo = from_q or '0000-00-00'
     hi = to_q or '9999-99-99'
-    period_label = (f"{from_q or 'start of history'} → {to_q or 'today'}"
+    period_label = (f"{from_q or 'start of history'} to {to_q or 'today'}"
                     if (from_q or to_q) else 'Full history')
 
     include = params.get('include') or ['invoiced', 'shipped_pending', 'on_order']
     if isinstance(include, str):
         include = [include]
     include = {str(x).strip().lower() for x in include}
+    if include & {'awaiting_invoice', 'awaiting', 'shipped_not_invoiced'}:
+        include.add('shipped_pending')
     group_by = (params.get('group_by') or 'po').strip().lower()
     notes = []
+    hist_payloads = []
 
-    # ── 1. invoiced PO rollups with style lines ──
-    inv_pos, inv_po_set = [], set()
-    if 'invoiced' in include:
-        try:
-            resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history", headers=_oo_api_headers(),
-                                     params={'account': code, 'from': lo, 'to': hi}, timeout=60)
-            data = resp.json()
-            if data.get('ready'):
-                inv_pos = data.get('pos') or []
-                inv_po_set = {p.get('po') for p in inv_pos}
-                if data.get('truncated'):
-                    notes.append('invoiced list truncated at 1500 POs — narrow the date range for full coverage')
-            else:
-                notes.append('invoice backfill unavailable — invoiced tab skipped')
-        except Exception as e:
-            notes.append(f'invoiced data failed to load: {e}')
+    # ── 1. invoiced PO rollups with style lines (newer builds add the awaiting rows) ──
+    inv_pos, ranged = [], None
+    if include & {'invoiced', 'shipped_pending'}:
+        ranged, rerr = _oo_json('GET', '/api/sales-history', params={'account': code, 'from': lo, 'to': hi},
+                                timeout=60)
+        if rerr:
+            notes.append(f"Invoices could not be loaded. {rerr.get('error')} The Invoiced tab is left out.")
+            ranged = None
+        elif not ranged.get('ready'):
+            notes.append('No invoice data is loaded on the server yet. The Invoiced tab is left out.')
+            ranged = None
+        else:
+            hist_payloads.append(ranged)
+            if 'invoiced' in include:
+                inv_pos = ranged.get('pos') or []
+                if ranged.get('truncated'):
+                    notes.append('The invoiced list stops at 1,500 POs. Narrow the dates to see them all.')
 
-    # ── 2. book-tracked shipped POs not yet invoiced (peak sizes) ──
-    pend_pos = []
+    # ── 2. shipped, not yet invoiced ──
+    pend_rows, pend_basis = [], ''
     if 'shipped_pending' in include:
-        data, _ok2 = _fetch_po_history(code)
-        if data and data.get('ready'):
-            for p in (data.get('pos') or []):
-                if not p.get('shipped') or p.get('orderNo') in inv_po_set:
-                    continue
-                seen = p.get('lastSeen') or ''
-                if seen < lo or seen > hi:
-                    continue
-                pend_pos.append(p)
-        elif data is None:
-            notes.append('book-tracked archive unavailable — awaiting-invoice tab skipped')
+        pend = (ranged or {}).get('pending') if ranged else None
+        if isinstance(pend, dict) and isinstance(pend.get('rows'), list) and _past_view_ready_payload(ranged):
+            # Newer build: the server joined invoices by key over all dates.
+            pend_rows = _sheet_pending_rows(pend['rows'], 'server')
+            pend_basis = 'estimate'
+        else:
+            data, _pok = _fetch_po_history(code)
+            if data is None or not data.get('ready'):
+                if (entry or {}).get('archive'):
+                    why = _po_hist_error(code) or 'the archive is still building'
+                    notes.append(f'The order-book archive could not be loaded ({why}). '
+                                 'The Shipped, not yet invoiced tab is left out.')
+            else:
+                hist_payloads.append(data)
+                final = _past_rows_final(data)
+                rule = (_hist_block(data) or {}).get('estimateRule')
+                cands = []
+                for p in (data.get('pos') or []):
+                    if final:
+                        st = _past_po_state(p, final=True, estimate_rule=rule)
+                        if not (st['bucket'] == 'awaiting_invoice' or st['remainder']):
+                            continue
+                        d = (st['remainder'] or {}).get('ship_date_est') if st['bucket'] == 'invoiced' else None
+                        d = d or p.get('estShipDate') or p.get('lastSeen') or ''
+                    else:
+                        st = _past_po_state(p, inv_checked=True, estimate_rule=rule)
+                        if not st['counted']:
+                            continue   # left before its window: an older build cannot see early shipments
+                        d = p.get('estShipDate') or p.get('lastSeen') or ''
+                    if d < lo or d > hi:
+                        continue
+                    cands.append((p, st))
+                if final:
+                    pend_rows = _sheet_pending_rows(cands, 'archive')
+                    pend_basis = 'estimate'
+                elif cands:
+                    # Older build: drop every PO invoiced on ANY date, matched by key.
+                    inv_map, lerr = _po_invoice_lookup([(code, p.get('orderNo')) for p, _st in cands])
+                    if lerr:
+                        notes.append(f"Could not check which POs are already invoiced ({lerr.get('error')}). "
+                                     'The Shipped, not yet invoiced tab is left out so nothing is counted twice.')
+                    else:
+                        keep = [(p, st) for p, st in cands if (code, p.get('orderNo')) not in inv_map]
+                        pend_rows = _sheet_pending_rows(keep, 'archive')
+                        pend_basis = 'peak booked'
+                        notes.append(_PAST_OLD_SERVER_NOTE)
 
     # ── 3. current open hard POs (no bulks/allocations; not date-filtered) ──
     open_pos = []
@@ -15206,12 +16104,16 @@ def _ai_tool_build_sales_sheet(params):
             ln['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
         open_pos = sorted(agg.values(), key=lambda p: p['start'] or '9999')
         if not ok3 and not open_pos:
-            notes.append('open-orders feed unavailable — on-order tab may be incomplete')
+            notes.append('The open-orders feed is unavailable, so the On Order tab may be incomplete.')
 
-    if not inv_pos and not pend_pos and not open_pos:
-        return {'error': f'nothing found for {full_name} ({code}) in {period_label} with include={sorted(include)}'}
+    meta = _history_info(*hist_payloads, sales_summary=_sales_summary_quiet())
+    if not inv_pos and not pend_rows and not open_pos:
+        if notes:
+            return {'error': f'Could not build a sheet for {full_name} ({code}). ' + ' '.join(notes), **meta}
+        return {'error': f'nothing found for {full_name} ({code}) in {period_label} with include={sorted(include)}',
+                **meta}
 
-    # ── flatten into per-tab line rows: (style, color, po, d1, d2, extra, qty, price, value) ──
+    # ── flatten into per-tab line rows ──
     def _line_rows_invoiced():
         rows = []
         for p in inv_pos:
@@ -15229,21 +16131,6 @@ def _ai_tool_build_sales_sheet(params):
             rows.sort(key=lambda r: (r['last'], r['po'], -r['qty']), reverse=True)
         return rows
 
-    def _line_rows_pending():
-        rows = []
-        for p in pend_pos:
-            lines = p.get('linesPeak') or p.get('lines') or []
-            for l in lines:
-                q = _sisc(l.get('qty'))
-                v = _sfsc(l.get('value'))
-                rows.append({'style': l.get('style') or '', 'color': '',
-                             'po': p.get('orderNo') or '', 'div': '',
-                             'first': p.get('start') or '', 'last': p.get('lastSeen') or '',
-                             'invs': '',
-                             'qty': q, 'price': round(v / q, 2) if q else _sfsc(l.get('price')), 'value': round(v, 2)})
-        rows.sort(key=lambda r: (r['last'], r['po']), reverse=True)
-        return rows
-
     def _line_rows_open():
         rows = []
         for p in open_pos:
@@ -15256,15 +16143,17 @@ def _ai_tool_build_sales_sheet(params):
                              'qty': q, 'price': round(v / q, 2) if q else 0, 'value': round(v, 2)})
         return rows
 
+    PEND_TAB = 'Shipped, not yet invoiced'
+    PEND_QTY = 'Qty (estimate until invoiced)'
     tabs = []
     if inv_pos:
         tabs.append(('Invoiced', _line_rows_invoiced(),
                      ['Image', 'Style', 'Color', 'PO #', 'Division', 'First Invoiced', 'Last Invoiced', 'Qty', 'Unit Price', 'Value'],
                      lambda r: [r['style'], r['color'], r['po'], r['div'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
-    if pend_pos:
-        tabs.append(('Shipped - Awaiting Invoice', _line_rows_pending(),
-                     ['Image', 'Style', 'PO #', 'Window Start', 'Left Book', 'Qty (peak booked)', 'Est. Price', 'Est. Value'],
-                     lambda r: [r['style'], r['po'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
+    if pend_rows:
+        tabs.append((PEND_TAB, pend_rows,
+                     ['Image', 'Style', 'PO #', 'Status', 'Left the book', 'Est. ship date', PEND_QTY, 'Est. Price', 'Est. Value'],
+                     lambda r: [r['style'], r['po'], r['status'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
     if open_pos:
         tabs.append(('On Order', _line_rows_open(),
                      ['Image', 'Style', 'PO #', 'Window Start', 'Cancel', 'Qty', 'Unit Price', 'Value'],
@@ -15289,9 +16178,10 @@ def _ai_tool_build_sales_sheet(params):
     ws = wb.add_worksheet('Summary')
     ws.set_column(0, 0, 30)
     ws.set_column(1, 1, 46)
-    ws.write(0, 0, f'{full_name} — Sales Sheet', f_title)
-    ws.write(1, 0, f'Period: {period_label} · generated {datetime.now().strftime("%b %d, %Y %H:%M")}', f_sub)
-    srow = 3
+    ws.write(0, 0, f'{full_name} Sales Sheet', f_title)
+    ws.write(1, 0, f'Period: {period_label}. Generated {datetime.now().strftime("%b %d, %Y %H:%M")}.', f_sub)
+    ws.write(2, 0, meta['history_label'], f_bold)
+    srow = 4
     for name, rows, _h, _g in tabs:
         units = sum(r['qty'] for r in rows)
         value = sum(r['value'] for r in rows)
@@ -15300,9 +16190,16 @@ def _ai_tool_build_sales_sheet(params):
         ws.write(srow, 1, f'{pos_ct:,} POs · {units:,} units · ${value:,.2f}')
         srow += 1
     srow += 1
+    pend_note = ('Shipped, not yet invoiced = POs that left the order book and shipped, with no invoice on file '
+                 'yet. Early shipments are included. Quantities are estimates until the invoice arrives.')
+    if pend_basis == 'peak booked':
+        pend_note = ('Shipped, not yet invoiced = POs that left the order book after their ship window opened, '
+                     'with no invoice on file under any date. Quantities are the peak booked size, an estimate '
+                     'until the invoice arrives.')
     for n in ['Invoiced = A2000 invoice records (real invoice dates and shipped quantities).',
-              'Awaiting invoice = left the open-order book after its window opened; quantities are the PEAK booked size.',
-              'On order = current open hard POs (bulks and allocations excluded), regardless of the date filter.'] + notes:
+              pend_note,
+              'On order = current open hard POs (bulks and allocations excluded), regardless of the date filter.',
+              meta['history_label']] + ([meta['invoices_behind']] if meta.get('invoices_behind') else []) + notes:
         ws.write(srow, 0, n, f_sub)
         srow += 1
 
@@ -15318,8 +16215,8 @@ def _ai_tool_build_sales_sheet(params):
         for ci, h in enumerate(headers):
             wsx.write(0, ci, h, f_head)
         wsx.freeze_panes(1, 0)
-        # Photos only for modern-taxonomy SKUs — legacy invoice styles (NAU-10395SS,
-        # SHAQ-22-106…) would collapse to bogus bases and could attach wrong images.
+        # Photos only for modern-taxonomy SKUs: legacy invoice styles would
+        # collapse to bogus bases and could attach wrong images.
         def _img_sku(style):
             base = get_base_style(str(style or '').upper())
             return base if re.match(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$', base) else ''
@@ -15343,7 +16240,7 @@ def _ai_tool_build_sales_sheet(params):
             for ci, v in enumerate(vals):
                 col = ci + 1
                 h = headers[col]
-                if h in ('Qty', 'Qty (peak booked)'):
+                if h in ('Qty', PEND_QTY):
                     wsx.write(row, col, v, nf)
                 elif h in ('Unit Price', 'Value', 'Est. Price', 'Est. Value'):
                     wsx.write(row, col, v, mf)
@@ -15371,9 +16268,11 @@ def _ai_tool_build_sales_sheet(params):
     out = {'download_url': url, 'customer': code, 'customer_full': full_name,
            'period': period_label,
            'tabs': [{'tab': n, 'lines': min(len(r), ROW_CAP), 'pos': len({x['po'] for x in r}),
-                     'units': sum(x['qty'] for x in r), 'value': round(sum(x['value'] for x in r), 2)}
+                     'units': sum(x['qty'] for x in r), 'value': round(sum(x['value'] for x in r), 2),
+                     'basis': ('estimate until invoiced' if n == PEND_TAB else
+                               ('invoice' if n == 'Invoiced' else 'open order book'))}
                     for n, r, _h, _g in tabs],
-           'note': 'give the user this link as a clickable download'}
+           'note': 'give the user this link as a clickable download', **meta}
     if notes:
         out['warnings'] = notes
     return out
@@ -16768,29 +17667,42 @@ _AI_AGENT_TOOLS = [
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'limit': {'type': 'integer'}}}},
     {'name': 'past_orders_lookup',
-     'description': ('CLOSED order history (past orders): every customer PO that already LEFT the open-order '
-                     'book, archived daily since 2026-06-03. status separates shipped vs cancelled_or_pulled '
-                     '(left the book before its ship window opened); left_book = the day it shipped out '
-                     '(accurate to about a day). Rows carry units (last-day residual) AND units_peak '
-                     '(true booked size — use units_peak for shipped POs; totals already do). '
-                     'No args = per-customer summary. customer = that '
-                     "customer's past POs with style lines. style = search a style # (substring) across "
-                     'every customer\'s history — a cold call can take up to a minute while per-customer '
-                     'archives load. received_after/received_before filter on left_book (YYYY-MM-DD). '
+     'description': ('Order history from the daily order-book archive (since 2026-06-03): every customer PO '
+                     'that has left the open-order book. Each PO has a status and a plain status_label. '
+                     'Counted, because they shipped: invoiced (at invoice quantity and value), and '
+                     'shipped_awaiting_invoice or left_in_window_unpicked (an order-book estimate until the '
+                     'invoice arrives). Not counted: left_pending (left on the newest file, not confirmed '
+                     'yet), moved, moved_to_bulk and reentered (the goods continue under another PO), '
+                     'left_before_window and closed_not_invoiced (no invoice). Older servers send only '
+                     'shipped_awaiting_invoice and left_before_window_no_invoice. Totals count only counted '
+                     'POs. Every answer carries invoices_through (wholesale and dropship dates) and '
+                     'history_label: state that cut-off whenever you give numbers, and call anything after '
+                     'it an estimate. Dropship never appears in this archive: use sales_history_lookup for '
+                     'dropship. left_book = the last day the PO was on the book, not its invoice date. '
+                     'No args = per-customer summary. customer = that customer\'s POs with style lines, plus '
+                     'awaiting_invoice and invoiced_lifetime (every invoice since Nov 2019; never add it to '
+                     'the archive totals). style = search a style # (substring) across every customer; a '
+                     'cold call can take up to a minute. status filters: all, invoiced, awaiting_invoice, '
+                     'not_counted, pending. received_after/received_before filter on left_book (YYYY-MM-DD). '
                      'Use open_orders_lookup for orders still open.'),
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'}, 'style': {'type': 'string'},
-         'status': {'type': 'string', 'enum': ['all', 'shipped', 'cancelled']},
+         'status': {'type': 'string', 'enum': ['all', 'invoiced', 'awaiting_invoice', 'not_counted', 'pending']},
          'received_after': {'type': 'string'}, 'received_before': {'type': 'string'},
          'limit': {'type': 'integer'}}}},
     {'name': 'sales_history_lookup',
-     'description': ('INVOICED sales history (ground truth): A2000 invoice records with real invoice dates '
-                     'and actually-shipped quantities, Nov 2019 through the last backfill ingest. '
-                     'No args = company summary (per-customer lifetime + per-year totals). '
-                     'customer = that customer\'s years/months/top styles/recent POs; add month (YYYY-MM) '
-                     'or from/to (YYYY-MM-DD) for that period\'s POs WITH style lines. '
-                     'style = search a style # (substring) across all invoices. '
-                     'For POs newer than the backfill, use past_orders_lookup (book-tracked, updated daily).'),
+     'description': ('INVOICED sales (ground truth): A2000 invoice lines with real invoice dates and shipped '
+                     'quantities, from Nov 2019 up to the invoice cut-off. Every answer carries '
+                     'invoices_through (wholesale and dropship dates, which can differ) and history_label: '
+                     'state that cut-off whenever you give numbers. Newer servers add awaiting_invoice: POs '
+                     'that shipped but have no invoice yet, as order-book estimates, never as invoices. '
+                     'No args = company summary (per-customer lifetime and per-year totals). '
+                     'customer = that customer\'s years, months, top styles and recent POs; add month '
+                     '(YYYY-MM) or from/to (YYYY-MM-DD) for that period\'s POs WITH style lines. '
+                     'style = search a style # (substring) across all invoices; matched totals cover every '
+                     'matching line even when the rows are capped. Dropship is only here, never in '
+                     'past_orders_lookup. past_orders_lookup has the status of POs that left the book '
+                     'after the cut-off.'),
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'}, 'style': {'type': 'string'},
          'month': {'type': 'string'}, 'from': {'type': 'string'}, 'to': {'type': 'string'},
@@ -16798,15 +17710,17 @@ _AI_AGENT_TOOLS = [
     {'name': 'build_sales_sheet',
      'description': ('Build a downloadable Excel SALES SHEET with photos for ONE customer\'s past selling '
                      'and pipeline: an Invoiced tab (real invoice dates + shipped quantities per PO and '
-                     'style), a Shipped-Awaiting-Invoice tab (book-tracked POs at peak booked size), and '
+                     'style), a "Shipped, not yet invoiced" tab (POs that shipped but have no invoice yet, '
+                     'early shipments included, with quantities marked as estimates until invoiced), and '
                      'an On Order tab (current open hard POs with ship windows; bulks excluded). '
                      'customer accepts a name or code (Winners, Burlington, ROSS…). Date filters: from/to '
-                     '(YYYY-MM-DD), or year (2026), or month (YYYY-MM) — applies to invoiced + awaiting; '
-                     'On Order always shows the current book. include narrows the tabs '
+                     '(YYYY-MM-DD), or year (2026), or month (YYYY-MM); they apply to the invoiced and the '
+                     'not yet invoiced rows. On Order always shows the current book. include narrows the tabs '
                      "(['invoiced','shipped_pending','on_order']); group_by 'po' (default) or 'month' sets "
-                     'the sort. Takes up to a minute. Present the returned download_url to the user as a '
-                     'clickable link. Use this whenever the user wants past selling as a line sheet / '
-                     'document rather than numbers in chat.'),
+                     'the sort. Takes up to a minute. The answer and the summary tab carry history_label, '
+                     'the invoice cut-off: state it with the link. Present the returned download_url to the '
+                     'user as a clickable link. Use this whenever the user wants past selling as a line '
+                     'sheet / document rather than numbers in chat.'),
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'},
          'from': {'type': 'string'}, 'to': {'type': 'string'},
@@ -17032,7 +17946,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA/NJ). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for CLOSED order history (what each customer already received or cancelled, daily archive since Jun 2026), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities — the ground truth for what shipped), build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute). build_presentation produces a print-ready PDF PRESENTATION of photo cards (brand logo on top, 8 cards per page, a new page per brand) for warehouse stock, overseas stock or one customer's open orders; it also returns a download URL and takes up to a minute or two. Whenever the user says presentation, presentation format, deck, print-out or photo cards, use build_presentation, never build_line_sheet."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for order history from the daily order-book archive since Jun 2026 (each PO that left the book has a status: invoiced, shipped and awaiting invoice as an estimate, not confirmed yet, moved to another PO, or left without shipping; only shipped POs count), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities; the ground truth for what shipped). Both answer with invoices_through and history_label: always state the invoice cut-off with past numbers, and call anything after it an estimate. Dropship is never in this archive: it is only in the invoices. build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute). build_presentation produces a print-ready PDF PRESENTATION of photo cards (brand logo on top, 8 cards per page, a new page per brand) for warehouse stock, overseas stock or one customer's open orders; it also returns a download URL and takes up to a minute or two. Whenever the user says presentation, presentation format, deck, print-out or photo cards, use build_presentation, never build_line_sheet."""
 
 
 def _mcp_rpc_result(rid, result):
