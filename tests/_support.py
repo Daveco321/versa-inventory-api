@@ -417,6 +417,11 @@ class FakeOpenOrders:
                    'months': [], 'topStyles': [], 'styleCount': 0, 'pos': pos[:1500],
                    'truncated': len(pos) > 1500}
             if self.mode == 'new':
+                # newer builds page the ranged call: offset / limit (default 1,500)
+                off = int(params.get('offset') or 0)
+                lim = min(int(params.get('limit') or 1500), 5000)
+                page = pos[off:off + lim]
+                out.update(pos=page, truncated=off + len(page) < len(pos), offset=off, limit=lim)
                 rows = self._pending_rows(account, lo, hi)
                 out['pending'] = {'pos': len(rows), 'rows': rows}
                 out.update(self._history_extra())

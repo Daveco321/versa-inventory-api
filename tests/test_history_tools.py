@@ -239,7 +239,8 @@ class PastOrdersOld(Base):
         self.assertEqual(out['invoices_through'], {'wholesale': '2026-08-21', 'dropship': None})
         self.assertEqual(out['history_label'], 'Invoices through Aug 21, 2026. Dropship end date not reported.')
         # Weekdays Aug 24 to Sep 14: today (Sep 15) is not counted, like the desktop page.
-        self.assertEqual(out['invoices_behind'], 'Invoices are 16 business days behind.')
+        # Aug 21 to Sep 15: 16 weekdays, minus Labor Day (the shared office rule, review R-05)
+        self.assertEqual(out['invoices_behind'], 'Invoices are 15 business days behind.')
         self.assertIn('dropship_note', out)
         self.assertEqual(out['totals']['left_before_window_pos'], 2)
         self.assertNotIn('cancelled', json.dumps(out['totals']))
@@ -666,6 +667,89 @@ class SheetNew(SheetBase):
         out, wb = self.build(customer='ZALPHA', month='2026-09', include=['shipped_pending'])
         self.assertEqual(self.tab_pos(wb, 'Shipped, not yet invoiced'), ['66-000001', '77001004', '77001010'])
         self.assertEqual(self.fake.count(*LOOKUP), 0)
+
+
+# ── Review round (Sep 15 2026): readers R-01, R-05, R-06 and AT-18 ────────
+
+class ReviewFixes(SheetBase):
+    mode = 'new'
+
+    def _cold(self):
+        r = self.fake.sales
+
+        def cold(params):
+            out = r(params)
+            if 'pending' in out:
+                out['pending'] = {'ready': False, 'basis': 'estimate',
+                                  'note': 'Awaiting invoice estimates are still loading on the server.'}
+            if 'pendingRows' in out:
+                out['pendingRows'], out['pendingReady'] = None, False
+            if 'excluded' in out:
+                out['excluded'] = {'ready': False}
+            return out
+        self.fake.sales = cold
+
+    def test_cold_server_awaiting_is_never_zero(self):
+        self._cold()
+        for params in ({'customer': 'ZALPHA'}, {'customer': 'ZALPHA', 'from': '2026-08-22', 'to': '2026-09-15'}):
+            out = self.app._ai_tool_sales_history(params)
+            self.assertIsNone(out['awaiting_invoice'], params)
+            self.assertIn('still loading', out['awaiting_note'])
+            self.assertNotIn('left_book_not_counted', out)
+            self.assertPlain(out)
+        out = self.app._ai_tool_sales_history({'style': 'ZZTEST001', 'customer': 'ZALPHA'})
+        self.assertNotIn('awaiting_invoice', out)
+        self.assertIn('still loading', out['awaiting_note'])
+
+    def test_server_count_and_warning_win(self):
+        hist = dict(self.data['history'], behindBusinessDays=2, warning='')
+        self.assertNotIn('invoices_behind', self.app._history_info({'history': hist}))
+        hist = dict(self.data['history'], behindBusinessDays=15, warning='Invoices are 15 business days behind.')
+        self.assertEqual(self.app._history_info({'history': hist})['invoices_behind'],
+                         'Invoices are 15 business days behind.')
+
+    def test_fallback_rule_skips_office_holidays(self):
+        from datetime import date
+        self.assertEqual(self.app._weekdays_after('2026-08-21', date(2026, 9, 15)), 15)
+        self.assertEqual(self.app._weekdays_after('2026-09-10', date(2026, 9, 16)), 3)
+        self.assertEqual(self.app._weekdays_after('2026-06-18', date(2026, 6, 22)), 1)   # Juneteenth is a workday
+
+    def test_split_remainder_rows_never_read_invoiced(self):
+        row = {'customer': 'ZALPHA', 'po': '66-000001', 'poKey': '66-000001', 'status': 'invoiced',
+               'statusLabel': 'Invoiced Aug 21. 100 more units left the book Sep 4 (estimate)',
+               'lastSeen': '2026-09-04', 'leftBook': ['2026-09-04', '2026-09-04'], 'basis': 'estimate',
+               'part': 'remainder', 'units': 100, 'value': 250.0, 'estShipDate': '2026-09-03',
+               'lines': [{'style': 'ZZTEST002SLS', 'qty': 100, 'value': 250.0}]}
+        lines = self.app._sheet_pending_rows([row], 'server')
+        self.assertEqual([(l['style'], l['qty'], l['status']) for l in lines],
+                         [('ZZTEST002SLS', 100, 'Rest of an invoiced PO. Shipped after the invoice cut-off (estimate)')])
+        ap = self.app._sales_pending_out([row], totals={'pos': 1, 'units': 100, 'value': 250.0})
+        self.assertEqual((ap['rows'][0]['status'], ap['rows'][0]['part'], ap['rows'][0]['units']),
+                         ('shipped_awaiting_invoice', 'remainder', 100))
+        self.assertPlain(ap)
+
+    def _many_pos(self):
+        for i in range(1700):
+            self.data['invoices'].append({'inv': f'7{i:05d}', 'date': f'2023-{1 + i % 12:02d}-{1 + i % 28:02d}',
+                                          'cust': 'ZALPHA', 'po': f'5100{i:04d}', 'div': 'OB', 'qty': 2,
+                                          'style': 'ZZTEST001SLS', 'value': 6.0, 'color': 'NAVY'})
+
+    def test_full_history_sheet_pages_every_po(self):
+        self._many_pos()
+        want = sum(r['qty'] for r in self.data['invoices'] if r['cust'] == 'ZALPHA')
+        n_pos = len({r['po'] for r in self.data['invoices'] if r['cust'] == 'ZALPHA'})
+        out, wb = self.build(customer='ZALPHA', include=['invoiced'])
+        tab = [t for t in out['tabs'] if t['tab'] == 'Invoiced'][0]
+        self.assertEqual((tab['pos'], tab['units']), (n_pos, want))
+        self.assertFalse(any('stops at' in w or 'stopped at' in w for w in out.get('warnings') or []))
+        offs = [c[2].get('offset') for c in self.fake.calls if c[:2] == SALES and c[2].get('account') == 'ZALPHA']
+        self.assertEqual(offs, [None, 1500])
+
+    def test_old_server_still_warns(self):
+        self._many_pos()
+        self.fake.mode = 'old'
+        out, wb = self.build(customer='ZALPHA', include=['invoiced'])
+        self.assertTrue(any('stops at 1,500 POs' in w for w in out['warnings']))
 
 
 # ── INV-08: tool text ────────────────────────────────────────────────────

@@ -14887,18 +14887,38 @@ def _hist_block(*payloads):
     return None
 
 
+def _office_holidays(year):
+    """The open-orders service's default office calendar: New Year's Day, MLK
+    Day, Presidents Day, Memorial Day, July 4, Labor Day, Thanksgiving and
+    Christmas, each as observed. Used only when the service sends no count."""
+    from datetime import date as _date
+    def nth(m, wd, n):
+        d = _date(year, m, 1)
+        return d + timedelta(days=(wd - d.weekday()) % 7 + 7 * (n - 1))
+    def last(m, wd):
+        d = (_date(year, m + 1, 1) - timedelta(days=1)) if m < 12 else _date(year, 12, 31)
+        return d - timedelta(days=(d.weekday() - wd) % 7)
+    def obs(m, day):
+        d = _date(year, m, day)
+        return d - timedelta(days=1) if d.weekday() == 5 else (d + timedelta(days=1) if d.weekday() == 6 else d)
+    return {obs(1, 1), nth(1, 0, 3), nth(2, 0, 3), last(5, 0), obs(7, 4), nth(9, 0, 1), nth(11, 3, 4), obs(12, 25)}
+
+
 def _weekdays_after(d, today):
-    """Weekdays after date d, up to yesterday (today's invoices cannot be in
-    yet). Office holidays are not known here, so this can read one day high.
-    It is the same count the desktop Past Orders page shows."""
+    """Business days after date d, up to yesterday (today's invoices cannot be
+    in yet): weekdays minus the default office holidays. The desktop and the
+    phone use the same rule when the service sends no count of its own."""
     try:
         x = datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
     except (TypeError, ValueError):
         return None
     n = 0
     x += timedelta(days=1)
+    hol = {}
     while x < today and n < 400:
-        if x.weekday() < 5:
+        if x.year not in hol:
+            hol[x.year] = _office_holidays(x.year)
+        if x.weekday() < 5 and x not in hol[x.year]:
             n += 1
         x += timedelta(days=1)
     return n
@@ -14930,7 +14950,18 @@ def _history_info(*payloads, sales_summary=None):
         else:
             label = 'The invoice cut-off date could not be read right now.'
     out = {'invoices_through': {'wholesale': wholesale, 'dropship': dropship}, 'history_label': label}
-    behind = _weekdays_after(wholesale, _pres_now_et().date()) if wholesale else None
+    # The service's own count and warning win (same office calendar for every
+    # reader); older builds send neither, so the shared rule counts here.
+    warn = hist.get('warning')
+    srv = hist.get('behindBusinessDays')
+    if isinstance(warn, str) and ('behindBusinessDays' in hist or warn.strip()):
+        if warn.strip():
+            out['invoices_behind'] = warn.strip()
+        return out
+    if isinstance(srv, int) and not isinstance(srv, bool):
+        behind = srv
+    else:
+        behind = _weekdays_after(wholesale, _pres_now_et().date()) if wholesale else None
     if behind is not None and behind > 3:
         out['invoices_behind'] = f'Invoices are {behind} business days behind.'
     return out
@@ -15793,14 +15824,20 @@ def _sales_pending_out(rows, totals=None, limit=30, customer=None):
     out_rows = []
     for r in rows:
         u, v = _pend_units_value(r)
+        # The rest of a split PO: its invoiced part is in the invoices, so the
+        # awaiting list never shows an 'invoiced' status (review R-06).
+        rem = r.get('part') == 'remainder' or r.get('remainder') is True
         o = {'customer': r.get('customer'), 'po': r.get('orderNo') or r.get('po'),
-             'status': r.get('status'), 'status_label': r.get('statusLabel'),
+             'status': 'shipped_awaiting_invoice' if rem else r.get('status'),
+             'status_label': _SHEET_REST_LABEL if rem else r.get('statusLabel'),
              'units': u, 'value': v,
              'ship_date_est': r.get('estShipDate') or ((r.get('afterCutoffEstimate') or {}).get('estShipDate')
                                                        if isinstance(r.get('afterCutoffEstimate'), dict) else None),
              'left_book': r.get('lastSeen')}
         if r.get('style'):
             o['style'] = r.get('style')
+        if rem:
+            o['part'] = 'remainder'
         out_rows.append(o)
     t = totals if isinstance(totals, dict) else {}
     if t.get('units') is not None and not customer:
@@ -15869,6 +15906,8 @@ def _sales_style_search(style_q, code, limit):
     out['truncated'] = truncated
     if isinstance(data.get('pendingRows'), list):
         out['awaiting_invoice'] = _sales_pending_out(data['pendingRows'], limit=limit, customer=code)
+    elif data.get('pendingReady') is False:
+        out['awaiting_note'] = _HIST_LOADING_NOTE
     if notes:
         out['note'] = ' '.join(notes)
     out.update(_history_info(data, sales_summary=_sales_summary_quiet()))
@@ -15911,13 +15950,18 @@ def _ai_tool_sales_history(params):
                 return {'error': data.get('note') or 'No invoice data is loaded on the server yet.'}
             meta = _history_info(data, sales_summary=_sales_summary_quiet())
             pend = data.get('pending') if isinstance(data.get('pending'), dict) else None
+            # A cold server sends pending {ready: false}: not loaded, never zero (review R-01).
+            pend_loading = pend is not None and pend.get('ready') is False
             if 'pos' in data:   # ranged query: PO rollups with style lines
                 pos = data.get('pos') or []
                 out = {'customer': data.get('account'), 'from': data.get('from'), 'to': data.get('to'),
                        'po_count': data.get('poCount'), 'units': data.get('units'),
                        'value': data.get('value'), 'rows': pos[:limit],
                        'truncated': bool(data.get('truncated')) or len(pos) > limit, **meta}
-                if pend is not None:
+                if pend_loading:
+                    out['awaiting_invoice'] = None
+                    out['awaiting_note'] = _HIST_LOADING_NOTE
+                elif pend is not None:
                     out['awaiting_invoice'] = _sales_pending_out(pend.get('rows') or [], totals=pend, limit=limit)
                 return out
             out = {'customer': data.get('account'), 'invoice_row_count': data.get('rows'),
@@ -15929,13 +15973,17 @@ def _ai_tool_sales_history(params):
             if not data.get('rows'):
                 out['note2'] = ('No invoices on file for this customer code. past_orders_lookup shows its '
                                 'order-book archive.')
-            if pend is not None:
+            if pend_loading:
+                out['awaiting_invoice'] = None
+                out['awaiting_note'] = _HIST_LOADING_NOTE
+            elif pend is not None:
                 aw = _sales_pending_out(pend.get('rows') or [], totals=pend, limit=limit)
                 if pend.get('months') is not None:
                     aw['months'] = pend.get('months')
                 out['awaiting_invoice'] = aw
-            if isinstance(data.get('excluded'), dict):
-                out['left_book_not_counted'] = data.get('excluded')
+            exc = data.get('excluded')
+            if isinstance(exc, dict) and exc.get('ready') is not False:
+                out['left_book_not_counted'] = exc
             return out
         data, err = _oo_json('GET', '/api/sales-history', timeout=45)
         if err:
@@ -15954,8 +16002,7 @@ def _ai_tool_sales_history(params):
                **_history_info(data, sales_summary=data)}
         pend = data.get('pending') if isinstance(data.get('pending'), dict) else None
         if pend is not None and pend.get('ready') is False:
-            out['awaiting_note'] = ('The awaiting-invoice estimate is still loading on the server. '
-                                    'Ask again in a minute.')
+            out['awaiting_note'] = _HIST_LOADING_NOTE
         elif pend is not None:
             aw = {'basis': 'estimate', 'note': _HIST_AWAITING_NOTE, 'totals': pend.get('totals'),
                   'by_month': pend.get('byMonth')}
@@ -15980,6 +16027,10 @@ def _lines_matching(units, *cands):
     return None
 
 
+_SHEET_REST_LABEL = 'Rest of an invoiced PO. Shipped after the invoice cut-off (estimate)'
+_HIST_LOADING_NOTE = 'The awaiting-invoice estimate is still loading on the server. Ask again in a minute.'
+
+
 def _sheet_pending_rows(pend_list, source):
     """Flatten awaiting-invoice POs into sheet lines.
     source 'server': rows from the server (newer builds, invoices joined by key
@@ -15991,17 +16042,25 @@ def _sheet_pending_rows(pend_list, source):
         else:
             p, st = item
         ace = p.get('afterCutoffEstimate') if isinstance(p.get('afterCutoffEstimate'), dict) else None
-        split = bool(ace) and (p.get('status') == 'invoiced' or p.get('bucket') == 'invoiced')
+        # A server pending row for the rest of a split PO carries part
+        # 'remainder' (and the PO's invoiced status), not afterCutoffEstimate.
+        rem_part = p.get('part') == 'remainder'
+        split = rem_part or (bool(ace) and (p.get('status') == 'invoiced' or p.get('bucket') == 'invoiced'))
         label = str(p.get('statusLabel') or (st or {}).get('status_label') or '')
         lb = p.get('leftBook')
         left = (f"{lb[0]} to {lb[-1]}" if isinstance(lb, (list, tuple)) and lb and lb[0] != lb[-1]
                 else (lb[0] if isinstance(lb, (list, tuple)) and lb else (p.get('lastSeen') or '')))
-        if split:
+        if split and rem_part:
+            est = p.get('estShipDate') or ''
+            u, v = _sisc(p.get('units')), round(_sfsc(p.get('value')), 2)
+            lines = _lines_matching(u, p.get('lines')) or [{'style': '', 'qty': u, 'value': v}]
+            label = _SHEET_REST_LABEL
+        elif split:
             est = ace.get('estShipDate') or ''
             lines = ace.get('lines') if isinstance(ace.get('lines'), list) and ace.get('lines') else [
                 {'style': '', 'qty': ace.get('units'), 'value': ace.get('value')}]
             # The invoiced part is on the Invoiced tab; this line is only the rest.
-            label = 'Rest of an invoiced PO. Shipped after the invoice cut-off (estimate)'
+            label = _SHEET_REST_LABEL
         else:
             est = p.get('estShipDate') or ''
             if st is not None:
@@ -16079,9 +16138,31 @@ def _ai_tool_build_sales_sheet(params):
         else:
             hist_payloads.append(ranged)
             if 'invoiced' in include:
-                inv_pos = ranged.get('pos') or []
+                inv_pos = list(ranged.get('pos') or [])
                 if ranged.get('truncated'):
-                    notes.append('The invoiced list stops at 1,500 POs. Narrow the dates to see them all.')
+                    if 'offset' in ranged or 'limit' in ranged:
+                        # Newer builds page the ranged call (AT-18): fetch every PO.
+                        total = ranged.get('poCount') if isinstance(ranged.get('poCount'), int) else None
+                        perr, pages = None, 1
+                        while pages < 40:
+                            d2, e2 = _oo_json('GET', '/api/sales-history',
+                                              params={'account': code, 'from': lo, 'to': hi,
+                                                      'offset': len(inv_pos), 'limit': 5000}, timeout=60)
+                            if e2:
+                                perr = e2
+                                break
+                            got = d2.get('pos') or []
+                            inv_pos.extend(got)
+                            pages += 1
+                            if not got or not d2.get('truncated'):
+                                break
+                        if perr or (total is not None and len(inv_pos) < total):
+                            why = f" ({perr.get('error')})" if perr else ''
+                            notes.append(f'The invoiced list stopped at {len(inv_pos):,} of '
+                                         f'{total if total is not None else len(inv_pos):,} POs{why}. '
+                                         'Narrow the dates to see them all.')
+                    else:
+                        notes.append('The invoiced list stops at 1,500 POs. Narrow the dates to see them all.')
 
     # ── 2. shipped, not yet invoiced ──
     pend_rows, pend_basis = [], ''
@@ -16218,7 +16299,8 @@ def _ai_tool_build_sales_sheet(params):
                      ['Image', 'Style', 'PO #', 'Window Start', 'Cancel', 'Qty', 'Unit Price', 'Value'],
                      lambda r: [r['style'], r['po'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
 
-    ROW_CAP = 3000
+    ROW_CAP = 60000        # lines per tab (AT-18: a full history fits; Excel allows about a million)
+    PHOTO_CAP = 3000       # photos only for the first 3,000 lines of each tab, to keep the file quick
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     f_title = wb.add_format({'bold': True, 'font_size': 16, 'font_name': 'Calibri'})
@@ -16279,7 +16361,7 @@ def _ai_tool_build_sales_sheet(params):
         def _img_sku(style):
             base = get_base_style(str(style or '').upper())
             return base if re.match(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$', base) else ''
-        img_items = [{'sku': _img_sku(r['style']), 'brand_abbr': ''} for r in rows]
+        img_items = [{'sku': _img_sku(r['style']), 'brand_abbr': ''} for r in rows[:PHOTO_CAP]]
         try:
             for it in img_items:
                 try:
@@ -16291,7 +16373,8 @@ def _ai_tool_build_sales_sheet(params):
             images = {}
         for ri, r in enumerate(rows):
             row = ri + 1
-            wsx.set_row(row, 60)
+            if ri < PHOTO_CAP:
+                wsx.set_row(row, 60)
             cf = f_cell2 if ri % 2 else f_cell
             nf = f_num2 if ri % 2 else f_num
             mf = f_money2 if ri % 2 else f_money
@@ -16315,6 +16398,8 @@ def _ai_tool_build_sales_sheet(params):
                 wsx.write(row, 0, '', cf)
         if truncated:
             notes.append(f'{name}: only the first {ROW_CAP:,} lines are in the sheet')
+        if len(rows) > PHOTO_CAP:
+            notes.append(f'{name}: photos are shown for the first {PHOTO_CAP:,} lines only')
 
     wb.close()
     buf.seek(0)
