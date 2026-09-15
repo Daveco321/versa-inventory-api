@@ -167,8 +167,10 @@ class Cascade(unittest.TestCase):
         self.assertEqual(c.resolve('ROQAQK105SLS', 'BB', 'BB26001')['fobU'], 3.3333)
         self.assertEqual(c.resolve('ROQAQK105SLP', 'BB', 'BB26001')['fobU'], 3.8787)
         m = c.resolve('ZZBAD', 'BB', 'BB26001')
-        self.assertEqual((m['level'], m['fobU'], m['rangeLo'], m['rangeHi']), ('L2', round((3.3333 + 3.8787) / 2, 4), 3.3333, 3.8787))
-        self.assertIn('malformed_sku', m['flags'])
+        # Contract C15: no pattern letter, so every row of the ref fits. One row, the lowest (R7), never their mean.
+        self.assertEqual((m['level'], m['fobU'], m['rangeLo'], m['rangeHi'], m['evidence']),
+                         ('L2', 3.3333, 3.3333, 3.8787, ['BB!H2']))
+        self.assertTrue({'malformed_sku', 'ambiguous_rows'} <= set(m['flags']))
 
     def test_l2_ref_pattern_fit(self):
         r = ci().resolve('ROQAQS110SLS', 'CC', 'CC26001')
@@ -180,8 +182,8 @@ class Cascade(unittest.TestCase):
         d = c.resolve('BUQAQF102SLS', 'AA', 'AA26009')
         self.assertEqual((d['level'], d['fobU']), ('L3', 6.6666))                         # same design
         f = c.resolve('ROQAQF999SLS', 'AA', 'AA26009')
-        self.assertEqual((f['level'], f['fobU']), ('L3', round((7.7777 + 6.6666) / 2, 4)))
-        self.assertIn('fabric_median', f['flags'])
+        self.assertEqual((f['level'], f['fobU']), ('L3', 6.6666))       # one row of the brand's list, the lowest (C15)
+        self.assertTrue({'fabric_median', 'ambiguous_rows'} <= set(f['flags']))
         self.assertEqual(c.resolve('ROQAQK105SLS', 'BB', 'BB26099', poName='RO-SYNTH')['fobU'], 3.3333)
         self.assertEqual(c.resolve('ROQAQK105SLS', 'BB', 'BB26099', poName='AM-SYNTH')['fobU'], 3.4444)
         k = c.resolve('ROQAQS111SSP', 'CC', 'CC26009')
@@ -213,11 +215,11 @@ class Cascade(unittest.TestCase):
         self.assertEqual((fit['level'], fit['fobU']), ('L4d', round(3.9393 + 0.2222, 4)))
         bt = c.resolve('ROQAQJ402BTS', 'NN')
         self.assertEqual(bt['fobU'], round(3.9393 + 0.5555, 4))
-        mf = c.resolve('ROQAQF501MFS', 'NN')
-        self.assertEqual((mf['level'], mf['fobU']), ('L4d', 4.6666))
-        pat = c.resolve('ROQAQJ601SLP', 'NN')
-        self.assertEqual((pat['level'], pat['fobU']), ('L4d', 3.9393))
-        self.assertIn('derived', pat['flags'])
+        mf = c.resolve('ROQAQF501MFS', 'NN')         # contract C15 R6: the regular column, an exact match
+        self.assertEqual((mf['level'], mf['fobU']), ('L4a', 4.6666))
+        self.assertIn('fit_as_regular', mf['flags'])
+        pat = c.resolve('ROQAQJ601SLP', 'NN')        # R4: a print style never takes the solid row (no relaxed rung)
+        self.assertEqual((pat['level'], pat['fobU']), ('L7', None))
 
     def test_exclude_flag_and_missing_pool(self):
         self.assertEqual(ci().resolve('ROQAQF201SLS', 'NN')['fobU'], 4.4444)   # the SKIP_ME row never matches
@@ -921,6 +923,29 @@ class BlackLabelF7(unittest.TestCase):
         self.assertEqual(ds['dict']['brands']['BLK'], 'Black Label')
         self.assertEqual((E._roy_pct('BLK', ds['settings']), E._roy_pct('BL', ds['settings'])), (10.0, 0.0))
 
+    def test_history_takes_the_feed_label_first(self):
+        # Invoices can name a Black Label style with another label (BLO). Shipped history takes the style's feed
+        # label first, as lines and the styles table do, so its history pays Black Label's royalty. A style with
+        # invoices only keeps its invoice label.
+        s = src()
+        s['inventory']['items'] = s['inventory']['items'] + [inv('ROBLQF301SLS', tr=10, brand='BLACK')]
+        for st in ('ROBLQF301SLS', 'ROBLQF309SLS'):
+            s['sales_analytics']['styles'].append([st, 'BLO', 12, 131.3131, '2025-06-01', '2026-02-10',
+                                                   {'2026-01': [12, 131.3131, 0, 0.0]}, {'ROSS': [12, 131.3131]}, 'NAVY'])
+        ds = build(s, settings={'royalty': {'byBrand': {'BLK': 2.25, 'BL': 5.4321}}})      # sentinel rates only
+        H = {r['base']: r for r in rows({'b': ds['shipped']['byCustomer']}, 'b') if r['cust'] == 'ROSS'}
+        Y = by({'b': ds['shipped']['byStyle']}, 'b', 'base')
+        blk, bl = H['ROBLQF301SLS'], H['ROBLQF309SLS']
+        self.assertEqual((blk['brand'], Y['ROBLQF301SLS']['brand'], by(ds, 'styles', 'base')['ROBLQF301SLS']['brand']),
+                         ('BLK', 'BLK', 'BLK'))
+        self.assertIsNotNone(blk['fob'])
+        self.assertEqual(blk['royalty'], E.r2(blk['net'] * 2.25 / 100))              # Black Label's own rate
+        self.assertNotEqual(blk['royalty'], E.r2(blk['net'] * 5.4321 / 100))
+        self.assertEqual((bl['brand'], Y['ROBLQF309SLS']['brand']), ('BL', 'BL'))
+        self.assertIsNotNone(bl['fob'])
+        self.assertEqual(bl['royalty'], E.r2(bl['net'] * 5.4321 / 100))
+        self.assertGreater(bl['royalty'], 0)
+
 
 class HistoryAliasF8(unittest.TestCase):
     def shipped_style(self, customers, fob=('FOBX',)):
@@ -1292,27 +1317,27 @@ class PriceBasisC10(unittest.TestCase):
         self.assertEqual(c.resolve('ROQAQF101SLS', 'AA', 'AA26001')['fobU'], 7.7777)
         self.assertEqual(c.resolve('ROQAQU201SLS', 'TT')['fobU'], 5.5151)
 
-    def test_candidates_are_repriced_before_the_median_and_range(self):
+    def test_candidates_are_repriced_before_the_lowest_is_picked(self):
+        # Contract C15 R7: rows still tied give the lowest, at the P&L's basis. Each row is repriced first.
         cb = basis_book(MIXED)
         p = ci(costbook=cb).resolve('ROQAQZ201SLS', 'NN')          # printed PA (at R2), PB and PC (at FXB)
-        self.assertEqual((p['fobU'], p['rangeLo'], p['rangeHi'], p['fxRef']), (PB, PA, PC, FXB))
-        # At FXB the record printed at R2 costs more than PB and becomes the median. Scaling the printed
-        # median instead would keep PB.
+        self.assertEqual((p['fobU'], p['rangeLo'], p['rangeHi'], p['fxRef'], p['evidence']), (PA, PA, PC, R2, ['GN!Z1']))
+        self.assertIn('ambiguous_rows', p['flags'])
+        # At FXB the row printed at R2 costs more than PB, so PB becomes the lowest. Scaling the printed pick instead
+        # would keep PA.
         at = ci(costbook=cb, settings={'fx': {'rate': FXB}}).resolve('ROQAQZ201SLS', 'NN')
-        self.assertEqual((at['fobU'], at['rangeLo'], at['rangeHi'], at['fxRef']), (E.r4(PA * R2 / FXB), PB, PC, FXB))
+        self.assertEqual((at['fobU'], at['rangeLo'], at['rangeHi'], at['fxRef'], at['evidence']), (PB, PB, PC, FXB, ['GN!Z2']))
         at2 = ci(costbook=cb, settings={'fx': {'rate': R2}}).resolve('ROQAQZ201SLS', 'NN')
-        self.assertEqual((at2['fobU'], at2['rangeLo'], at2['rangeHi']), (PA, E.r4(PB * FXB / R2), E.r4(PC * FXB / R2)))
+        self.assertEqual((at2['fobU'], at2['rangeLo'], at2['rangeHi']), (E.r4(PB * FXB / R2), E.r4(PB * FXB / R2),
+                                                                         E.r4(PC * FXB / R2)))
 
-    def test_fx_ref_is_value_weighted_and_the_what_if_matches(self):
+    def test_one_row_keeps_its_own_rate_and_the_what_if_matches(self):
         cb = basis_book(MIXED)
-        p = ci(costbook=cb).resolve('ROQAQY201SLS', 'NN')          # even count: the mean of PA (at FXB) and PC (at R2)
-        med, ref = (PA + PC) / 2, (PA * FXB / 2 + PC * R2 / 2) / ((PA + PC) / 2)
-        self.assertEqual((p['fobU'], p['fxShare'], p['fxRef']), (E.r4(med), 1.0, E.r4(ref)))
+        p = ci(costbook=cb).resolve('ROQAQY201SLS', 'NN')          # PA (at FXB) and PC (at R2): the lowest, PA
+        self.assertEqual((p['fobU'], p['fxShare'], p['fxRef']), (PA, 1.0, FXB))
         at = ci(costbook=cb, settings={'fx': {'rate': 7.7}}).resolve('ROQAQY201SLS', 'NN')
-        self.assertEqual(at['fobU'], E.r4((PA * FXB / 7.7 + PC * R2 / 7.7) / 2))
-        # fxRef is published at 4 decimals, so the page's what-if can land 0.0001 from a rebuild.
+        self.assertEqual(at['fobU'], E.r4(PA * FXB / 7.7))
         self.assertAlmostEqual(E.fx_what_if_unit(p['fobU'], p['fxShare'], p['fxRef'], 7.7), at['fobU'], delta=0.00015)
-        self.assertAlmostEqual(med * ref / 7.7, (PA * FXB / 7.7 + PC * R2 / 7.7) / 2, places=12)   # exact before rounding
 
     def test_dollar_steps_do_not_move(self):
         # Regular fit from the slim row plus the fit premium (a dollar step): only the row moves.
@@ -1812,9 +1837,11 @@ class CombinedCostC13(unittest.TestCase):
         self.assertEqual((p['rule'], p['fobU'], p['level'], p['grade'], p['fxShare'], p['fxRef']),
                          ('single', 6.6666, 'L1', 'A', 0.0, None))
         self.assertEqual(p['costByFactory'], [['AA', 'PC', 'AA26002', 6.6666, 'L1']])
-        m = c.style_quote('ROQAQF101SLS')                         # one factory on two refs: the median of its quotes
-        self.assertEqual((m['rule'], m['fobU'], m['spread'], m['rangeLo'], m['rangeHi']),
-                         ('single', E.r4((7.1111 + 7.7777) / 2), 0.0, 7.1111, 7.7777))
+        m = c.style_quote('ROQAQF101SLS')                         # one factory on two refs: its lowest quote (C15 R7)
+        self.assertEqual((m['rule'], m['fobU'], m['spread'], m['rangeLo'], m['rangeHi'], m['evidence']),
+                         ('single', 7.1111, 0.0, 7.1111, 7.7777, ['AA!J8']))
+        self.assertIn('ambiguous_rows', m['flags'])
+        self.assertEqual(c.combined('ROQAQF101SLS')['res']['skip'], (('AA!J2', 'tie_not_lowest'),))
         self.assertEqual([q[2] for q in m['costByFactory']], ['AA26003', 'AA26001'])          # sorted by price
         d = c.style_quote('ROQAQK105SLS')                         # ref and pattern list, for a ref carrying the style
         self.assertEqual((d['rule'], d['fobU'], d['level'], d['costByFactory']),
@@ -1913,16 +1940,17 @@ class CombinedCostC13(unittest.TestCase):
             self.assertEqual((q['rule'], q['fobU'], q['level'], q['costByFactory']),
                              ('single', 4.6666, 'L4a', [['NN', 'GN', 'S', 4.6666, 'L4a']]), st)
             self.assertIn('fit_as_regular', q['flags'])
-            self.assertEqual(c.resolve(st, 'NN')['level'], 'L4d')    # the ladder alone derives it
+            self.assertEqual(c.resolve(st, 'NN')['level'], 'L4a')    # contract C15 R6: the ladder reads the same column
         k = c.style_quote('ROQAQS803TFS')                           # the KinYun-type regular fit column
         self.assertEqual((k['rule'], k['fobU'], k['level'], k['costByFactory']),
                          ('single', 2.9393, 'L2', [['CC', 'KY', 'CC26001', 2.9393, 'L2']]))
         self.assertIn('fit_as_regular', k['flags'])
         lad = c.resolve('ROQAQS803TFS', 'CC', 'CC26001')
-        self.assertEqual((lad['level'], lad['fobU']), ('L3', 2.2222))  # the ladder reads the slim rate
+        self.assertEqual((lad['level'], lad['fobU']), ('L2', 2.9393))  # the ladder reads the regular rate too (C15 R6)
+        self.assertIn('fit_as_regular', lad['flags'])
         now, old = build(src_c13(), cb=C13_BOOK), build(src_c13(), cb=C13_BOOK, settings=CASCADE)
         self.assertEqual((by(now, 'production', 'style')['ROQAQS803TFS']['fobU'],
-                          by(old, 'production', 'style')['ROQAQS803TFS']['fobU']), (2.9393, 2.2222))
+                          by(old, 'production', 'style')['ROQAQS803TFS']['fobU']), (2.9393, 2.9393))
 
     def test_one_cost_for_a_style_everywhere(self):
         ds = build(src_c13(), cb=C13_BOOK)
@@ -1939,7 +1967,8 @@ class CombinedCostC13(unittest.TestCase):
         st = by(ds, 'styles', 'base')['ROQAQF201SLS']
         self.assertEqual((st['costRule'], st['costSpread'], st['factories']),
                          ('average', E.r4(4.4444 / 4.1717 - 1), ['NN', 'TT']))
-        self.assertEqual(ds['styles']['fields'][-3:], ['costByFactory', 'costRule', 'costSpread'])
+        self.assertEqual(ds['styles']['fields'][-6:], ['costByFactory', 'costRule', 'costSpread', 'costRow',
+                                                       'costRowsSkipped', 'costFlags'])
         self.assertEqual(set(ds['dict']['costRules']), set(E.COST_RULES))
         for t in ('lines', 'apo'):                                               # the page recompute still matches
             for r in rows(ds, t):
@@ -1953,6 +1982,29 @@ class CombinedCostC13(unittest.TestCase):
         for v in list(ds['dict']['costRules'].values()) + [ds['dict']['flags'][f] for f in ('cost_average', 'cost_lowest',
                                                                                             'fit_as_regular')]:
             self.assertNotRegex(v, '[–—]')
+
+    def test_production_keeps_each_factorys_own_price(self):
+        # Cost of goods takes the style's combined cost, but a factory bills its own price. Each production row carries
+        # the maker's own ladder cost (ownFobU, with its fxShare and fxRef) for the page's factory payments.
+        ds = build(src_c13(), cb=C13_BOOK)
+        self.assertEqual(ds['production']['fields'][-3:], ['ownFobU', 'ownFxShare', 'ownFxRef'])
+        c = c13(src_c13()['ledger']['rows'])
+        P = rows(ds, 'production')
+        for r in P:
+            own = c.resolve(r['style'], r['factory'], r['ref'], r['poName'])
+            self.assertEqual((r['ownFobU'], r['ownFxShare']), (own['fobU'], own['fxShare']), r['ref'])
+        mine = {r['factory']: r for r in P if r['base'] == 'ROQAQF201SLS'}
+        want = E.r4((4.1717 + 4.4444) / 2)
+        self.assertEqual((mine['TT']['fobU'], mine['NN']['fobU']), (want, want))            # one cost of goods
+        self.assertEqual((mine['TT']['ownFobU'], mine['NN']['ownFobU']), (4.1717, 4.4444))  # each factory's own price
+        self.assertEqual((mine['TT']['ownFxShare'], mine['TT']['ownFxRef']), (1.0, FXB))
+        lst = [r for r in P if r['ref'] == 'AA26004'][0]                                      # a list price: no RMB part
+        self.assertEqual((lst['ownFobU'], lst['ownFxShare'], lst['ownFxRef']), (6.1616, 0.0, None))
+        at = {r['factory']: r for r in rows(build(src_c13(), cb=C13_BOOK, settings={'fx': {'rate': 7.7}}), 'production')
+              if r['base'] == 'ROQAQF201SLS'}                                                # the RMB what-if moves it like fobU
+        self.assertAlmostEqual(E.fx_what_if_unit(4.1717, 1.0, FXB, 7.7), at['TT']['ownFobU'], delta=0.00015)
+        for r in rows(build(src_c13(), cb=C13_BOOK, settings=CASCADE), 'production'):   # cascade: the same price
+            self.assertEqual(r['ownFobU'], r['fobU'], r['ref'])
 
     def test_cascade_mode_equals_the_old_result(self):
         keep = E.CostIndex.final
@@ -1974,6 +2026,350 @@ class CombinedCostC13(unittest.TestCase):
             self.assertEqual(r['fobU'], c.resolve(r['style'], r['factory'], r['ref'], r['poName'])['fobU'], r['ref'])
         comb = {(r['ref'], r['style']): r['fobU'] for r in rows(build(src_c13(), cb=C13_BOOK), 'production')}
         self.assertNotEqual(comb[('TT26001', 'ROQAQF201SLS')], by(cas, 'production', 'ref')['TT26001']['fobU'])
+
+
+# ── contract C15 (Sep 15): one right row per factory sheet. Sentinel prices only. ──
+def c15rec(rid, price, fab, brand='QA', pat='SOLID', sleeve='LS', fit='SLIM', conf='high', tags=(), label='SAMPLE ROW',
+           pool='GN:BASE', **kw):
+    return calc(rid, pool, price, brand, fab, fit, pat, sleeve, fabric_code_confidence=conf, variant_tags=list(tags),
+                fabrication=label, row=int(''.join(ch for ch in rid.split('!')[1] if ch.isdigit())), **kw)
+
+
+C15_RECS = [
+    # Fabric VQ, brand QA, grid GN: the slim, regular and big and tall columns of one plain solid row, and its variants.
+    c15rec('GN!F101', 3.3131, ['VQ'], label='SAMPLE PLAIN SOLID'),
+    c15rec('GN!K101', 3.5217, ['VQ'], fit='REGULAR', label='SAMPLE PLAIN SOLID'),
+    c15rec('GN!P101', 4.1287, ['VQ'], fit='BIG_TALL', label='SAMPLE PLAIN SOLID'),
+    c15rec('GN!F102', 3.7171, ['VQ'], conf='medium', tags=['brushed'], label='SAMPLE BRUSHED SOLID'),
+    c15rec('GN!F103', 3.9191, ['UP', 'VQ'], tags=['perforated'], label='SAMPLE PERFORATED SOLID'),
+    c15rec('GN!F104', 3.5353, ['VQ'], pat='PRINT', tags=['regular_print'], label='SAMPLE REGULAR PRINT'),
+    c15rec('GN!F105', 3.8629, ['VQ'], pat='PRINT', tags=['digital_print'], label='SAMPLE DIGITAL PRINT'),
+    c15rec('GN!F106', 3.1515, ['VQ'], sleeve='SS', label='SAMPLE SHORT SLEEVE SOLID'),
+    c15rec('GN!F107', 3.0101, ['VZ', 'VQ'], conf='low', label='SAMPLE OTHER FABRIC'),
+    c15rec('GN!F108', 2.9292, ['VQ'], brand='QB', label='SAMPLE OTHER BRAND SOLID'),
+    # VT: two plain rows (a tie), no sleeve stated. VR: a digital print row only.
+    c15rec('GN!F109', 3.6363, ['VT'], sleeve=None, label='SAMPLE TIE A'),
+    c15rec('GN!F110', 3.4242, ['VT'], sleeve=None, label='SAMPLE TIE B'),
+    c15rec('GN!F111', 3.6868, ['VR'], pat='PRINT', tags=['digital_print'], label='SAMPLE DIGITAL PRINT ONLY'),
+    # VC: a plain row, a white row and a colour row. VD: white and colour rows only.
+    c15rec('GN!F112', 3.5555, ['VC'], label='SAMPLE PLAIN'),
+    c15rec('GN!F113', 3.2323, ['VC'], tags=['white'], label='SAMPLE WHITE'),
+    c15rec('GN!F114', 3.3434, ['VC'], tags=['colour'], label='SAMPLE COLOUR'),
+    c15rec('GN!F115', 3.2626, ['VD'], tags=['white'], label='SAMPLE WHITE'),
+    c15rec('GN!F116', 3.3737, ['VD'], tags=['colour'], label='SAMPLE COLOUR'),
+    # VN: a row whose text names one style (no pattern stated), and a plain solid row.
+    c15rec('GN!F117', 4.4573, ['VN'], pat=None, names_styles=['301PSS'], label='SAMPLE ROW STYLE#301PSS'),
+    c15rec('GN!K117', 4.6161, ['VN'], pat=None, fit='REGULAR', names_styles=['301PSS'], label='SAMPLE ROW STYLE#301PSS'),
+    c15rec('GN!F118', 3.9797, ['VN'], label='SAMPLE PLAIN SOLID'),
+    c15rec('GN!K118', 4.1919, ['VN'], fit='REGULAR', label='SAMPLE PLAIN SOLID'),
+    # Grid GY club block: an all-brand row for fabric VG, and a QA row of another fabric (QA has a section there).
+    c15rec('GY!F119', 4.1414, ['VG'], brand=None, brand_scope='all', label='SAMPLE ALL BRANDS', pool='GY:CLUB'),
+    c15rec('GY!F120', 4.2929, ['VH'], label='SAMPLE QA ROW', pool='GY:CLUB'),
+    # VK: a section that serves two brand codes. PO: a zip polo next to the plain polo GK!F1.
+    c15rec('GN!F121', 3.7979, ['VK'], brand_codes=['QA', 'QE'], label='SAMPLE TWO CODE SECTION'),
+    c15rec('GK!F122', 2.8989, ['PO'], category='polo', tags=['zipper'], label='SAMPLE ZIP POLO', pool='GK:ANY'),
+    # A list names style ROQDVQ301SLS on a ref of factory AA: a proxy (L5) for any other factory.
+    rec('AA!J9', 'PC', 'ref_price_list', 5.2525, factory_code='AA', production_ref='AA26007', style='ROQDVQ301SLS',
+        fabric_codes=['VQ'], scope='ref_style'),
+]
+C15_BOOK = basis_book(C15_RECS)
+
+
+def pick15(style, fac='NN', costbook=None):
+    """The internal resolution (with its C15 row and the rows set aside) of one style at one factory."""
+    return ci(costbook=costbook or C15_BOOK).raw(style, fac)
+
+
+class OneRightRowC15(unittest.TestCase):
+    def test_a_plain_row_beats_a_brushed_row(self):
+        # R5: brushed and perforated rows price only a style that shows them. Never a median with them.
+        r = pick15('ROQAVQ201SLS')
+        self.assertEqual((r['level'], r['price'], r['ids'], r['row'], r['rng']),
+                         ('L4a', 3.3131, ('GN!F101',), ('GN!F101', 'slim'), None))
+        skip = dict(r['skip'])
+        self.assertEqual((skip['GN!F102'], skip['GN!F103']), ('variant_not_this_style', 'variant_not_this_style'))
+        self.assertEqual((skip['GN!F104'], skip['GN!F106'], skip['GN!F107'], skip['GN!F108']),
+                         ('other_pattern', 'other_sleeve', 'lower_confidence', 'other_brand'))
+        self.assertNotIn('ambiguous_rows', r['flags'])
+        self.assertEqual(r['skip'][0], ('GN!F102', 'variant_not_this_style'))        # the closest rows come first
+        up = pick15('ROQAUP202SLS')                                                  # fabric UP: a perforated style
+        self.assertEqual((up['price'], up['ids']), (3.9191, ('GN!F103',)))
+
+    def test_solid_and_print_rows(self):
+        # R4: solid rows for solid styles, print rows for print styles. A regular print beats a digital print when
+        # the style number does not say digital (flag pattern_guess). A digital print row alone serves as it is.
+        p = pick15('ROQAVQ230SLP')
+        self.assertEqual((p['price'], p['ids']), (3.5353, ('GN!F104',)))
+        self.assertIn('pattern_guess', p['flags'])
+        skip = dict(p['skip'])
+        self.assertEqual((skip['GN!F105'], skip['GN!F101']), ('variant_not_this_style', 'other_pattern'))
+        d = pick15('ROQAVR231SLP')
+        self.assertEqual((d['price'], d['flags']), (3.6868, ()))
+        self.assertEqual(pick15('ROQAVR232SLS')['level'], 'L7')        # a solid style: no print row, nothing relaxed
+
+    def test_brand_sections_are_never_combined(self):
+        # R1: a style takes its own brand's row, even when another brand's row is cheaper. The other brand takes its own.
+        a, b = pick15('ROQAVQ201SLS'), pick15('ROQBVQ201SLS')
+        self.assertEqual((a['price'], b['price'], b['ids']), (3.3131, 2.9292, ('GN!F108',)))
+        self.assertEqual(dict(b['skip'])['GN!F101'], 'other_brand')
+        e = pick15('ROQEVK201SLS')                     # a section serving two brand codes (the cost book's brand_codes)
+        self.assertEqual((e['level'], e['price']), ('L4a', 3.7979))
+
+    def test_generic_section_when_the_brand_has_none(self):
+        # R1: with no section for the brand on a sheet, that sheet's all-brand rows serve.
+        g = pick15('ROQCVG201SLS', 'TT')
+        self.assertEqual((g['level'], g['price'], g['ids']), ('L4b', 4.1414, ('GY!F119',)))
+        self.assertNotIn('cross_brand', g['flags'])
+
+    def test_another_brand_only_as_the_last_resort(self):
+        # R1: no sheet quotes brand QD, so another brand's row prices it, after the proxies: level L4c, grade D.
+        x = pick15('ROQDVQ201SLS')
+        self.assertEqual((x['level'], x['price'], x['gcap']), ('L4c', 2.9292, 'D'))
+        self.assertTrue({'cross_brand', 'ambiguous_rows'} <= set(x['flags']))    # QA's and QB's rows tie: the lowest
+        self.assertEqual(dict(x['skip'])['GN!F101'], 'tie_not_lowest')
+        self.assertEqual(E.grade_of('L4c'), 'D')
+        p = pick15('ROQDVQ301SLS')                     # the same style on a factory list: the proxy comes first
+        self.assertEqual((p['level'], p['price']), ('L5', 5.2525))
+
+    def test_fit_columns(self):
+        # R6: the slim, regular and big and tall columns by the fit code. Modern and tailored use regular. An unknown
+        # fit code uses regular, flagged fit_unknown.
+        want = {'ROQAVQ201SLS': ('L4a', 3.3131, 'slim', ()), 'ROQAVQ211RFS': ('L4a', 3.5217, 'regular', ()),
+                'ROQAVQ212BTS': ('L4a', 4.1287, 'big_tall', ()),
+                'ROQAVQ213MFS': ('L4a', 3.5217, 'regular', ('fit_as_regular',)),
+                'ROQAVQ214TFS': ('L4a', 3.5217, 'regular', ('fit_as_regular',)),
+                'ROQAVQ215PSS': ('L4d', 3.5217, 'regular', ('fit_unknown',))}
+        for st, (lv, p, col, fl) in want.items():
+            r = pick15(st)
+            self.assertEqual((r['level'], r['price'], r['row'][1]), (lv, p, col), st)
+            for f in fl:
+                self.assertIn(f, r['flags'], st)
+        self.assertIsNone(E.decode_sku('ROQAVQ215PSS')['fit'])
+
+    def test_ties_take_the_lowest_and_list_every_row(self):
+        # R7: two plain rows fit: the lowest, flagged ambiguous_rows, the other listed. The range keeps both.
+        t = pick15('ROQAVT201SLS')
+        self.assertEqual((t['price'], t['ids'], t['rng'], t['skip']),
+                         (3.4242, ('GN!F110',), (3.4242, 3.6363), (('GN!F109', 'tie_not_lowest'),)))
+        self.assertIn('ambiguous_rows', t['flags'])
+        # R3: a row with no sleeve is a long sleeve price, so a short sleeve style takes it with the short sleeve step.
+        s = pick15('ROQAVT221SSS')
+        self.assertEqual((s['level'], E.r4(s['price']), s['ids']), ('L4d', E.r4(3.4242 - 0.1111), ('GN!F110',)))
+
+    def test_sleeve_row_for_a_short_sleeve_style(self):
+        s = pick15('ROQAVQ220SSS')
+        self.assertEqual((s['level'], s['price']), ('L4a', 3.1515))
+        self.assertEqual(dict(s['skip'])['GN!F101'], 'other_sleeve')
+
+    def test_fabric_code_confidence(self):
+        # R2: a row that carries the code at low confidence gives way on the exact rung. It prices a style only when no
+        # better row fits (a derived match).
+        w = pick15('ROQAVZ201SLS')
+        self.assertEqual((w['level'], w['price']), ('L4d', 3.0101))
+        self.assertIn('derived', w['flags'])
+
+    def test_a_row_that_names_the_style(self):
+        # R5: a row whose text names the style is that style's row, before the pattern rule. For other styles it is one
+        # row among the rest, so a plain solid row beats it.
+        n = pick15('ROQAVN301PSS')
+        self.assertEqual((n['level'], n['price'], n['ids']), ('L4d', 4.6161, ('GN!K117',)))     # fit PS: regular column
+        self.assertEqual(dict(n['skip'])['GN!K118'], 'variant_not_this_style')
+        o = pick15('ROQAVN302SLS')
+        self.assertEqual((o['price'], dict(o['skip'])['GN!F117']), (3.9797, 'other_pattern'))
+
+    def test_white_and_colour_rows(self):
+        # R5: a plain row beats white and colour rows. With no plain row, the lowest of them, flagged.
+        v = pick15('ROQAVC201SLS')
+        self.assertEqual((v['price'], dict(v['skip'])['GN!F113']), (3.5555, 'variant_not_this_style'))
+        d = pick15('ROQAVD201SLS')
+        self.assertEqual((d['price'], d['skip']), (3.2626, (('GN!F116', 'tie_not_lowest'),)))
+        self.assertIn('ambiguous_rows', d['flags'])
+
+    def test_zip_polo(self):
+        # R5: the zip collar letter shows the variant, so a zip polo takes the zipper row and a plain polo does not.
+        z, p = pick15('ROQAPO401SLZ', 'TT'), pick15('ROQAPO402SLS', 'TT')
+        self.assertEqual((z['price'], p['price']), (2.8989, 3.1313))
+        self.assertEqual(dict(p['skip'])['GK!F122'], 'variant_not_this_style')
+
+    def test_list_rates_keep_to_the_brand(self):
+        # R1 on a price list: a factory's list rate for one brand never prices another brand's style.
+        cb = basis_book(change={'CC!F3': {'brand_code': 'QK'}, 'CC!F4': {'brand_code': 'QK'}})
+        c = ci(costbook=cb)
+        self.assertEqual(c.resolve('ROQKQS111SSP', 'CC', 'CC26009')['fobU'], 2.7222)     # its own brand's rate
+        self.assertEqual(c.resolve('ROQAQS111SSP', 'CC', 'CC26009')['level'], 'L7')      # no rate, no grid row for QA
+
+    def test_dataset_names_the_row_and_the_rows_set_aside(self):
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('21', 'ROQAVQ201SLS', 10, 9.0),
+                                                                   order('22', 'ROQDVQ201SLS', 10, 9.0)]
+        ds = build(s, cb=C15_BOOK)
+        S = by(ds, 'styles', 'base')
+        a = S['ROQAVQ201SLS']
+        self.assertEqual(a['costRow'], ['SYN-GN', 'F101', 'SAMPLE PLAIN SOLID', 'slim', 3.3131])
+        self.assertEqual((a['fobU'], a['ev']), (3.3131, ['GN!F101']))
+        sk = {x[0]: x for x in a['costRowsSkipped']}
+        self.assertEqual(sk['GN!F102'], ['GN!F102', 'SAMPLE BRUSHED SOLID', 3.7171, 'variant_not_this_style'])
+        self.assertTrue(all(x[3] in E.C15_REASONS for x in a['costRowsSkipped']))
+        self.assertTrue({'GN!F101'} | set(sk) <= set(ds['evidence']))            # every cell named is in the evidence
+        x = S['ROQDVQ201SLS']
+        # costRow is the contract's five items; its C15 flags are styles.costFlags.
+        self.assertEqual((x['level'], x['grade'], x['costRow'][:2], len(x['costRow']), x['costFlags']),
+                         ('L4c', 'D', ['SYN-GN', 'F108'], 5, ['ambiguous_rows', 'cross_brand']))
+        self.assertEqual(a['costFlags'], [])
+        line = [r for r in rows(ds, 'lines') if r['base'] == 'ROQDVQ201SLS'][0]
+        self.assertEqual((line['level'], line['grade']), ('L4c', 'D'))
+        self.assertTrue({'cross_brand', 'ambiguous_rows'} <= set(line['flags']))
+        for f in E.C15_FLAGS:
+            self.assertIn(f, ds['dict']['flags'])
+            self.assertNotRegex(ds['dict']['flags'][f], '[–—]')
+        self.assertEqual(ds['dict']['levels']['L4c']['grade'], 'D')
+        for st in rows(ds, 'styles'):                                              # the page's shape check
+            if st['costRow'] is not None:
+                self.assertEqual(len(st['costRow']), 5)
+                self.assertIn(st['costRow'][3], ('slim', 'regular', 'big_tall'))
+                self.assertIsInstance(st['costRow'][4], float)
+            self.assertTrue(set(st['costFlags']) <= set(E.C15_FLAGS))
+        self.assertTrue(any(n.startswith("Each factory's price for a style comes from one sheet row") for n in ds['notes']))
+
+
+# The C15 fix run (Sep 15): named rows first, yarn dyed CY, inferred patterns, cooling, provisional prices, customer
+# quotes in the other-brand rung, a quote in a picture, a ten character style number, the list fabric rung's fit, the
+# order of the derived rungs and the tie break. Sentinel prices only.
+def _fx(r, **kw):
+    return dict(r, **kw)
+
+
+FIX_RECS = [
+    # CY (FABRIC_RULES: Yarn Dye): a yarn dyed row and a solid row.
+    c15rec('GN!F140', 4.2323, ['CY'], pat='YARN_DYED', label='SAMPLE YARN DYED'),
+    c15rec('GN!F141', 3.9111, ['CY'], label='SAMPLE CY SOLID'),
+    # WC: rows that name styles, with other sleeves and patterns, and a plain long sleeve print row.
+    c15rec('GN!K142', 3.4444, ['WC'], pat='PRINT', sleeve='SS', fit='REGULAR', names_styles=['401WSP'], label='SAMPLE SS ROW STYLE#401WSP'),
+    c15rec('GN!K143', 3.9999, ['WC'], pat='PRINT', fit='REGULAR', label='SAMPLE PLAIN PRINT'),
+    c15rec('GN!K144', 3.7777, ['WC'], fit='REGULAR', names_styles=['402WSP'], label='SAMPLE SOLID ROW STYLE#402WSP'),
+    c15rec('GN!F145', 3.1212, ['WC'], pat='PRINT', sleeve='SS', names_styles=['403SLP'], label='SAMPLE SS ROW STYLE#403SLP'),
+    c15rec('GN!F146', 3.6161, ['WC'], pat='PRINT', names_styles=['403SLP'], label='SAMPLE LS ROW STYLE#403SLP'),
+    c15rec('GN!K148', 3.8888, ['WC'], pat='PRINT', fit='REGULAR', names_styles=['404PSP'], label='SAMPLE LS ROW STYLE#404PSP'),
+    c15rec('GN!K149', 3.5959, ['WC'], pat='PRINT', sleeve='SS', fit='REGULAR', names_styles=['404PSP'], label='SAMPLE SS ROW STYLE#404PSP'),
+    # WD: a row whose pattern the cost book only inferred (the sheet states none).
+    _fx(c15rec('GN!F150', 4.0404, ['WD'], pat=None, label='SAMPLE WD ROW'), pattern_effective='SOLID',
+        flags=['PATTERN_NOT_STATED_INFERRED_SOLID']),
+    # WG: a row naming a style without its fabric code, and a cheaper plain row.
+    c15rec('GN!K151', 4.4545, ['WG'], fit='REGULAR', names_styles=['ROQA801WRS'], label='SAMPLE ROW ROQA801WRS'),
+    c15rec('GN!K152', 4.0101, ['WG'], fit='REGULAR', label='SAMPLE PLAIN SOLID'),
+    # WF: a plain row and a cooling row. WH: a white row whose price is still needed and a colour row. WJ: only such a row.
+    c15rec('GN!F153', 3.5050, ['WF'], label='SAMPLE PLAIN SOLID'),
+    c15rec('GN!F154', 3.4040, ['WF'], tags=['cooling'], label='SAMPLE SOLID COOLING'),
+    c15rec('GN!F155', 3.3030, ['WH'], tags=['white'], flags=['PROVISIONAL_TEXT_NEED_PRICE'], label='SAMPLE NEED WHITE PRICE'),
+    c15rec('GN!F156', 3.6464, ['WH'], tags=['colour'], label='SAMPLE SOLID COLOUR'),
+    c15rec('GN!F157', 3.7070, ['WJ'], flags=['PROVISIONAL_TEXT_NEED_PRICE'], label='SAMPLE NEED PRICE'),
+    # WN: a long sleeve row in grid GN and a short sleeve row in grid GY that carries WN as its second code.
+    c15rec('GN!F158', 4.2020, ['WN'], label='SAMPLE LS SOLID'),
+    c15rec('GY!F159', 3.8080, ['WP', 'WN'], sleeve='SS', label='SAMPLE SS SECOND CODE', pool='GY:BASE'),
+    # WQ: two rows at the same price.
+    c15rec('GN!F160', 3.9090, ['WQ'], label='SAMPLE TWIN LOW ROW'),
+    c15rec('GN!F99', 3.9090, ['WQ'], label='SAMPLE TWIN HIGH ROW'),
+    # WK: the club group's own brand-less quotation.
+    rec('HQ!D161', 'SYN-HQ', 'factory_quotation', 5.6161, pool='GN:CLUB', brand_code=None, fabric_codes=['WK'],
+        fit_class='SLIM', pattern='SOLID', sleeve='LS', factory_code='TT', row=161),
+    # WE: a customer quotation that names one style, its price in a picture.
+    rec('HQ!IMG-ROQAWE601WSJ', 'SYN-HQ', 'image_callout', 6.1234, style='ROQAWE601WSJ', factory_code='TT',
+        fabric_codes=['WE'], brand_code='QA', customer_group='CLUB', flags=['IMAGE_ONLY_PRICE_NOT_IN_A_CELL']),
+    # WL and WM: list styles of factory AA, a slim one and a regular one.
+    rec('AA!J12', 'PC', 'ref_price_list', 7.1313, factory_code='AA', production_ref='AA26011', style='ROQAWL011SLS',
+        fabric_codes=['WL'], scope='ref_style'),
+    rec('AA!J13', 'PC', 'ref_price_list', 7.4242, factory_code='AA', production_ref='AA26013', style='ROQAWM021RFS',
+        fabric_codes=['WM'], scope='ref_style'),
+]
+FIX_BOOK = basis_book(C15_RECS + FIX_RECS)
+
+
+def fix15(style, fac='NN', ref=None):
+    return ci(costbook=FIX_BOOK).raw(style, fac, ref)
+
+
+class OneRightRowFixes(unittest.TestCase):
+    def test_cy_is_yarn_dyed_whatever_the_letter(self):
+        # The platform's FABRIC_RULES says CY is a yarn dye, like YD and SP, so a CY style takes the yarn dyed row.
+        self.assertEqual((E.decode_sku('ROQACY201SLB')['pat'], E.decode_sku('ROQACY202SLD')['pat']), ('YARN_DYED', 'YARN_DYED'))
+        r = fix15('ROQACY201SLB')
+        self.assertEqual((r['level'], r['price'], r['ids']), ('L4a', 4.2323, ('GN!F140',)))
+        self.assertEqual(dict(r['skip'])['GN!F141'], 'other_pattern')
+
+    def test_a_row_that_names_the_style_comes_before_sleeve_and_pattern(self):
+        # R0: with an unknown fit code the named row's own sleeve decides.
+        r = fix15('ROQAWC401WSP')
+        self.assertEqual((r['level'], r['price'], r['ids']), ('L4d', 3.4444, ('GN!K142',)))
+        self.assertEqual(dict(r['skip'])['GN!K143'], 'variant_not_this_style')
+        self.assertNotIn('named_row_conflict', r['flags'])
+        # A named row whose pattern differs from the style number still wins, flagged for a check.
+        c = fix15('ROQAWC402WSP')
+        self.assertEqual((c['price'], c['ids']), (3.7777, ('GN!K144',)))
+        self.assertIn('named_row_conflict', c['flags'])
+        self.assertIn('Confirm which is right', c['basis'])
+        # A known fit code's sleeve decides between two named rows.
+        k = fix15('ROQAWC403SLP')
+        self.assertEqual((k['level'], k['price'], dict(k['skip'])['GN!F145']), ('L4a', 3.6161, 'other_sleeve'))
+        # An unknown fit code named by a long and a short sleeve row: both fit, the lowest, flagged.
+        t = fix15('ROQAWC404PSP')
+        self.assertEqual((t['price'], dict(t['skip'])['GN!K148']), (3.5959, 'tie_not_lowest'))
+        self.assertIn('ambiguous_rows', t['flags'])
+
+    def test_a_pattern_the_cost_book_inferred_serves_both(self):
+        # R4: the sheet states no pattern, so the row serves a print style when the section has no print row.
+        self.assertEqual((fix15('ROQAWD501SLP')['price'], fix15('ROQAWD502SLS')['price']), (4.0404, 4.0404))
+
+    def test_a_number_without_its_fabric_code_names_the_style(self):
+        n = fix15('ROQAWG801WRS')
+        self.assertEqual((n['price'], dict(n['skip'])['GN!K152']), (4.4545, 'variant_not_this_style'))
+        self.assertEqual(fix15('TMQAWG801WRS')['price'], 4.0101)            # another customer: not named
+
+    def test_cooling_is_a_finish_that_loses_to_a_plain_row(self):
+        r = fix15('ROQAWF701SLS')
+        self.assertEqual((r['price'], dict(r['skip'])['GN!F154']), (3.5050, 'variant_not_this_style'))
+        self.assertNotIn('ambiguous_rows', r['flags'])
+
+    def test_a_price_still_needed_loses_to_a_confirmed_row(self):
+        r = fix15('ROQAWH901SLS')
+        self.assertEqual((r['price'], dict(r['skip'])['GN!F155']), (3.6464, 'lower_confidence'))
+        self.assertNotIn('ambiguous_rows', r['flags'])
+        u = fix15('ROQAWJ902SLS')                                         # the only row: used, flagged
+        self.assertEqual(u['price'], 3.7070)
+        self.assertIn('price_unconfirmed', u['flags'])
+        self.assertIn('price_unconfirmed', E.FLAG_LABELS)
+
+    def test_the_derived_rungs_try_every_sheet_before_the_next_step(self):
+        # L4d order: the alternate fabric code on every sheet first, then the short sleeve step, then the fit premium.
+        r = fix15('ROQAWN951SSS')
+        self.assertEqual((r['level'], r['price'], r['ids']), ('L4d', 3.8080, ('GY!F159',)))
+
+    def test_equal_prices_take_the_lowest_sheet_row(self):
+        r = fix15('ROQAWQ961SLS')
+        self.assertEqual((r['ids'], dict(r['skip'])['GN!F160']), (('GN!F99',), 'tie_not_lowest'))
+
+    def test_a_customer_quotation_never_serves_another_group(self):
+        own = fix15('CLQDWK171SLS')
+        self.assertEqual((own['level'], own['price']), ('L4a', 5.6161))
+        self.assertIn('customer_quote', own['flags'])
+        self.assertEqual(fix15('ROQDWK172SLS')['level'], 'L7')      # no other brand's section quotes WK
+
+    def test_a_quote_in_a_picture_names_its_style(self):
+        c = ci(costbook=FIX_BOOK)
+        r = c.resolve('ROQAWE601WSJ', 'UNKNOWN')
+        self.assertEqual((r['level'], r['fobU'], r['evidence']), ('L1', 6.1234, ['HQ!IMG-ROQAWE601WSJ']))
+        q = c.quotes('ROQAWE601WSJ')
+        self.assertEqual([(x['fac'], x['level'], x['price']) for x in q], [('TT', 'L1', 6.1234)])
+        self.assertEqual(c.resolve('ROQAWE602WSJ', 'UNKNOWN')['level'], 'L7')
+
+    def test_the_list_fabric_rung_keeps_to_the_fit(self):
+        # R6 on a price list: a regular style takes a slim style's price plus the fit premium (derived); a slim style
+        # with only a regular style listed falls through.
+        c = ci(costbook=FIX_BOOK)
+        r = c.raw('ROQAWL012RFS', 'AA', 'AA26012')
+        self.assertEqual((r['level'], E.r4(r['price'])), ('L3', E.r4(7.1313 + 0.2222)))
+        self.assertTrue({'fabric_median', 'derived'} <= set(r['flags']))
+        self.assertEqual(c.raw('ROQAWL013SLS', 'AA', 'AA26014')['price'], 7.1313)
+        self.assertNotEqual(c.raw('ROQAWM022SLS', 'AA', 'AA26015')['level'], 'L3')
 
 
 class FiberMapC11(unittest.TestCase):

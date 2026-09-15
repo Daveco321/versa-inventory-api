@@ -993,8 +993,11 @@ def _sanitize(value, spec, path, problems, dropped):
                 out[kk] = vv
         return out
     if kind == 'list':
-        if not isinstance(value, list) or len(value) > spec[2]:
+        if not isinstance(value, list):
             problems.append(_problem(path, 'not_a_list'))
+            return _INVALID
+        if len(value) > spec[2]:          # a list over its cap is a list: say it is too long
+            problems.append(_problem(path, 'too_long'))
             return _INVALID
         out = []
         for i, v in enumerate(value):

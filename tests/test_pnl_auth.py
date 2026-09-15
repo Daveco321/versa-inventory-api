@@ -1839,6 +1839,9 @@ class TestSettingsC11ToC14(PnlTestCase):
                ({'revenueCosts': {'items': [item, dict(item, pct=2.25)]}}, 'revenueCosts.items[1].key', 'duplicate'),
                ({'revenueCosts': {'items': [dict(item, key='bad key!')]}}, 'revenueCosts.items[0].key', 'invalid_token'),
                ({'revenueCosts': {'items': 'rent'}}, 'revenueCosts.items', 'not_a_list'),
+               # A list over its cap is a list: the page words 'too_long' as "is too long".
+               ({'revenueCosts': {'items': [dict(item, key='k%d' % i) for i in range(51)]}}, 'revenueCosts.items', 'too_long'),
+               ({'opex': {'items': [{'name': 'Payroll', 'monthly': 111111}] * 51}}, 'opex.items', 'too_long'),
                ({'regimeByCustomer': {'ZZPEER': 'mars'}}, 'regimeByCustomer.ZZPEER', 'invalid_choice'),
                ({'regimeByCustomer': {'ZZ.SHOP': 'us'}}, 'regimeByCustomer.ZZ.SHOP', 'invalid_custkey'),
                ({'costRule': {'mode': 'median'}}, 'costRule.mode', 'invalid_choice'),

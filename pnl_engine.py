@@ -95,7 +95,7 @@ a ref and pattern and a KinYun-type list a ref, pattern and fit, L2, for refs of
 style on the ledger) and exact calculator matches (grid_exact: the style's own brand, fabric, fit, sleeve and
 pattern at the style's fit column, L4a or L4b) under every factory that makes the style. Modern and tailored
 fits use the regular fit price (price_fit). Sibling and fabric medians, relaxed matches, proxies and defaults
-are not direct quotes. One value per factory (the median of its quotes). CostIndex.combined(b): one factory
+are not direct quotes. One value per factory (its one row: the lowest of its quotes, C15). CostIndex.combined(b): one factory
 gives 'single'; several give 'average', unless max > min x (1 + wideSpreadPct / 100), then 'lowest'
 (exactly at the threshold is 'average'). The grade is the worst grade among the values used; the level is
 the used value's level ('single', 'lowest') or the best level among the inputs ('average'). fxShare and
@@ -103,16 +103,43 @@ fxRef are value weighted over the values used. CostIndex.final(b, res) is the on
 takes its cost through: a manual cost (L0) wins outright, a style with a direct quote takes its combined
 cost on every row (the row keeps its factory), anything else keeps its ladder result ('fallback').
 settings.costRule.mode 'cascade' switches the rule off (today's behaviour).
+One right row (contract C15, David, Sep 15 2026). A style's cost on a factory sheet (calculator or price list)
+comes from exactly one row, picked from the style number [customer][brand][fabric][serial][fit][pattern]: R1 the
+style's own brand section only (brand sections are never combined; with no section on a sheet, its generic
+all-brand rows or the customer group's own quotation; another brand's row only when nothing else prices the style:
+level L4c, flag cross_brand, grade D, after the L5 proxies; a customer's brand-less quotation never serves another
+group), R2 the fabric code (high confidence and the first code preferred), R0 a row whose text names the style is
+that style's row, before the sleeve and pattern rules (its sleeve decides when the fit code is unknown; a pattern
+that disagrees with the style number is flagged named_row_conflict), R3 the sleeve, R4 the pattern (solid for
+solid, print for print; yarn dyed fabrics YD, SP and CY read yarn dyed; a row with no pattern, or whose pattern the
+cost book only inferred, serves only when no pattern row fits; regular print over digital print unless the style
+says digital, flag pattern_guess; never relaxed), R5 variant rows (brushed, perforated, zipper, tie, both side
+print, camp collar) only for a style that shows the variant by its number; white, colour, cooling and cotton-origin
+rows lose to a plain row; a row whose sheet text says its price is still needed loses to any confirmed row (flag
+price_unconfirmed when it is the only one), R6 the fit column (modern and tailored: regular; unknown: regular, flag
+fit_unknown), R7 the lowest of the rows still tied (then the lowest sheet row), flag ambiguous_rows, every
+candidate listed. Never a median. Contract C13 then combines the factories. styles.costRow, costFlags and
+costRowsSkipped name the row used, its C15 flags and the rows set aside (CostIndex._pick).
 
 Contract additions (beyond DESIGN 5.4), all appended after the contract fields:
     lines: basis, dutyRegime, costRef, pieces, fxRef, revCost
     alloc: costRef, lotTier, pieces, fxShare, fxRef, revCost (the line's revenue costs for these units)
     apo: routing, ref, basis, ev, dutyRegime, costRef, coveredBy, fxRef, revCost
-    inventory: basis, ev, dutyRegime, flags, fxRef    production: basis, ev, dutyRegime, fxRef
+    inventory: basis, ev, dutyRegime, flags, fxRef
+    production: basis, ev, dutyRegime, fxRef, ownFobU, ownFxShare, ownFxRef (the maker's own ladder cost for
+            the line, L['res']: what that factory bills. fobU stays the style's cost after contract C13; the
+            page's factory payments use ownFobU)
     styles: basis, ev, t12Net, dutyRegime, dedPct, atsFreeStock, atsFreeProd, fxShare, fxRef, openRevCost,
             costByFactory ([factory, source, refOrSheet, price4, level] per direct quote, by price),
             costRule (single, average, lowest, manual, fallback; 'cascade' in cascade mode), costSpread
-            (r4(max / min - 1) over the per-factory values, 0 for one, null for none) (contract C13)
+            (r4(max / min - 1) over the per-factory values, 0 for one, null for none) (contract C13),
+            costRow ([source, cell on that sheet, row label, fit column 'slim' | 'regular' | 'big_tall', price4 as
+            the sheet prints it]; null when no row prices the style: for an average of factories, the lowest
+            factory's row), costFlags (the C15 flags of that cost, possibly empty), costRowsSkipped ([cell as its
+            record id 'SRC!CELL', because a row set aside can sit on another sheet, row label, price4, reason] per
+            row set aside; reasons other_brand, other_pattern, other_sleeve, variant_not_this_style,
+            lower_confidence, tie_not_lowest) (contract C15)
+    row flags (contract C15): ambiguous_rows, cross_brand, fit_unknown, pattern_guess
     shipped.company: costedRev, revCost     shipped.byStyle: fobU, level, grade, origin, fxShare, fxRef, caShare
     shipped.byCustomer {fields, rows}, shipped.range (contract C14)
     inputs.fx: {mode, rate, basis, base, printed[], weighted, unrated} (the price basis in use)
@@ -156,7 +183,7 @@ LEVEL_INFO = {
     'L3': ('Factory list: sibling ref', 'B'),
     'L4a': ("Calculator: factory's own grid", 'B'),
     'L4b': ('Calculator: other grid', 'B'),
-    'L4c': ('Calculator: other brand', 'B'),
+    'L4c': ('Calculator: other brand', 'D'),        # contract C15 R1: the last resort, grade D
     'L4d': ('Calculator: derived', 'B'),
     'L5': ('Proxy: same style or design on a list', 'C'),
     'L6': ('Default for category', 'C'),
@@ -166,7 +193,8 @@ GRADE_INFO = {
     'A': {'label': 'Solid', 'desc': 'Factory list price or manual cost, and a clean supply match.'},
     'B': {'label': 'Good', 'desc': 'Calculator price or a sibling list price. Or a forced pull.'},
     'C': {'label': 'Rough', 'desc': 'Proxy or category default. Or a stale batch or a fallback supply match.'},
-    'D': {'label': 'Missing', 'desc': 'No usable cost or no supply record. Needs a manual cost or a check.'},
+    'D': {'label': 'Missing', 'desc': "No usable cost, a cost from another brand's row, or no supply record. Needs a "
+                                      'manual cost or a check.'},
 }
 ROUTING_INFO = {
     'R1': 'Clean placement',
@@ -296,7 +324,7 @@ FLAG_LABELS = {
     'fob_line': 'FOB or factory direct. No US duty or freight.', 'unsourced': 'Some units have no supply record',
     'partial_cost': 'Only part of the units have a cost', 'forced': 'Forced pull from a later batch',
     'fob_wh_fallback': 'FOB account served from the US warehouse', 'program_map': 'Program code decoded by the cost book map',
-    'assumed': 'Attributes assumed. Confirm.', 'range': 'Several prices match. Median used.',
+    'assumed': 'Attributes assumed. Confirm.', 'range': 'Several prices match.',
     'derived': 'Price derived from a related calculator row', 'default': 'Category default price',
     'price_conflict': 'The price file has two prices for the same text',
     'sheet_rate_far': 'This sheet prints an RMB rate far from the other sheets.',
@@ -306,7 +334,8 @@ FLAG_LABELS = {
     'fob_flag': 'Batch has no firm date', 'double_booking': 'Possible double booking', 'blank_ref': 'Ref filled from the PO name',
     'no_ref': 'Ledger line has no ref', 'unpriced': 'No price estimate', 'price_proxy': 'Price estimated from the style',
     'blended_lot': 'Stock may span several receipts', 'legacy_brand_default': 'Legacy SKU. Brand default used.',
-    'sibling': 'Price from a sibling ref of the same factory', 'fabric_median': 'Median of the factory list for the fabric',
+    'sibling': 'Price from a sibling ref of the same factory',
+    'fabric_median': "A row of the factory's list for the same brand and fabric, not this style",
     'non_us_dest': 'Not a US import', 'no_units': 'No open units. The line value is left out.',
     'price_offprice': 'Price estimated from Ross, TJX and Burlington prices for the brand',
     'price_history': "Price from this customer's past invoices",
@@ -319,7 +348,46 @@ FLAG_LABELS = {
     'cost_average': 'Average of several factory quotes',
     'cost_lowest': 'Lowest of several factory quotes. They differ a lot.',
     'fit_as_regular': 'Modern or tailored fit priced at the regular fit',
+    # contract C15
+    'ambiguous_rows': 'Several sheet rows fit. The lowest is used.',
+    'cross_brand': "No sheet quotes this brand. Priced from another brand's row.",
+    'fit_unknown': 'Fit unknown. The regular column is used.',
+    'pattern_guess': 'Regular or digital print not known. The regular print row is used.',
+    'price_unconfirmed': 'The sheet says this price is still needed. Treat it as unconfirmed.',
+    'named_row_conflict': 'A sheet row names this style, but its pattern or sleeve differs from the style number. '
+                          'Confirm which is right.',
 }
+
+# ── Contract C15 (David, Sep 15 2026): one right row per factory sheet ──
+# A style's cost on a sheet comes from exactly one row, picked from the style number: the brand's section (R1), the
+# fabric code (R2), the sleeve (R3), the pattern (R4), no special finish the style does not show (R5), the column for
+# its fit (R6). Rows still tied: the lowest, flagged ambiguous_rows (R7). Never a median of rows.
+C15_FLAGS = ('ambiguous_rows', 'cross_brand', 'fit_unknown', 'pattern_guess')
+C15_REASONS = ('other_brand', 'other_pattern', 'other_sleeve', 'variant_not_this_style', 'lower_confidence',
+               'tie_not_lowest')
+# costRowsSkipped order: the rows closest to the one used first.
+_REASON_ORDER = {r: i for i, r in enumerate(('tie_not_lowest', 'variant_not_this_style', 'lower_confidence',
+                                             'other_pattern', 'other_sleeve', 'other_brand'))}
+# Cost book variant tags. A hard variant row prices only a style that shows that variant. A relative variant row
+# loses to a plain row, and competes with the others (R7) only when no plain row is left.
+HARD_VARIANTS = frozenset({'perforated', 'brushed', 'zipper', 'with_tie', 'two_side_print', 'camp_collar'})
+REL_VARIANTS = frozenset({'white', 'colour', 'usa_cotton', 'xinjiang_cotton', 'cooling'})
+# Fabric codes whose public FABRIC_RULES text says Yarn Dye (YD, SP and CY). A style of these fabrics reads yarn dyed
+# whatever its pattern letter (contract C15 R4 and R5).
+YARN_DYE_FABRICS = frozenset({'YD', 'SP', 'CY'})
+# Cost book record flags read by contract C15: a row whose text says its price is still needed (it loses to any
+# confirmed row), and a row whose pattern the cost book only inferred (R4 reads it as a row with no pattern).
+PROVISIONAL_FLAGS = frozenset({'PROVISIONAL_TEXT_NEED_PRICE'})
+INFERRED_PATTERN_FLAGS = frozenset({'PATTERN_NOT_STATED_INFERRED_SOLID'})
+# What the style number shows, from the public platform dictionaries: fabric UP is perforated (FABRIC_RULES);
+# pattern letter A is a both side print, J and K a camp collar, Z and U a zip collar (SHIRT_COLLAR_CODES,
+# SPORTSWEAR_COLLAR_CODES); customer JT is a shirt and tie set (CUSTOMER_CODES).
+VARIANT_BY_FABRIC = {'UP': 'perforated'}
+VARIANT_BY_COLLAR = {'A': 'two_side_print', 'J': 'camp_collar', 'K': 'camp_collar', 'Z': 'zipper', 'U': 'zipper'}
+VARIANT_BY_CUSTOMER = {'JT': 'with_tie'}
+_CONF_RANK = {'high': 0, 'medium': 1, 'low': 2}
+# The sheet column a price fit reads (styles.costRow).
+FIT_COLUMN = {'SLIM': 'slim', 'REGULAR': 'regular', 'BIG_TALL': 'big_tall'}
 
 # ── Public defaults (DESIGN 5.2; r1_landed_cost.md). The UI marks unconfirmed blocks. ──
 _OFFPRICE = ('ROSS', 'DDS', 'BURL', 'MARS', 'TJMA', 'WINN', 'BEAL', 'BEAL1', 'HAMR', 'CITI', 'VARI', 'GABE', 'FORM')
@@ -639,7 +707,7 @@ def decode_sku(sku, params=None):
             fit = None
         sleeve = 'SS' if (fitc in SHORT_SLEEVE_FITS and cat != 'pants') else 'LS'
         c0 = collar[:1]
-        pat = ('YARN_DYED' if fab in ('YD', 'SP') or c0 == 'Y' else
+        pat = ('YARN_DYED' if fab in YARN_DYE_FABRICS or c0 == 'Y' else
                'SOLID' if c0 and c0 in SOLID_COLLARS else 'PRINT' if c0 and c0 in PRINT_COLLARS else None)
         grp = gp.get(cust)
         d = {'base': b, 'program': False, 'modern': True, 'cust': cust, 'brand': brand, 'fab': fab,
@@ -1232,7 +1300,7 @@ def clean_params(params):
 _REC_TEXT = ('source_code', 'record_kind', 'factory_code', 'production_ref', 'production_ref_resolved', 'style',
              'brand_code', 'category', 'fabric_code_confidence', 'sleeve', 'fit_class', 'pattern',
              'pattern_effective', 'pool')
-_REC_LISTS = ('fabric_codes', 'flags')
+_REC_LISTS = ('fabric_codes', 'flags', 'variant_tags', 'brand_codes', 'names_styles')
 
 
 def _rec_ok(r):
@@ -1241,6 +1309,18 @@ def _rec_ok(r):
     if any(r.get(k) is not None and not isinstance(r.get(k), str) for k in _REC_TEXT):
         return False
     return all(r.get(k) is None or _str_list(r.get(k)) for k in _REC_LISTS)
+
+
+def _rec_brands(r):
+    """The SKU brand codes a record's brand section serves (contract C15 R1): the cost book's brand_codes, else
+    its brand_code, else none."""
+    bc = frozenset(_u(x) for x in (r.get('brand_codes') or ()) if x)
+    return bc or (frozenset([_u(r['brand_code'])]) if r.get('brand_code') else frozenset())
+
+
+def _brand_ok(brands, brand):
+    """A list row serves a style's brand when it names that brand, or names none (contract C15 R1)."""
+    return not brands or brand in brands
 
 
 def program_brand(base):
@@ -1289,32 +1369,28 @@ def _pool_label(pool):
     return lab + (' (%s block)' % grp.title() if head in ('NF-OC', 'YW-SM') and grp else '')
 
 
-def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=()):
+def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=(), row=None, skip=()):
     """A resolution. fx: the share of price that is RMB based (value share; a negative dollar step
-    can put it a little above 1). fxr: the rate that RMB-based part stands at, or None."""
-    return {'level': level, 'price': price, 'alt': price if alt is None else alt, 'basis': basis,
-            'ids': tuple(ids), 'fac': fac, 'rng': rng, 'fx': fx, 'fxr': fxr if fx else None, 'flags': tuple(flags)}
+    can put it a little above 1). fxr: the rate that RMB-based part stands at, or None. row: (record id, fit
+    column) of the one row the price comes from (contract C15), or None. skip: ((record id, reason), ...), the
+    rows the rule set aside. A price from another brand's row (flag cross_brand) caps the grade at D (gcap)."""
+    flags = tuple(flags)
+    out = {'level': level, 'price': price, 'alt': price if alt is None else alt, 'basis': basis,
+           'ids': tuple(ids), 'fac': fac, 'rng': rng, 'fx': fx, 'fxr': fxr if fx else None, 'flags': flags,
+           'row': row, 'skip': tuple(skip)}
+    if 'cross_brand' in flags:
+        out['gcap'] = 'D'
+    return out
 
 
-def _med_parts(cands):
-    """(median price, RMB-based dollars inside it, RMB amount inside it) of calculator candidates,
-    with statistics.median's value: the middle price, or the mean of the two middle prices."""
-    s = sorted(cands, key=lambda c: (c['price'], c['id']))
-    n = len(s)
-    mid = [s[n // 2]] if n % 2 else [s[n // 2 - 1], s[n // 2]]
-    med = mid[0]['price'] if n % 2 else (mid[0]['price'] + mid[1]['price']) / 2
-    k = 1.0 / len(mid)
-    rv = sum(k * c['price'] for c in mid if c['rmb'])
-    ra = sum(k * c['price'] * c['ref'] for c in mid if c['rmb'])
-    return med, rv, ra
-
-
-def _mean(xs):
-    return sum(xs) / len(xs) if xs else None
-
-
-def _med(xs):
-    return statistics.median(xs) if xs else None
+def _lowest(items):
+    """Contract C15 R7 on list prices: [(price, record id)] -> (price, record id, flags, range, skip). The lowest
+    price wins (then the lowest id); more than one row is flagged ambiguous_rows and the others are listed."""
+    s = sorted(items, key=lambda x: (x[0], x[1]))
+    if len(s) == 1:
+        return s[0][0], s[0][1], (), None, ()
+    return (s[0][0], s[0][1], ('ambiguous_rows',), (s[0][0], s[-1][0]),
+            tuple((x[1], 'tie_not_lowest') for x in s[1:]))
 
 
 def _wmedian(items):
@@ -1450,6 +1526,12 @@ class CostIndex:
                 return p * e / self.fx_rate
         return p
 
+    def sheet_price(self, r):
+        """The price a record's sheet prints (the 'usd' role, else the 'base' role), whatever the saved rate or
+        basis: the price styles.costRow and costRowsSkipped show (contract C15)."""
+        p = self.rec_usd(r)
+        return _fnum(r.get(self._f_base)) if p is None and self._f_base else p
+
     def rec_ref(self, r):
         """fxRef of a record: the rate its price stands at (the saved rate, else its sheet rate).
         None for a USD price (lists, quotations) or a record whose rate cannot be found."""
@@ -1509,8 +1591,14 @@ class CostIndex:
         self.ky_ref, self.ky_rate = {}, defaultdict(list)
         self.pc_facs, self.dp_facs, self.ky_facs = set(), set(), set()
         self.dp_fabs, self.ky_fabs = set(), set()
+        # A customer quotation that names one exact style with its price in a picture on the sheet (record kind
+        # image_callout): that style's own quote, {style: (price, record id, factory)} (contract C15 R0).
+        self.img_style = {}
         for r in recs:
             sc, pr = r.get('source_code'), self.rec_price(r)
+            if pr is not None and r.get('record_kind') == 'image_callout' and _u(r.get('style')):
+                self.img_style[norm_vd(_u(r.get('style')))] = (pr, r['id'], _u(r.get('factory_code')) or 'UNKNOWN')
+                continue
             if pr is None or r.get('record_kind') != 'ref_price_list':
                 continue
             if sc == 'PC':
@@ -1525,22 +1613,25 @@ class CostIndex:
                 d = self.decode(stn)
                 if d:
                     self.pc_design[stn[2:]].append((pr, r['id'], ref))
+                    # brand, pattern and price fit of the listed style: the fabric rung takes one row of the style's
+                    # own brand, pattern and fit column (contract C15 R1, R4, R6).
                     for code in (r.get('fabric_codes') or [d['fab']]):
-                        self.pc_fcs[(code, d['cat'], d['sleeve'] if d['cat'] != 'pants' else '-')].append((pr, r['id']))
+                        self.pc_fcs[(code, d['cat'], d['sleeve'] if d['cat'] != 'pants' else '-')].append(
+                            (pr, r['id'], d['brand'], d['pat'], price_fit(d['fit'])))
             elif sc == 'DP':
                 ref = _u(r.get('production_ref_resolved'))
                 self.dp_facs.add(_u(r.get('factory_code')) or fac_of(ref))
                 self.dp_fabs.update(r.get('fabric_codes') or [])
                 self.dp_ref[(ref, r.get('pattern'))].append((pr, r['id']))
                 amazon = 'AMAZON' in str(r.get('customer_group') or '').upper()
-                self.dp_rate[(r.get('pattern'), r.get('sleeve') or 'LS', amazon)].append((pr, r['id']))
+                self.dp_rate[(r.get('pattern'), r.get('sleeve') or 'LS', amazon)].append((pr, r['id'], _rec_brands(r)))
             elif sc == 'KY':
                 ref = _u(r.get('production_ref_resolved'))
                 self.ky_facs.add(_u(r.get('factory_code')) or fac_of(ref))
                 self.ky_fabs.update(r.get('fabric_codes') or [])
                 self.ky_ref[(ref, r.get('pattern'), r.get('fit_class'))] = (pr, r['id'])
                 amazon = 'AMAZON' in (str(r.get('customer_group') or '') + str(r.get('fabrication') or '')).upper()
-                self.ky_rate[(r.get('pattern'), r.get('fit_class'), amazon)].append((pr, r['id']))
+                self.ky_rate[(r.get('pattern'), r.get('fit_class'), amazon)].append((pr, r['id'], _rec_brands(r)))
         self.dp_refs = {k[0] for k in self.dp_ref}
         self.ky_refs = {k[0] for k in self.ky_ref}
         # Contract C13: the Pinnacle-type list quotes of each style (DV brand letters fold to VD), one per ref.
@@ -1568,7 +1659,9 @@ class CostIndex:
         cfg = self.pool_cfg
         kinds = set(cfg.get('recordKinds') or ('calculator', 'factory_quotation'))
         excl = set(cfg.get('excludeFlags') or ())
-        self.calc_p, self.calc_a = defaultdict(list), defaultdict(list)
+        # calc_a: the calculator rows of each pool (sheet) by every fabric code they carry. pool_brands: the SKU
+        # brand codes each pool has a section for (contract C15 R1).
+        self.calc_a, self.pool_brands = defaultdict(list), defaultdict(set)
         for r in recs:
             if r.get('record_kind') not in kinds or excl.intersection(r.get('flags') or ()):
                 continue
@@ -1579,16 +1672,30 @@ class CostIndex:
             alt = self.rec_cut(r)
             ref = self.rec_ref(r)
             codes = [c for c in (r.get('fabric_codes') or []) if c]
+            prim = r.get('fabric_code_primary')
+            brands = _rec_brands(r)
             # price: the printed Current USD, or its RMB amount at the saved rate (contract C10). rmb and
-            # ref: an RMB-based record and the rate its price stands at (fxRef).
-            c = {'id': r['id'], 'brand': r.get('brand_code'), 'codes': codes, 'conf': r.get('fabric_code_confidence'),
-                 'cat': r.get('category'), 'fit': r.get('fit_class'), 'sleeve': r.get('sleeve'),
-                 'pat': r.get('pattern_effective'), 'price': pr, 'alt': pr if alt is None else alt,
-                 'rmb': ref is not None, 'ref': ref, 'quote': r.get('record_kind') == 'factory_quotation',
-                 'restated': any('SHEET_E1_IS' in str(f) for f in (r.get('flags') or ())),
+            # ref: an RMB-based record and the rate its price stands at (fxRef). Contract C15: brands (the SKU
+            # brand codes its section serves), generic (an all-brand section), primary (its first fabric code),
+            # pat (its pattern; a pattern the cost book only inferred reads as none, R4), tags (its variant tags),
+            # names (the style numbers its text names), prov (its text says the price is still needed), row (its
+            # sheet row, the last tie break).
+            rfl = set(r.get('flags') or ())
+            rn = r.get('row')
+            c = {'id': r['id'], 'brand': r.get('brand_code'), 'brands': brands, 'generic': r.get('brand_scope') == 'all',
+                 'codes': codes, 'primary': prim if prim in codes else (codes[0] if codes else None),
+                 'conf': r.get('fabric_code_confidence'), 'cat': r.get('category'), 'fit': r.get('fit_class'),
+                 'sleeve': r.get('sleeve'),
+                 'pat': r.get('pattern') if rfl & INFERRED_PATTERN_FLAGS else r.get('pattern_effective'), 'price': pr,
+                 'alt': pr if alt is None else alt, 'rmb': ref is not None, 'ref': ref,
+                 'quote': r.get('record_kind') == 'factory_quotation',
+                 'tags': frozenset(t for t in (r.get('variant_tags') or ()) if t),
+                 'names': tuple(n for n in (_u(x) for x in (r.get('names_styles') or ())) if n),
+                 'prov': bool(rfl & PROVISIONAL_FLAGS),
+                 'row': rn if isinstance(rn, int) and not isinstance(rn, bool) else 10 ** 9,
+                 'restated': any('SHEET_E1_IS' in str(f) for f in rfl),
                  'conflict': any(str(g).startswith('same_text') for g in self.conflict_of.get(r['id'], ()))}
-            if codes:
-                self.calc_p[(pool, codes[0])].append(c)
+            self.pool_brands[pool].update(brands)
             for code in dict.fromkeys(codes):
                 self.calc_a[(pool, code)].append(c)
 
@@ -1709,150 +1816,334 @@ class CostIndex:
         quotation pool for group HALF)."""
         return self.QUOTE_BRAND_NEUTRAL and bool(grp) and str(pool or '').partition(':')[2] == grp
 
-    def _cand(self, pools, sku, brand, alt, fit, sleeve, pat_mode='exact'):
-        fab, polo, sp = sku['fab'], sku['cat'] == 'polo', sku['pat']
-        idx = self.calc_a if alt else self.calc_p
+    def style_hints(self, sku):
+        """The variants a style shows by its number (contract C15 R5): its fabric code, pattern letter and customer
+        code, read with the public platform dictionaries (VARIANT_BY_FABRIC, _COLLAR, _CUSTOMER)."""
+        if not sku:
+            return frozenset()
+        return frozenset(v for v in (VARIANT_BY_FABRIC.get(sku.get('fab')),
+                                     VARIANT_BY_COLLAR.get((sku.get('collar') or '')[:1]),
+                                     VARIANT_BY_CUSTOMER.get(sku.get('cust'))) if v)
+
+    @staticmethod
+    def names_style(c, b):
+        """True when a calculator row's text names base style b (contract C15 R0): a full style number names its
+        design on any customer (the part after the customer code); a ten character number written without its fabric
+        code ('ZZQA901WRS': customer, brand, serial, fit and pattern; the cost book flags the row for a check) names
+        the style of that customer and brand; a number written after STYLE# names the serial, fit and pattern letters
+        within the row's own brand section."""
+        if not c['names'] or not MOD_SKU_RE.match(b or ''):
+            return False
+        return any((len(n) >= 11 and n[2:] == b[2:]) or (len(n) == 10 and n[:4] == b[:4] and n[4:] == b[6:])
+                   or (len(n) < 10 and n == b[6:]) for n in c['names'])
+
+    @staticmethod
+    def fit_col(sku):
+        """(price fit, known) of contract C15 R6: the slim, regular or big and tall column from the fit code; modern
+        and tailored take regular (price_fit); an unknown or missing fit takes regular, with known False."""
+        f = price_fit(sku.get('fit')) if sku else None
+        return (f, True) if f in FIT_COLUMN else ('REGULAR', False)
+
+    def _cv(self, c):
+        """The value a calculator row counts at in R7: the price in use (the after-cut reading on that basis)."""
+        return c['alt'] if self.after_cut else c['price']
+
+    def _lrow(self, rid, sku):
+        """(record id, fit column) of a list row for styles.costRow: the row's own fit column, else the style's."""
+        r = self.records.get(rid) or {}
+        return rid, FIT_COLUMN.get(r.get('fit_class')) or FIT_COLUMN[self.fit_col(sku)[0]]
+
+    @staticmethod
+    def _fit_note(sku):
+        if not sku or sku.get('fit') in ('SLIM', 'REGULAR', 'BIG_TALL'):
+            return ''
+        if sku.get('fit') in ('MODERN', 'TAILORED'):
+            return ' The %s fit takes the regular fit price.' % str(sku['fit']).lower()
+        return ' The style number has no known fit, so the regular fit price is used.'
+
+    def _pick(self, pools, sku, fc, sleeve, cross=False, strict=True):
+        """Contract C15: the one row of the first pool (sheet) in pools that quotes the style, or None.
+        -> {'pool', 'c': the row, 'tie': the rows R7 chose among (lowest first), 'skip': [(row, reason)], 'flags'}.
+        Rows looked at: the pool's rows that carry the style's fabric code (R2), at the fit column fc (R6), in the
+        style's garment class (polo or not). In order:
+          R1  the style's own brand section. With no section for the brand on this sheet: its generic (all-brand)
+              rows, or the customer group's own brand-less quotation. cross: every other brand's section (last
+              resort); a customer's brand-less quotation serves there only in that customer group's own pool.
+          R0  a row whose text names the style is that style's row, before the sleeve, pattern and variant rules
+              (own brand only). A known fit code's sleeve decides between named rows; with an unknown fit code the
+              named rows' own sleeves decide. A named row whose pattern (or, with a known fit, sleeve) differs from
+              the style number still wins, flagged named_row_conflict.
+          R3  the row's sleeve. A row with no sleeve is a long sleeve price, as the cost book reads it; a short
+              sleeve style reaches it only through the short sleeve step (calc_match).
+          R4  the row's pattern, when both are known (a pattern the cost book only inferred counts as none).
+          R5  a hard variant row (brushed, perforated, zipper, tie, both side print, camp collar) only for a style
+              that shows the variant, and a style that shows one takes that row.
+          R2  strict (the exact rungs): the style's code comes first on the row, at high or medium confidence. Then
+              the best confidence, then rows where the code comes first.
+          R4  a pattern-specific row beats a row with no pattern. A regular print beats a digital print unless the
+              style shows a digital print (flag pattern_guess).
+          R5  a row whose text says its price is still needed loses to any confirmed row (reason lower_confidence;
+              flag price_unconfirmed when only such rows are left). A plain row beats white, colour, cooling and
+              cotton-origin rows and rows that name other styles.
+          R7  the lowest (then the lowest sheet row, then the lowest id); more than one row left is flagged
+              ambiguous_rows."""
+        fab, b, sp = sku['fab'], sku['base'], sku.get('pat')
+        polo, brand = sku['cat'] == 'polo', sku.get('brand')
+        hints = self.style_hints(sku)
+        known = self.fit_col(sku)[1]
+
+        def tie_key(c):
+            return self._cv(c), c['row'], c['id']
         for pool in pools:
-            src = idx.get((pool, fab))
+            src = self.calc_a.get((pool, fab))
             if not src:
                 continue
-            # A factory quotation made for one customer group names no brand. In that group's own
-            # pool it counts as brand matched, so the customer's own quote is not skipped.
+            rows = [c for c in src if c['cat'] != 'other' and polo == (c['cat'] == 'polo') and c['fit'] == fc]
+            if not rows:
+                continue
+            # A factory quotation made for this customer group (it names no brand) in the group's own pool.
             own = self._own_pool(pool, sku.get('group'))
-            out = []
-            for c in src:
-                if brand and c['brand'] != sku['brand'] and not (own and c['quote'] and c['brand'] is None):
+            if cross:
+                def ok_b(c):
+                    return (brand is None or brand not in c['brands']) and (own or not (c['quote'] and not c['brands']))
+            elif brand is not None and brand in self.pool_brands.get(pool, ()):
+                def ok_b(c):
+                    return brand in c['brands']
+            else:
+                # No section for the brand on this sheet: an all-brand section, or the group's own quotation.
+                def ok_b(c):
+                    return c['generic'] or (own and c['quote'] and not c['brands'])
+            skip, E, why = [], [], {}
+            for c in rows:
+                s_ok = (c['sleeve'] or 'LS') == sleeve
+                p_ok = sp is None or c['pat'] is None or c['pat'] == sp
+                if not ok_b(c):
+                    if s_ok and p_ok:                  # other brands' rows for the same key only
+                        skip.append((c, 'other_brand'))
                     continue
-                if not alt and c['conf'] not in ('high', 'medium'):
-                    continue
-                if c['cat'] == 'other' or polo != (c['cat'] == 'polo'):
-                    continue
-                if c['fit'] != fit or (c['sleeve'] or 'LS') != sleeve:
-                    continue
-                if pat_mode == 'exact' and c['pat'] is not None and sp is not None and c['pat'] != sp:
-                    continue
-                out.append(c)
-            if out:
-                if brand and any(c['brand'] == sku['brand'] for c in out):
-                    out = [c for c in out if c['brand'] == sku['brand']]
-                if pat_mode == 'exact' and sp is not None and any(c['pat'] == sp for c in out):
-                    out = [c for c in out if c['pat'] == sp]
-                return pool, out
-        return None, []
+                why[c['id']] = ('other_sleeve' if not s_ok else 'other_pattern' if not p_ok else
+                                'variant_not_this_style' if (c['tags'] & HARD_VARIANTS) - hints else None)
+            named = [] if cross else [c for c in rows if c['id'] in why and self.names_style(c, b)]
+            if named:
+                return self._pick_named(pool, rows, named, why, skip, sleeve, sp, known, tie_key)
+            for c in rows:
+                if c['id'] in why:
+                    if why[c['id']]:
+                        skip.append((c, why[c['id']]))
+                    else:
+                        E.append(c)
 
-    def calc_match(self, sku, fac, grp):
-        """-> (level, pool, candidates, adjustment, how) or None."""
+            def narrow(keep, reason):
+                ks = {c['id'] for c in keep}
+                skip.extend((c, reason) for c in E if c['id'] not in ks)
+                return keep
+            hv = [c for c in E if c['tags'] & hints & HARD_VARIANTS]
+            if hv:
+                E = narrow(hv, 'variant_not_this_style')
+            if strict:
+                E = narrow([c for c in E if c['primary'] == fab and c['conf'] in ('high', 'medium')], 'lower_confidence')
+            if not E:
+                continue
+
+            def rank(c):
+                return _CONF_RANK.get(c['conf'], 3), 0 if c['primary'] == fab else 1
+            r0 = min(rank(c) for c in E)
+            E = narrow([c for c in E if rank(c) == r0], 'lower_confidence')
+            flags = []
+            if sp is not None and any(c['pat'] == sp for c in E):
+                E = narrow([c for c in E if c['pat'] == sp], 'other_pattern')
+            if sp == 'PRINT':
+                dig = [c for c in E if 'digital_print' in c['tags']]
+                if dig and len(dig) < len(E):
+                    if 'digital_print' in hints:
+                        E = narrow(dig, 'variant_not_this_style')
+                    else:
+                        E = narrow([c for c in E if 'digital_print' not in c['tags']], 'variant_not_this_style')
+                        flags.append('pattern_guess')
+            firm = [c for c in E if not c['prov']]
+            if firm and len(firm) < len(E):
+                E = narrow(firm, 'lower_confidence')
+            elif not firm:
+                flags.append('price_unconfirmed')
+            rel = [c for c in E if c['tags'] & hints & REL_VARIANTS]
+            plain = [c for c in E if not (c['tags'] & REL_VARIANTS) and not c['names']]
+            if rel or plain:
+                E = narrow(rel or plain, 'variant_not_this_style')
+            E = sorted(E, key=tie_key)
+            if len(E) > 1:
+                flags.append('ambiguous_rows')
+                skip.extend((c, 'tie_not_lowest') for c in E[1:])
+            skip.sort(key=lambda t: (_REASON_ORDER[t[1]],) + tie_key(t[0]))
+            return {'pool': pool, 'c': E[0], 'tie': E, 'skip': skip, 'flags': flags}
+        return None
+
+    def _pick_named(self, pool, rows, named, why, skip, sleeve, sp, known, tie_key):
+        """Contract C15 R0 on one sheet: the rows whose text names the style. A known fit code's sleeve decides between
+        them (a row with no sleeve serves); an unknown fit code lets their own sleeves decide. Then the style's
+        pattern (a row with no pattern serves), a confirmed price over one the sheet says is still needed, and R7.
+        A named row that disagrees with the style number's pattern or sleeve still wins, flagged named_row_conflict.
+        Every other row of the brand's section is set aside with its own reason, else variant_not_this_style (a
+        row names this style)."""
+        flags, N = [], list(named)
+
+        def narrow(keep, reason):
+            ks = {c['id'] for c in keep}
+            skip.extend((c, reason) for c in N if c['id'] not in ks)
+            return keep
+        if known:
+            m = [c for c in N if c['sleeve'] in (None, sleeve)]
+            if m:
+                N = narrow(m, 'other_sleeve')
+            else:
+                flags.append('named_row_conflict')
+        m = [c for c in N if sp is None or c['pat'] is None or c['pat'] == sp]
+        if m:
+            N = narrow(m, 'other_pattern')
+        elif 'named_row_conflict' not in flags:
+            flags.append('named_row_conflict')
+        firm = [c for c in N if not c['prov']]
+        if firm and len(firm) < len(N):
+            N = narrow(firm, 'lower_confidence')
+        elif not firm:
+            flags.append('price_unconfirmed')
+        N = sorted(N, key=tie_key)
+        if len(N) > 1:
+            flags.append('ambiguous_rows')
+            skip.extend((c, 'tie_not_lowest') for c in N[1:])
+        ids = {c['id'] for c in named}
+        skip.extend((c, why[c['id']] or 'variant_not_this_style') for c in rows if c['id'] in why and c['id'] not in ids)
+        skip.sort(key=lambda t: (_REASON_ORDER[t[1]],) + tie_key(t[0]))
+        return {'pool': pool, 'c': N[0], 'tie': N, 'skip': skip, 'flags': flags, 'named': True}
+
+    def calc_match(self, sku, fac, grp, cross=False):
+        """-> (level, pick, adjustment, how, cross) or None (contract C15). Own brand: the exact rungs (L4a in the
+        factory's own grid, L4b in the other; a style with no known fit takes the regular column at L4d), then the
+        derived rungs (L4d): an alternate or low confidence fabric code, short sleeve from the long sleeve row plus
+        the short sleeve step, regular or big and tall from the slim row plus the fit premium. cross: the same rungs
+        on other brands' rows, every one at level L4c (flag cross_brand, grade D); _resolve tries it last. Each rung
+        takes one row (_pick). A solid style never takes a print row, nor the reverse (R4): no rung relaxes it."""
         if sku['cat'] in ('pants', 'blazer', 'vest', 'overshirt') or not sku.get('fab'):
             return None
         prim, fb = self.pool_order(fac, grp, sku['cat'])
-        fitc, sl = sku['fit'], sku['sleeve']
-        fc = fitc if fitc in ('SLIM', 'REGULAR', 'BIG_TALL') else None
-        if fc:
-            for lvl, pools, brand in (('L4a', prim, True), ('L4b', fb, True), ('L4c', prim + fb, False)):
-                pool, c = self._cand(pools, sku, brand, False, fc, sl)
-                if c:
-                    return lvl, pool, c, 0.0, 'exact'
-        fits = [fc] if fc else []
-        if fitc in ('MODERN', 'TAILORED'):
-            fits.append('REGULAR')
-        if not fits:
-            fits = ['SLIM']
         allp = prim + fb
-        ssd = self.ss_delta
-        for brand in (True, False):
-            for f in fits:
-                pool, c = self._cand(allp, sku, brand, True, f, sl)
-                if c:
-                    return 'L4d', pool, c, 0.0, ('alt_code' if f == fc else 'fit_mapped')
-            if sl == 'SS' and ssd is not None:
-                for f in fits:
-                    pool, c = self._cand(allp, sku, brand, True, f, 'LS')
-                    if c:
-                        return 'L4d', pool, c, ssd, 'ss_from_ls'
-            add = self.bt_add if fits[0] == 'BIG_TALL' else self.reg_add if fits[0] == 'REGULAR' else None
-            if add is not None:
-                for s in ([sl, 'LS'] if sl == 'SS' else [sl]):
-                    if s != sl and ssd is None:
-                        continue
-                    pool, c = self._cand(allp, sku, brand, True, 'SLIM', s)
-                    if c:
-                        return 'L4d', pool, c, add + (ssd if s != sl else 0.0), 'fit_from_slim'
-            for f in fits:
-                for s in ([sl, 'LS'] if sl == 'SS' else [sl]):
-                    if s != sl and ssd is None:
-                        continue
-                    pool, c = self._cand(allp, sku, brand, True, f, s, 'any')
-                    if c:
-                        return 'L4d', pool, c, (ssd if s != sl else 0.0), 'pattern_relaxed'
+        fc, known = self.fit_col(sku)
+        sl, ssd = sku['sleeve'], self.ss_delta
+        how = 'exact' if fc == sku['fit'] else 'fit_regular' if known else 'fit_unknown'
+        lvl_d = 'L4c' if cross else 'L4d'
+        exact = ((('L4c', allp),) if cross else (('L4a', prim), ('L4b', fb)) if known else (('L4d', allp),))
+        for lvl, pools in exact:
+            s = self._pick(pools, sku, fc, sl, cross)
+            if s:
+                return lvl, s, 0.0, how, cross
+        s = self._pick(allp, sku, fc, sl, cross, strict=False)
+        if s:
+            return lvl_d, s, 0.0, 'alt_code', cross
+        if sl == 'SS' and ssd is not None:
+            s = self._pick(allp, sku, fc, 'LS', cross, strict=False)
+            if s:
+                return lvl_d, s, ssd, 'ss_from_ls', cross
+        add = self.bt_add if fc == 'BIG_TALL' else self.reg_add if fc == 'REGULAR' else None
+        if add is not None:
+            for s_ in ([sl, 'LS'] if sl == 'SS' else [sl]):
+                if s_ != sl and ssd is None:
+                    continue
+                s = self._pick(allp, sku, 'SLIM', s_, cross, strict=False)
+                if s:
+                    return lvl_d, s, add + (ssd if s_ != sl else 0.0), 'fit_from_slim', cross
         return None
 
-    def _calc_res(self, sku, fac, lvl, pool, cands, adj, how):
-        """A calculator resolution (levels L4a to L4d) from matched candidates. The ladder and the direct
-        calculator quotes of contract C13 both build it here, so their prices, ranges, RMB parts and flags
-        agree. how 'fit_regular': a modern or tailored fit priced at the regular fit column (C13)."""
-        pr = [c['price'] for c in cands]
-        al = [c['alt'] for c in cands]
-        med, rv, ra = _med_parts(cands)
-        fit_word = str(sku['fit'] or '').lower()
-        how_text = {'exact': ('same brand, fabric, fit, sleeve and pattern' if lvl != 'L4c'
-                              else 'another brand with the same fabric, fit, sleeve and pattern'),
-                    'fit_regular': 'same brand, fabric, sleeve and pattern, %s fit at the regular fit price' % fit_word,
-                    'alt_code': 'alternate or low confidence fabric code',
-                    'fit_mapped': '%s fit priced as regular' % fit_word,
-                    'ss_from_ls': 'short sleeve derived from the long sleeve row',
-                    'fit_from_slim': 'fit derived from the slim row plus the median fit premium',
-                    'pattern_relaxed': 'pattern relaxed'}[how]
+    def _calc_res(self, sku, fac, lvl, sel, adj, how, cross=False):
+        """A calculator resolution (levels L4a to L4d; L4c for another brand's row) from the one row picked by
+        contract C15 (sel, from _pick). The ladder and the direct calculator quotes of contract C13 both build it
+        here, so their prices, RMB parts and flags agree. The price is the row's price plus a dollar step (adj: the
+        short sleeve step or a fit premium, from the cost book params; it does not move with the rate). The
+        evidence is the row used; the rows set aside ride along in skip. A tie (R7) keeps its price range."""
+        c = sel['c']
+        fit = sku.get('fit')
+        known = self.fit_col(sku)[1]
+        who = 'fabric' if cross else 'brand, fabric'
+        text = {'exact': 'same %s, fit, sleeve and pattern' % who,
+                'fit_regular': 'same %s, sleeve and pattern, %s fit at the regular fit price' % (who, str(fit).lower()),
+                'fit_unknown': 'same %s, sleeve and pattern at the regular fit price, because the style number has '
+                               'no known fit' % who,
+                'alt_code': 'alternate or low confidence fabric code',
+                'ss_from_ls': 'short sleeve derived from the long sleeve row',
+                'fit_from_slim': 'fit derived from the slim row plus the fit premium'}[how]
         # The customer's own factory quotation, matched in its group pool although it names no brand.
-        neutral = sku['brand'] is not None and all(c['quote'] and c['brand'] is None for c in cands)
+        neutral = not cross and sku.get('brand') is not None and c['quote'] and not c['brands']
         if neutral and how == 'exact':
-            how_text = "this customer's own quotation for the fabric, fit, sleeve and pattern"
+            text = "this customer's own quotation for the fabric, fit, sleeve and pattern"
+        said = ["Another brand's row, because no sheet quotes this brand for the style"] if cross else []
+        said.append(text)
+        if sel.get('named'):
+            said.append('The row text names this style, so it is the style\'s row')
+        if 'named_row_conflict' in sel['flags']:
+            said.append('That row\'s pattern or sleeve differs from the style number. Confirm which is right')
+        if 'pattern_guess' in sel['flags']:
+            said.append('The style number does not say digital print, so the regular print row is used')
+        if 'price_unconfirmed' in sel['flags']:
+            said.append('The sheet says this price is still needed, so it is unconfirmed')
+        if 'ambiguous_rows' in sel['flags']:
+            said.append('Several rows fit, so the lowest is used')
         flags = ['customer_quote'] if neutral else []
-        if max(pr) - min(pr) > 0.005:
-            flags.append('range')
-        if lvl == 'L4d':
+        if lvl == 'L4d' or (cross and how in ('alt_code', 'ss_from_ls', 'fit_from_slim')):
             flags.append('derived')
-        if how == 'fit_regular':
+        if cross:
+            flags.append('cross_brand')
+        if fit in ('MODERN', 'TAILORED'):
             flags.append('fit_as_regular')
+        if not known:
+            flags.append('fit_unknown')
+        flags.extend(sel['flags'])
         if sku['program']:
             flags.append('program_map')
             if 'ASSUM' in str(sku.get('src') or '').upper():
                 flags.append('assumed')
-        if any(c['conflict'] for c in cands):
+        if c['conflict']:
             flags.append('price_conflict')
-        if any(c['restated'] for c in cands):
+        if c['restated']:
             flags.append('sheet_rate_far')
-        basis = '%s: %s.' % (_pool_label(pool), how_text[0].upper() + how_text[1:])
+        basis = '%s: %s.' % (_pool_label(sel['pool']), '. '.join(s[0].upper() + s[1:] for s in said))
         if sku['program']:
             basis += ' Program code decoded by the cost book map.'
-        # Candidates already stand at the P&L's basis, so the median, the range and the RMB-based share
-        # (value share) are consistent. A fit or sleeve step (adj) is a dollar amount from the cost book
-        # params and does not move with the rate.
-        price = med + adj
-        fx = rv / price if price > 0 and rv > 0 else 0.0
-        return _R(lvl, price, basis, [c['id'] for c in cands], fac, alt=_med(al) + adj,
-                  rng=(min(pr) + adj, max(pr) + adj), fx=fx, fxr=(ra / rv) if rv > 0 else None, flags=flags)
+        # The row's price already stands at the P&L's basis (printed, or the saved rate), so the RMB-based share
+        # (value share) is exact.
+        price = c['price'] + adj
+        tie = sel['tie']
+        return _R(lvl, price, basis, (c['id'],), fac, alt=c['alt'] + adj,
+                  rng=(tie[0]['price'] + adj, max(x['price'] for x in tie) + adj) if len(tie) > 1 else None,
+                  fx=c['price'] / price if c['rmb'] and price > 0 else 0.0, fxr=c['ref'] if c['rmb'] else None,
+                  flags=flags, row=(c['id'], FIT_COLUMN.get(c['fit'], 'regular')),
+                  skip=tuple((x['id'], why) for x, why in sel['skip']))
 
     # ── contract C13: every factory's direct quote, and one combined cost per style ──
     def grid_exact(self, sku, fac):
         """The exact calculator match of a style under one factory's grid order (contract C13): the style's own
         brand, fabric, fit, sleeve and pattern, at the style's fit column (modern and tailored at the regular
-        column). -> (level, pool, candidates, 0.0, how) with level L4a (the factory's own grid) or L4b (the
-        other grid), or None. It repeats the first, exact rung of calc_match."""
+        column). -> (level, pick, 0.0, how) with level L4a (the factory's own grid) or L4b (the other grid), or
+        None. It repeats the exact rungs of calc_match, so it picks the same one row (contract C15)."""
         if sku is None or sku['cat'] in ('pants', 'blazer', 'vest', 'overshirt') or not sku.get('fab'):
             return None
         fc = price_fit(sku['fit'])
-        if fc not in ('SLIM', 'REGULAR', 'BIG_TALL'):
+        if fc not in FIT_COLUMN:
             return None
         prim, fb = self.pool_order(fac, sku['group'], sku['cat'])
         for lvl, pools in (('L4a', prim), ('L4b', fb)):
-            pool, c = self._cand(pools, sku, True, False, fc, sku['sleeve'])
-            if c:
-                return lvl, pool, c, 0.0, ('exact' if fc == sku['fit'] else 'fit_regular')
+            s = self._pick(pools, sku, fc, sku['sleeve'])
+            if s:
+                return lvl, s, 0.0, ('exact' if fc == sku['fit'] else 'fit_regular')
         return None
 
     def _qv(self, q):
         """The value a quote or a factory value counts at: the price in use (the after-cut reading on that basis)."""
         return q['alt'] if self.after_cut else q['price']
+
+    def _img_res(self, im, sku, fac):
+        """Level L1 from a customer quotation that names the exact style, its price shown in a picture on the sheet
+        (contract C15 R0: the row that names the style is its row). A USD price: no RMB part."""
+        pr, rid = im[0], im[1]
+        return _R('L1', pr, "This customer's quotation names the style. Its price is shown in a picture on the sheet.",
+                  (rid,), fac, flags=('customer_quote',), row=self._lrow(rid, sku))
 
     def _pool_sheet(self, cands):
         sheets = sorted({str((self.records.get(c['id']) or {}).get('sheet') or '').strip() for c in cands} - {''})
@@ -1882,62 +2173,66 @@ class CostIndex:
         out = []
         for ref, pr, rid in self.pc_by_style.get(norm_vd(b), ()):
             r = self.records[rid]
-            q = _R('L1', pr, 'Factory list, same ref and style.', (rid,), _u(r.get('factory_code')) or fac_of(ref))
+            q = _R('L1', pr, 'Factory list, same ref and style.', (rid,), _u(r.get('factory_code')) or fac_of(ref),
+                   row=self._lrow(rid, sku))
             out.append(dict(q, src=str(r.get('source_code') or ''), where=ref or None))
+        im = self.img_style.get(norm_vd(b))
+        if im:                                  # a customer quotation that names the style (its factory's one row)
+            r = self.records[im[1]]
+            out.append(dict(self._img_res(im, sku, im[2]), src=str(r.get('source_code') or ''),
+                            where=str(r.get('sheet') or '').strip() or None))
         if sku:
             pat, fit = sku['pat'], price_fit(sku['fit'])
             for fac in sorted(carry):
                 for ref in sorted(carry[fac]):
                     if ref in self.dp_refs and (ref, pat) in self.dp_ref:
-                        ps = self.dp_ref[(ref, pat)]
-                        q = _R('L2', _mean([x[0] for x in ps]), 'Factory list, same ref and pattern.',
-                               [x[1] for x in ps], fac)
+                        p, rid, fl, rng, sk = _lowest(self.dp_ref[(ref, pat)])       # one row (contract C15 R7)
+                        q = _R('L2', p, 'Factory list, same ref and pattern.' + (
+                            ' Several rows fit, so the lowest is used.' if fl else ''), (rid,), fac, rng=rng, flags=fl,
+                            row=self._lrow(rid, sku), skip=sk)
                     elif ref in self.ky_refs and (ref, pat, fit) in self.ky_ref:
                         pr, rid = self.ky_ref[(ref, pat, fit)]
                         mapped = fit != sku['fit']
                         q = _R('L2', pr, 'Factory list, same ref, pattern and fit.' + (
                             ' The %s fit takes the regular fit price.' % str(sku['fit']).lower() if mapped else ''),
-                            (rid,), fac, flags=('fit_as_regular',) if mapped else ())
+                            (rid,), fac, flags=('fit_as_regular',) if mapped else (), row=self._lrow(rid, sku))
                     else:
                         continue
                     out.append(dict(q, src=str(self.records[q['ids'][0]].get('source_code') or ''), where=ref))
         lists = self.pc_facs | self.dp_facs | self.ky_facs
         grid = [fac for fac in sorted(carry)
-                if fac not in lists or not any(self.raw(b, fac, ref, pn, allow_default=False, use_ovr=False)['level']
-                                               in _LIST_LEVELS for ref, pn in sorted(carry[fac].items()))]
+                if (not im or fac != im[2])
+                and (fac not in lists or not any(self.raw(b, fac, ref, pn, allow_default=False, use_ovr=False)['level']
+                                                 in _LIST_LEVELS for ref, pn in sorted(carry[fac].items())))]
         if not carry and not out:
             grid = ['UNKNOWN']
         for fac in grid:
             m = self.grid_exact(sku, fac)
             if m:
-                out.append(dict(self._calc_res(sku, fac, *m), src=str(m[1]).partition(':')[0],
-                                where=self._pool_sheet(m[2])))
+                out.append(dict(self._calc_res(sku, fac, *m), src=str(m[1]['pool']).partition(':')[0],
+                                where=self._pool_sheet([m[1]['c']])))
         out.sort(key=lambda q: (self._qv(q), q['fac'], q['src'], q['where'] or ''))
         self._quotes[b] = out
         return out
 
     def _fac_value(self, fac, qs):
-        """One value per factory (contract C13): the median of its direct quotes (the mean of the middle two for
-        an even count), with the RMB-based part and rate of the quotes it takes, its least certain level and
-        that level's grade."""
+        """One value per factory (contracts C13 and C15): its one row. A factory that quotes the style more than
+        once (a list on several refs) counts at its lowest quote (R7, flag ambiguous_rows); the other quotes' rows
+        are listed as set aside. Level, grade, RMB part and rate are the used quote's."""
         s = sorted(qs, key=lambda q: (self._qv(q), q['where'] or '', q['ids']))
-        n = len(s)
-        mid = [s[n // 2]] if n % 2 else [s[n // 2 - 1], s[n // 2]]
-        k = 1.0 / len(mid)
-        price = sum(k * q['price'] for q in mid)
-        rv = sum(k * q['price'] * (q['fx'] or 0.0) for q in mid)
-        level = _worst_level(q['level'] for q in s)
+        q0, n = s[0], len(s)
         vals = [q['price'] for q in s]
-        flags = list(dict.fromkeys(f for q in s for f in q['flags']))
-        if n > 1 and max(vals) - min(vals) > 0.005 and 'range' not in flags:
-            flags.append('range')
-        return {'fac': fac, 'price': price, 'alt': sum(k * q['alt'] for q in mid),
-                'fx': rv / price if price > 0 and rv > 0 else 0.0,
-                'fxr': _ref_mix((k * q['price'] * (q['fx'] or 0.0), q.get('fxr')) for q in mid) if rv > 0 else None,
-                'level': level, 'grade': LEVEL_INFO[level][1], 'n': n,
-                'ids': tuple(dict.fromkeys(i for q in s for i in q['ids'])), 'flags': tuple(flags),
-                'rng': (min(vals), max(vals)) if n > 1 else s[0].get('rng'),
-                'basis': s[0]['basis'] if n == 1 else '%s The middle of its %d quotes.' % (s[0]['basis'], n)}
+        flags, skip = list(q0['flags']), list(q0.get('skip') or ())
+        if n > 1:
+            if 'ambiguous_rows' not in flags:
+                flags.append('ambiguous_rows')
+            skip = [(q['row'][0], 'tie_not_lowest') for q in s[1:] if q.get('row')] + skip
+        fx = q0['fx'] or 0.0
+        return {'fac': fac, 'price': q0['price'], 'alt': q0['alt'], 'fx': fx, 'fxr': q0.get('fxr') if fx else None,
+                'level': q0['level'], 'grade': LEVEL_INFO[q0['level']][1], 'n': n, 'ids': tuple(q0['ids']),
+                'flags': tuple(flags), 'rng': (min(vals), max(vals)) if n > 1 else q0.get('rng'),
+                'basis': q0['basis'] if n == 1 else '%s The lowest of its %d quotes.' % (q0['basis'], n),
+                'row': q0.get('row'), 'skip': tuple(dict.fromkeys(skip))}
 
     def combined(self, b):
         """The combined cost of base style b (contract C13), or None when no factory quotes it directly:
@@ -1996,8 +2291,11 @@ class CostIndex:
                 rng = (min(x['price'] for x in vals), max(x['price'] for x in vals))
                 basis = ('Lowest of %d factory quotes (%s), because they differ by more than %s percent. The lowest '
                          'is from %s. %s' % (len(vals), names, pct, _factory_name(self.S, v['fac']), v['basis']))
+        # Contract C15: the style's sheet row is the used value's (for an average, the lowest factory's; Cost by
+        # factory lists the others).
         res = _R(level, price, basis, tuple(dict.fromkeys(i for v in use for i in v['ids'])), None, alt=alt,
-                 rng=rng, fx=fx, fxr=fxr, flags=tuple(dict.fromkeys(flags)))
+                 rng=rng, fx=fx, fxr=fxr, flags=tuple(dict.fromkeys(flags)), row=use[0].get('row'),
+                 skip=use[0].get('skip') or ())
         res['gcap'], res['rule'] = grade, rule
         return res
 
@@ -2066,67 +2364,96 @@ class CostIndex:
             o = self._override(b, sku, ref, fac)
             if o:
                 return o
+        # Contract C15: every rung takes one row of the style's own brand (R1), pattern (R4) and fit column (R6).
+        # Rows still tied give the lowest, flagged ambiguous_rows (R7). Never a mean or a median of rows.
+        many = ' Several rows fit, so the lowest is used.'
         if ref and (ref, b) in self.pc_exact:
             pr, rid = self.pc_exact[(ref, b)]
-            return _R('L1', pr, 'Factory list, same ref and style.', (rid,), fac)
+            return _R('L1', pr, 'Factory list, same ref and style.', (rid,), fac, row=self._lrow(rid, sku))
+        im = self.img_style.get(norm_vd(b))
+        if im and (fac == im[2] or fac in _LIST_FACTORY_PSEUDO):
+            return self._img_res(im, sku, fac)
         if ref in self.dp_refs and sku is None:
-            ps = [x for k, v in self.dp_ref.items() if k[0] == ref for x in v]
-            vals = [x[0] for x in ps]
-            return _R('L2', _mean(vals), 'Factory list, same ref. The SKU has no pattern letter, so solid and print are averaged.',
-                      [x[1] for x in ps], fac, rng=(min(vals), max(vals)), flags=('malformed_sku', 'range'))
+            p, rid, fl, rng, sk = _lowest([x for k, v in self.dp_ref.items() if k[0] == ref for x in v])
+            return _R('L2', p, 'Factory list, same ref. The SKU has no pattern letter, so every row of the ref fits.'
+                      + (many if fl else ''), (rid,), fac, rng=rng, flags=('malformed_sku',) + fl,
+                      row=self._lrow(rid, sku), skip=sk)
         if ref in self.dp_refs and sku and (ref, sku['pat']) in self.dp_ref:
-            ps = self.dp_ref[(ref, sku['pat'])]
-            return _R('L2', _mean([x[0] for x in ps]), 'Factory list, same ref and pattern.', [x[1] for x in ps], fac)
-        if ref in self.ky_refs and sku and (ref, sku['pat'], sku['fit']) in self.ky_ref:
-            pr, rid = self.ky_ref[(ref, sku['pat'], sku['fit'])]
-            return _R('L2', pr, 'Factory list, same ref, pattern and fit.', (rid,), fac)
+            p, rid, fl, rng, sk = _lowest(self.dp_ref[(ref, sku['pat'])])
+            return _R('L2', p, 'Factory list, same ref and pattern.' + (many if fl else ''), (rid,), fac, rng=rng,
+                      flags=fl, row=self._lrow(rid, sku), skip=sk)
+        brand = sku.get('brand') if sku else None
+        fcl, known = self.fit_col(sku)
+        ffl = () if not sku else ('fit_as_regular',) if sku['fit'] in ('MODERN', 'TAILORED') else () if known else (
+            'fit_unknown',)
+        if ref in self.ky_refs and sku and (ref, sku['pat'], fcl) in self.ky_ref:
+            pr, rid = self.ky_ref[(ref, sku['pat'], fcl)]
+            return _R('L2', pr, 'Factory list, same ref, pattern and fit.' + self._fit_note(sku), (rid,), fac,
+                      flags=ffl, row=self._lrow(rid, sku))
         if sku and fac in self.pc_facs and not sku['program']:
             bn = norm_vd(b)
             for src, text in ((self.pc_style.get(bn, []), 'Same style on another ref of this factory list.'),
                               (self.pc_design.get(bn[2:], []), 'Same design on another ref of this factory list.')):
                 c = [x for x in src if x[2] != ref]
                 if c:
-                    vals = [x[0] for x in c]
-                    return _R('L3', _med(vals), text, [x[1] for x in c], fac, rng=(min(vals), max(vals)),
-                              flags=('sibling',) + (('range',) if max(vals) - min(vals) > 0.005 else ()))
-            c = self.pc_fcs.get((sku['fab'], sku['cat'], sku['sleeve'] if sku['cat'] != 'pants' else '-'), [])
-            if c:
-                vals = [x[0] for x in c]
-                return _R('L3', _med(vals), 'Median of this factory list for the fabric, category and sleeve.',
-                          [x[1] for x in c], fac, rng=(min(vals), max(vals)), flags=('fabric_median', 'range'))
+                    p, rid, fl, rng, sk = _lowest([(x[0], x[1]) for x in c])
+                    return _R('L3', p, text + (many if fl else ''), (rid,), fac, rng=rng, flags=('sibling',) + fl,
+                              row=self._lrow(rid, sku), skip=sk)
+            # The listed styles of the same brand, fabric, category, sleeve and pattern (C15 R1, R4), at the style's
+            # own fit (R6: a listed style's fit decides its price). With only slim styles listed, a regular or big and
+            # tall style takes the slim price plus the fit premium (flag derived); any other fit falls through.
+            c = [x for x in self.pc_fcs.get((sku['fab'], sku['cat'], sku['sleeve'] if sku['cat'] != 'pants' else '-'), [])
+                 if x[2] == brand and (sku['pat'] is None or x[3] is None or x[3] == sku['pat'])]
+            same = [x for x in c if x[4] == fcl]
+            add = self.bt_add if fcl == 'BIG_TALL' else self.reg_add if fcl == 'REGULAR' else None
+            slim = [x for x in c if x[4] == 'SLIM'] if not same and add is not None else []
+            if same or slim:
+                p, rid, fl, rng, sk = _lowest([(x[0], x[1]) for x in (same or slim)])
+                if same:
+                    return _R('L3', p, "This factory's list for the same brand, fabric, category, sleeve, pattern and "
+                              'fit (not this style).' + (many if fl else ''), (rid,), fac, rng=rng,
+                              flags=('fabric_median',) + ffl + fl, row=self._lrow(rid, sku), skip=sk)
+                return _R('L3', p + add, "This factory's list for the same brand, fabric, category, sleeve and pattern "
+                          '(not this style), at a slim style\'s price plus the fit premium.' + (many if fl else ''),
+                          (rid,), fac, alt=p + add, rng=(rng[0] + add, rng[1] + add) if rng else None,
+                          flags=('fabric_median', 'derived') + ffl + fl, row=self._lrow(rid, sku), skip=sk)
         if sku and fac in self.dp_facs and sku['fab'] in self.dp_fabs and sku['pat'] in ('SOLID', 'PRINT'):
             amazon = str(poName or '').upper().startswith('AM')
-            ps = (self.dp_rate.get((sku['pat'], sku['sleeve'], amazon))
-                  or self.dp_rate.get((sku['pat'], sku['sleeve'], not amazon)))
-            if ps:
-                vals = [x[0] for x in ps]
-                return _R('L3', _med(vals), "This factory's list rate for the pattern and sleeve. The ref is not on its list.",
-                          [x[1] for x in ps], fac, rng=(min(vals), max(vals)), flags=('sibling',))
+            for am in (amazon, not amazon):
+                ps = [x[:2] for x in self.dp_rate.get((sku['pat'], sku['sleeve'], am), ()) if _brand_ok(x[2], brand)]
+                if ps:
+                    p, rid, fl, rng, sk = _lowest(ps)
+                    return _R('L3', p, "This factory's list rate for the brand, pattern and sleeve. The ref is not on "
+                              'its list.' + (many if fl else ''), (rid,), fac, rng=rng, flags=('sibling',) + fl,
+                              row=self._lrow(rid, sku), skip=sk)
         if sku and fac in self.ky_facs and sku['fab'] in self.ky_fabs and sku['pat'] in ('SOLID', 'PRINT'):
-            fcl = sku['fit'] if sku['fit'] in ('SLIM', 'REGULAR') else 'SLIM'
-            ps = self.ky_rate.get((sku['pat'], fcl, False)) or self.ky_rate.get((sku['pat'], fcl, True))
-            if ps:
-                vals = [x[0] for x in ps]
-                ss = sku['sleeve'] == 'SS'
-                return _R('L3', _med(vals), "This factory's list rate for the pattern and fit. The ref is not on its list."
-                          + (' Short sleeve at the long sleeve rate, so an upper bound.' if ss else ''),
-                          [x[1] for x in ps], fac, rng=(min(vals), max(vals)),
-                          flags=('sibling',) + (('ss_upper_bound',) if ss else ()))
+            for am in (False, True):
+                ps = [x[:2] for x in self.ky_rate.get((sku['pat'], fcl, am), ()) if _brand_ok(x[2], brand)]
+                if ps:
+                    p, rid, fl, rng, sk = _lowest(ps)
+                    ss = sku['sleeve'] == 'SS'
+                    return _R('L3', p, "This factory's list rate for the brand, pattern and fit. The ref is not on its "
+                              'list.' + self._fit_note(sku) + (' Short sleeve at the long sleeve rate, so an upper bound.'
+                                                               if ss else '') + (many if fl else ''),
+                              (rid,), fac, rng=rng, flags=('sibling',) + (('ss_upper_bound',) if ss else ()) + ffl + fl,
+                              row=self._lrow(rid, sku), skip=sk)
         if sku:
             m = self.calc_match(sku, fac, sku['group'])
             if m:
                 return self._calc_res(sku, fac, *m)
             if not sku['program']:
-                c = [x for x in self.list_style.get(b, []) if x[2] != ref]
-                if c:
-                    vals = [x[0] for x in c]
-                    return _R('L5', _med(vals), 'Same style priced on a factory list (another ref).',
-                              [i for x in c for i in x[1]], fac, rng=(min(vals), max(vals)))
-                c = self.list_design.get(b[2:], [])
-                if c:
-                    vals = [x[0] for x in c]
-                    return _R('L5', _med(vals), 'Same design priced on a factory list.', [i for x in c for i in x[1]],
-                              fac, rng=(min(vals), max(vals)))
+                for items, text in (([x for x in self.list_style.get(b, []) if x[2] != ref],
+                                     'Same style priced on a factory list (another ref).'),
+                                    (self.list_design.get(b[2:], []), 'Same design priced on a factory list.')):
+                    ps = list(dict.fromkeys((x[0], x[1][0]) for x in items if x[1]))
+                    if ps:
+                        p, rid, fl, rng, sk = _lowest(ps)
+                        return _R('L5', p, text + (many if fl else ''), (rid,), fac, rng=rng, flags=fl,
+                                  row=self._lrow(rid, sku), skip=sk)
+            # Contract C15 R1: another brand's row only when nothing else prices the style (level L4c, grade D).
+            m = self.calc_match(sku, fac, sku['group'], cross=True)
+            if m:
+                return self._calc_res(sku, fac, *m)
         if allow_default and self.defaults:
             if sku:
                 for k, nm in (((sku['cat'], sku['fab']), 'category and fabric'),
@@ -2303,10 +2630,11 @@ class _WarehouseCoster:
         fac = top[0] if len(fw) == 1 or top[1] >= 0.6 * tw2 else 'MIX'
         worst = next(res for _, _, res in priced if res['level'] == lv)
         vals = [res['price'] for _, _, res in priced]
+        top = max(priced, key=lambda x: x[1])[2]      # contract C15: the sheet row of the ref with the most units
         return {'level': lv, 'price': price, 'alt': alt, 'fx': fx, 'fxr': fxr if fx else None, 'ids': ids, 'fac': fac, 'ref': None,
                 'rng': (min(vals), max(vals)), 'flags': tuple(sorted(flags)), 'tier': tier,
                 'basis': 'Weighted average of the %d refs that made this style. Least certain part: %s'
-                         % (len(priced), worst['basis'])}
+                         % (len(priced), worst['basis']), 'row': top.get('row'), 'skip': tuple(top.get('skip') or ())}
 
 
 # ── Dataset builder ──
@@ -2345,13 +2673,14 @@ INVENTORY_FIELDS = ('sku', 'base', 'brand', 'cat', 'fiber', 'wh', 'units', 'fobU
                     'dutyRegime', 'flags', 'fxRef')
 PRODUCTION_FIELDS = ('ref', 'factory', 'poName', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'etd', 'arrival',
                      'landing', 'fobLanding', 'fobU', 'fob', 'landedU', 'landed', 'level', 'grade', 'claimed', 'free',
-                     'origin', 'fxShare', 'flags', 'basis', 'ev', 'dutyRegime', 'fxRef')
+                     'origin', 'fxShare', 'flags', 'basis', 'ev', 'dutyRegime', 'fxRef', 'ownFobU', 'ownFxShare',
+                     'ownFxRef')
 STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 'fobU', 'landedU', 'level', 'grade',
                 'rangeLo', 'rangeHi', 'factories', 'onHand', 'onHandFob', 'onHandLanded', 'incoming', 'incomingFob',
                 'ats', 'committed', 'allocated', 'openUnits', 'openRev', 'openGp', 'openContrib', 'apoUnits', 'apoRev',
                 't12Units', 't12Rev', 't12Cogs', 't12Gp', 'lifeUnits', 'lifeRev', 'expPrice', 'atsPotentialGp', 'ladder',
                 'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd', 'fxShare', 'fxRef',
-                'openRevCost', 'costByFactory', 'costRule', 'costSpread')
+                'openRevCost', 'costByFactory', 'costRule', 'costSpread', 'costRow', 'costRowsSkipped', 'costFlags')
 SHIPPED_COMPANY_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
                           'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost')
 SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', 'months', 'fobU', 'level', 'grade',
@@ -2503,26 +2832,32 @@ class _Build:
                 'lotTier': next(iter(tiers)) if len(tiers) == 1 else None,
                 'basis': worst['basis'] if worst else 'No price found. Needs a manual cost.'}
 
-    def base_label(self, b):
-        """The feed's brand label for a base style (any of its SKUs), else the invoice history's."""
-        cache = self.__dict__.setdefault('_blab', {})
+    def feed_label(self, b):
+        """The ATS feed's brand label for a base style (any of its SKUs), or None."""
+        cache = self.__dict__.setdefault('_flab', {})
         if b not in cache:
             lab = None
             for s in (getattr(self, 'inv_by_base', {}) or {}).get(b) or ():
                 lab = (self.inv.get(s) or {}).get('label')
                 if lab:
                     break
-            if not lab:
-                lab = ((getattr(self, 'an', None) or {}).get(b) or {}).get('label')
             cache[b] = lab
         return cache[b]
+
+    def base_label(self, b):
+        """The feed's brand label for a base style (any of its SKUs), else the invoice history's."""
+        return self.feed_label(b) or ((getattr(self, 'an', None) or {}).get(b) or {}).get('label')
 
     def brand_of(self, dec, sku=None, label=None, base=None):
         """Brand code of a row (contract C7): the decoded SKU brand (program map included); else the
         feed label; else the code's own brand letters (program and legacy codes); else ''. SKU brand
-        BL with the feed label BLACK is Black Label (BLK), which carries its own royalty row."""
+        BL with the feed label BLACK is Black Label (BLK), which carries its own royalty row. A style row
+        (sku None: styles, shipped history) reads the style's feed label before the label passed in, so a
+        Black Label style whose invoices say BLO stays Black Label (review finding R5-1)."""
         b = base or (dec['base'] if dec else (base_of(sku) if sku else ''))
-        lab = _u(label) if label else ''
+        lab = _u(self.feed_label(b)) if (sku is None and b) else ''
+        if not lab and label:
+            lab = _u(label)
         if not lab and sku:
             lab = _u((getattr(self, 'inv', {}).get(_u(sku)) or {}).get('label'))
         if not lab and b:
@@ -3137,6 +3472,10 @@ class _Build:
             fobU = r4(unit)
             fob = r2(units * fobU) if fobU is not None else None
             lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S)
+            # The maker's own price for this line (L['res'], its own ladder before contract C13): what that factory
+            # bills. The page's factory payments use it; cost of goods keeps the style's cost (fobU).
+            own_u, own_fx = self.ci.eff(L['res'])
+            own_share = r4(own_fx) if own_u is not None else 0.0
             lu = LU.get(L['i']) or {}
             claimed = _int(lu.get('claimed'))
             level = res['level'] if unit is not None else 'L7'
@@ -3163,7 +3502,9 @@ class _Build:
                    'free': max(0, units - claimed),
                    'origin': origin, 'fxShare': r4(fx) if unit is not None else 0.0, 'flags': sorted(flags),
                    'basis': self.bkey(res['basis']), 'ev': self.ev(res['ids']), 'dutyRegime': regime,
-                   'fxRef': _fxref_out(r4(fx) if unit is not None else 0.0, self.ci.fx_ref(res))}
+                   'fxRef': _fxref_out(r4(fx) if unit is not None else 0.0, self.ci.fx_ref(res)),
+                   'ownFobU': r4(own_u), 'ownFxShare': own_share,
+                   'ownFxRef': _fxref_out(own_share, self.ci.fx_ref(L['res']))}
             self.production.append(row)
             cell = self.cov['production'][level]
             cell[0] += units
@@ -3188,8 +3529,46 @@ class _Build:
         rng = [self.ci.eff_range(res) for _, res, _, _, _ in parts]
         lo = min([x[0] for x in rng if x[0] is not None] + units) if units else None
         hi = max([x[1] for x in rng if x[1] is not None] + units) if units else None
-        out = dict(ag, lo=lo, hi=hi, facs=sorted({c['fac'] for c in comps if c['fac']}))
+        # Contract C15: the style's sheet row is the one behind the largest share of its cost (every share when the
+        # style takes one combined cost).
+        best = None
+        for sh, res, _, _, _ in parts:
+            if res.get('row') and (best is None or sh > best[0]):
+                best = (sh, res)
+        # costFlags: the C15 flags of the cost behind that row (styles.costFlags).
+        out = dict(ag, lo=lo, hi=hi, facs=sorted({c['fac'] for c in comps if c['fac']}),
+                   row=best[1]['row'] if best else None, skip=tuple(best[1].get('skip') or ()) if best else (),
+                   costFlags=[f for f in C15_FLAGS if best and f in best[1]['flags']])
         self._gen[key] = out
+        return out
+
+    @staticmethod
+    def _row_label(r):
+        return ' '.join(str(r.get('fabrication') or r.get('style') or '').split())
+
+    def cost_row(self, sc):
+        """styles.costRow (contract C15): [source, cell on that sheet, row label, fit column, price4] of the one sheet
+        row behind the style's cost. price4 is the price the sheet prints. Its C15 flags go to styles.costFlags. A
+        price shown in a picture has no cell: its cell reads as the record id's part after the source. None when no
+        row prices the style (a manual cost, a default, no cost)."""
+        row = sc.get('row')
+        r = self.ci.records.get(row[0]) if row else None
+        if not r:
+            return None
+        self.ev_used.add(r['id'])
+        cell = r['id'].partition('!')[2] if r.get('record_kind') == 'image_callout' else (r.get('cell') or
+                                                                                         r['id'].partition('!')[2])
+        return [str(r.get('source_code') or ''), str(cell), self._row_label(r), row[1], r4(self.ci.sheet_price(r))]
+
+    def cost_skip(self, sc):
+        """styles.costRowsSkipped (contract C15): [cell as its record id, row label, price4, reason] per row the rule
+        set aside on the sheet of the row used, closest first. Every cell listed is in the evidence table."""
+        out = []
+        for rid, why in sc.get('skip') or ():
+            r = self.ci.records.get(rid)
+            if r:
+                self.ev_used.add(rid)
+                out.append([rid, self._row_label(r), r4(self.ci.sheet_price(r)), why])
         return out
 
     def build_styles(self):
@@ -3305,7 +3684,11 @@ class _Build:
                    'openRevCost': r2(ob['rc']) if ob else 0.0,
                    # Contract C13: every direct factory quote, how the cost was set, how far the quotes spread.
                    'costByFactory': self.ci.cost_by_factory(b), 'costRule': self.ci.cost_rule(b, level),
-                   'costSpread': self.ci.cost_spread(b)}
+                   'costSpread': self.ci.cost_spread(b),
+                   # Contract C15: the one sheet row behind the cost, and the rows the rule set aside.
+                   'costRow': self.cost_row(sc) if unit is not None else None,
+                   'costRowsSkipped': self.cost_skip(sc) if unit is not None else [],
+                   'costFlags': list(sc.get('costFlags') or ()) if unit is not None else []}
             self.styles.append(row)
 
     # ── shipped lens (invoiced units at today's style cost) ──
@@ -4006,6 +4389,9 @@ class _Build:
             notes.append('When several factories quote a style, its cost is the average of their quotes, or the lowest '
                          'quote when they differ by more than %s percent. Every row of the style uses that one cost.'
                          % ('%g' % self.ci.wide_pct))
+        notes.append("Each factory's price for a style comes from one sheet row, picked from the style number: its "
+                     "brand's section, fabric, sleeve, pattern and fit column, and no special finish the style does not "
+                     'have. Rows are never averaged. Where several rows still fit, the lowest is used and flagged.')
         if not S['bulk'].get('includeInTotals'):
             notes.append('Bulk lines are a forecast. They are shown apart and left out of the totals.')
         if self.ci.unrated:
