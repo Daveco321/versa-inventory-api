@@ -29,17 +29,29 @@ build_dataset(src, costbook, settings, overrides, now_iso, routing_module) -> di
 decode_sku(sku, params=None) -> dict | None     SKU attributes (None when undecodable)
 CostIndex(costbook, settings, overrides, ledger_rows, today=None)
     .resolve(style, factory, ref=None, poName=None, customer_group=None)
-        -> {fobU, level, basis, evidence, rangeLo, rangeHi, factory, flags, fxShare}
+        -> {fobU, level, basis, evidence, rangeLo, rangeHi, factory, flags, fxShare, fxRef}
 landed(fobU, attrs, settings, regime, origin) -> {duty, freight, fees, landedU}   per unit
 line_money(...) / stock_money(...)               DESIGN 5.6 row math (the client repeats it)
+fx_what_if_unit(fobU, fxShare, fxRef, rate_new, rate_fallback=None) -> fobU'   the RMB what-if
 merge_settings(stored, params=None) -> effective settings
 clean_params(params) -> (clean, missing, invalid) the cost book params, type checked
-price_field_roles(costbook) -> {usd, base, cut, rmb}   cost-book price field names by role
+price_field_roles(costbook) -> {usd, base, cut, rmb, e1}   cost-book field names by role
 DEFAULT_SETTINGS                                 public defaults only
 
 Cost-book price fields are read by ROLE (contract C1): meta.priceFieldRoles, else the order of
 meta.priceFields (usd, base, cut, rmb), else the role-neutral names. This file never spells a
 cost-book field name that carries a workbook rate.
+
+Price basis (contract C10, David, Sep 15 2026). Every record is priced at the Current USD printed
+on its own sheet for its fit (the 'usd' role), at the sheet's own printed rate (the 'e1' role).
+settings.fx.rate null (the default) keeps every price as printed. A saved rate R prices every
+RMB-based (calculator) record at printed x (its sheet rate / R), which is its RMB amount / R. The
+scaling happens on each candidate record, before medians, ranges, sibling and default levels, so
+every level stays consistent. List prices and USD quotations never move. The 'base' role (prices
+restated at params.fxBase) is only read to find a sheet rate a record does not carry.
+Every row with an RMB-based part carries fxShare (the share of its unit cost that is RMB based)
+and fxRef (the printed rate that part stands at, value weighted). The page's what-if:
+    fobU' = r4(fobU x (1 - fxShare + fxShare x fxRef / rateNew)),   fob' = r2(qty x fobU')
 
 Duty regimes (contract C2). Every lines, apo, inventory and production row carries dutyRegime:
     none  no import costs (FOB customer rows, and destinations mapped to 'none')
@@ -52,12 +64,13 @@ The `regime` argument of adders, landed, line_money and stock_money also accepts
 fob_line boolean (true = none, false = us).
 
 Contract additions (beyond DESIGN 5.4), all appended after the contract fields:
-    lines: basis, dutyRegime, costRef, pieces
-    alloc: costRef, lotTier, pieces
-    apo: routing, ref, basis, ev, dutyRegime, costRef, coveredBy
-    inventory: basis, ev, dutyRegime, flags          production: basis, ev, dutyRegime
-    styles: basis, ev, t12Net, dutyRegime, dedPct, atsFreeStock, atsFreeProd
-    shipped.company: costedRev     shipped.byStyle: fobU, level, grade, origin, fxShare
+    lines: basis, dutyRegime, costRef, pieces, fxRef
+    alloc: costRef, lotTier, pieces, fxShare, fxRef
+    apo: routing, ref, basis, ev, dutyRegime, costRef, coveredBy, fxRef
+    inventory: basis, ev, dutyRegime, flags, fxRef    production: basis, ev, dutyRegime, fxRef
+    styles: basis, ev, t12Net, dutyRegime, dedPct, atsFreeStock, atsFreeProd, fxShare, fxRef
+    shipped.company: costedRev     shipped.byStyle: fobU, level, grade, origin, fxShare, fxRef
+    inputs.fx: {mode, rate, basis, base, printed[], weighted, unrated} (the price basis in use)
     dict: basis{key: text}, flags{flag: label}, alertKinds{kind: {label, unit, valueLabel}},
           lotTiers{tier: {label, tone}}, priceBasis{basis: text}, regimes{regime: text}
     alerts: unit, valueLabel (C4); thin_contribution also lineCount; every alert refsTotal
@@ -74,7 +87,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 
 __all__ = [
-    'build_dataset', 'decode_sku', 'CostIndex', 'landed', 'line_money', 'stock_money', 'adders',
+    'build_dataset', 'decode_sku', 'CostIndex', 'landed', 'line_money', 'stock_money', 'adders', 'fx_what_if_unit',
     'merge_settings', 'grade_of', 'base_of', 'fac_of', 'r2', 'r4', 'load_snapshot',
     'clean_params', 'price_field_roles', 'program_brand', 'friendly_date',
     'DEFAULT_SETTINGS', 'LEVELS', 'LEVEL_INFO', 'GRADE_INFO', 'ROUTING_INFO', 'CAT_GROUP',
@@ -210,7 +223,8 @@ FLAG_LABELS = {
     'fob_wh_fallback': 'FOB account served from the US warehouse', 'program_map': 'Program code decoded by the cost book map',
     'assumed': 'Attributes assumed. Confirm.', 'range': 'Several prices match. Median used.',
     'derived': 'Price derived from a related calculator row', 'default': 'Category default price',
-    'price_conflict': 'The price file has two prices for the same text', 'rate_restated': 'Sheet rate looked stale. Restated.',
+    'price_conflict': 'The price file has two prices for the same text',
+    'sheet_rate_far': 'This sheet prints an RMB rate far from the other sheets.',
     'ss_upper_bound': 'Long sleeve rate used. Upper bound.', 'malformed_sku': 'SKU could not be decoded',
     'not_in_feed': 'Style not in the ATS feed', 'gate_fail': 'Routing gate failed. FIFO used.',
     'assignment': 'Manual deduction assignment honored', 'suppressed': 'Batch looks arrived. Routing skips it.',
@@ -238,8 +252,8 @@ _LICENSED = ('NA', 'DK', 'CH', 'CS', 'US', 'JN', 'KN', 'GB', 'VD', 'VC', 'EB', '
 _HOUSE = ('BL', 'NE', 'VS')
 DEFAULT_SETTINGS = {
     'v': 1,
-    # rate None = the cost book's params.fxBase (filled at build time; the effective rate is in
-    # dataset.settings). A saved rate restates every calculator price to that rate.
+    # rate None = as printed on each sheet: every price is the sheet's Current USD at its own rate
+    # (contract C10). A saved rate R prices every RMB-based record at its RMB amount / R.
     'fx': {'rate': None, 'asOf': None, 'basis': 'current_usd'},
     'gridPrecedence': None,
     'factories': {'TF': {'name': 'Topfind', 'origin': 'CN'}, 'NB': {'name': 'Yuxiu', 'origin': 'CN'},
@@ -554,13 +568,13 @@ def _at(d, path):
 
 def merge_settings(stored, params=None):
     """Effective settings: stored values over DEFAULT_SETTINGS (dicts merge key by key, lists
-    and scalars replace). fx.rate null falls back to the cost book's fxBase. In the settings maps a
-    null value means 'use the default' (contract C3; see _NULL_TO_RULE and _NULL_TO_DEFAULT)."""
+    and scalars replace). fx.rate null (or any value that is not a positive number) stays null: every
+    price as printed on its own sheet (contract C10). In the settings maps a null value means 'use the
+    default' (contract C3; see _NULL_TO_RULE and _NULL_TO_DEFAULT)."""
     s = _deep_merge(DEFAULT_SETTINGS, stored if isinstance(stored, dict) else {})
     fx = s.get('fx') if isinstance(s.get('fx'), dict) else {}
     s['fx'] = fx
-    if _pos(fx.get('rate')) is None:
-        fx['rate'] = _pos((params if isinstance(params, dict) else {}).get('fxBase'))
+    fx['rate'] = _pos(fx.get('rate'))
     if str(fx.get('basis') or '') not in ('current_usd', 'after_cut'):
         fx['basis'] = 'current_usd'
     for k in ('tariff', 'freight', 'royalty', 'deductions', 'routing', 'bulk', 'confirmed', 'factories',
@@ -743,6 +757,40 @@ def stock_money(fob, units, cat, fiber, origin, regime, S):
     lnd = r2(fob + d + f + e)
     return lnd, (r4(lnd / units) if units > 0 else None)
 
+
+def fx_what_if_unit(fobU, fx_share, fx_ref, rate_new, rate_fallback=None):
+    """The page's RMB what-if on one published unit cost (DESIGN 5.6, contract C10):
+        r4(fobU x (1 - fxShare + fxShare x fxRef / rateNew))
+    fx_ref is the row's fxRef. Rows of datasets built before fxRef have none, so rate_fallback
+    (settings.fx.rate, then params.fxBase) stands in. The unit cost comes back unchanged when the row
+    has no RMB-based part or a rate is missing. The page repeats the same operation order."""
+    u = _fnum(fobU)
+    if u is None:
+        return None
+    s = _fnum(fx_share) or 0.0
+    ref = _pos(fx_ref) or _pos(rate_fallback)
+    rn = _pos(rate_new)
+    if s <= 0 or not ref or not rn:
+        return fobU
+    return r4(u * (1 - s + s * ref / rn))
+
+
+def _ref_mix(parts):
+    """Value-weighted rate of RMB-based parts: [(dollar value of the RMB-based part, its rate)] -> rate
+    or None. It is the rate at which the parts' RMB amounts equal their dollar value, so the page's
+    what-if (fxShare x fxRef / rateNew) reprices every part at the new rate."""
+    v = a = 0.0
+    for x, e in parts:
+        if x and e:
+            v += x
+            a += x * e
+    return a / v if v else None
+
+
+def _fxref_out(share, fxr):
+    """fxRef as published: 4 decimals, only on rows with an RMB-based share."""
+    return r4(fxr) if share and fxr else None
+
 # ── Cost index: the cost-resolution cascade L0-L7 (port of study synth/cascade.py) ──
 def _fnum(v):
     """A finite float from an int or float, else None (never raises: huge ints give None)."""
@@ -757,17 +805,22 @@ def _fnum(v):
 
 # ── Cost-book price fields by role (contract C1) ──
 _ROLE_ORDER = ('usd', 'base', 'cut', 'rmb')
-_ROLE_DEFAULTS = {'usd': 'price_usd', 'base': 'price_usd_base', 'cut': 'price_usd_cut', 'rmb': 'rmb_price'}
+_ROLE_DEFAULTS = {'usd': 'price_usd', 'base': 'price_usd_base', 'cut': 'price_usd_cut', 'rmb': 'rmb_price',
+                  'e1': 'fx_sheet_e1'}
 
 
 def price_field_roles(costbook):
-    """{usd, base, cut, rmb} -> the cost book's field name for that role. From meta.priceFieldRoles,
-    else the order of meta.priceFields (usd, base, cut, rmb), else the role-neutral names. A record
-    without the base field falls back to the usd field, and one without the cut field to its price."""
+    """{usd, base, cut, rmb, e1} -> the cost book's field name for that role. From
+    meta.priceFieldRoles, else the order of meta.priceFields (usd, base, cut, rmb), else the
+    role-neutral names. e1 (the sheet's printed rate) comes from meta.priceFieldRoles or its
+    role-neutral name. A record without the usd field falls back to the base field, and one without
+    the cut field to its price."""
     cb = costbook if isinstance(costbook, dict) else {}
     meta = cb.get('meta') if isinstance(cb.get('meta'), dict) else {}
     roles = dict(_ROLE_DEFAULTS)
     pr = meta.get('priceFieldRoles')
+    if isinstance(pr, dict) and isinstance(pr.get('e1'), str) and pr.get('e1'):
+        roles['e1'] = pr['e1']
     if isinstance(pr, dict) and any(isinstance(pr.get(k), str) and pr.get(k) for k in _ROLE_ORDER):
         for k in _ROLE_ORDER:
             v = pr.get(k)
@@ -991,9 +1044,24 @@ def _pool_label(pool):
     return lab + (' (%s block)' % grp.title() if head in ('NF-OC', 'YW-SM') and grp else '')
 
 
-def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, flags=()):
+def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=()):
+    """A resolution. fx: the share of price that is RMB based (value share; a negative dollar step
+    can put it a little above 1). fxr: the rate that RMB-based part stands at, or None."""
     return {'level': level, 'price': price, 'alt': price if alt is None else alt, 'basis': basis,
-            'ids': tuple(ids), 'fac': fac, 'rng': rng, 'fx': fx, 'flags': tuple(flags)}
+            'ids': tuple(ids), 'fac': fac, 'rng': rng, 'fx': fx, 'fxr': fxr if fx else None, 'flags': tuple(flags)}
+
+
+def _med_parts(cands):
+    """(median price, RMB-based dollars inside it, RMB amount inside it) of calculator candidates,
+    with statistics.median's value: the middle price, or the mean of the two middle prices."""
+    s = sorted(cands, key=lambda c: (c['price'], c['id']))
+    n = len(s)
+    mid = [s[n // 2]] if n % 2 else [s[n // 2 - 1], s[n // 2]]
+    med = mid[0]['price'] if n % 2 else (mid[0]['price'] + mid[1]['price']) / 2
+    k = 1.0 / len(mid)
+    rv = sum(k * c['price'] for c in mid if c['rmb'])
+    ra = sum(k * c['price'] * c['ref'] for c in mid if c['rmb'])
+    return med, rv, ra
 
 
 def _mean(xs):
@@ -1005,14 +1073,14 @@ def _med(xs):
 
 
 def _wmedian(items):
-    """Weighted median of [(value, weight, fxShare)] -> (value, fxShare)."""
-    items = sorted(items)
-    tot = sum(w for _, w, _ in items)
+    """Weighted median of [(value, weight, fxShare, fxRef)] -> (value, fxShare, fxRef)."""
+    items = sorted(items, key=lambda t: t[:3])
+    tot = sum(t[1] for t in items)
     acc = 0
-    for v, w, fx in items:
+    for v, w, fx, fxr in items:
         acc += w
         if acc >= tot / 2:
-            return v, fx
+            return v, fx, fxr
     return None
 
 
@@ -1031,10 +1099,14 @@ class CostIndex:
         self.today = _d10(today)
         roles = price_field_roles(cb)
         self._f_usd, self._f_base, self._f_cut = roles['usd'], roles['base'], roles['cut']
-        self.fx_base = _pos(p.get('fxBase')) or _pos(S['fx'].get('rate'))
-        self.fx_rate = _pos(S['fx'].get('rate')) or self.fx_base
-        self.fx_factor = (self.fx_base / self.fx_rate) if (self.fx_base and self.fx_rate) else 1.0
+        self._f_rmb, self._f_e1 = roles.get('rmb'), roles.get('e1')
+        # Price basis (contract C10): the Current USD printed on each sheet. fx_rate None keeps every
+        # price as printed; a saved rate reprices each RMB-based record at printed x (sheet rate / rate).
+        # fx_base (the cost book's own base rate) only helps find a sheet rate a record does not carry.
+        self.fx_base = _pos(p.get('fxBase'))
+        self.fx_rate = _pos(S['fx'].get('rate'))
         self.after_cut = S['fx'].get('basis') == 'after_cut'
+        self._rate_cache = {}
         self.ss_delta = _fnum(p.get('ssDelta'))
         fp = p.get('fitPremium') if isinstance(p.get('fitPremium'), dict) else {}
         self.reg_add, self.bt_add = _fnum(fp.get('regular')), _fnum(fp.get('bigTall'))
@@ -1049,6 +1121,16 @@ class CostIndex:
         recs = [r for r in raw if _rec_ok(r)]
         self.bad_records = sum(1 for r in raw if isinstance(r, dict)) - len(recs)
         self.records = {r['id']: r for r in recs}
+        # The rates the calculator sheets print, and the RMB-based records whose rate cannot be found
+        # (those keep their printed price under a saved rate or a what-if).
+        self.sheet_rates, self.unrated = Counter(), 0
+        for r in recs:
+            if r.get('record_kind') == 'calculator':
+                e = self.rec_rate(r)
+                if e:
+                    self.sheet_rates[r4(e)] += 1
+                elif self.rec_usd(r) is not None:
+                    self.unrated += 1
         self.conflicts = {}
         self.conflict_of = defaultdict(list)
         for g in (cb.get('conflict_groups') if isinstance(cb.get('conflict_groups'), (list, tuple)) else []):
@@ -1072,32 +1154,74 @@ class CostIndex:
             self._dec[b] = decode_sku(b, self.params)
         return self._dec[b]
 
+    def rec_usd(self, r):
+        """The Current USD printed on the record's own sheet (the 'usd' role)."""
+        return _fnum(r.get(self._f_usd))
+
+    def rec_rate(self, r):
+        """The RMB rate printed on an RMB-based (calculator) record's own sheet (the 'e1' role), else
+        None. A record that does not carry it: the rate its base-role price was restated from
+        (params.fxBase x base / usd), else its RMB amount / its printed USD."""
+        if r.get('record_kind') != 'calculator':
+            return None
+        rid = r.get('id')
+        if rid in self._rate_cache:
+            return self._rate_cache[rid]
+        e = _fnum(r.get(self._f_e1)) if self._f_e1 else None
+        if e is None or e <= 0:
+            e = None
+            u = self.rec_usd(r)
+            if u is not None and u > 0:
+                b = _fnum(r.get(self._f_base)) if self._f_base else None
+                m = _fnum(r.get(self._f_rmb)) if self._f_rmb else None
+                if b is not None and b > 0 and self.fx_base:
+                    e = self.fx_base * b / u
+                elif m is not None and m > 0:
+                    e = m / u
+        self._rate_cache[rid] = e
+        return e
+
     def rec_price(self, r):
-        """Record price at params.fxBase (the 'base' role: calculators restated; lists and USD quotes
-        as typed). Falls back to the 'usd' role when the base field is absent."""
-        p = _fnum(r.get(self._f_base)) if self._f_base else None
-        return p if p is not None else _fnum(r.get(self._f_usd))
+        """The price used for a record (contract C10): the Current USD printed on its sheet, for its
+        fit (the 'usd' role; the 'base' role only when a record has no usd value). With a saved RMB
+        rate, an RMB-based record prices at printed x (its sheet rate / the saved rate), which is its
+        RMB amount at that rate. List prices and USD quotations never move."""
+        p = self.rec_usd(r)
+        if p is None and self._f_base:
+            p = _fnum(r.get(self._f_base))
+        if p is None:
+            return None
+        if self.fx_rate:
+            e = self.rec_rate(r)
+            if e:
+                return p * e / self.fx_rate
+        return p
+
+    def rec_ref(self, r):
+        """fxRef of a record: the rate its price stands at (the saved rate, else its sheet rate).
+        None for a USD price (lists, quotations) or a record whose rate cannot be found."""
+        e = self.rec_rate(r)
+        return (self.fx_rate or e) if e else None
 
     def rec_cut(self, r):
         """The after-cut reading (the 'cut' role), or None."""
         return _fnum(r.get(self._f_cut)) if self._f_cut else None
 
-    def rec_usd(self, r):
-        return _fnum(r.get(self._f_usd))
-
     def eff(self, res):
-        """(unit cost at the P&L rate, calculator share of it) for a resolution."""
+        """(unit cost used, RMB-based share of it) for a resolution. Candidate prices already stand
+        at the P&L's basis (printed, or the saved rate), so nothing is scaled here."""
         p = res.get('price')
         if p is None:
             return None, 0.0
         if self.after_cut:
             return res.get('alt', p), 0.0
-        fx = res.get('fx') or 0.0
-        if not fx or self.fx_factor == 1.0:
-            return p, fx
-        rmb = p * fx * self.fx_factor
-        u = p * (1 - fx) + rmb
-        return u, (rmb / u if u else fx)
+        return p, res.get('fx') or 0.0
+
+    def fx_ref(self, res):
+        """fxRef of a resolution: the rate its RMB-based part stands at, or None."""
+        if self.after_cut or res.get('price') is None or not res.get('fx'):
+            return None
+        return res.get('fxr')
 
     def eff_range(self, res):
         rng = res.get('rng')
@@ -1107,17 +1231,15 @@ class CostIndex:
         if self.after_cut:
             k = (res.get('alt') or 0) / res['price'] if res['price'] else 1.0
             return lo * k, hi * k
-        fx = res.get('fx') or 0.0
-        if not fx or self.fx_factor == 1.0:
-            return lo, hi
-        return lo * (1 - fx) + lo * fx * self.fx_factor, hi * (1 - fx) + hi * fx * self.fx_factor
+        return lo, hi
 
     def public(self, res):
         u, fx = self.eff(res)
         lo, hi = self.eff_range(res)
+        share = r4(fx) if u is not None else 0.0
         return {'fobU': r4(u), 'level': res['level'], 'basis': res['basis'], 'evidence': list(res['ids']),
                 'rangeLo': r4(lo), 'rangeHi': r4(hi), 'factory': res['fac'], 'flags': list(res['flags']),
-                'fxShare': r4(fx)}
+                'fxShare': share, 'fxRef': _fxref_out(share, self.fx_ref(res))}
 
     def resolve(self, style, factory=None, ref=None, poName=None, customer_group=None, brand_label=None):
         """DESIGN 3.6: cost of one style from one factory (ref and poName when known)."""
@@ -1182,11 +1304,14 @@ class CostIndex:
             if pr is None or not pool:
                 continue
             alt = self.rec_cut(r)
+            ref = self.rec_ref(r)
             codes = [c for c in (r.get('fabric_codes') or []) if c]
+            # price: the printed Current USD, or its RMB amount at the saved rate (contract C10). rmb and
+            # ref: an RMB-based record and the rate its price stands at (fxRef).
             c = {'id': r['id'], 'brand': r.get('brand_code'), 'codes': codes, 'conf': r.get('fabric_code_confidence'),
                  'cat': r.get('category'), 'fit': r.get('fit_class'), 'sleeve': r.get('sleeve'),
                  'pat': r.get('pattern_effective'), 'price': pr, 'alt': pr if alt is None else alt,
-                 'rmb': r.get('record_kind') == 'calculator', 'quote': r.get('record_kind') == 'factory_quotation',
+                 'rmb': ref is not None, 'ref': ref, 'quote': r.get('record_kind') == 'factory_quotation',
                  'restated': any('SHEET_E1_IS' in str(f) for f in (r.get('flags') or ())),
                  'conflict': any(str(g).startswith('same_text') for g in self.conflict_of.get(r['id'], ()))}
             if codes:
@@ -1276,7 +1401,7 @@ class CostIndex:
                 sku = self.decode(L['b'])
                 if sku:
                     for k in ((sku['cat'], sku['fab']), (sku['cat'], sku['brand']), (sku['cat'],)):
-                        dd[k].append((res['price'], L['units'], res['fx']))
+                        dd[k].append((res['price'], L['units'], res['fx'], res.get('fxr')))
         self.defaults = {k: _wmedian(v) for k, v in dd.items()}
         self._cache.clear()
         for L in self.ledger:
@@ -1458,7 +1583,7 @@ class CostIndex:
                 lvl, pool, cands, adj, how = m
                 pr = [c['price'] for c in cands]
                 al = [c['alt'] for c in cands]
-                nrmb = sum(1 for c in cands if c['rmb'])
+                med, rv, ra = _med_parts(cands)
                 how_text = {'exact': ('same brand, fabric, fit, sleeve and pattern' if lvl != 'L4c'
                                       else 'another brand with the same fabric, fit, sleeve and pattern'),
                             'alt_code': 'alternate or low confidence fabric code',
@@ -1482,12 +1607,17 @@ class CostIndex:
                 if any(c['conflict'] for c in cands):
                     flags.append('price_conflict')
                 if any(c['restated'] for c in cands):
-                    flags.append('rate_restated')
+                    flags.append('sheet_rate_far')
                 basis = '%s: %s.' % (_pool_label(pool), how_text[0].upper() + how_text[1:])
                 if sku['program']:
                     basis += ' Program code decoded by the cost book map.'
-                return _R(lvl, _med(pr) + adj, basis, [c['id'] for c in cands], fac, alt=_med(al) + adj,
-                          rng=(min(pr) + adj, max(pr) + adj), fx=nrmb / len(cands), flags=flags)
+                # Candidates already stand at the P&L's basis, so the median, the range and the
+                # RMB-based share (value share) are consistent. A fit or sleeve step (adj) is a dollar
+                # amount from the cost book params and does not move with the rate.
+                price = med + adj
+                fx = rv / price if price > 0 and rv > 0 else 0.0
+                return _R(lvl, price, basis, [c['id'] for c in cands], fac, alt=_med(al) + adj,
+                          rng=(min(pr) + adj, max(pr) + adj), fx=fx, fxr=(ra / rv) if rv > 0 else None, flags=flags)
             if not sku['program']:
                 c = [x for x in self.list_style.get(b, []) if x[2] != ref]
                 if c:
@@ -1504,15 +1634,15 @@ class CostIndex:
                 for k, nm in (((sku['cat'], sku['fab']), 'category and fabric'),
                               ((sku['cat'], sku['brand']), 'category and brand'), ((sku['cat'],), 'category')):
                     if self.defaults.get(k):
-                        v, fx = self.defaults[k]
+                        v, fx, fxr = self.defaults[k]
                         return _R('L6', v, 'Default: weighted median of ledger costs for this %s.' % nm, (), fac,
-                                  fx=fx, flags=('default',))
+                                  fx=fx, fxr=fxr, flags=('default',))
             elif brand_label:
                 k = ('dress_shirt', BRAND_LABEL_CODE.get(brand_label, '?'))
                 if self.defaults.get(k):
-                    v, fx = self.defaults[k]
+                    v, fx, fxr = self.defaults[k]
                     return _R('L6', v, 'Default for a legacy SKU: brand %s, dress shirt assumed.' % brand_label, (), fac,
-                              fx=fx, flags=('default', 'legacy_brand_default'))
+                              fx=fx, fxr=fxr, flags=('default', 'legacy_brand_default'))
         return _R('L7', None, 'No price found. Needs a manual cost.', (), fac,
                   flags=('malformed_sku',) if sku is None else ())
 
@@ -1661,6 +1791,7 @@ class _WarehouseCoster:
         alt = sum(w * res['alt'] for _, w, res in priced) / tw
         amt = sum(w * res['price'] for _, w, res in priced)
         fx = (sum(w * res['price'] * (res['fx'] or 0) for _, w, res in priced) / amt) if amt else 0.0
+        fxr = _ref_mix((w * res['price'] * (res['fx'] or 0), res.get('fxr')) for _, w, res in priced)
         lv = _worst_level(res['level'] for _, _, res in priced)
         ids = tuple(dict.fromkeys(i for _, _, res in priced for i in res['ids']))
         flags = set(f for _, _, res in priced for f in res['flags'])
@@ -1674,7 +1805,7 @@ class _WarehouseCoster:
         fac = top[0] if len(fw) == 1 or top[1] >= 0.6 * tw2 else 'MIX'
         worst = next(res for _, _, res in priced if res['level'] == lv)
         vals = [res['price'] for _, _, res in priced]
-        return {'level': lv, 'price': price, 'alt': alt, 'fx': fx, 'ids': ids, 'fac': fac, 'ref': None,
+        return {'level': lv, 'price': price, 'alt': alt, 'fx': fx, 'fxr': fxr if fx else None, 'ids': ids, 'fac': fac, 'ref': None,
                 'rng': (min(vals), max(vals)), 'flags': tuple(sorted(flags)), 'tier': tier,
                 'basis': 'Weighted average of the %d refs that made this style. Least certain part: %s'
                          % (len(priced), worst['basis'])}
@@ -1704,28 +1835,28 @@ LINE_FIELDS = ('id', 'ctrlNo', 'orderNo', 'cust', 'type', 'style', 'base', 'bran
                'units', 'price', 'rev', 'start', 'cancel', 'late', 'fobLine', 'wh',
                'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'contrib',
                'level', 'grade', 'routing', 'factory', 'ref', 'origin', 'fxShare', 'ev', 'flags', 'basis',
-               'dutyRegime', 'costRef', 'pieces')
+               'dutyRegime', 'costRef', 'pieces', 'fxRef')
 ALLOC_FIELDS = ('line', 'units', 'kind', 'factory', 'ref', 'poName', 'landing', 'etd', 'arrival', 'fobU', 'level',
-                'routing', 'forced', 'costRef', 'lotTier', 'pieces')
+                'routing', 'forced', 'costRef', 'lotTier', 'pieces', 'fxShare', 'fxRef')
 APO_FIELDS = ('id', 'cust', 'custName', 'po', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'estPrice',
               'priceBasis', 'rev', 'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty',
               'contrib', 'level', 'grade', 'factory', 'origin', 'fxShare', 'flags', 'routing', 'ref', 'basis', 'ev',
-              'dutyRegime', 'costRef', 'coveredBy')
+              'dutyRegime', 'costRef', 'coveredBy', 'fxRef')
 INVENTORY_FIELDS = ('sku', 'base', 'brand', 'cat', 'fiber', 'wh', 'units', 'fobU', 'landedU', 'fob', 'landed', 'level',
                     'grade', 'factory', 'ref', 'lotTier', 'receiveDate', 'ageDays', 'origin', 'fxShare', 'basis', 'ev',
-                    'dutyRegime', 'flags')
+                    'dutyRegime', 'flags', 'fxRef')
 PRODUCTION_FIELDS = ('ref', 'factory', 'poName', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'etd', 'arrival',
                      'landing', 'fobLanding', 'fobU', 'fob', 'landedU', 'landed', 'level', 'grade', 'claimed', 'free',
-                     'origin', 'fxShare', 'flags', 'basis', 'ev', 'dutyRegime')
+                     'origin', 'fxShare', 'flags', 'basis', 'ev', 'dutyRegime', 'fxRef')
 STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 'fobU', 'landedU', 'level', 'grade',
                 'rangeLo', 'rangeHi', 'factories', 'onHand', 'onHandFob', 'onHandLanded', 'incoming', 'incomingFob',
                 'ats', 'committed', 'allocated', 'openUnits', 'openRev', 'openGp', 'openContrib', 'apoUnits', 'apoRev',
                 't12Units', 't12Rev', 't12Cogs', 't12Gp', 'lifeUnits', 'lifeRev', 'expPrice', 'atsPotentialGp', 'ladder',
-                'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd')
+                'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd', 'fxShare', 'fxRef')
 SHIPPED_COMPANY_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
                           'royalty', 'contrib', 'costedShare', 'costedRev')
 SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', 'months', 'fobU', 'level', 'grade',
-                        'origin', 'fxShare')
+                        'origin', 'fxShare', 'fxRef')
 _COVERAGE_SETS = ('openBook', 'bulk', 'apo', 'inventory', 'production')
 
 
@@ -1765,7 +1896,7 @@ class _Build:
         u, fx = self.ci.eff(res)
         tier = res.get('tier') if kind == 'warehouse' else None
         cap = 'B' if kind == 'warehouse' and tier not in ('T1', 'T2') else 'A'
-        return {'u': units, 'p': u, 'fx': fx, 'pb': res['price'], 'lv': res['level'], 'fac': fac, 'ref': ref,
+        return {'u': units, 'p': u, 'fx': fx, 'fxr': self.ci.fx_ref(res), 'pb': res['price'], 'lv': res['level'], 'fac': fac, 'ref': ref,
                 'ids': res['ids'], 'fl': res['flags'], 'basis': res['basis'], 'kind': kind, 'a': arow,
                 'tier': tier, 'cap': cap}
 
@@ -1818,15 +1949,17 @@ class _Build:
         priced = bool(comps) and all(c['p'] is not None for c in comps)
         lv = _worst_level(c['lv'] for c in comps) or 'L7'
         flags = set(f for c in comps for f in c['fl'])
-        unit = fx = None
+        unit = fx = fxr = None
         if priced:
             if tu > 0:
                 amt = sum(c['u'] * c['p'] for c in comps)
                 unit = amt / tu
                 fx = (sum(c['u'] * c['p'] * c['fx'] for c in comps) / amt) if amt else 0.0
+                fxr = _ref_mix((c['u'] * c['p'] * c['fx'], c.get('fxr')) for c in comps)
             else:
                 unit = sum(c['p'] for c in comps) / len(comps)
                 fx = sum(c['fx'] for c in comps) / len(comps)
+                fxr = _ref_mix((c['p'] * c['fx'], c.get('fxr')) for c in comps)
         else:
             if any(c['p'] is not None for c in comps):
                 flags.add('partial_cost')
@@ -1852,7 +1985,7 @@ class _Build:
         ofac = ow.most_common(1)[0][0] if ow else None
         worst = next((c for c in comps if c['lv'] == lv), None)
         tiers = {c.get('tier') for c in comps if c.get('kind') == 'warehouse'}
-        return {'unit': unit, 'fx': fx, 'level': lv, 'factory': fac, 'ref': ref, 'costRef': cost_ref,
+        return {'unit': unit, 'fx': fx, 'fxr': fxr, 'level': lv, 'factory': fac, 'ref': ref, 'costRef': cost_ref,
                 'origin': _factory_origin(self.S, ofac) if ofac else _factory_origin(self.S, '_default'),
                 'flags': flags, 'ids': [i for c in comps for i in c['ids']], 'priced': priced,
                 'cap': max([c.get('cap') or 'A' for c in comps] or ['A']),
@@ -2080,7 +2213,8 @@ class _Build:
                    'routing': routing, 'factory': ag['factory'], 'ref': ag['ref'], 'origin': ag['origin'],
                    'fxShare': r4(ag['fx']) if fobU is not None else 0.0, 'ev': self.ev(ag['ids']),
                    'flags': sorted(flags), 'basis': self.bkey(ag['basis']), 'dutyRegime': regime,
-                   'costRef': ag['costRef'], 'pieces': q * pcs}
+                   'costRef': ag['costRef'], 'pieces': q * pcs,
+                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr'])}
             row.update(money)
             row['_pcs'], row['_group'], row['_comps'] = pcs, group, comps
             self.lines.append(row)
@@ -2104,6 +2238,7 @@ class _Build:
                 g[1] += rev
             for a, cs in arows:
                 aa = self.agg(cs)
+                ash = r4(aa['fx']) if aa['priced'] else 0.0
                 prod = a.get('kind') == 'production'
                 self.alloc.append({'line': key, 'units': a['units'], 'kind': a.get('kind'),
                                    'factory': (self.ci.ledger[a['ledgerIndex']]['fac'] if prod
@@ -2112,7 +2247,8 @@ class _Build:
                                    'landing': a.get('landing'), 'etd': a.get('etd'), 'arrival': a.get('arrival'),
                                    'fobU': r4(aa['unit']) if aa['priced'] else None, 'level': aa['level'],
                                    'routing': a.get('routing'), 'forced': 1 if a.get('forced') else 0,
-                                   'costRef': aa['costRef'], 'lotTier': aa['lotTier'], 'pieces': a['units'] * pcs})
+                                   'costRef': aa['costRef'], 'lotTier': aa['lotTier'], 'pieces': a['units'] * pcs,
+                                   'fxShare': ash, 'fxRef': _fxref_out(ash, aa['fxr'])})
 
     # ── invoice analytics (shipped lens) ──
     _AN_FIELDS = ('style', 'brand', 'qty', 'value', 'firstInv', 'lastInv', 'months', 'customers', 'color')
@@ -2339,7 +2475,8 @@ class _Build:
                    'fob': fob, 'level': level, 'grade': max(grade_of(level, routing), ag['cap']),
                    'factory': ag['factory'], 'origin': ag['origin'], 'fxShare': r4(ag['fx']) if fobU is not None else 0.0,
                    'flags': sorted(flags), 'routing': routing, 'ref': ag['ref'], 'basis': self.bkey(ag['basis']),
-                   'ev': self.ev(ag['ids']), 'dutyRegime': regime, 'costRef': ag['costRef'], 'coveredBy': covered}
+                   'ev': self.ev(ag['ids']), 'dutyRegime': regime, 'costRef': ag['costRef'], 'coveredBy': covered,
+                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr'])}
             row.update(money)
             row['_comps'] = comps
             self.apo.append(row)
@@ -2373,6 +2510,8 @@ class _Build:
             ev = self.ev(w['ids'])
             bk = self.bkey(w['basis'])
             fobU = r4(unit)
+            share = r4(fx) if unit is not None else 0.0
+            fxref = _fxref_out(share, self.ci.fx_ref(w))
             # C5: stock is tied to the ref whose price it uses only by a lot match (T1, T2). Anything
             # else is a style estimate, so it cannot be graded better than B.
             grade = max(grade_of(level), 'A' if w.get('tier') in ('T1', 'T2') else 'B')
@@ -2390,8 +2529,8 @@ class _Build:
                        'fobU': fobU, 'landedU': lndU, 'fob': fob, 'landed': lnd, 'level': level,
                        'grade': grade, 'factory': w['fac'], 'ref': w.get('ref'), 'lotTier': w.get('tier'),
                        'receiveDate': m['rd'], 'ageDays': age, 'origin': origin,
-                       'fxShare': r4(fx) if unit is not None else 0.0, 'basis': bk, 'ev': ev,
-                       'dutyRegime': regime, 'flags': sorted(flags)}
+                       'fxShare': share, 'basis': bk, 'ev': ev,
+                       'dutyRegime': regime, 'flags': sorted(flags), 'fxRef': fxref}
                 self.inventory.append(row)
                 cell = self.cov['inventory'][level]
                 cell[0] += units
@@ -2479,7 +2618,8 @@ class _Build:
                    'fobLanding': 1 if fob_landing else 0, 'fobU': fobU, 'fob': fob, 'landedU': lndU, 'landed': lnd,
                    'level': level, 'grade': grade_of(level), 'claimed': claimed, 'free': max(0, units - claimed),
                    'origin': origin, 'fxShare': r4(fx) if unit is not None else 0.0, 'flags': sorted(flags),
-                   'basis': self.bkey(res['basis']), 'ev': self.ev(res['ids']), 'dutyRegime': regime}
+                   'basis': self.bkey(res['basis']), 'ev': self.ev(res['ids']), 'dutyRegime': regime,
+                   'fxRef': _fxref_out(r4(fx) if unit is not None else 0.0, self.ci.fx_ref(res))}
             self.production.append(row)
             cell = self.cov['production'][level]
             cell[0] += units
@@ -2615,7 +2755,8 @@ class _Build:
                                     key=lambda x: (-x[2], x[0])) if ob else [],
                    'basis': self.bkey(sc['basis']), 'ev': self.ev(sc['ids']), 't12Net': sh['net'],
                    'dutyRegime': regime, 'dedPct': ded4, 'atsFreeStock': max(0, ats - free_prod),
-                   'atsFreeProd': free_prod}
+                   'atsFreeProd': free_prod, 'fxShare': r4(sc['fx']) if unit is not None else 0.0,
+                   'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr'))}
             self.styles.append(row)
 
     # ── shipped lens (invoiced units at today's style cost) ──
@@ -2690,7 +2831,8 @@ class _Build:
                              'fobShare': r4(sm.get('fobShare', 0.0)),
                              'months': {ym: [int(round(r['u'])), r2(r['v'])] for ym, r in sm['rows'].items()},
                              'fobU': r4(unit), 'level': level, 'grade': max(grade_of(level), sc['cap']),
-                             'origin': sc['origin'], 'fxShare': r4(sc['fx']) if unit is not None else 0.0})
+                             'origin': sc['origin'], 'fxShare': r4(sc['fx']) if unit is not None else 0.0,
+                             'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr'))})
             for ym, r in sm['rows'].items():
                 c = comp[ym]
                 c['units'] += r['u']
@@ -2918,8 +3060,10 @@ class _Build:
             if bad:
                 parts.append('Some pricing rules are switched off because their parameters are missing or invalid: %s.'
                              % ', '.join(_PARAM_NAMES.get(k, 'other parameters') for k in bad))
-                if 'fxBase' in bad and _pos(self.S['fx'].get('rate')) is not None:
-                    parts.append('The saved RMB rate cannot restate calculator prices until the cost book rate is fixed.')
+            if self.ci.unrated:
+                parts.append('%d calculator %s no sheet rate. A saved RMB rate or a what-if cannot reprice %s.'
+                             % (self.ci.unrated, 'price carries' if self.ci.unrated == 1 else 'prices carry',
+                                'it' if self.ci.unrated == 1 else 'them'))
             if self.ci.bad_records:
                 parts.append('%d price rows could not be read and are skipped.' % self.ci.bad_records)
             parts.append('Rebuild the cost book.')
@@ -2968,15 +3112,19 @@ class _Build:
             r = self.ci.records.get(rid)
             if not r:
                 continue
+            # priceUsd: the price the P&L uses for this record (printed, at the saved rate, or the after-cut
+            # reading). priceSheet: the Current USD the sheet prints. fxSheet: the sheet's own rate.
             p = self.ci.rec_price(r)
-            rmb = r.get('record_kind') == 'calculator'
-            at_rate = (p * self.ci.fx_factor if (rmb and not self.ci.after_cut) else p) if p is not None else None
+            cut = self.ci.rec_cut(r) if (self.ci.after_cut and r.get('record_kind') == 'calculator') else None
+            used = cut if cut is not None else p
+            f_rmb = self.ci._f_rmb
             out[rid] = {'src': r.get('origin_file') or r.get('source_code'), 'sheet': r.get('sheet'), 'cell': r.get('cell'),
                         'row': r.get('row'), 'factory': r.get('factory_code'), 'scope': r.get('scope'),
                         'fabrication': r.get('fabrication'), 'fabric': r.get('fabric_code_primary'),
                         'fit': r.get('fit_class'), 'sleeve': r.get('sleeve'), 'pattern': r.get('pattern_effective'),
-                        'customerGroup': r.get('customer_group'), 'priceUsd': r4(at_rate), 'rmb': r.get('rmb_price'),
-                        'fxSheet': r.get('fx_sheet_e1'), 'flags': list(r.get('flags') or []),
+                        'customerGroup': r.get('customer_group'), 'priceUsd': r4(used),
+                        'rmb': _fnum(r.get(f_rmb)) if f_rmb else None,
+                        'fxSheet': r4(self.ci.rec_rate(r)), 'flags': list(r.get('flags') or []),
                         'kind': r.get('record_kind'), 'ref': r.get('production_ref_resolved') or r.get('production_ref'),
                         'style': r.get('style'), 'brand': r.get('brand'), 'priceSheet': self.ci.rec_usd(r)}
         return out
@@ -3095,6 +3243,54 @@ class _Build:
                 'lotTiers': copy.deepcopy(LOT_TIER_LABELS), 'priceBasis': dict(PRICE_BASIS_LABELS),
                 'regimes': dict(REGIME_LABELS)}
 
+    # ── price basis (contract C10) ──
+    def fx_inputs(self):
+        """inputs.fx: the price basis in use. mode 'printed' (each sheet's Current USD at its own rate),
+        'rate' (every RMB-based price at the saved rate) or 'after_cut'. printed: the rates the
+        calculator sheets print. weighted: the unit-weighted printed rate of the RMB-based costs
+        (see weighted_rate). base: the cost book's own base rate (params.fxBase), for older pages."""
+        ci = self.ci
+        mode = 'after_cut' if ci.after_cut else ('rate' if ci.fx_rate else 'printed')
+        return {'mode': mode, 'rate': ci.fx_rate, 'basis': self.S['fx'].get('basis'), 'base': ci.fx_base,
+                'printed': sorted(ci.sheet_rates), 'weighted': self.weighted_rate(), 'unrated': ci.unrated}
+
+    def weighted_rate(self):
+        """The unit-weighted rate of the RMB-based costs, from the published rows: the sum of
+        pieces x fxShare x fxRef over the sum of pieces x fxShare. The A2000 open book first, else
+        production, else stock. None when no row has an RMB-based part."""
+        sets = ((self.lines, lambda r: r['pieces'] if r['type'] == 'a2000' and r['units'] > 0 else 0),
+                (self.production, lambda r: r['units']), (self.inventory, lambda r: r['units']))
+        for rows, qty in sets:
+            w = a = 0.0
+            for r in rows:
+                s, e, n = r.get('fxShare') or 0.0, r.get('fxRef'), qty(r)
+                if s > 0 and e and n > 0:
+                    w += n * s
+                    a += n * s * e
+            if w > 0:
+                return r4(a / w)
+        return None
+
+    @staticmethod
+    def _rate_txt(x):
+        return ('%.4f' % x).rstrip('0').rstrip('.')
+
+    def fx_note(self, fxin):
+        pr = fxin['printed']
+        span = ''
+        if pr:
+            span = self._rate_txt(pr[0]) if len(pr) == 1 else '%s to %s' % (self._rate_txt(pr[0]), self._rate_txt(pr[-1]))
+        if fxin['mode'] == 'after_cut':
+            return 'Calculator prices use the after-cut reading. They do not move with the rate.'
+        if fxin['mode'] == 'rate':
+            fx = self.S['fx']
+            as_of = (friendly_date(fx['asOf']) or str(fx['asOf'])) if fx.get('asOf') else None
+            return ('Every RMB-based calculator price uses %s RMB per US dollar%s.'
+                    % (self._rate_txt(fxin['rate']), (' as of %s' % as_of) if as_of else '')
+                    + (' The sheets print %s.' % span if span else ''))
+        return ("Calculator prices are the Current USD printed on each sheet, for the style's fit."
+                + (' The sheets print %s RMB per US dollar.' % span if span else ''))
+
     def run(self):
         self.load_inputs()
         self.route()
@@ -3117,10 +3313,9 @@ class _Build:
         st = self.R.get('stats') or {}
         ls = st.get('lines') or {}
         S = self.S
-        fx = S['fx']
-        as_of = (friendly_date(fx['asOf']) or str(fx['asOf'])) if fx.get('asOf') else None
+        fxin = self.fx_inputs()
         notes = [
-            'Calculator prices use %s RMB per US dollar%s.' % (fx.get('rate'), (' as of %s' % as_of) if as_of else ''),
+            self.fx_note(fxin),
             'Factory prices are FOB. Duty, freight, fees, royalty and deductions use the Assumptions tab.',
             'Goods that land in Canada use an assumed Canadian duty rate. Goods the customer imports carry no US duty, freight or fees.',
             'Supply follows the smart routing engine. Units it cannot place are costed at the style average.',
@@ -3128,8 +3323,10 @@ class _Build:
         ]
         if not S['bulk'].get('includeInTotals'):
             notes.append('Bulk lines are a forecast. They are shown apart and left out of the totals.')
-        if self.ci.after_cut:
-            notes.append('Calculator prices use the after-cut reading. They do not move with the rate.')
+        if self.ci.unrated:
+            notes.append('%d calculator %s no sheet rate. %s as printed.'
+                         % (self.ci.unrated, 'price carries' if self.ci.unrated == 1 else 'prices carry',
+                            'It stays' if self.ci.unrated == 1 else 'They stay'))
         if self.whc.tiers:
             notes.append('Warehouse stock is costed by lot where the ledger allows it, else by the refs that made the style.')
         blocks = self.assumption_blocks()
@@ -3152,6 +3349,7 @@ class _Build:
                         'placedUnits': ls.get('placed'), 'unsourcedUnits': ls.get('unsourced'),
                         'forcedUnits': ls.get('forcedUnits'), 'options': st.get('options')},
             'lotTiers': dict(self.whc.tiers), 'overridesActive': self.ci.overrides_active,
+            'fx': fxin,
         }
         return {
             'v': 1, 'builtAt': self.now_iso, 'asOf': self.today, 'inputs': inputs, 'settings': S,

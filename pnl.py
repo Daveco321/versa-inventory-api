@@ -824,7 +824,8 @@ _REGIMES = ('us', 'ca', 'none')
 # default for this key": the engine's merge_settings drops it.
 SETTINGS_SCHEMA = {
     'v': ('server',),
-    # rate null = the cost book's own base rate (params.fxBase), which is the engine default.
+    # rate null = as printed on each sheet (the engine default, contract C10). A number reprices every
+    # RMB-based cost at that rate.
     'fx': ('obj', {'rate': ('nullable', _n(*_FX_BAND)), 'asOf': ('date',), 'basis': ('token',)}),
     'gridPrecedence': ('nullable', ('map', ('code',), ('list', ('code',), 12))),
     'factories': ('map', ('code',), _nullable(('obj', {'name': _TEXT80, 'origin': ('code',)}))),

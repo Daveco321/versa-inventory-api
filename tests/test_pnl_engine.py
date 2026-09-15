@@ -16,6 +16,7 @@ import pnl_engine as E  # noqa: E402
 import pnl_routing as R  # noqa: E402
 
 FXB = 7.0
+R2 = 7.9191          # a second synthetic sheet rate (contract C10)
 PARAMS = {
     'fxBase': FXB, 'ssDelta': -0.1111, 'fitPremium': {'regular': 0.2222, 'bigTall': 0.5555},
     'gridPrecedence': {'TT': ['GY', 'GN'], '_default': ['GN', 'GY']},
@@ -32,9 +33,11 @@ PARAMS = {
 
 
 # Cost-book price fields are read by role (contract C1). The fixtures use role-neutral synthetic
-# names and declare them in meta.priceFieldRoles, as the parser does.
-F_BASE, F_CUT = 'price_usd_base', 'price_usd_cut'
-ROLES = {'usd': 'price_usd', 'base': F_BASE, 'cut': F_CUT, 'rmb': 'rmb_price'}
+# names and declare them in meta.priceFieldRoles, as the parser does. e1 is the sheet's printed RMB
+# rate (contract C10). Calculator fixtures print at FXB unless a test says otherwise, so their
+# printed (usd) and restated (base) prices are equal.
+F_BASE, F_CUT, F_E1 = 'price_usd_base', 'price_usd_cut', 'fx_sheet_e1'
+ROLES = {'usd': 'price_usd', 'base': F_BASE, 'cut': F_CUT, 'rmb': 'rmb_price', 'e1': F_E1}
 
 
 def rec(rid, sc, kind, price, **kw):
@@ -44,15 +47,19 @@ def rec(rid, sc, kind, price, **kw):
          'category': 'dress_shirt', 'fabric_codes': [], 'fabric_code_confidence': 'high', 'sleeve': None,
          'fit_class': None, 'pattern': None, 'pattern_effective': None, 'flags': [], 'pool': None,
          'scope': 'fabrication', 'origin_file': 'SYNTH.xlsx', 'sheet': 'S', 'cell': rid.split('!')[1], 'row': 1,
-         'fabrication': 'synthetic', 'brand': 'Synthetic', 'rmb_price': None, 'fx_sheet_e1': None}
+         'fabrication': 'synthetic', 'brand': 'Synthetic', 'rmb_price': None, F_E1: None}
     r.update(kw)
     if 'pattern' in kw and 'pattern_effective' not in kw:
         r['pattern_effective'] = kw['pattern']
     return r
 
 
-def calc(rid, pool, price, brand, fab, fit, pat=None, sleeve=None, alt=None, **kw):
+def calc(rid, pool, price, brand, fab, fit, pat=None, sleeve=None, alt=None, e1=FXB, **kw):
+    """A calculator record printed at price (Current USD) on a sheet whose rate is e1. Its base-role
+    price is the printed price restated at FXB, as the parser writes it."""
     kw[F_CUT] = alt
+    kw.setdefault(F_BASE, round(price * e1 / FXB, 4))
+    kw[F_E1] = e1
     return rec(rid, 'SYN-' + pool.split(':')[0], 'calculator', price, pool=pool, brand_code=brand, fabric_codes=fab,
                fit_class=fit, pattern=pat, pattern_effective=pat, sleeve=sleeve, factory_code='UNKNOWN', **kw)
 
@@ -91,7 +98,7 @@ RECORDS = [
 COSTBOOK = {'v': 1, 'generatedAt': '2026-01-01T00:00:00Z', 'params': PARAMS, 'records': RECORDS,
             'conflict_groups': [{'id': 'same_text_price_conflict#x1', 'kind': 'same_text_price_conflict',
                                  'members': ['GY!F1'], 'spread': 0.0, 'median': 4.1717}],
-            'meta': {'priceFieldRoles': dict(ROLES), 'priceFields': {n: {} for n in ROLES.values()}}}
+            'meta': {'priceFieldRoles': dict(ROLES), 'priceFields': {n: {} for k, n in ROLES.items() if k != 'e1'}}}
 
 
 def led(ref, style, units, po='SYNTH PO', etd='2026-06-01', landing='TR'):
@@ -260,8 +267,10 @@ class Cascade(unittest.TestCase):
         self.assertEqual(c.resolve('ROQAQF101SLS', 'AA', 'AA26001')['fobU'], 7.7777)   # lists are USD
         self.assertEqual(c.resolve('ROQAQU201SLS', 'TT')['fobU'], 5.5151)               # USD quote
         a = ci(settings={'fx': {'basis': 'after_cut'}}).resolve('ROQAQF201SLS', 'NN')
-        self.assertEqual((a['fobU'], a['fxShare']), (4.5454, 0.0))
-        self.assertEqual(E.merge_settings({}, PARAMS)['fx']['rate'], FXB)
+        self.assertEqual((a['fobU'], a['fxShare'], a['fxRef']), (4.5454, 0.0, None))
+        self.assertIsNone(E.merge_settings({}, PARAMS)['fx']['rate'])         # null = as printed on each sheet
+        self.assertIsNone(E.merge_settings({'fx': {'rate': 'x'}}, PARAMS)['fx']['rate'])
+        self.assertEqual(E.merge_settings({'fx': {'rate': 7.7}}, PARAMS)['fx']['rate'], 7.7)
 
     def test_grid_precedence_setting(self):
         c = ci(settings={'gridPrecedence': {'TT': ['GN', 'GY']}})
@@ -404,6 +413,20 @@ def client_recalc(r, S, dct, table):
             'contrib': E.r2(gp - roy)}
 
 
+def client_recalc_fx(r, S, dct, rate):
+    """Python copy of the page's RMB what-if (pnl.core.js _pnlRecalc with scen {fxRate}): the unit cost
+    first, fobU' = r4(fobU x (1 - fxShare + fxShare x fxRef / rate)), then fob' = r2(qty x fobU') and
+    DESIGN 5.6. Rows without fxRef scale from settings.fx.rate."""
+    kit = 'kit' in (r.get('flags') or [])
+    qty = math.floor(r['fob'] / r['fobU'] + 0.5) if kit and r['fobU'] and r['fob'] else r['units']
+    u = E.fx_what_if_unit(r['fobU'], r['fxShare'], r.get('fxRef'), rate, S['fx'].get('rate'))
+    fob = E.r2(qty * u) if (u != r['fobU'] and qty > 0) else r['fob']
+    grp = dct['customers'][r['cust']]['group']
+    m = E.line_money(r['rev'], fob, qty, r['cat'], r['fiber'], r['origin'], r['dutyRegime'],
+                     E._ded_pct(r['cust'], S, grp), E._roy_pct(r['brand'], S), S)
+    return dict(m, fobU=u, fob=fob, qty=qty)
+
+
 class Dataset(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -438,7 +461,7 @@ class Dataset(unittest.TestCase):
 
     def test_rounding(self):
         money = {'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'contrib', 'landed'}
-        unit = {'fobU', 'landedU', 'fxShare', 'price', 'estPrice'}
+        unit = {'fobU', 'landedU', 'fxShare', 'fxRef', 'price', 'estPrice'}
         for t in ('lines', 'apo', 'inventory', 'production', 'alloc'):
             for r in rows(self.ds, t):
                 for k, v in r.items():
@@ -585,18 +608,27 @@ def kinds_of(ds):
 
 
 class PriceRolesC1(unittest.TestCase):
-    """Cost-book price fields are found by role, never by a name spelled in the engine."""
+    """Cost-book price fields are found by role, never by a name spelled in the engine. The usd role
+    is the price used (contract C10); the base role and the RMB amount only help find a sheet rate
+    that a record does not carry; the cut role is the after-cut reading."""
+    PRINTED, RATE = 3.4343, R2                # GN!F1: printed on a sheet at R2, restated at FXB below
+    BASE = round(PRINTED * RATE / FXB, 6)
 
-    def book(self, base_name, cut_name, meta):
+    def book(self, base_name, cut_name, meta, e1_name=None, rmb_name=None):
         recs = []
         for r in copy.deepcopy(RECORDS):
             p, c = r.pop(F_BASE), r.pop(F_CUT)
+            e = r.pop(F_E1)
             if r['id'] == 'GN!F1':
-                r['price_usd'] = 1.1111          # the sheet value differs from the base-role value
+                r['price_usd'], p, e = self.PRINTED, self.BASE, self.RATE
+                if rmb_name:
+                    r[rmb_name] = self.PRINTED * self.RATE
             if base_name:
                 r[base_name] = p
             if cut_name:
                 r[cut_name] = c
+            if e1_name:
+                r[e1_name] = e
             recs.append(r)
         cb = {k: v for k, v in COSTBOOK.items() if k != 'meta'}
         cb['records'] = recs
@@ -604,22 +636,35 @@ class PriceRolesC1(unittest.TestCase):
             cb['meta'] = meta
         return cb
 
-    def check(self, cb, base=4.4444, cut=4.5454):
-        self.assertEqual(ci(costbook=cb).resolve('ROQAQF201SLS', 'NN')['fobU'], base)
+    def check(self, cb, used=PRINTED, cut=4.5454, ref=RATE):
+        r = ci(costbook=cb).resolve('ROQAQF201SLS', 'NN')
+        self.assertEqual((r['fobU'], r['fxRef']), (used, ref))
         self.assertEqual(ci(costbook=cb, settings={'fx': {'basis': 'after_cut'}}).resolve('ROQAQF201SLS', 'NN')['fobU'], cut)
+        at = ci(costbook=cb, settings={'fx': {'rate': FXB}}).resolve('ROQAQF201SLS', 'NN')
+        self.assertEqual(at['fobU'], E.r4(used * ref / FXB) if ref else used)   # the RMB amount at the saved rate
 
     def test_roles_from_meta(self):
-        roles = {'usd': 'price_usd', 'base': 'price_usd_alpha', 'cut': 'price_usd_beta', 'rmb': 'rmb_price'}
-        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFieldRoles': roles}))
+        roles = {'usd': 'price_usd', 'base': 'price_usd_alpha', 'cut': 'price_usd_beta', 'rmb': 'rmb_price',
+                 'e1': 'sheet_rate_gamma'}
+        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFieldRoles': roles}, e1_name='sheet_rate_gamma'))
 
     def test_roles_from_price_fields_order(self):
         pf = {'price_usd': {}, 'price_usd_alpha': {}, 'price_usd_beta': {}, 'rmb_price': {}}
-        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFields': pf}))
-        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFields': list(pf)}))
+        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFields': pf}, e1_name=F_E1))
+        self.check(self.book('price_usd_alpha', 'price_usd_beta', {'priceFields': list(pf)}, e1_name=F_E1))
 
     def test_no_meta_uses_role_neutral_names_then_price_usd(self):
+        self.check(self.book(F_BASE, F_CUT, None, e1_name=F_E1))
+        # a study table: price_usd only, so no sheet rate can be found and the price never moves
+        self.check(self.book(None, None, None), used=self.PRINTED, cut=self.PRINTED, ref=None)
+
+    def test_sheet_rate_fallbacks(self):
+        # no sheet-rate field: the rate the base-role price was restated from (FXB x base / usd) ...
         self.check(self.book(F_BASE, F_CUT, None))
-        self.check(self.book(None, None, None), base=1.1111, cut=1.1111)   # a study table: price_usd only
+        # ... else the RMB amount over the printed price
+        self.check(self.book(None, F_CUT, None, rmb_name='rmb_price'))
+        c = ci(costbook=self.book(F_BASE, F_CUT, None, e1_name=F_E1))
+        self.assertEqual((dict(c.sheet_rates), c.unrated), ({FXB: 8, R2: 1}, 0))
 
     def test_engine_source_spells_no_rate_bearing_field(self):
         with open(E.__file__, encoding='utf-8') as f:
@@ -662,9 +707,20 @@ class ParamsBackstopF2(unittest.TestCase):
         self.assertEqual((clean['ssDelta'], missing, invalid), (None, [], ['ssDelta']))
 
     def test_bad_base_rate_with_a_saved_rate_is_named(self):
-        ds = build(cb=dict(COSTBOOK, params=dict(PARAMS, fxBase=0)), settings={'fx': {'rate': 7.7}})
+        # A calculator price with no sheet rate, and no base rate to find it from, cannot be repriced.
+        recs = copy.deepcopy(RECORDS)
+        for r in recs:
+            if r['id'] == 'GN!F1':
+                r[F_E1] = None
+        ds = build(cb=dict(COSTBOOK, params=dict(PARAMS, fxBase=0), records=recs), settings={'fx': {'rate': 7.7}})
         al = {a['id']: a for a in ds['alerts']}['al_costbook_params']
         self.assertIn('saved RMB rate', al['detail'])
+        self.assertIn('1 calculator price carries no sheet rate', al['detail'])
+        self.assertIn('1 calculator price carries no sheet rate. It stays as printed.', ds['notes'])
+        self.assertEqual(ds['inputs']['fx']['unrated'], 1)
+        r = ci(costbook=dict(COSTBOOK, params=dict(PARAMS, fxBase=0), records=recs), settings={'fx': {'rate': 7.7}})
+        self.assertEqual(r.resolve('ROQAQF201SLS', 'NN')['fobU'], 4.4444)      # stays as printed
+        self.assertNotRegex(al['detail'], '[–—]')
 
     def test_unreadable_record_is_skipped(self):
         bad = rec('BAD!Z1', 'SYN-GN', 'calculator', 4.4444, pool='GN:BASE', pattern=['SOLID'])
@@ -1183,6 +1239,164 @@ class KitPiecesF11(unittest.TestCase):
         tb = ds['totals']['bulk']
         self.assertEqual((tb['units'], tb['kitCartons']), (1000 + 120, 10))
         self.assertEqual(sum(v[0] for v in ds['coverage']['bulk'].values()), 1000 + 120)
+
+
+# ── price basis (contract C10): the Current USD printed on each sheet, repriced only at a saved rate ──
+def basis_book(extra=(), change=None):
+    """COSTBOOK with extra records and per-id field changes."""
+    recs = copy.deepcopy(RECORDS)
+    for r in recs:
+        if change and r['id'] in change:
+            r.update(change[r['id']])
+    return dict(COSTBOOK, records=recs + [copy.deepcopy(x) for x in extra])
+
+
+# Fabric QZ: three candidates on sheets at two rates. Fabric QY: two candidates (an even count).
+PA, PB, PC = 4.0404, 4.2323, 5.0505
+MIXED = [calc('GN!Z1', 'GN:BASE', PA, 'QA', ['QZ'], 'SLIM', 'SOLID', e1=R2),
+         calc('GN!Z2', 'GN:BASE', PB, 'QA', ['QZ'], 'SLIM', 'SOLID', e1=FXB),
+         calc('GN!Z3', 'GN:BASE', PC, 'QA', ['QZ'], 'SLIM', 'SOLID', e1=FXB),
+         calc('GN!Y1', 'GN:BASE', PA, 'QA', ['QY'], 'SLIM', 'SOLID', e1=FXB),
+         calc('GN!Y2', 'GN:BASE', PC, 'QA', ['QY'], 'SLIM', 'SOLID', e1=R2)]
+P1 = 3.4343                                                   # GN!F1 printed on a sheet at R2
+AT_R2 = {'GN!F1': {'price_usd': P1, F_BASE: round(P1 * R2 / FXB, 6), F_E1: R2}}
+
+
+class PriceBasisC10(unittest.TestCase):
+    def test_printed_current_usd_is_used(self):
+        c = ci(costbook=basis_book(change=AT_R2))
+        r = c.resolve('ROQAQF201SLS', 'NN')
+        self.assertEqual((r['level'], r['fobU'], r['fxShare'], r['fxRef']), ('L4a', P1, 1.0, R2))
+        lst = c.resolve('ROQAQF101SLS', 'AA', 'AA26001')
+        self.assertEqual((lst['fobU'], lst['fxShare'], lst['fxRef']), (7.7777, 0.0, None))     # lists are USD
+        q = c.resolve('ROQAQU201SLS', 'TT')
+        self.assertEqual((q['fobU'], q['fxShare'], q['fxRef']), (5.5151, 0.0, None))           # USD quotation
+
+    def test_saved_rate_prices_the_rmb_amount(self):
+        c = ci(costbook=basis_book(change=AT_R2), settings={'fx': {'rate': 7.7}})
+        r = c.resolve('ROQAQF201SLS', 'NN')
+        self.assertEqual((r['fobU'], r['fxRef']), (E.r4(P1 * R2 / 7.7), 7.7))
+        self.assertEqual(c.resolve('ROQAQF201SLS', 'TT')['fobU'], E.r4(4.1717 * FXB / 7.7))   # a sheet at FXB
+        self.assertEqual(c.resolve('ROQAQF101SLS', 'AA', 'AA26001')['fobU'], 7.7777)
+        self.assertEqual(c.resolve('ROQAQU201SLS', 'TT')['fobU'], 5.5151)
+
+    def test_candidates_are_repriced_before_the_median_and_range(self):
+        cb = basis_book(MIXED)
+        p = ci(costbook=cb).resolve('ROQAQZ201SLS', 'NN')          # printed PA (at R2), PB and PC (at FXB)
+        self.assertEqual((p['fobU'], p['rangeLo'], p['rangeHi'], p['fxRef']), (PB, PA, PC, FXB))
+        # At FXB the record printed at R2 costs more than PB and becomes the median. Scaling the printed
+        # median instead would keep PB.
+        at = ci(costbook=cb, settings={'fx': {'rate': FXB}}).resolve('ROQAQZ201SLS', 'NN')
+        self.assertEqual((at['fobU'], at['rangeLo'], at['rangeHi'], at['fxRef']), (E.r4(PA * R2 / FXB), PB, PC, FXB))
+        at2 = ci(costbook=cb, settings={'fx': {'rate': R2}}).resolve('ROQAQZ201SLS', 'NN')
+        self.assertEqual((at2['fobU'], at2['rangeLo'], at2['rangeHi']), (PA, E.r4(PB * FXB / R2), E.r4(PC * FXB / R2)))
+
+    def test_fx_ref_is_value_weighted_and_the_what_if_matches(self):
+        cb = basis_book(MIXED)
+        p = ci(costbook=cb).resolve('ROQAQY201SLS', 'NN')          # even count: the mean of PA (at FXB) and PC (at R2)
+        med, ref = (PA + PC) / 2, (PA * FXB / 2 + PC * R2 / 2) / ((PA + PC) / 2)
+        self.assertEqual((p['fobU'], p['fxShare'], p['fxRef']), (E.r4(med), 1.0, E.r4(ref)))
+        at = ci(costbook=cb, settings={'fx': {'rate': 7.7}}).resolve('ROQAQY201SLS', 'NN')
+        self.assertEqual(at['fobU'], E.r4((PA * FXB / 7.7 + PC * R2 / 7.7) / 2))
+        # fxRef is published at 4 decimals, so the page's what-if can land 0.0001 from a rebuild.
+        self.assertAlmostEqual(E.fx_what_if_unit(p['fobU'], p['fxShare'], p['fxRef'], 7.7), at['fobU'], delta=0.00015)
+        self.assertAlmostEqual(med * ref / 7.7, (PA * FXB / 7.7 + PC * R2 / 7.7) / 2, places=12)   # exact before rounding
+
+    def test_dollar_steps_do_not_move(self):
+        # Regular fit from the slim row plus the fit premium (a dollar step): only the row moves.
+        p = ci().resolve('ROQAQJ401RFS', 'NN')
+        self.assertEqual((p['fobU'], p['fxShare'], p['fxRef']),
+                         (E.r4(3.9393 + 0.2222), E.r4(3.9393 / (3.9393 + 0.2222)), FXB))
+        at = ci(settings={'fx': {'rate': 7.7}}).resolve('ROQAQJ401RFS', 'NN')
+        self.assertEqual(at['fobU'], E.r4(3.9393 * FXB / 7.7 + 0.2222))
+        self.assertAlmostEqual(E.fx_what_if_unit(p['fobU'], p['fxShare'], p['fxRef'], 7.7), at['fobU'], delta=0.00015)
+        # Short sleeve from long sleeve (a negative step): the share is a little above 1 and still exact.
+        s = ci().resolve('ROQAQJ301SSS', 'NN')
+        self.assertGreater(s['fxShare'], 1.0)
+        at = ci(settings={'fx': {'rate': 7.7}}).resolve('ROQAQJ301SSS', 'NN')
+        self.assertAlmostEqual(E.fx_what_if_unit(s['fobU'], s['fxShare'], s['fxRef'], 7.7), at['fobU'], delta=0.00015)
+
+    def test_defaults_and_lists_follow_the_saved_rate(self):
+        ledger = [led('NN26001', 'ROQAQF801SLS', 500), led('TT26001', 'ROQAQF802SLS', 100)]
+        p = ci(ledger).resolve('ROQAQV901SLS', 'TT')      # L6 by category and brand: the 500-unit L4a line
+        self.assertEqual((p['level'], p['fobU'], p['fxShare'], p['fxRef']), ('L6', 4.4444, 1.0, FXB))
+        c2 = ci(ledger, settings={'fx': {'rate': R2}})
+        at = c2.resolve('ROQAQV901SLS', 'TT')
+        self.assertEqual((at['level'], at['fobU'], at['fxRef']), ('L6', E.r4(4.4444 * FXB / R2), R2))
+        self.assertEqual(c2.resolve('ROQAQF101SLS', 'AA', 'AA26009')['fobU'], 7.7777)   # L3 sibling list price
+
+    def test_rows_carry_fx_ref_and_the_dataset_says_which_basis(self):
+        ds = build()
+        self.assertIsNone(ds['settings']['fx']['rate'])
+        fx = ds['inputs']['fx']
+        self.assertEqual((fx['mode'], fx['rate'], fx['printed'], fx['weighted'], fx['unrated']), ('printed', None, [FXB], FXB, 0))
+        for t in ('lines', 'alloc', 'apo', 'inventory', 'production', 'styles'):
+            self.assertIn('fxShare', ds[t]['fields'], t)
+            self.assertIn('fxRef', ds[t]['fields'], t)
+            n = 0
+            for r in rows(ds, t):
+                if r['fxShare']:
+                    n += 1
+                    self.assertEqual(r['fxRef'], FXB, (t, r))
+                else:
+                    self.assertIsNone(r['fxRef'], (t, r))
+            self.assertGreater(n, 0, t)
+        sh = rows({'b': ds['shipped']['byStyle']}, 'b')
+        self.assertTrue(sh and all((r['fxRef'] == FXB) if r['fxShare'] else r['fxRef'] is None for r in sh))
+        self.assertIn("Calculator prices are the Current USD printed on each sheet, for the style's fit. "
+                      'The sheets print 7 RMB per US dollar.', ds['notes'])
+        at = build(settings={'fx': {'rate': 7.7}})
+        self.assertEqual((at['settings']['fx']['rate'], at['inputs']['fx']['mode'], at['inputs']['fx']['weighted']),
+                         (7.7, 'rate', 7.7))
+        self.assertTrue(all(r['fxRef'] in (None, 7.7) for r in rows(at, 'lines')))
+        self.assertIn('Every RMB-based calculator price uses 7.7 RMB per US dollar. The sheets print 7.', at['notes'])
+        cut = build(settings={'fx': {'basis': 'after_cut'}})
+        self.assertEqual((cut['inputs']['fx']['mode'], cut['inputs']['fx']['weighted']), ('after_cut', None))
+        self.assertTrue(all(r['fxShare'] == 0.0 and r['fxRef'] is None for r in rows(cut, 'lines')))
+        for n in ds['notes'] + at['notes'] + cut['notes']:
+            self.assertNotRegex(n, '[–—]')
+
+    def test_evidence_shows_the_price_used_and_the_sheet_rate(self):
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('13', 'ROQAQF207SLS', 60, 9.0, cust='KOHL')]
+        for settings, used in (({}, P1), ({'fx': {'rate': 7.7}}, E.r4(P1 * R2 / 7.7))):
+            ev = build(s, cb=basis_book(change=AT_R2), settings=settings)['evidence']['GN!F1']
+            self.assertEqual((ev['priceUsd'], ev['priceSheet'], ev['fxSheet']), (used, P1, R2))
+
+    def test_what_if_on_the_printed_dataset_matches_a_rebuild(self):
+        # The page's what-if starts from 4-decimal published values, so unit costs agree to rounding.
+        base, at = build(), build(settings={'fx': {'rate': 7.7}})
+        A, n = by(at, 'lines', 'id'), 0
+        for r in rows(base, 'lines'):
+            if r['fobU'] is None:
+                continue
+            u = E.fx_what_if_unit(r['fobU'], r['fxShare'], r['fxRef'], 7.7)
+            self.assertAlmostEqual(u, A[r['id']]['fobU'], delta=0.0002, msg=r['id'])
+            n += r['fxShare'] > 0
+        self.assertGreater(n, 0)
+
+    def test_client_formula(self):
+        self.assertEqual(E.fx_what_if_unit(4.4444, 1.0, 7.0, 7.7), E.r4(4.4444 * (1 - 1.0 + 1.0 * 7.0 / 7.7)))
+        self.assertEqual(E.fx_what_if_unit(4.4444, 0.0, None, 7.7), 4.4444)                  # no RMB-based part
+        self.assertEqual(E.fx_what_if_unit(4.4444, 0.5, None, 7.7, 7.0), E.r4(4.4444 * (0.5 + 0.5 * 7.0 / 7.7)))
+        self.assertEqual(E.fx_what_if_unit(4.4444, 0.5, None, 7.7), 4.4444)                  # nothing to scale from
+        self.assertIsNone(E.fx_what_if_unit(None, 1.0, 7.0, 7.7))
+        ds = build()
+        moved = 0
+        for t in ('lines', 'apo'):
+            for r in rows(ds, t):
+                if r['fob'] is None or r['rev'] is None:
+                    continue
+                c = client_recalc_fx(r, ds['settings'], ds['dict'], 7.7)
+                self.assertEqual(c['fob'], E.r2(c['qty'] * c['fobU']) if r['fxShare'] else r['fob'], (t, r['id']))
+                self.assertEqual(c['cogs'], E.r2(c['fob'] + c['duty'] + c['freight'] + c['fees']))
+                self.assertEqual((c['deduct'], c['net']), (r['deduct'], r['net']))              # revenue side unchanged
+                if r['fxShare'] and r['fob'] > 0:
+                    self.assertLess(c['fob'], r['fob'])                                         # a weaker RMB: cheaper
+                    moved += 1
+                    if 'kit' in r['flags']:
+                        self.assertEqual(c['qty'], r['pieces'])
+        self.assertGreater(moved, 0)
 
 
 if __name__ == '__main__':
