@@ -264,6 +264,9 @@ class FakeOpenOrders:
             if self.mode == 'new':
                 q.update(copy.deepcopy(p['_new']))
                 q['poKey'], q['poKind'] = _key(p['orderNo'])
+                if q.get('bucket') != 'pending':
+                    # Contract C7: legacy `shipped` = counted; a pending PO keeps the book rule.
+                    q['shipped'] = bool(q.get('counted'))
             out.append(q)
         out.sort(key=lambda p: p['lastSeen'], reverse=True)
         return out

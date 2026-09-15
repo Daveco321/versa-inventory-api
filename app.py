@@ -14888,24 +14888,28 @@ def _hist_block(*payloads):
 
 
 def _weekdays_after(d, today):
-    """Weekdays after date d, up to and including today (holidays not removed)."""
+    """Weekdays after date d, up to yesterday (today's invoices cannot be in
+    yet). Office holidays are not known here, so this can read one day high.
+    It is the same count the desktop Past Orders page shows."""
     try:
         x = datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
     except (TypeError, ValueError):
         return None
     n = 0
-    while x < today:
-        x += timedelta(days=1)
+    x += timedelta(days=1)
+    while x < today and n < 400:
         if x.weekday() < 5:
             n += 1
+        x += timedelta(days=1)
     return n
 
 
 def _history_info(*payloads, sales_summary=None):
     """invoices_through {wholesale, dropship} and history_label for one answer.
-    Newer open-orders builds send a `history` block; older builds only the
-    invoice summary's source dates, and then the dropship date is unknown."""
-    hist = _hist_block(*payloads) or {}
+    Newer open-orders builds send a `history` block (the answer's own first,
+    then the invoice summary's); older builds only the invoice summary's
+    source dates, and then the dropship date is unknown."""
+    hist = _hist_block(*payloads, sales_summary) or {}
     thru = hist.get('invoicesThrough') if isinstance(hist.get('invoicesThrough'), dict) else {}
     wholesale = thru.get('OB') or None
     dropship = thru.get('DS') or None
@@ -14990,11 +14994,11 @@ def _po_hist_uncacheable(data, previous, account):
             return 'the invoice match is still loading on the server'
         if (hist.get('flags') or {}).get('degraded'):
             return 'the server kept an older archive (degraded)'
-    if account is None:
-        if not (data.get('accounts') or []) and (previous or {}).get('accounts'):
-            return 'empty-after-full'
-    elif not (data.get('pos') or []) and (previous or {}).get('pos'):
-        return 'empty-after-full'
+    field = 'accounts' if account is None else 'pos'
+    if not (data.get(field) or []):
+        # A working archive always has customers, and a listed account always
+        # has POs, so an empty list is never kept, even as the first answer.
+        return 'empty-after-full' if (previous or {}).get(field) else 'empty'
     return ''
 
 
@@ -15008,10 +15012,11 @@ def _fetch_po_history(account=None):
     """Fetch the received-PO archive (summary, or one account's POs) from the
     open-orders service, cached module-level. Returns (payload_or_None, ok);
     ok is False when the payload is not a fresh, complete answer (still
-    building, or the last good copy served after an error). Never cached: a
-    failure, a 'still building' answer, an answer whose invoice match is still
-    loading (history.viewReady false), a degraded answer, and an empty list
-    that follows a non-empty one (the last good copy is served instead)."""
+    building, or the last good copy served after an error or while the server
+    rebuilds). Never cached: a failure, a 'still building' answer, an answer
+    whose invoice match is still loading (history.viewReady false), a degraded
+    answer, and an empty list (after a non-empty one the last good copy is
+    served instead)."""
     now = time.time()
     key = (str(account).strip().upper() if account else None) or None
     ck = key or '__summary__'
@@ -15043,7 +15048,16 @@ def _fetch_po_history(account=None):
             _po_hist_proxy_cache['errors'][ck] = 'The archive answered with an empty list. Showing the last good copy.'
         return cached, False
     if why == 'not ready':
-        return data, False   # index still building server-side
+        if cached is not None and cached.get('ready'):
+            # The server is rebuilding its index: answer from the last good
+            # copy, flagged not fresh, instead of "try again later".
+            return cached, False
+        return data, False   # index still building server-side, nothing kept here
+    if why == 'empty':
+        print(f"[PastOrders] po-history {key or 'summary'}: empty list, not cached", flush=True)
+        with _po_hist_proxy_lock:
+            _po_hist_proxy_cache['errors'][ck] = 'The archive answered with an empty list.'
+        return data, True
     if why:
         print(f"[PastOrders] po-history {key or 'summary'} not cached: {why}", flush=True)
         return data, True
@@ -15108,6 +15122,20 @@ def _fetch_sales_summary():
 def _sales_summary_quiet():
     data, _err = _fetch_sales_summary()
     return data if isinstance(data, dict) and data.get('ready') else None
+
+
+def _sales_summary_cached():
+    """The last good invoice summary in memory, with no network call (or None)."""
+    with _sales_sum_lock:
+        d = _sales_sum_cache['data']
+    return d if isinstance(d, dict) and d.get('ready') else None
+
+
+def _past_meta_offline():
+    """Cut-off fields for answers that could not reach the archive. Read from
+    the invoice summary already in memory, so an error answer never waits on
+    a second call to a service that is failing."""
+    return {**_history_info(sales_summary=_sales_summary_cached()), 'dropship_note': _HIST_DROPSHIP_NOTE}
 
 
 # ── Invoice truth for archive POs, matched by the canonical key ──
@@ -15454,12 +15482,14 @@ def _ai_tool_past_orders(params):
     summary, _ok = _fetch_po_history()
     if summary is None:
         why = _po_hist_error() or 'no answer from the order history service'
-        return {'error': f'The past-orders archive is unavailable right now ({why}). Try again in a minute.'}
+        return {'error': f'The past-orders archive is unavailable right now ({why}). Try again in a minute.',
+                **_past_meta_offline()}
     if not summary.get('ready'):
         prog = summary.get('progress') or {}
         return {'building': True,
                 'note': (f"The archive index is still building ({prog.get('done', 0)} of "
-                         f"{prog.get('total', 0)} days). Try again in a minute.")}
+                         f"{prog.get('total', 0)} days). Try again in a minute."),
+                **_past_meta_offline()}
     hist_sum = _hist_block(summary) or {}
     est_rule = hist_sum.get('estimateRule')
     meta = {**_history_info(summary, sales_summary=_sales_summary_quiet()),
@@ -15475,6 +15505,9 @@ def _ai_tool_past_orders(params):
     accounts = [a for a in (summary.get('accounts') or [])
                 if any((a.get(k) or 0) > 0 for k in ('poCount', 'cancelledCount', 'pendingPos',
                                                      'notCountedPos', 'invoicedPos', 'awaitingPos'))]
+    if not accounts:
+        return {'error': ('The past-orders archive answered with no customers. That is not normal and may be '
+                          'a server problem. Try again in a few minutes.'), **meta}
     cust_q = (params.get('customer') or '').strip() or None
     style_q = (params.get('style') or '').strip().upper() or None
     status_raw = (params.get('status') or 'all').strip().lower()
@@ -15575,9 +15608,11 @@ def _ai_tool_past_orders(params):
         else:
             server_bd = None if filtered else _past_acct_breakdown(acct)
             if server_bd and final:
-                bd = server_bd          # the server's own numbers: every reader shows the same total
-                tot_units = _sisc(acct.get('units'))
-                tot_val = round(_sfsc(acct.get('value')), 2)
+                # The server's own numbers, so every reader shows the same
+                # figures. The total is invoiced plus awaiting, so the parts add up.
+                bd = server_bd
+                tot_units = _sisc(bd['invoiced']['units']) + _sisc(bd['awaiting_invoice']['units'])
+                tot_val = round(_sfsc(bd['invoiced']['value']) + _sfsc(bd['awaiting_invoice']['value']), 2)
             else:
                 parts = {'invoiced': ('invoiced',), 'awaiting_invoice': ('awaiting_invoice',),
                          'pending': (), 'not_counted': ()}.get(status_f, ('invoiced', 'awaiting_invoice'))
@@ -15611,6 +15646,9 @@ def _ai_tool_past_orders(params):
             out['invoice_check_note'] = (f"Could not match these POs to invoices ({inv_err.get('error')}). "
                                          'Every count here is an order-book estimate, and some of these POs are '
                                          'already invoiced. Do not add these totals to invoiced sales.')
+        elif final and inv_err is not None:
+            out['invoice_check_note'] = (f"Could not load invoice lines for the invoiced POs ({inv_err.get('error')}). "
+                                         'Their style quantities here are booked sizes, an estimate.')
         elif not final and _hist_block(data):
             out['invoice_check_note'] = ('The server is still matching invoices. These POs were matched to '
                                          'invoices here instead.')
@@ -15915,13 +15953,31 @@ def _ai_tool_sales_history(params):
                         'awaiting_invoice here or past_orders_lookup. Dropship is only in invoices.'),
                **_history_info(data, sales_summary=data)}
         pend = data.get('pending') if isinstance(data.get('pending'), dict) else None
-        if pend is not None and pend.get('ready') is not False:
+        if pend is not None and pend.get('ready') is False:
+            out['awaiting_note'] = ('The awaiting-invoice estimate is still loading on the server. '
+                                    'Ask again in a minute.')
+        elif pend is not None:
             aw = {'basis': 'estimate', 'note': _HIST_AWAITING_NOTE, 'totals': pend.get('totals'),
                   'by_month': pend.get('byMonth')}
+            custs = pend.get('customers') if isinstance(pend.get('customers'), dict) else {}
+            if custs:
+                top = sorted(custs.items(), key=lambda kv: -_sfsc((kv[1] or {}).get('value')))[:60]
+                aw['by_customer'] = [{'customer': k, 'pos': (v or {}).get('pos'),
+                                      'units': (v or {}).get('units'), 'value': (v or {}).get('value')}
+                                     for k, v in top]
             out['awaiting_invoice'] = aw
         return out
     except Exception as e:
         return {'error': f'sales history unavailable: {e}'}
+
+
+def _lines_matching(units, *cands):
+    """The first style-line list whose quantities add up to units, so a sheet
+    tab always totals the PO count it shows. None when no list adds up."""
+    for c in cands:
+        if isinstance(c, list) and c and sum(_sisc(l.get('qty')) for l in c if isinstance(l, dict)) == units:
+            return c
+    return None
 
 
 def _sheet_pending_rows(pend_list, source):
@@ -15949,12 +16005,15 @@ def _sheet_pending_rows(pend_list, source):
         else:
             est = p.get('estShipDate') or ''
             if st is not None:
-                lines = st['lines']
+                u, v = st['units'], st['value']
+                lines = _lines_matching(u, st['lines'], p.get('estLines'), p.get('linesPeak'), p.get('lines'))
             else:
-                lines = p.get('estLines') or p.get('lines') or p.get('linesPeak') or []
-                if not lines:
-                    u, v = _pend_units_value(p)
-                    lines = [{'style': '', 'qty': u, 'value': v}]
+                u, v = _pend_units_value(p)
+                lines = _lines_matching(u, p.get('estLines'), p.get('linesPeak'), p.get('lines'))
+            if lines is None:
+                # No style list adds up to the counted quantity: one PO line
+                # keeps the tab total equal to the count.
+                lines = [{'style': '', 'qty': u, 'value': v}]
         for l in lines:
             q = _sisc(l.get('qty'))
             v = _sfsc(l.get('value'))

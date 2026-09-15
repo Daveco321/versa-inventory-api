@@ -125,6 +125,31 @@ class CacheRules(Base):
         self.assertFalse(ok2)
         self.assertEqual(len(got2['pos']), len(acct['pos']))
 
+    def test_building_serves_last_good(self):
+        good, _ = self.app._fetch_po_history()
+        self.expire()
+        self.fake.po_history_override[None] = {'ready': False, 'building': True,
+                                               'progress': {'done': 3, 'total': 105}}
+        got, ok = self.app._fetch_po_history()
+        self.assertFalse(ok)
+        self.assertIs(got, good)
+        out = self.app._ai_tool_past_orders({})
+        self.assertNotIn('building', out)
+        self.assertIn('stale_note', out)
+        self.assertTrue(out['customers'])
+
+    def test_empty_first_answer_is_not_cached(self):
+        empty = self.fake.po_history()
+        empty['accounts'] = []
+        self.fake.po_history_override[None] = empty
+        self.app._fetch_po_history()
+        self.app._fetch_po_history()
+        self.assertEqual(self.fake.count(*PO_HISTORY), 2)
+        out = self.app._ai_tool_past_orders({})
+        self.assertIn('no customers', out['error'])
+        self.assertMeta(out)
+        self.assertPlain(out)
+
     def test_error_serves_last_good_and_backs_off(self):
         self.app._fetch_po_history()
         self.expire()
@@ -213,7 +238,8 @@ class PastOrdersOld(Base):
         self.assertMeta(out)
         self.assertEqual(out['invoices_through'], {'wholesale': '2026-08-21', 'dropship': None})
         self.assertEqual(out['history_label'], 'Invoices through Aug 21, 2026. Dropship end date not reported.')
-        self.assertEqual(out['invoices_behind'], 'Invoices are 17 business days behind.')
+        # Weekdays Aug 24 to Sep 14: today (Sep 15) is not counted, like the desktop page.
+        self.assertEqual(out['invoices_behind'], 'Invoices are 16 business days behind.')
         self.assertIn('dropship_note', out)
         self.assertEqual(out['totals']['left_before_window_pos'], 2)
         self.assertNotIn('cancelled', json.dumps(out['totals']))
@@ -335,6 +361,35 @@ class PastOrdersNew(Base):
         self.assertIn('invoice_check_note', out)
         self.assertPlain(out)
 
+    def test_error_answers_carry_the_cutoff(self):
+        self.app._fetch_sales_summary()          # a good invoice summary is in memory
+        n = self.fake.count(*SALES)
+        self.fake.fail[PO_HISTORY] = 500
+        out = self.app._ai_tool_past_orders({'customer': 'ZALPHA'})
+        self.assertIn('HTTP 500', out['error'])
+        self.assertEqual(out['invoices_through'], {'wholesale': '2026-08-21', 'dropship': '2026-07-31'})
+        self.assertEqual(out['history_label'], self.data['history']['label'])
+        self.assertIn('dropship_note', out)
+        self.assertEqual(self.fake.count(*SALES), n)   # the error answer made no extra call
+        self.assertPlain(out)
+
+    def test_customer_total_is_invoiced_plus_awaiting(self):
+        s = self.fake.po_history()
+        for a in s['accounts']:
+            if a['customer'] == 'ZALPHA':
+                a['units'], a['value'] = 1, 1.0      # a server total that disagrees with its parts
+        self.fake.po_history_override[None] = s
+        out = self.app._ai_tool_past_orders({'customer': 'ZALPHA'})
+        bd = out['by_status']
+        self.assertEqual(out['total_units'], bd['invoiced']['units'] + bd['awaiting_invoice']['units'])
+        self.assertEqual((out['total_units'], out['total_value']), (3300, 8850.0))
+
+    def test_style_lines_without_invoice_lines_are_flagged(self):
+        self.fake.fail[LOOKUP] = 500
+        out = self.app._ai_tool_past_orders({'customer': 'ZALPHA', 'style': 'ZZTEST001'})
+        self.assertIn('booked sizes', out['invoice_check_note'])
+        self.assertPlain(out)
+
 
 class LookupScoping(Base):
     mode = 'new'
@@ -435,6 +490,32 @@ class SalesHistoryNew(Base):
         out = self.app._ai_tool_sales_history({})
         self.assertEqual(out['invoices_through'], {'wholesale': '2026-08-21', 'dropship': '2026-07-31'})
         self.assertEqual(out['awaiting_invoice']['basis'], 'estimate')
+        self.assertPlain(out)
+
+    def test_summary_awaiting_by_customer(self):
+        orig = self.fake.sales_summary
+
+        def with_custs():
+            s = orig()
+            s['pending']['customers'] = {'ZBETA1': {'pos': 1, 'units': 10, 'value': 5.0},
+                                         'ZALPHA': {'pos': 3, 'units': 700, 'value': 2050.0}}
+            return s
+        self.fake.sales_summary = with_custs
+        out = self.app._ai_tool_sales_history({})
+        self.assertEqual([c['customer'] for c in out['awaiting_invoice']['by_customer']], ['ZALPHA', 'ZBETA1'])
+        self.assertEqual(out['awaiting_invoice']['basis'], 'estimate')
+
+    def test_summary_awaiting_not_ready_is_said(self):
+        orig = self.fake.sales_summary
+
+        def not_ready():
+            s = orig()
+            s['pending'] = {'ready': False}
+            return s
+        self.fake.sales_summary = not_ready
+        out = self.app._ai_tool_sales_history({})
+        self.assertNotIn('awaiting_invoice', out)
+        self.assertIn('still loading', out['awaiting_note'])
         self.assertPlain(out)
 
     def test_by_div_without_history_block(self):
@@ -547,6 +628,28 @@ class SheetNew(SheetBase):
         self.assertEqual(out['history_label'], self.data['history']['label'])
         self.assertIn(self.data['history']['label'], self.cells(wb))
         self.assertPlain(out)
+
+    def pend_lines(self, wb, po):
+        ws = wb['Shipped, not yet invoiced']
+        head = [c.value for c in ws[1]]
+        i_po, i_st, i_q = head.index('PO #'), head.index('Style'), head.index('Qty (estimate until invoiced)')
+        return [(r[i_st].value or '', r[i_q].value) for r in ws.iter_rows(min_row=2) if str(r[i_po].value) == po]
+
+    def test_pending_lines_follow_the_peak_rule(self):
+        # A server still on the peak estimate sends no estLines: the peak lines add up.
+        a4 = self.data['archive'][3]['_new']
+        a4.pop('estLines')
+        a4.update(estUnits=500, estValue=1500.0, countUnits=500, countValue=1500.0)
+        out, wb = self.build(customer='ZALPHA', include=['shipped_pending'])
+        self.assertEqual(self.pend_lines(wb, '77001004'), [('ZZTEST001SLS', 500)])
+
+    def test_pending_lines_that_do_not_add_up_become_one_line(self):
+        # No style list adds up to the counted 480: one PO line keeps the tab equal to the count.
+        self.data['archive'][3]['_new'].pop('estLines')
+        out, wb = self.build(customer='ZALPHA', include=['shipped_pending'])
+        self.assertEqual(self.pend_lines(wb, '77001004'), [('', 480)])
+        tab = [t for t in out['tabs'] if t['tab'] == 'Shipped, not yet invoiced'][0]
+        self.assertEqual(tab['units'], 700)
 
     def test_moved_po_is_not_awaiting(self):
         out, wb = self.build(customer='ZBETA1')
