@@ -27,12 +27,21 @@ build_dataset(src, costbook, settings, overrides, now_iso, routing_module) -> di
     routing_module  pnl_routing (route_all is called once).
     Returns the DESIGN 5.4 dataset. Money is rounded to cents, unit costs to 4 decimals.
 decode_sku(sku, params=None) -> dict | None     SKU attributes (None when undecodable)
-CostIndex(costbook, settings, overrides, ledger_rows, today=None)
+CostIndex(costbook, settings, overrides, ledger_rows, today=None, history_rows=None)
     .resolve(style, factory, ref=None, poName=None, customer_group=None)
-        -> {fobU, level, basis, evidence, rangeLo, rangeHi, factory, flags, fxShare, fxRef}
+        -> {fobU, level, basis, evidence, rangeLo, rangeHi, factory, flags, fxShare, fxRef}   one factory's cost
+    .style_quote(style) -> the combined cost of a style (contract C13) with its rule, grade, spread and
+        costByFactory, or None when no factory quotes it directly
+    .final(base, res) -> the resolution every table uses (contract C13 choke point)
+price_fit(fit) -> the price column a fit uses (modern and tailored: regular)
 landed(fobU, attrs, settings, regime, origin) -> {duty, freight, fees, landedU}   per unit
-line_money(...) / stock_money(...)               DESIGN 5.6 row math (the client repeats it)
+line_money(...) / stock_money(...)               DESIGN 5.6 and C11 row math (the client repeats it)
 fx_what_if_unit(fobU, fxShare, fxRef, rate_new, rate_fallback=None) -> fobU'   the RMB what-if
+fiber_class(fiber) -> 'natural' | 'synthetic'    the import multiplier's fiber class (C11)
+fiber_group_of(content) -> 'cotton' | 'linen' | 'wool' | 'mmf' | None   the C11 predominant fiber rule
+landed_multiplier(S, fiber) -> m | None          the multiplier a row uses (None = itemized math)
+revenue_cost_pct(S) -> revCostPct                settings.revenueCosts item percents, summed in order
+royalty_base(S) -> 'net' | 'revenue'             what royalty is a percent of
 merge_settings(stored, params=None) -> effective settings
 clean_params(params) -> (clean, missing, invalid) the cost book params, type checked
 price_field_roles(costbook) -> {usd, base, cut, rmb, e1}   cost-book field names by role
@@ -63,20 +72,59 @@ warehouse (inventory) to a regime. Unit costs round to 4 decimals first; fob = r
 The `regime` argument of adders, landed, line_money and stock_money also accepts the old
 fob_line boolean (true = none, false = us).
 
+Cost model (contract C11, David, Sep 15 2026). settings.landed.mode 'itemized' (the default) keeps the
+duty, freight and fees above. 'multiplier' costs every 'us' or 'ca' row with one import multiplier m
+for the row's fiber class (fiber_class: natural = cotton, linen or wool; synthetic = everything else):
+    duty = r2(fob x (m - 1)), freight = fees = 0, cogs (revenue rows) or landed (stock) = r2(fob + duty)
+    per unit (landed()): duty = r4(fobU x (m - 1)), landedU = r4(fobU + duty)
+In that mode the duty field means "Import (tariffs, freight and fees)" (dict.dutyLabel). A fiber class
+with no multiplier keeps the itemized math on its rows, and the alert 'settings_incomplete' names it.
+Every revenue row (lines, apo, shipped.byCustomer):
+    royalty = r2(B x royaltyPct / 100)       B = net (settings.royalty.base 'net', the default) or rev
+    revCost = r2(rev x revCostPct / 100)     revCostPct = revenue_cost_pct(S); set whenever rev is set
+    contrib = r2(gp - royalty - revCost)     null when the row has no cost
+Duty regime by customer (contract C12). A row with a customer (lines, apo, shipped history) takes, in
+order: settings.regimeByCustomer[cust], 'none' for an FOB customer, settings.destinations[wh] (for an
+allocation: its customer's open lines, C2), then 'us'. Stock rows follow destinations only.
+Shipped history by customer (contract C14): shipped.byCustomer holds lifetime invoices per account and
+style (history codes fold into their account), costed like order lines at today's style cost with the
+account's chargeback rate and regime (no warehouse). shipped.range = {from, to, ingestedAt}.
+Multi-factory cost of goods (contract C13). CostIndex.quotes(b) lists every direct factory quote for a base
+style: list quotes (a Pinnacle-type list names the exact style on any ref, L1; a David Peng-type list prices
+a ref and pattern and a KinYun-type list a ref, pattern and fit, L2, for refs of that factory that carry the
+style on the ledger) and exact calculator matches (grid_exact: the style's own brand, fabric, fit, sleeve and
+pattern at the style's fit column, L4a or L4b) under every factory that makes the style. Modern and tailored
+fits use the regular fit price (price_fit). Sibling and fabric medians, relaxed matches, proxies and defaults
+are not direct quotes. One value per factory (the median of its quotes). CostIndex.combined(b): one factory
+gives 'single'; several give 'average', unless max > min x (1 + wideSpreadPct / 100), then 'lowest'
+(exactly at the threshold is 'average'). The grade is the worst grade among the values used; the level is
+the used value's level ('single', 'lowest') or the best level among the inputs ('average'). fxShare and
+fxRef are value weighted over the values used. CostIndex.final(b, res) is the one choke point every table
+takes its cost through: a manual cost (L0) wins outright, a style with a direct quote takes its combined
+cost on every row (the row keeps its factory), anything else keeps its ladder result ('fallback').
+settings.costRule.mode 'cascade' switches the rule off (today's behaviour).
+
 Contract additions (beyond DESIGN 5.4), all appended after the contract fields:
-    lines: basis, dutyRegime, costRef, pieces, fxRef
-    alloc: costRef, lotTier, pieces, fxShare, fxRef
-    apo: routing, ref, basis, ev, dutyRegime, costRef, coveredBy, fxRef
+    lines: basis, dutyRegime, costRef, pieces, fxRef, revCost
+    alloc: costRef, lotTier, pieces, fxShare, fxRef, revCost (the line's revenue costs for these units)
+    apo: routing, ref, basis, ev, dutyRegime, costRef, coveredBy, fxRef, revCost
     inventory: basis, ev, dutyRegime, flags, fxRef    production: basis, ev, dutyRegime, fxRef
-    styles: basis, ev, t12Net, dutyRegime, dedPct, atsFreeStock, atsFreeProd, fxShare, fxRef
-    shipped.company: costedRev     shipped.byStyle: fobU, level, grade, origin, fxShare, fxRef
+    styles: basis, ev, t12Net, dutyRegime, dedPct, atsFreeStock, atsFreeProd, fxShare, fxRef, openRevCost,
+            costByFactory ([factory, source, refOrSheet, price4, level] per direct quote, by price),
+            costRule (single, average, lowest, manual, fallback; 'cascade' in cascade mode), costSpread
+            (r4(max / min - 1) over the per-factory values, 0 for one, null for none) (contract C13)
+    shipped.company: costedRev, revCost     shipped.byStyle: fobU, level, grade, origin, fxShare, fxRef, caShare
+    shipped.byCustomer {fields, rows}, shipped.range (contract C14)
     inputs.fx: {mode, rate, basis, base, printed[], weighted, unrated} (the price basis in use)
     dict: basis{key: text}, flags{flag: label}, alertKinds{kind: {label, unit, valueLabel}},
-          lotTiers{tier: {label, tone}}, priceBasis{basis: text}, regimes{regime: text}
+          lotTiers{tier: {label, tone}}, priceBasis{basis: text}, regimes{regime: text},
+          fiberClasses{class: text}, dutyLabel (the duty field's name under the cost model in use),
+          costRules{rule: text} (contract C13)
     alerts: unit, valueLabel (C4); thin_contribution also lineCount; every alert refsTotal
     inputs: analytics_to, costbook_generated, routing{...counts}, lotTiers, overridesActive,
             analyticsProblem, analyticsRowsSkipped, costbookInvalid, costbookBadRecords
-    totals.*: costedRev, costedNet, costedUnits, costedLines, grades; lines totals count pieces
+    totals.*: costedRev, costedNet, costedUnits, costedLines, grades, revCost, uncostedRevCost; lines
+              totals count pieces. contrib = gp - royalty - (revCost - uncostedRevCost) on each part.
     evidence entries: kind, ref, style, brand, priceSheet
 """
 import copy
@@ -93,6 +141,9 @@ __all__ = [
     'DEFAULT_SETTINGS', 'LEVELS', 'LEVEL_INFO', 'GRADE_INFO', 'ROUTING_INFO', 'CAT_GROUP',
     'CATEGORY_LABELS', 'FIBER_BY_FABRIC', 'FLAG_LABELS', 'ALERT_KINDS', 'LOT_TIER_LABELS',
     'PRICE_BASIS_LABELS', 'REGIME_LABELS', 'DUTY_REGIMES',
+    'fiber_class', 'fiber_group_of', 'landed_multiplier', 'revenue_cost_pct', 'royalty_base',
+    'FIBER_CLASSES', 'NATURAL_FIBERS', 'LANDED_MODES',
+    'price_fit', 'PRICE_FIT', 'COST_RULES', 'COST_RULE_LABELS', 'COST_RULE_MODES',
 ]
 
 # ── Levels, grades, routing labels (DESIGN 5.7; UI copy: no em or en dashes) ──
@@ -149,16 +200,40 @@ BIG_TALL_FITS = frozenset({'BT', 'BB', 'TT', 'WB', 'SB', 'ST', 'TB'})
 SOLID_COLLARS = frozenset('SBCFJHWMZO')
 PRINT_COLLARS = frozenset('PADEGKLXUNR')
 FIT_CLASS = {'SLIM': 'slim', 'REGULAR': 'regular', 'BIG_TALL': 'bigTall', 'MODERN': 'modern', 'TAILORED': 'tailored'}
+# The price column a fit uses (contract C13): SKU fit code MF decodes to MODERN and TF to TAILORED, and both
+# take the regular fit price, in the calculator grids and in the KinYun-type fit columns.
+PRICE_FIT = {'MODERN': 'REGULAR', 'TAILORED': 'REGULAR'}
 
-# Majority fiber by fabric code, from the public FABRIC_RULES text (index.html) and the fabric
-# content of each fabrication (study section 4.4). Anything not listed counts as man-made fiber.
-# The broker's HTS lines must override this. costbook.params.fiberByFabric may override it too.
+
+def price_fit(fit):
+    """The price column of a decoded fit (contract C13): modern and tailored use the regular fit price."""
+    return PRICE_FIT.get(fit, fit)
+
+
+# Fiber group by fabric code, from the public FABRIC_RULES text (index.html) and the fabric content of each
+# fabrication (study section 4.4), under the predominant fiber rule of contract C11 (fiber_group_of): the
+# largest single fiber share wins, and a tie between a natural and a synthetic fiber counts as natural. So CL
+# (lyocell and cotton tie) and PY (cotton is the largest share) are cotton. A code whose name gives no fiber
+# content counts as man-made fiber (synthetic), except CV (CVC: cotton is the chief fiber) and SF (flannel,
+# cotton in the factory's own content). The broker's HTS lines must override this for duty.
+# costbook.params.fiberByFabric may override it too. REVIEW docs/FABRIC_CLASS.md lists every code.
 FIBER_BY_FABRIC = dict(
-    [(c, 'cotton') for c in ('CB', 'CF', 'CG', 'CJ', 'CK', 'CM', 'CN', 'CP', 'CQ', 'CR', 'CT', 'CU', 'CV',
-                             'CW', 'CX', 'CY', 'LC', 'OC', 'PD', 'SC', 'SF', 'SG', 'SH', 'SJ', 'SN', 'ST',
+    [(c, 'cotton') for c in ('CB', 'CF', 'CG', 'CJ', 'CK', 'CL', 'CM', 'CN', 'CP', 'CQ', 'CR', 'CT', 'CU', 'CV',
+                             'CW', 'CX', 'CY', 'LC', 'OC', 'PD', 'PY', 'SC', 'SF', 'SG', 'SH', 'SJ', 'SN', 'ST',
                              'SV', 'SW')]
     + [(c, 'linen') for c in ('LB', 'LE', 'LN', 'LT')])
 _FIBERS = ('cotton', 'mmf', 'linen', 'wool')
+# Fiber class of the import multiplier (contract C11): natural = cotton, linen or wool; synthetic =
+# everything else (man-made fiber and anything unknown).
+NATURAL_FIBERS = ('cotton', 'linen', 'wool')
+FIBER_CLASSES = ('natural', 'synthetic')
+FIBER_CLASS_LABELS = {'natural': 'Natural fibers (cotton, linen, wool)', 'synthetic': 'Synthetic fibers'}
+_FIBER_CLASS_WORDS = {'natural': 'natural fibers', 'synthetic': 'synthetic fibers'}
+# Words of a fabric content that name a natural fiber group (fiber_group_of). Every other fiber is
+# synthetic: polyester, nylon, spandex, elastane, and also rayon, viscose, modal, lyocell and tencel.
+_NATURAL_WORDS = {'cotton': 'cotton', 'linen': 'linen', 'flax': 'linen', 'wool': 'wool', 'merino': 'wool',
+                  'lambswool': 'wool'}
+_STRETCH_WORDS = frozenset({'spandex', 'elastane', 'lycra'})
 
 # Public brand names by SKU brand code (display only).
 BRAND_NAMES = {
@@ -240,6 +315,10 @@ FLAG_LABELS = {
     'regime_from_orders': "No import costs, like this customer's open orders",
     'ref_after_stock': 'Stock arrived before this ref shipped. The cost is a style estimate.',
     'customer_quote': 'Factory quotation for this customer',
+    'customer_regime': "Import costs follow this customer's setting",
+    'cost_average': 'Average of several factory quotes',
+    'cost_lowest': 'Lowest of several factory quotes. They differ a lot.',
+    'fit_as_regular': 'Modern or tailored fit priced at the regular fit',
 }
 
 # ── Public defaults (DESIGN 5.2; r1_landed_cost.md). The UI marks unconfirmed blocks. ──
@@ -272,13 +351,25 @@ DEFAULT_SETTINGS = {
     'freight': {'oceanPerUnit': {'shirt': 0.285, 'knit': 0.211, 'pants': 0.356, 'blazer': 0.95},
                 'inlandPerUnit': {'shirt': 0.092, 'knit': 0.068, 'pants': 0.114, 'blazer': 0.305}},
     # Black Label (BLK) follows the licensed default until David says otherwise.
-    'royalty': {'defaultPct': 10.0, 'byBrand': dict([(b, 10.0) for b in _LICENSED] + [(b, 0.0) for b in _HOUSE]
-                                                    + [('BLK', 10.0)])},
+    # base: royalty on net sales ('net', after chargebacks) or on revenue ('revenue') (contract C11).
+    'royalty': {'defaultPct': 10.0, 'base': 'net',
+                'byBrand': dict([(b, 10.0) for b in _LICENSED] + [(b, 0.0) for b in _HOUSE] + [('BLK', 10.0)])},
     # Duty regime by A2000 wh, ledger landing or stock warehouse (contract C2). Anything not listed is
     # a US import. CH = factory direct, FOB = FOB at the factory, WALM = Walmart imports it.
     'destinations': {'CH': 'none', 'FOB': 'none', 'WALM': 'none', 'AE': 'ca', 'AW': 'ca', 'CAN': 'ca', 'ABFI': 'ca'},
+    # Import costs by A2000 customer code (contract C12): 'us', 'ca' or 'none'. It beats the FOB list and
+    # the destinations. Empty by default.
+    'regimeByCustomer': {},
+    # Cost model (contract C11): 'itemized' = the duty, freight and fees above; 'multiplier' = the factory
+    # cost times one import multiplier per fiber class (1 to 3). No multiplier until David sets one.
+    'landed': {'mode': 'itemized', 'multiplier': {'natural': None, 'synthetic': None}},
     'deductions': {'byGroup': {'offprice': 1.0, 'department': 7.0, 'club': 2.5, 'walmart': 1.5, 'fob': 0.5, 'other': 2.0},
                    'byCustomer': {}},
+    # Revenue costs (contract C11): each item is a percent of revenue (0 to 50), taken off contribution.
+    # Zero until David sets them.
+    'revenueCosts': {'items': [{'key': 'warehouse', 'name': 'Warehouse', 'pct': 0},
+                               {'key': 'factoring', 'name': 'R&R factoring', 'pct': 0},
+                               {'key': 'rent', 'name': 'Rent', 'pct': 0}]},
     'customerGroups': dict([(c, 'offprice') for c in _OFFPRICE] + [(c, 'department') for c in _DEPARTMENT]
                            + [(c, 'club') for c in _CLUB] + [(c, 'walmart') for c in _WALMART]),
     'fobCustomers': None,
@@ -290,8 +381,12 @@ DEFAULT_SETTINGS = {
     # (R5, what the platform shows); 'engine' runs the engine without the gate.
     'routing': {'picksAsWarehouse': False, 'honorAssignments': True, 'gateFallback': 'fifo'},
     'bulk': {'includeInTotals': False},
+    # How a style's unit cost combines the prices of every factory that quotes it (contract C13).
+    'costRule': {'mode': 'combined', 'wideSpreadPct': 10},
+    # A note the Customers and Statement views show next to shipped history (contract C14).
+    'history': {'caveat': None},
     'confirmed': {'fx': False, 'grid': False, 'tariff': False, 'freight': False, 'royalty': False,
-                  'deductions': False, 'opex': False},
+                  'deductions': False, 'opex': False, 'landed': False, 'revenueCosts': False},
     'updatedAt': None, 'updatedBy': None,
 }
 # Alert thresholds (not cost data).
@@ -307,7 +402,7 @@ REGIME_LABELS = {'us': 'US import', 'ca': 'Canada', 'none': 'Not a US import'}
 # None means the count is not meaningful (one feed, one file); a valueLabel of None means no value.
 ALERT_KINDS = {
     'below_cost': {'label': 'Lines sold below cost', 'unit': 'lines', 'valueLabel': 'Loss before royalty'},
-    'thin_contribution': {'label': 'Thin contribution POs', 'unit': 'POs', 'valueLabel': 'Revenue on these POs'},
+    'thin_contribution': {'label': 'Thin profit POs', 'unit': 'POs', 'valueLabel': 'Revenue on these POs'},
     'needs_cost': {'label': 'Revenue with no cost', 'unit': 'lines', 'valueLabel': 'Revenue with no cost'},
     'bulk_needs_cost': {'label': 'Bulk forecast with no cost', 'unit': 'lines', 'valueLabel': 'Bulk revenue with no cost'},
     'grade_d': {'label': 'Grade D exposure', 'unit': 'lines', 'valueLabel': 'Revenue'},
@@ -318,6 +413,7 @@ ALERT_KINDS = {
     'non_us_dest': {'label': 'Canada and direct-import costs are assumed', 'unit': 'styles', 'valueLabel': None},
     'stale_input': {'label': 'Input may be out of date', 'unit': None, 'valueLabel': None},
     'costbook_params': {'label': 'Cost book has missing or invalid parameters', 'unit': 'settings', 'valueLabel': None},
+    'settings_incomplete': {'label': 'Import multiplier not set', 'unit': 'settings', 'valueLabel': None},
     'assumption': {'label': 'Assumptions to confirm', 'unit': 'settings', 'valueLabel': None},
 }
 # Lot tier labels (contract C6). The engine keeps the codes; T5 is shown in the warning tone.
@@ -341,10 +437,34 @@ PRICE_BASIS_LABELS = {
     'none': 'No price estimate',
 }
 # Assumption blocks in the order the UI lists them, with their plain names (contract C4).
-_ASSUMPTION_NAMES = (('fx', 'RMB rate'), ('grid', 'calculator grid order'), ('deductions', 'customer deductions'),
-                     ('freight', 'freight and fees'), ('opex', 'operating expenses'), ('royalty', 'royalty'),
+_ASSUMPTION_NAMES = (('fx', 'RMB rate'), ('grid', 'calculator grid order'), ('deductions', 'chargebacks'),
+                     ('freight', 'freight and fees'), ('opex', 'payroll and monthly costs'), ('royalty', 'royalty'),
+                     ('revenueCosts', 'revenue costs'), ('landed', 'import cost method'),
                      ('tariff', 'duty and tariffs'))
 _DESTINATIONS_NAME = 'Canada and direct-import destinations'
+# Cost model settings (contract C11) and the cost rule modes (contract C13). Bands, not Versa data.
+LANDED_MODES = ('itemized', 'multiplier')
+ROYALTY_BASES = ('net', 'revenue')
+COST_RULE_MODES = ('combined', 'cascade')
+# How a style's unit cost was set (styles.costRule, contract C13). 'cascade' marks cascade mode.
+COST_RULES = ('single', 'average', 'lowest', 'manual', 'fallback', 'cascade')
+COST_RULE_LABELS = {
+    'single': 'One factory quote',
+    'average': 'Average of the factory quotes',
+    'lowest': 'Lowest factory quote. The quotes are far apart.',
+    'manual': 'Manual cost',
+    'fallback': 'No direct factory quote. The best estimate is used.',
+    'cascade': 'Price ladder. Factory quotes are not combined.',
+}
+_DIRECT_LEVELS = ('L1', 'L2', 'L4a', 'L4b')      # levels a direct quote can have (C13)
+_LIST_LEVELS = ('L1', 'L2', 'L3')                # a list factory's own list answers at these levels
+_LOT_FLAGS = ('blended_lot', 'ref_after_stock')  # stock flags that stay on a combined cost
+_SPREAD_TOL = 1e-9                               # float noise: exactly at the threshold stays 'average'
+_MULT_BAND = (1.0, 3.0)          # a valid import multiplier
+_REV_COST_MAX = 50.0             # a valid revenue cost item, percent of revenue
+_SPREAD_MAX = 100.0              # costRule.wideSpreadPct
+_CAVEAT_MAX = 500                # history.caveat characters
+DUTY_LABELS = {'itemized': 'Duty and tariffs', 'multiplier': 'Import (tariffs, freight and fees)'}
 # Cost-book params by plain name (alert text never shows a raw key).
 _PARAM_NAMES = {'params': 'all parameters', 'fxBase': 'cost book RMB rate', 'ssDelta': 'short sleeve adjustment',
                 'fitPremium': 'fit premiums', 'gridPrecedence': 'calculator grid order',
@@ -536,6 +656,39 @@ def decode_sku(sku, params=None):
     return d
 
 
+def fiber_group_of(content):
+    """Fiber group of a fabric content (contract C11): {fiber name: percent} or [(name, percent)] ->
+    'cotton' | 'linen' | 'wool' | 'mmf', or None when nothing is readable. The largest single share
+    wins. A tie between a natural and a synthetic fiber counts as natural. Spandex or elastane decides
+    only when it is the largest share on its own. Rayon, viscose, modal, lyocell and tencel are
+    synthetic, like every fiber that is not cotton, linen or wool."""
+    pairs = content.items() if isinstance(content, dict) else content if isinstance(content, (list, tuple)) else ()
+    shares = []
+    for pair in pairs:
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and isinstance(pair[0], str)):
+            continue
+        p = _fnum(pair[1])
+        if p is None or p <= 0:
+            continue
+        words = re.findall(r'[a-z]+', pair[0].lower())
+        group = next((_NATURAL_WORDS[w] for w in words if w in _NATURAL_WORDS), 'mmf')
+        shares.append((p, group, any(w in _STRETCH_WORDS for w in words)))
+    if not shares:
+        return None
+    top = max(s[0] for s in shares)
+    lead = [s for s in shares if s[0] == top]
+    lead = [s for s in lead if not s[2]] or lead       # a stretch fiber decides only on its own
+    return next((g for g in NATURAL_FIBERS if any(s[1] == g for s in lead)), 'mmf')
+
+
+def fiber_class(fiber):
+    """'natural' (cotton, linen or wool) or 'synthetic' (everything else, unknown included), contract
+    C11. fiber: a fiber group as rows carry it, or a fabric content (see fiber_group_of)."""
+    if isinstance(fiber, (dict, list, tuple)):
+        fiber = fiber_group_of(fiber)
+    return 'natural' if isinstance(fiber, str) and fiber.strip().lower() in NATURAL_FIBERS else 'synthetic'
+
+
 # ── Settings ──
 def _deep_merge(base, over):
     out = copy.deepcopy(base)
@@ -570,7 +723,9 @@ def merge_settings(stored, params=None):
     """Effective settings: stored values over DEFAULT_SETTINGS (dicts merge key by key, lists
     and scalars replace). fx.rate null (or any value that is not a positive number) stays null: every
     price as printed on its own sheet (contract C10). In the settings maps a null value means 'use the
-    default' (contract C3; see _NULL_TO_RULE and _NULL_TO_DEFAULT)."""
+    default' (contract C3; see _NULL_TO_RULE and _NULL_TO_DEFAULT). The C11 to C14 blocks (landed,
+    royalty.base, revenueCosts, regimeByCustomer, costRule, history) follow the same rule: a null or a
+    value the engine cannot use gives the public default, and a saved list replaces the default list."""
     s = _deep_merge(DEFAULT_SETTINGS, stored if isinstance(stored, dict) else {})
     fx = s.get('fx') if isinstance(s.get('fx'), dict) else {}
     s['fx'] = fx
@@ -578,7 +733,7 @@ def merge_settings(stored, params=None):
     if str(fx.get('basis') or '') not in ('current_usd', 'after_cut'):
         fx['basis'] = 'current_usd'
     for k in ('tariff', 'freight', 'royalty', 'deductions', 'routing', 'bulk', 'confirmed', 'factories',
-              'destinations'):
+              'destinations', 'regimeByCustomer', 'landed', 'revenueCosts', 'costRule', 'history'):
         if not isinstance(s.get(k), dict):
             s[k] = copy.deepcopy(DEFAULT_SETTINGS[k])
     for k in ('addonPct', 'mfnPct'):
@@ -620,6 +775,45 @@ def merge_settings(stored, params=None):
     s['destinations'] = dest
     if _fnum(s['tariff'].get('caMfnPct')) is None:
         s['tariff']['caMfnPct'] = DEFAULT_SETTINGS['tariff']['caMfnPct']
+    # regimeByCustomer (C12): upper-case customer codes and known regimes only. Any other entry (null
+    # included) is dropped, so that customer falls through to the FOB list and the destinations.
+    rbc = {}
+    for k, v in s['regimeByCustomer'].items():
+        reg = v.strip().lower() if isinstance(v, str) else None
+        if isinstance(k, str) and k.strip() and reg in DUTY_REGIMES:
+            rbc[k.strip().upper()] = reg
+    s['regimeByCustomer'] = rbc
+    # landed (C11): a known mode; each multiplier a number from 1 to 3, else null (not set).
+    L = s['landed']
+    if L.get('mode') not in LANDED_MODES:
+        L['mode'] = DEFAULT_SETTINGS['landed']['mode']
+    mm = L.get('multiplier') if isinstance(L.get('multiplier'), dict) else {}
+    L['multiplier'] = {c: _mult_ok(mm.get(c)) for c in FIBER_CLASSES}
+    if s['royalty'].get('base') not in ROYALTY_BASES:
+        s['royalty']['base'] = DEFAULT_SETTINGS['royalty']['base']
+    # revenueCosts (C11): the saved list replaces the default list. A percent that is null or not a
+    # number from 0 to 50 counts as 0 (the default), so a bad value switches that item off.
+    items = s['revenueCosts'].get('items')
+    if not isinstance(items, list):
+        items = copy.deepcopy(DEFAULT_SETTINGS['revenueCosts']['items'])
+    clean = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        key = it.get('key') if isinstance(it.get('key'), str) else ''
+        p = _fnum(it.get('pct'))
+        clean.append({'key': key, 'name': it.get('name') if isinstance(it.get('name'), str) else key,
+                      'pct': it.get('pct') if p is not None and 0 <= p <= _REV_COST_MAX else 0})
+    s['revenueCosts']['items'] = clean
+    # costRule (C13) and history (C14).
+    cr = s['costRule']
+    if cr.get('mode') not in COST_RULE_MODES:
+        cr['mode'] = DEFAULT_SETTINGS['costRule']['mode']
+    w = _fnum(cr.get('wideSpreadPct'))
+    if w is None or not 0 <= w <= _SPREAD_MAX:
+        cr['wideSpreadPct'] = DEFAULT_SETTINGS['costRule']['wideSpreadPct']
+    cav = s['history'].get('caveat')
+    s['history']['caveat'] = (cav.strip()[:_CAVEAT_MAX] or None) if isinstance(cav, str) else None
     return s
 
 
@@ -645,12 +839,52 @@ def _ca_mfn(T):
     return _num(DEFAULT_SETTINGS['tariff']['caMfnPct'] if v is None else v)
 
 
+def _mult_ok(v):
+    """An import multiplier (contract C11): a number from 1 to 3, else None (not set)."""
+    f = _fnum(v)
+    return f if f is not None and _MULT_BAND[0] <= f <= _MULT_BAND[1] else None
+
+
+def landed_multiplier(S, fiber):
+    """The import multiplier a row uses (contract C11): in multiplier mode, settings.landed.multiplier of
+    the row's fiber class. None in itemized mode, or when that class has no multiplier: the row then
+    keeps the itemized duty, freight and fees (and the build raises 'settings_incomplete')."""
+    L = S.get('landed') if isinstance(S, dict) else None
+    if not isinstance(L, dict) or L.get('mode') != 'multiplier' or not isinstance(L.get('multiplier'), dict):
+        return None
+    return _mult_ok(L['multiplier'].get(fiber_class(fiber or 'mmf')))
+
+
+def revenue_cost_pct(S):
+    """revCostPct (contract C11): settings.revenueCosts.items[].pct summed in list order, starting at 0.
+    An item whose percent is not a number from 0 to 50 adds nothing. The page sums the same way."""
+    rc = S.get('revenueCosts') if isinstance(S, dict) else None
+    items = rc.get('items') if isinstance(rc, dict) else None
+    t = 0.0
+    for it in (items if isinstance(items, list) else ()):
+        p = _fnum(it.get('pct')) if isinstance(it, dict) else None
+        if p is not None and 0 <= p <= _REV_COST_MAX:
+            t += p
+    return t
+
+
+def royalty_base(S):
+    """'net' (royalty on net sales, the default) or 'revenue' (contract C11)."""
+    R = S.get('royalty') if isinstance(S, dict) else None
+    return 'revenue' if isinstance(R, dict) and R.get('base') == 'revenue' else 'net'
+
+
 def adders(fob, qty, cat, fiber, origin, S, regime):
     """(duty, freight, fees) for a row: fob in dollars (already rounded), qty in pieces.
-    regime: 'us', 'ca' or 'none' (contract C2); the old fob_line flag still works (true = none)."""
+    regime: 'us', 'ca' or 'none' (contract C2); the old fob_line flag still works (true = none).
+    Multiplier mode (contract C11): a 'us' or 'ca' row pays duty = r2(fob x (m - 1)) and no freight or
+    fees, m being the multiplier of its fiber class. A class with no multiplier keeps the math below."""
     reg = _regime(regime)
     if reg == 'none' or fob is None:
         return 0.0, 0.0, 0.0
+    m = landed_multiplier(S, fiber)
+    if m is not None:
+        return r2(fob * (m - 1)), 0.0, 0.0         # one import cost: tariffs, freight and fees
     g = CAT_GROUP.get(cat, 'shirt')
     fiber = fiber or 'mmf'
     T, F = S['tariff'], S['freight']
@@ -687,6 +921,13 @@ def landed(fobU, attrs, settings, regime, origin):
     reg = _regime(regime)
     if reg == 'none':
         return {'duty': 0.0, 'freight': 0.0, 'fees': 0.0, 'landedU': r4(fobU)}
+    m = landed_multiplier(S, (attrs or {}).get('fiber'))
+    if m is not None:
+        # Multiplier mode (C11): the unit cost is rounded to 4 decimals first (C2), then the duty, so the
+        # page gets the same landedU from the published fobU.
+        u = r4(fobU)
+        duty = r4(u * (m - 1))
+        return {'duty': duty, 'freight': 0.0, 'fees': 0.0, 'landedU': r4(u + duty)}
     g = CAT_GROUP.get((attrs or {}).get('cat'), 'shirt')
     fiber = (attrs or {}).get('fiber') or 'mmf'
     T, F = S['tariff'], S['freight']
@@ -732,20 +973,24 @@ def _roy_pct(brand, S):
 
 
 def line_money(rev, fob, qty, cat, fiber, origin, regime, ded_pct, roy_pct, S):
-    """One revenue row (DESIGN 5.6). rev None = unpriced (APO). fob None = uncosted (L7).
-    regime: 'us', 'ca' or 'none' (the old fob_line flag still works)."""
+    """One revenue row (DESIGN 5.6, contract C11). rev None = unpriced (APO). fob None = uncosted (L7).
+    regime: 'us', 'ca' or 'none' (the old fob_line flag still works). Royalty is a percent of net sales
+    or of revenue (settings.royalty.base). revCost = r2(rev x revCostPct / 100) whenever rev is set,
+    and contrib = r2(gp - royalty - revCost). The page repeats this operation order."""
     out = {'duty': None, 'freight': None, 'fees': None, 'cogs': None, 'deduct': None, 'net': None,
-           'gp': None, 'royalty': None, 'contrib': None}
+           'gp': None, 'royalty': None, 'revCost': None, 'contrib': None}
     if fob is not None:
         d, f, e = adders(fob, qty, cat, fiber, origin, S, regime)
         out.update(duty=d, freight=f, fees=e, cogs=r2(fob + d + f + e))
     if rev is not None:
         out['deduct'] = r2(rev * ded_pct / 100)
         out['net'] = r2(rev - out['deduct'])
+        out['revCost'] = r2(rev * revenue_cost_pct(S) / 100)
         if fob is not None:
             out['gp'] = r2(out['net'] - out['cogs'])
-            out['royalty'] = r2(out['net'] * roy_pct / 100)
-            out['contrib'] = r2(out['gp'] - out['royalty'])
+            base = rev if royalty_base(S) == 'revenue' else out['net']
+            out['royalty'] = r2(base * roy_pct / 100)
+            out['contrib'] = r2(out['gp'] - out['royalty'] - out['revCost'])
     return out
 
 
@@ -1087,9 +1332,10 @@ def _wmedian(items):
 class CostIndex:
     """The cost book indexed for the cascade. ledger_rows: the current style ledger (L5 list
     siblings and the L6 defaults are computed from it). self.ledger holds one prepared entry per
-    ledger row (same index) with its resolution in 'res'."""
+    ledger row (same index) with its resolution in 'res' (the row's own factory, the ladder). history_rows:
+    optional past ledger lines; with the ledger they say which refs carry each style (contract C13)."""
 
-    def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None):
+    def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None, history_rows=None):
         cb = costbook if isinstance(costbook, dict) else {}
         # Params are type checked here, so a stored or restored cost book with a bad param switches
         # that rule off (and the dataset says so) instead of failing the build.
@@ -1147,6 +1393,13 @@ class CostIndex:
         self.ledger = self._prepare_ledger(ledger_rows or [])
         self._pass1()
         self._pass2()
+        # Contract C13: the cost rule, and the refs that carry each style (the ledger, then its history).
+        cr = S.get('costRule') if isinstance(S.get('costRule'), dict) else {}
+        self.rule_mode = cr.get('mode') if cr.get('mode') in COST_RULE_MODES else 'combined'
+        w = _fnum(cr.get('wideSpreadPct'))
+        self.wide_pct = w if w is not None and 0 <= w <= _SPREAD_MAX else DEFAULT_SETTINGS['costRule']['wideSpreadPct']
+        self.carry = self._carriers(history_rows)
+        self._quotes, self._comb = {}, {}
 
     # ── decode / helpers ──
     def decode(self, b):
@@ -1290,6 +1543,26 @@ class CostIndex:
                 self.ky_rate[(r.get('pattern'), r.get('fit_class'), amazon)].append((pr, r['id']))
         self.dp_refs = {k[0] for k in self.dp_ref}
         self.ky_refs = {k[0] for k in self.ky_ref}
+        # Contract C13: the Pinnacle-type list quotes of each style (DV brand letters fold to VD), one per ref.
+        self.pc_by_style = defaultdict(list)
+        for (ref, st), (pr, rid) in self.pc_exact.items():
+            self.pc_by_style[norm_vd(st)].append((ref, pr, rid))
+
+    def _carriers(self, history_rows):
+        """{base: {factory: {ref: poName}}}: the production refs that carry each style on the current ledger,
+        then on the ledger history when there is one (contract C13). Blank, N/A and other refs that name no
+        factory are left out."""
+        rows = [(L['b'], L['ref'], L['poName']) for L in self.ledger]
+        for h in history_rows or ():
+            if isinstance(h, dict):
+                rows.append((base_of(h.get('style')), _u(h.get('production') or h.get('ref')),
+                             str(h.get('poName') or h.get('po_name') or '').strip()))
+        out = {}
+        for b, ref, pn in rows:
+            fac = fac_of(ref)
+            if b and ref and fac not in _LIST_FACTORY_PSEUDO:
+                out.setdefault(b, {}).setdefault(fac, {}).setdefault(ref, pn)
+        return out
 
     def _build_calc(self, recs):
         cfg = self.pool_cfg
@@ -1513,6 +1786,268 @@ class CostIndex:
                         return 'L4d', pool, c, (ssd if s != sl else 0.0), 'pattern_relaxed'
         return None
 
+    def _calc_res(self, sku, fac, lvl, pool, cands, adj, how):
+        """A calculator resolution (levels L4a to L4d) from matched candidates. The ladder and the direct
+        calculator quotes of contract C13 both build it here, so their prices, ranges, RMB parts and flags
+        agree. how 'fit_regular': a modern or tailored fit priced at the regular fit column (C13)."""
+        pr = [c['price'] for c in cands]
+        al = [c['alt'] for c in cands]
+        med, rv, ra = _med_parts(cands)
+        fit_word = str(sku['fit'] or '').lower()
+        how_text = {'exact': ('same brand, fabric, fit, sleeve and pattern' if lvl != 'L4c'
+                              else 'another brand with the same fabric, fit, sleeve and pattern'),
+                    'fit_regular': 'same brand, fabric, sleeve and pattern, %s fit at the regular fit price' % fit_word,
+                    'alt_code': 'alternate or low confidence fabric code',
+                    'fit_mapped': '%s fit priced as regular' % fit_word,
+                    'ss_from_ls': 'short sleeve derived from the long sleeve row',
+                    'fit_from_slim': 'fit derived from the slim row plus the median fit premium',
+                    'pattern_relaxed': 'pattern relaxed'}[how]
+        # The customer's own factory quotation, matched in its group pool although it names no brand.
+        neutral = sku['brand'] is not None and all(c['quote'] and c['brand'] is None for c in cands)
+        if neutral and how == 'exact':
+            how_text = "this customer's own quotation for the fabric, fit, sleeve and pattern"
+        flags = ['customer_quote'] if neutral else []
+        if max(pr) - min(pr) > 0.005:
+            flags.append('range')
+        if lvl == 'L4d':
+            flags.append('derived')
+        if how == 'fit_regular':
+            flags.append('fit_as_regular')
+        if sku['program']:
+            flags.append('program_map')
+            if 'ASSUM' in str(sku.get('src') or '').upper():
+                flags.append('assumed')
+        if any(c['conflict'] for c in cands):
+            flags.append('price_conflict')
+        if any(c['restated'] for c in cands):
+            flags.append('sheet_rate_far')
+        basis = '%s: %s.' % (_pool_label(pool), how_text[0].upper() + how_text[1:])
+        if sku['program']:
+            basis += ' Program code decoded by the cost book map.'
+        # Candidates already stand at the P&L's basis, so the median, the range and the RMB-based share
+        # (value share) are consistent. A fit or sleeve step (adj) is a dollar amount from the cost book
+        # params and does not move with the rate.
+        price = med + adj
+        fx = rv / price if price > 0 and rv > 0 else 0.0
+        return _R(lvl, price, basis, [c['id'] for c in cands], fac, alt=_med(al) + adj,
+                  rng=(min(pr) + adj, max(pr) + adj), fx=fx, fxr=(ra / rv) if rv > 0 else None, flags=flags)
+
+    # ── contract C13: every factory's direct quote, and one combined cost per style ──
+    def grid_exact(self, sku, fac):
+        """The exact calculator match of a style under one factory's grid order (contract C13): the style's own
+        brand, fabric, fit, sleeve and pattern, at the style's fit column (modern and tailored at the regular
+        column). -> (level, pool, candidates, 0.0, how) with level L4a (the factory's own grid) or L4b (the
+        other grid), or None. It repeats the first, exact rung of calc_match."""
+        if sku is None or sku['cat'] in ('pants', 'blazer', 'vest', 'overshirt') or not sku.get('fab'):
+            return None
+        fc = price_fit(sku['fit'])
+        if fc not in ('SLIM', 'REGULAR', 'BIG_TALL'):
+            return None
+        prim, fb = self.pool_order(fac, sku['group'], sku['cat'])
+        for lvl, pools in (('L4a', prim), ('L4b', fb)):
+            pool, c = self._cand(pools, sku, True, False, fc, sku['sleeve'])
+            if c:
+                return lvl, pool, c, 0.0, ('exact' if fc == sku['fit'] else 'fit_regular')
+        return None
+
+    def _qv(self, q):
+        """The value a quote or a factory value counts at: the price in use (the after-cut reading on that basis)."""
+        return q['alt'] if self.after_cut else q['price']
+
+    def _pool_sheet(self, cands):
+        sheets = sorted({str((self.records.get(c['id']) or {}).get('sheet') or '').strip() for c in cands} - {''})
+        return ', '.join(sheets) or None
+
+    @staticmethod
+    def _names(names):
+        """'A', 'A and B', 'A, B and C' (plain UI text)."""
+        names = [n for n in names if n]
+        return names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1] if names else ''
+
+    def quotes(self, b):
+        """Every direct factory quote for base style b (contract C13), sorted by price. Each is a resolution with
+        'fac' (the factory), 'src' (the list's source code, or the calculator sheet family) and 'where' (the ref,
+        or the calculator sheet):
+          - lists: a Pinnacle-type list names the exact style on any ref (L1); a David Peng-type list prices a
+            ref and pattern, and a KinYun-type list a ref, pattern and fit (L2), for refs of that factory that
+            carry the style on the ledger or its history;
+          - calculators: the exact match (grid_exact) under each factory that makes the style. A list factory
+            counts here only where its own list does not answer for the style (its ladder gives no L1 to L3).
+            A style made by no known factory and on no list is matched under the default grid order (UNKNOWN).
+        Sibling and fabric medians, relaxed or other-brand matches, proxies and defaults are not direct quotes."""
+        if b in self._quotes:
+            return self._quotes[b]
+        sku = self.decode(b)
+        carry = self.carry.get(b) or {}
+        out = []
+        for ref, pr, rid in self.pc_by_style.get(norm_vd(b), ()):
+            r = self.records[rid]
+            q = _R('L1', pr, 'Factory list, same ref and style.', (rid,), _u(r.get('factory_code')) or fac_of(ref))
+            out.append(dict(q, src=str(r.get('source_code') or ''), where=ref or None))
+        if sku:
+            pat, fit = sku['pat'], price_fit(sku['fit'])
+            for fac in sorted(carry):
+                for ref in sorted(carry[fac]):
+                    if ref in self.dp_refs and (ref, pat) in self.dp_ref:
+                        ps = self.dp_ref[(ref, pat)]
+                        q = _R('L2', _mean([x[0] for x in ps]), 'Factory list, same ref and pattern.',
+                               [x[1] for x in ps], fac)
+                    elif ref in self.ky_refs and (ref, pat, fit) in self.ky_ref:
+                        pr, rid = self.ky_ref[(ref, pat, fit)]
+                        mapped = fit != sku['fit']
+                        q = _R('L2', pr, 'Factory list, same ref, pattern and fit.' + (
+                            ' The %s fit takes the regular fit price.' % str(sku['fit']).lower() if mapped else ''),
+                            (rid,), fac, flags=('fit_as_regular',) if mapped else ())
+                    else:
+                        continue
+                    out.append(dict(q, src=str(self.records[q['ids'][0]].get('source_code') or ''), where=ref))
+        lists = self.pc_facs | self.dp_facs | self.ky_facs
+        grid = [fac for fac in sorted(carry)
+                if fac not in lists or not any(self.raw(b, fac, ref, pn, allow_default=False, use_ovr=False)['level']
+                                               in _LIST_LEVELS for ref, pn in sorted(carry[fac].items()))]
+        if not carry and not out:
+            grid = ['UNKNOWN']
+        for fac in grid:
+            m = self.grid_exact(sku, fac)
+            if m:
+                out.append(dict(self._calc_res(sku, fac, *m), src=str(m[1]).partition(':')[0],
+                                where=self._pool_sheet(m[2])))
+        out.sort(key=lambda q: (self._qv(q), q['fac'], q['src'], q['where'] or ''))
+        self._quotes[b] = out
+        return out
+
+    def _fac_value(self, fac, qs):
+        """One value per factory (contract C13): the median of its direct quotes (the mean of the middle two for
+        an even count), with the RMB-based part and rate of the quotes it takes, its least certain level and
+        that level's grade."""
+        s = sorted(qs, key=lambda q: (self._qv(q), q['where'] or '', q['ids']))
+        n = len(s)
+        mid = [s[n // 2]] if n % 2 else [s[n // 2 - 1], s[n // 2]]
+        k = 1.0 / len(mid)
+        price = sum(k * q['price'] for q in mid)
+        rv = sum(k * q['price'] * (q['fx'] or 0.0) for q in mid)
+        level = _worst_level(q['level'] for q in s)
+        vals = [q['price'] for q in s]
+        flags = list(dict.fromkeys(f for q in s for f in q['flags']))
+        if n > 1 and max(vals) - min(vals) > 0.005 and 'range' not in flags:
+            flags.append('range')
+        return {'fac': fac, 'price': price, 'alt': sum(k * q['alt'] for q in mid),
+                'fx': rv / price if price > 0 and rv > 0 else 0.0,
+                'fxr': _ref_mix((k * q['price'] * (q['fx'] or 0.0), q.get('fxr')) for q in mid) if rv > 0 else None,
+                'level': level, 'grade': LEVEL_INFO[level][1], 'n': n,
+                'ids': tuple(dict.fromkeys(i for q in s for i in q['ids'])), 'flags': tuple(flags),
+                'rng': (min(vals), max(vals)) if n > 1 else s[0].get('rng'),
+                'basis': s[0]['basis'] if n == 1 else '%s The middle of its %d quotes.' % (s[0]['basis'], n)}
+
+    def combined(self, b):
+        """The combined cost of base style b (contract C13), or None when no factory quotes it directly:
+        {'rule': 'single' | 'average' | 'lowest', 'res': its resolution, 'values': the per-factory values,
+        'spread': r4(max / min - 1) over them (0 for one)}. One factory: its value. Two or more: their average,
+        unless max > min x (1 + wideSpreadPct / 100), then the lowest. Exactly at the threshold is 'average'."""
+        if b in self._comb:
+            return self._comb[b]
+        qs = self.quotes(b)
+        out = None
+        if qs:
+            by = defaultdict(list)
+            for q in qs:
+                by[q['fac']].append(q)
+            vals = sorted((self._fac_value(f, v) for f, v in by.items()), key=lambda v: (self._qv(v), v['fac']))
+            lo, hi = self._qv(vals[0]), self._qv(vals[-1])
+            if len(vals) == 1:
+                rule, use = 'single', vals
+            elif hi > lo * (1 + self.wide_pct / 100) + _SPREAD_TOL:
+                rule, use = 'lowest', vals[:1]
+            else:
+                rule, use = 'average', vals
+            spread = 0.0 if len(vals) == 1 else (r4(hi / lo - 1) if lo > 0 else None)
+            out = {'rule': rule, 'res': self._comb_res(rule, use, vals), 'values': vals, 'spread': spread}
+        self._comb[b] = out
+        return out
+
+    def _comb_res(self, rule, use, vals):
+        """The resolution of a combined cost (contract C13). gcap: its grade, the worst grade among the values
+        used. Level: the used value's level, or for 'average' the best level among the inputs. fxShare and fxRef
+        are value weighted over the values used, so the page's RMB what-if stays exact."""
+        pct = '%g' % self.wide_pct
+        names = self._names([_factory_name(self.S, v['fac']) for v in vals])
+        if rule == 'average':
+            n = len(use)
+            price = sum(v['price'] for v in use) / n
+            alt = sum(v['alt'] for v in use) / n
+            rv = sum(v['price'] * v['fx'] for v in use) / n
+            fxr = _ref_mix((v['price'] * v['fx'], v['fxr']) for v in use)
+            fx = rv / price if price > 0 and rv > 0 else 0.0
+            level = min((v['level'] for v in use), key=LEVEL_RANK.get)
+            grade = max(v['grade'] for v in use)
+            flags = [f for v in use for f in v['flags'] if f != 'range'] + ['cost_average']
+            rng = (min(v['price'] for v in use), max(v['price'] for v in use))
+            basis = 'Average of %d factory quotes (%s). They are within %s percent of each other.' % (n, names, pct)
+        else:
+            v = use[0]
+            price, alt, fx, fxr, level, grade = v['price'], v['alt'], v['fx'], v['fxr'], v['level'], v['grade']
+            if rule == 'single':
+                flags, rng = list(v['flags']), v['rng']
+                basis = ('No factory is known for this style. %s' % v['basis'] if v['fac'] == 'UNKNOWN' else
+                         '%s is the only factory that quotes this style. %s' % (_factory_name(self.S, v['fac']),
+                                                                               v['basis']))
+            else:
+                flags = [f for f in v['flags'] if f != 'range'] + ['cost_lowest']
+                rng = (min(x['price'] for x in vals), max(x['price'] for x in vals))
+                basis = ('Lowest of %d factory quotes (%s), because they differ by more than %s percent. The lowest '
+                         'is from %s. %s' % (len(vals), names, pct, _factory_name(self.S, v['fac']), v['basis']))
+        res = _R(level, price, basis, tuple(dict.fromkeys(i for v in use for i in v['ids'])), None, alt=alt,
+                 rng=rng, fx=fx, fxr=fxr, flags=tuple(dict.fromkeys(flags)))
+        res['gcap'], res['rule'] = grade, rule
+        return res
+
+    def final(self, b, res):
+        """The cost every table uses for base style b: the one choke point of contract C13. A manual cost (L0)
+        wins outright. In combined mode a style that some factory quotes directly takes its combined cost on
+        every row; the row keeps its own factory, ref, lot tier and lot flags. Anything else keeps its ladder
+        result (the 'fallback'). Cascade mode returns res unchanged (today's behaviour)."""
+        if res is None or self.rule_mode != 'combined' or res.get('level') == 'L0':
+            return res
+        c = self.combined(b)
+        if c is None:
+            return res
+        out = dict(c['res'], fac=res.get('fac'))
+        for k in ('tier', 'ref'):
+            if k in res:
+                out[k] = res[k]
+        lot = tuple(f for f in (res.get('flags') or ()) if f in _LOT_FLAGS)
+        if lot:
+            out['flags'] = tuple(dict.fromkeys(tuple(out['flags']) + lot))
+        return out
+
+    def cost_rule(self, b, level):
+        """styles.costRule (contract C13) of a style whose cost stands at level."""
+        if level == 'L0':
+            return 'manual'
+        if self.rule_mode != 'combined':
+            return 'cascade'
+        c = self.combined(b)
+        return c['rule'] if c else 'fallback'
+
+    def cost_by_factory(self, b):
+        """styles.costByFactory (contract C13): [factory, source, ref or sheet, price, level] per direct quote."""
+        return [[q['fac'], q['src'], q['where'], r4(self._qv(q)), q['level']] for q in self.quotes(b)]
+
+    def cost_spread(self, b):
+        """styles.costSpread (contract C13): r4(max / min - 1) over the per-factory values, 0 for one, None for none."""
+        c = self.combined(b)
+        return c['spread'] if c else None
+
+    def style_quote(self, style):
+        """The combined cost of a style (contract C13) as published: public fields plus rule, grade, spread and
+        costByFactory. None when no factory quotes the style directly."""
+        b = base_of(style)
+        c = self.combined(b)
+        if c is None:
+            return None
+        return dict(self.public(c['res']), rule=c['rule'], grade=c['res']['gcap'], spread=c['spread'],
+                    costByFactory=self.cost_by_factory(b))
+
     # ── the cascade ──
     def raw(self, b, fac, ref=None, poName=None, allow_default=True, brand_label=None, customer_group=None,
             use_ovr=True):
@@ -1580,44 +2115,7 @@ class CostIndex:
         if sku:
             m = self.calc_match(sku, fac, sku['group'])
             if m:
-                lvl, pool, cands, adj, how = m
-                pr = [c['price'] for c in cands]
-                al = [c['alt'] for c in cands]
-                med, rv, ra = _med_parts(cands)
-                how_text = {'exact': ('same brand, fabric, fit, sleeve and pattern' if lvl != 'L4c'
-                                      else 'another brand with the same fabric, fit, sleeve and pattern'),
-                            'alt_code': 'alternate or low confidence fabric code',
-                            'fit_mapped': '%s fit priced as regular' % str(sku['fit'] or '').lower(),
-                            'ss_from_ls': 'short sleeve derived from the long sleeve row',
-                            'fit_from_slim': 'fit derived from the slim row plus the median fit premium',
-                            'pattern_relaxed': 'pattern relaxed'}[how]
-                # The customer's own factory quotation, matched in its group pool although it names no brand.
-                neutral = sku['brand'] is not None and all(c['quote'] and c['brand'] is None for c in cands)
-                if neutral and how == 'exact':
-                    how_text = "this customer's own quotation for the fabric, fit, sleeve and pattern"
-                flags = ['customer_quote'] if neutral else []
-                if max(pr) - min(pr) > 0.005:
-                    flags.append('range')
-                if lvl == 'L4d':
-                    flags.append('derived')
-                if sku['program']:
-                    flags.append('program_map')
-                    if 'ASSUM' in str(sku.get('src') or '').upper():
-                        flags.append('assumed')
-                if any(c['conflict'] for c in cands):
-                    flags.append('price_conflict')
-                if any(c['restated'] for c in cands):
-                    flags.append('sheet_rate_far')
-                basis = '%s: %s.' % (_pool_label(pool), how_text[0].upper() + how_text[1:])
-                if sku['program']:
-                    basis += ' Program code decoded by the cost book map.'
-                # Candidates already stand at the P&L's basis, so the median, the range and the
-                # RMB-based share (value share) are consistent. A fit or sleeve step (adj) is a dollar
-                # amount from the cost book params and does not move with the rate.
-                price = med + adj
-                fx = rv / price if price > 0 and rv > 0 else 0.0
-                return _R(lvl, price, basis, [c['id'] for c in cands], fac, alt=_med(al) + adj,
-                          rng=(min(pr) + adj, max(pr) + adj), fx=fx, fxr=(ra / rv) if rv > 0 else None, flags=flags)
+                return self._calc_res(sku, fac, *m)
             if not sku['program']:
                 c = [x for x in self.list_style.get(b, []) if x[2] != ref]
                 if c:
@@ -1835,13 +2333,13 @@ LINE_FIELDS = ('id', 'ctrlNo', 'orderNo', 'cust', 'type', 'style', 'base', 'bran
                'units', 'price', 'rev', 'start', 'cancel', 'late', 'fobLine', 'wh',
                'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'contrib',
                'level', 'grade', 'routing', 'factory', 'ref', 'origin', 'fxShare', 'ev', 'flags', 'basis',
-               'dutyRegime', 'costRef', 'pieces', 'fxRef')
+               'dutyRegime', 'costRef', 'pieces', 'fxRef', 'revCost')
 ALLOC_FIELDS = ('line', 'units', 'kind', 'factory', 'ref', 'poName', 'landing', 'etd', 'arrival', 'fobU', 'level',
-                'routing', 'forced', 'costRef', 'lotTier', 'pieces', 'fxShare', 'fxRef')
+                'routing', 'forced', 'costRef', 'lotTier', 'pieces', 'fxShare', 'fxRef', 'revCost')
 APO_FIELDS = ('id', 'cust', 'custName', 'po', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'estPrice',
               'priceBasis', 'rev', 'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty',
               'contrib', 'level', 'grade', 'factory', 'origin', 'fxShare', 'flags', 'routing', 'ref', 'basis', 'ev',
-              'dutyRegime', 'costRef', 'coveredBy', 'fxRef')
+              'dutyRegime', 'costRef', 'coveredBy', 'fxRef', 'revCost')
 INVENTORY_FIELDS = ('sku', 'base', 'brand', 'cat', 'fiber', 'wh', 'units', 'fobU', 'landedU', 'fob', 'landed', 'level',
                     'grade', 'factory', 'ref', 'lotTier', 'receiveDate', 'ageDays', 'origin', 'fxShare', 'basis', 'ev',
                     'dutyRegime', 'flags', 'fxRef')
@@ -1852,11 +2350,17 @@ STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 
                 'rangeLo', 'rangeHi', 'factories', 'onHand', 'onHandFob', 'onHandLanded', 'incoming', 'incomingFob',
                 'ats', 'committed', 'allocated', 'openUnits', 'openRev', 'openGp', 'openContrib', 'apoUnits', 'apoRev',
                 't12Units', 't12Rev', 't12Cogs', 't12Gp', 'lifeUnits', 'lifeRev', 'expPrice', 'atsPotentialGp', 'ladder',
-                'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd', 'fxShare', 'fxRef')
+                'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd', 'fxShare', 'fxRef',
+                'openRevCost', 'costByFactory', 'costRule', 'costSpread')
 SHIPPED_COMPANY_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
-                          'royalty', 'contrib', 'costedShare', 'costedRev')
+                          'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost')
 SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', 'months', 'fobU', 'level', 'grade',
-                        'origin', 'fxShare', 'fxRef')
+                        'origin', 'fxShare', 'fxRef', 'caShare')
+# Contract C14: lifetime invoices per account and style, costed like order lines (pieces appended: kit
+# programs are invoiced by the carton, like their order lines).
+SHIPPED_CUSTOMER_FIELDS = ('cust', 'base', 'brand', 'cat', 'fiber', 'origin', 'units', 'rev', 'fobU', 'fob', 'duty',
+                           'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'revCost', 'contrib', 'level',
+                           'grade', 'dutyRegime', 'fxShare', 'fxRef', 'pieces')
 _COVERAGE_SETS = ('openBook', 'bulk', 'apo', 'inventory', 'production')
 
 
@@ -1877,6 +2381,7 @@ class _Build:
         self.ev_used = set()
         self._gen = {}
         self.notes = []
+        self.hist_rows = []            # shipped.byCustomer rows (contract C14)
 
     # ── helpers ──
     def bkey(self, text):
@@ -1892,27 +2397,29 @@ class _Build:
 
     def comp(self, units, res, fac, ref, kind, arow=None):
         """One costed component. Warehouse components are capped at grade B unless their lot tier
-        is T1 or T2 (contract C5): only a lot match ties a carton to the ref whose price is used."""
+        is T1 or T2 (contract C5): only a lot match ties a carton to the ref whose price is used. A
+        combined cost (contract C13) caps the grade at its own grade (gcap)."""
         u, fx = self.ci.eff(res)
         tier = res.get('tier') if kind == 'warehouse' else None
-        cap = 'B' if kind == 'warehouse' and tier not in ('T1', 'T2') else 'A'
+        cap = max('B' if kind == 'warehouse' and tier not in ('T1', 'T2') else 'A', res.get('gcap') or 'A')
         return {'u': units, 'p': u, 'fx': fx, 'fxr': self.ci.fx_ref(res), 'pb': res['price'], 'lv': res['level'], 'fac': fac, 'ref': ref,
                 'ids': res['ids'], 'fl': res['flags'], 'basis': res['basis'], 'kind': kind, 'a': arow,
-                'tier': tier, 'cap': cap}
+                'tier': tier, 'cap': cap, 'comb': bool(res.get('rule'))}
 
     def wh_fac(self, fac):
         return 'WH' if fac in ('UNKNOWN', None) else fac
 
     def generic(self, sku, b):
         """Style cost with no placement: the style's ledger mix, else its warehouse cost, else
-        the calculator with the factory unknown. -> [(share, res, factory, ref, kind)]."""
+        the calculator with the factory unknown. -> [(share, res, factory, ref, kind)]. Every res here
+        has passed CostIndex.final (contract C13)."""
         key = (sku, b)
         if key in self._gen:
             return self._gen[key]
         lines = self.led_by_base.get(b) or []
         if lines:
             tot = sum(L['units'] for L in lines)
-            out = [(L['units'] / tot, L['res'], L['fac'], L['ref'] or None, 'ledger') for L in lines]
+            out = [(L['units'] / tot, L['use'], L['fac'], L['ref'] or None, 'ledger') for L in lines]
         else:
             rows = [sku] if sku in self.wh else list(self.wh_by_base.get(b) or [])
             rows = [s for s in rows if self.wh[s]['price'] is not None]
@@ -1925,7 +2432,7 @@ class _Build:
                     out = [(self.inv[s]['onhand'] / tot, self.wh[s], self.wh_fac(self.wh[s]['fac']), self.wh[s].get('ref'),
                             'warehouse') for s in rows if self.inv[s]['onhand'] > 0]
             else:
-                res = self.ci.raw(b, 'UNKNOWN')
+                res = self.ci.final(b, self.ci.raw(b, 'UNKNOWN'))
                 out = [(1.0, res, 'UNKNOWN', None, 'calculator')]
         self._gen[key] = out
         return out
@@ -1934,7 +2441,7 @@ class _Build:
         kind = a.get('kind')
         if kind == 'production' and a.get('ledgerIndex') is not None and 0 <= a['ledgerIndex'] < len(self.ci.ledger):
             L = self.ci.ledger[a['ledgerIndex']]
-            return [self.comp(a['units'], L['res'], L['fac'], L['ref'] or None, 'production', a)]
+            return [self.comp(a['units'], L['use'], L['fac'], L['ref'] or None, 'production', a)]
         if kind == 'warehouse':
             w = self.wh.get(sku)
             if w is not None and w['price'] is not None:
@@ -1950,7 +2457,11 @@ class _Build:
         lv = _worst_level(c['lv'] for c in comps) or 'L7'
         flags = set(f for c in comps for f in c['fl'])
         unit = fx = fxr = None
-        if priced:
+        if priced and all(c.get('comb') for c in comps) and len({(c['p'], c['fx'], c.get('fxr')) for c in comps}) == 1:
+            # Every component carries the same combined cost (contract C13): take it as it is, so float noise in a
+            # weighted average can never move its 4-decimal rounding. One style, one cost on every row.
+            unit, fx, fxr = comps[0]['p'], comps[0]['fx'], comps[0].get('fxr')
+        elif priced:
             if tu > 0:
                 amt = sum(c['u'] * c['p'] for c in comps)
                 unit = amt / tu
@@ -2028,6 +2539,16 @@ class _Build:
     def dest_regime(self, code):
         """Duty regime of an A2000 wh, ledger landing or stock warehouse (settings.destinations)."""
         return self.S['destinations'].get(_u(code), 'us') if code else 'us'
+
+    def cust_regime(self, cust, code=None):
+        """Duty regime of a row with a customer (contract C12): settings.regimeByCustomer first, then
+        'none' for an FOB customer, then settings.destinations for the wh or landing, then 'us'."""
+        r = self.S['regimeByCustomer'].get(cust)
+        if r in DUTY_REGIMES:
+            return r
+        if cust in self.fob_set:
+            return 'none'
+        return self.dest_regime(code)
 
     @staticmethod
     def hist_code(c):
@@ -2109,15 +2630,22 @@ class _Build:
             self.inv_by_base[m['b']].append(sku)
 
     def cost_supply(self):
-        self.ci = CostIndex(self.cb, self.S, self.overrides, self.ledger_rows, today=self.today)
+        self.ci = CostIndex(self.cb, self.S, self.overrides, self.ledger_rows, today=self.today,
+                            history_rows=self.history)
         self.whc = _WarehouseCoster(self.ci, self.history)
-        self.wh = {sku: self.whc.cost(sku, m['onhand'], m['lot'], m['label'], m['rd']) for sku, m in self.inv.items()}
+        # Contract C13: every table takes a style's cost through CostIndex.final, the one choke point. The
+        # warehouse cost of a SKU and each ledger line's cost ('use') pass it here; generic() and style_cost()
+        # pass it for the calculator fallback. L['res'] keeps the line's own factory ladder result.
+        self.wh = {sku: self.ci.final(m['b'], self.whc.cost(sku, m['onhand'], m['lot'], m['label'], m['rd']))
+                   for sku, m in self.inv.items()}
+        for L in self.ci.ledger:
+            L['use'] = self.ci.final(L['b'], L['res'])
         self.wh_by_base = defaultdict(list)
         for sku, m in self.inv.items():
             self.wh_by_base[m['b']].append(sku)
         self.led_by_base = defaultdict(list)
         for L in self.ci.ledger:
-            if L['units'] > 0 and L['res']['price'] is not None:
+            if L['units'] > 0 and L['use']['price'] is not None:
                 self.led_by_base[L['b']].append(L)
 
     # ── open order lines ──
@@ -2151,7 +2679,7 @@ class _Build:
             cust, wh = _u(o.get('customer')), _u(o.get('wh'))
             fob_cust = cust in self.fob_set
             fob_line = fob_cust or wh == 'CH'
-            regime = 'none' if fob_cust else self.dest_regime(wh)
+            regime = self.cust_regime(cust, wh)        # C12: customer setting, FOB list, destinations
             start, cancel = _d10(o.get('startDate')), _d10(o.get('cancelDate'))
             late = 1 if cancel and cancel < self.today else 0
             summ = LS.get(key) or {}
@@ -2188,6 +2716,8 @@ class _Build:
                 flags.add('fob_line')
             if regime != 'us' and not fob_line:
                 flags.add('non_us_dest')
+            if cust in self.S['regimeByCustomer']:
+                flags.add('customer_regime')
             if no_units:
                 flags.add('no_units')
             if typ == 'bulk' and (cust, b) in apo_keys:
@@ -2248,7 +2778,10 @@ class _Build:
                                    'fobU': r4(aa['unit']) if aa['priced'] else None, 'level': aa['level'],
                                    'routing': a.get('routing'), 'forced': 1 if a.get('forced') else 0,
                                    'costRef': aa['costRef'], 'lotTier': aa['lotTier'], 'pieces': a['units'] * pcs,
-                                   'fxShare': ash, 'fxRef': _fxref_out(ash, aa['fxr'])})
+                                   'fxShare': ash, 'fxRef': _fxref_out(ash, aa['fxr']),
+                                   # The line's revenue costs for these units, pro rata (C11).
+                                   'revCost': (r2(money['revCost'] * a['units'] / q)
+                                               if money['revCost'] is not None and q > 0 else None)})
 
     # ── invoice analytics (shipped lens) ──
     _AN_FIELDS = ('style', 'brand', 'qty', 'value', 'firstInv', 'lastInv', 'months', 'customers', 'color')
@@ -2442,12 +2975,17 @@ class _Build:
             fobU = r4(ag['unit']) if ag['priced'] else None
             fob = None if fobU is None else (r2(qty * fobU) if qty > 0 else 0.0)
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
-            # Duty regime (C2): an FOB customer imports nothing. Otherwise an allocation follows the
-            # customer's open orders when they all share one non-US regime (for example Peerless,
-            # whose orders all ship factory direct). Anything else is a US import.
+            # Duty regime (C12, then C2): the customer's own setting (regimeByCustomer, for the booked
+            # account or its other codes) comes first. Then an FOB customer imports nothing. Otherwise an
+            # allocation follows the customer's open orders when they all share one non-US regime (for
+            # example orders that all ship factory direct). Anything else is a US import.
             fob_line = cust in self.fob_set
+            rbc = self.S['regimeByCustomer']
+            set_by = next((c for c in [cust] + list(codes) if c in rbc), None)
             derived = False
-            if fob_line:
+            if set_by is not None:
+                regime = rbc[set_by]
+            elif fob_line:
                 regime = 'none'
             else:
                 regs = set().union(*[self.cust_regimes.get(c, set()) for c in codes]) if codes else set()
@@ -2458,10 +2996,14 @@ class _Build:
             routing = _worst_routing(al.get('routing') for al in arows) or ('R6' if qty > 0 else None)
             level = ag['level'] if fobU is not None else 'L7'
             flags = set(ag['flags']) | pflags
-            if fob_line:
+            if fob_line and regime == 'none':
                 flags.add('fob_line')
             if derived:
                 flags.update(('non_us_dest', 'regime_from_orders'))
+            elif regime != 'us' and not fob_line:
+                flags.add('non_us_dest')
+            if set_by is not None:
+                flags.add('customer_regime')
             if qty <= 0:
                 flags.add('no_units')
             if any(al.get('kind') == 'unsourced' for al in arows):
@@ -2513,8 +3055,9 @@ class _Build:
             share = r4(fx) if unit is not None else 0.0
             fxref = _fxref_out(share, self.ci.fx_ref(w))
             # C5: stock is tied to the ref whose price it uses only by a lot match (T1, T2). Anything
-            # else is a style estimate, so it cannot be graded better than B.
-            grade = max(grade_of(level), 'A' if w.get('tier') in ('T1', 'T2') else 'B')
+            # else is a style estimate, so it cannot be graded better than B. A combined cost (C13) also
+            # caps the grade at its own grade.
+            grade = max(grade_of(level), 'A' if w.get('tier') in ('T1', 'T2') else 'B', w.get('gcap') or 'A')
             for k, code in _STOCK_KEYS:
                 units = m[k]
                 if units <= 0:
@@ -2584,7 +3127,7 @@ class _Build:
         self.production = []
         LU = self.R.get('ledgerUse') or {}
         for L in self.ci.ledger:
-            r, res, units = L['row'], L['res'], L['units']
+            r, res, units = L['row'], L['use'], L['units']      # 'use': the style's cost after contract C13
             dec = self.ci.decode(L['b'])
             unit, fx = self.ci.eff(res)
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
@@ -2616,7 +3159,8 @@ class _Build:
                    'base': L['b'], 'brand': self.brand_of(dec, L['style'], r.get('brand')), 'cat': cat, 'fiber': fiber,
                    'units': units, 'etd': L['etd'], 'arrival': self.arrival_of(r, L['b']), 'landing': L['landing'] or None,
                    'fobLanding': 1 if fob_landing else 0, 'fobU': fobU, 'fob': fob, 'landedU': lndU, 'landed': lnd,
-                   'level': level, 'grade': grade_of(level), 'claimed': claimed, 'free': max(0, units - claimed),
+                   'level': level, 'grade': max(grade_of(level), res.get('gcap') or 'A'), 'claimed': claimed,
+                   'free': max(0, units - claimed),
                    'origin': origin, 'fxShare': r4(fx) if unit is not None else 0.0, 'flags': sorted(flags),
                    'basis': self.bkey(res['basis']), 'ev': self.ev(res['ids']), 'dutyRegime': regime,
                    'fxRef': _fxref_out(r4(fx) if unit is not None else 0.0, self.ci.fx_ref(res))}
@@ -2636,7 +3180,7 @@ class _Build:
             return self._gen[key]
         parts = self.generic(b, b)
         if len(parts) == 1 and parts[0][1]['level'] == 'L7' and label and self.ci.decode(b) is None:
-            res = self.ci.raw(b, 'UNKNOWN', brand_label=label)
+            res = self.ci.final(b, self.ci.raw(b, 'UNKNOWN', brand_label=label))
             parts = [(1.0, res, 'UNKNOWN', None, 'calculator')]
         comps = [self.comp(sh, res, fac, ref, k) for sh, res, fac, ref, k in parts]
         ag = self.agg(comps)
@@ -2673,7 +3217,7 @@ class _Build:
             e[1] += abs(m['committed'])
             e[2] += abs(m['allocated'])
             e[3] = e[3] or m['label']
-        open_b = defaultdict(lambda: {'u': 0, 'rev': 0.0, 'ded': 0.0, 'gp': 0.0, 'contrib': 0.0,
+        open_b = defaultdict(lambda: {'u': 0, 'rev': 0.0, 'ded': 0.0, 'gp': 0.0, 'contrib': 0.0, 'rc': 0.0,
                                       'lad': defaultdict(lambda: [0, 0.0])})
         for r in self.lines:
             if r['type'] != 'a2000' or r['units'] <= 0:
@@ -2684,6 +3228,7 @@ class _Build:
             e['ded'] += r['deduct'] or 0.0
             e['gp'] += r['gp'] or 0.0
             e['contrib'] += r['contrib'] or 0.0
+            e['rc'] += r['revCost'] or 0.0
             e['lad'][r['cust']][0] += r['units']
             e['lad'][r['cust']][1] += r['rev']
         apo_b = defaultdict(lambda: [0, 0.0, 0.0])
@@ -2756,20 +3301,28 @@ class _Build:
                    'basis': self.bkey(sc['basis']), 'ev': self.ev(sc['ids']), 't12Net': sh['net'],
                    'dutyRegime': regime, 'dedPct': ded4, 'atsFreeStock': max(0, ats - free_prod),
                    'atsFreeProd': free_prod, 'fxShare': r4(sc['fx']) if unit is not None else 0.0,
-                   'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr'))}
+                   'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr')),
+                   'openRevCost': r2(ob['rc']) if ob else 0.0,
+                   # Contract C13: every direct factory quote, how the cost was set, how far the quotes spread.
+                   'costByFactory': self.ci.cost_by_factory(b), 'costRule': self.ci.cost_rule(b, level),
+                   'costSpread': self.ci.cost_spread(b)}
             self.styles.append(row)
 
     # ── shipped lens (invoiced units at today's style cost) ──
     def mix_of(self, an):
-        """(deduction percent, FOB share) from the style's lifetime customer mix."""
-        # History codes (drop-ship accounts, legacy suffixes) count as the account they belong to.
+        """(deduction percent, share with no import costs, share landing in Canada) from the style's
+        lifetime customer mix, by invoice value. History codes (drop-ship accounts, legacy suffixes) count
+        as the account they belong to, with its chargeback rate and its duty regime (contract C12:
+        regimeByCustomer, then the FOB list, else a US import; invoices carry no warehouse)."""
         cust = an.get('customers') or {}
         tv = sum(v[1] for v in cust.values() if v[1] > 0)
         if tv <= 0:
-            return _ded_pct('', self.S, 'other'), 0.0
+            return _ded_pct('', self.S, 'other'), 0.0, 0.0
         ded = sum(v[1] * self.cust_info(self.hist_code(c))[1] for c, v in cust.items() if v[1] > 0) / tv
-        fobs = sum(v[1] for c, v in cust.items() if v[1] > 0 and self.hist_code(c) in self.fob_set) / tv
-        return ded, fobs
+        regs = {c: self.cust_regime(self.hist_code(c)) for c in cust}
+        fobs = sum(v[1] for c, v in cust.items() if v[1] > 0 and regs[c] == 'none') / tv
+        cas = sum(v[1] for c, v in cust.items() if v[1] > 0 and regs[c] == 'ca') / tv
+        return ded, fobs, cas
 
     def shipped_style_money(self, b, an, unit, cat, fiber, origin, brand):
         out = {'cogs': 0.0 if unit is not None else None, 'gp': None, 'net': 0.0, 'rows': {}}
@@ -2777,8 +3330,10 @@ class _Build:
             if unit is None:
                 out['cogs'] = None
             return out
-        ded, fobs = self.mix_of(an)
+        ded, fobs, cas = self.mix_of(an)
         roy = _roy_pct(brand, self.S)
+        on_rev = royalty_base(self.S) == 'revenue'
+        rcp = revenue_cost_pct(self.S)
         unit4 = r4(unit)
         rev = cogs = dsum = rsum = 0.0
         for ym in self.months:
@@ -2789,17 +3344,25 @@ class _Build:
             rev += v
             dd = v * ded / 100
             dsum += dd
-            rec = {'u': u, 'v': v, 'ded': dd}
+            rec = {'u': u, 'v': v, 'ded': dd, 'rc': v * rcp / 100}
             if unit is not None:
                 fob = r2(u * unit4)
-                d, f, x = adders(fob, u, cat, fiber, origin, self.S, False)
+                d, f, x = adders(fob, u, cat, fiber, origin, self.S, 'us')
                 k = 1 - fobs
-                rec.update(fob=fob, duty=d * k, freight=f * k, fees=x * k, roy=(v - dd) * roy / 100)
-                cogs += fob + (d + f + x) * k
+                if cas:
+                    # The Canada share (C12) pays the Canadian adders on the same factory cost.
+                    k -= cas
+                    dc, fc, xc = adders(fob, u, cat, fiber, origin, self.S, 'ca')
+                    rec.update(fob=fob, duty=d * k + dc * cas, freight=f * k + fc * cas, fees=x * k + xc * cas)
+                    cogs += fob + (d + f + x) * k + (dc + fc + xc) * cas
+                else:
+                    rec.update(fob=fob, duty=d * k, freight=f * k, fees=x * k)
+                    cogs += fob + (d + f + x) * k
+                rec['roy'] = (v if on_rev else v - dd) * roy / 100
                 rsum += rec['roy']
             out['rows'][ym] = rec
         out['net'] = r2(rev - dsum)
-        out['ded'], out['fobShare'] = ded, fobs
+        out['ded'], out['fobShare'], out['caShare'] = ded, fobs, cas
         if unit is not None:
             out['cogs'] = r2(cogs)
             out['gp'] = r2(out['net'] - out['cogs'])
@@ -2811,7 +3374,8 @@ class _Build:
                     'invalid': 'Shipped history could not be read. The rest of the P&L is not affected.'}.get(
                         self.an_state, 'Shipped history is not available on this server yet.')
             self.shipped = {'months': [], 'company': _table(SHIPPED_COMPANY_FIELDS, []),
-                            'byStyle': _table(SHIPPED_STYLE_FIELDS, []), 'note': note, 'state': self.an_state}
+                            'byStyle': _table(SHIPPED_STYLE_FIELDS, []), 'note': note, 'state': self.an_state,
+                            'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, []), 'range': self.shipped_range()}
             return
         comp = {ym: defaultdict(float) for ym in self.months}
         by_style = []
@@ -2832,7 +3396,8 @@ class _Build:
                              'months': {ym: [int(round(r['u'])), r2(r['v'])] for ym, r in sm['rows'].items()},
                              'fobU': r4(unit), 'level': level, 'grade': max(grade_of(level), sc['cap']),
                              'origin': sc['origin'], 'fxShare': r4(sc['fx']) if unit is not None else 0.0,
-                             'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr'))})
+                             'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr')),
+                             'caShare': r4(sm.get('caShare', 0.0))})
             for ym, r in sm['rows'].items():
                 c = comp[ym]
                 c['units'] += r['u']
@@ -2841,6 +3406,7 @@ class _Build:
                 if unit is not None:
                     c['costedRev'] += r['v']
                     c['costedDed'] += r['ded']
+                    c['revCost'] += r['rc']           # like royalty: styles that have a cost only
                     for k in ('fob', 'duty', 'freight', 'fees', 'roy'):
                         c[k] += r[k]
         rows = []
@@ -2851,17 +3417,66 @@ class _Build:
             net = r2(c['rev'] - c['deduct'])
             gp = r2((c['costedRev'] - c['costedDed']) - cogs)
             roy = r2(c['roy'])
+            rc = r2(c['revCost'])
             rows.append({'month': ym, 'units': int(round(c['units'])), 'rev': r2(c['rev']), 'fob': fob, 'duty': duty,
                          'freight': freight, 'fees': fees, 'cogs': cogs, 'deduct': r2(c['deduct']), 'net': net, 'gp': gp,
-                         'royalty': roy, 'contrib': r2(gp - roy),
+                         'royalty': roy, 'contrib': r2(gp - roy - rc),
                          'costedShare': round(c['costedRev'] / c['rev'], 3) if c['rev'] else 0.0,
-                         'costedRev': r2(c['costedRev'])})
+                         'costedRev': r2(c['costedRev']), 'revCost': rc})
         when = friendly_date(self.sa_src.get('to'))
         note = ((('Invoices run through %s. ' % when) if when else '')
-                + 'Gross profit, royalty and contribution count only styles that have a cost. '
+                + 'Gross profit, royalty, revenue costs and profit count only styles that have a cost. '
                   'The Revenue with a cost row shows that share.')
+        self.hist_rows = self.shipped_by_customer()
         self.shipped = {'months': list(self.months), 'company': _table(SHIPPED_COMPANY_FIELDS, rows),
-                        'byStyle': _table(SHIPPED_STYLE_FIELDS, by_style), 'note': note, 'state': 'ready'}
+                        'byStyle': _table(SHIPPED_STYLE_FIELDS, by_style), 'note': note, 'state': 'ready',
+                        'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, self.hist_rows), 'range': self.shipped_range()}
+
+    def shipped_range(self):
+        """shipped.range (contract C14): the invoice history's own dates, from sales_analytics.source."""
+        s = self.sa_src if isinstance(getattr(self, 'sa_src', None), dict) else {}
+        return {'from': s.get('from'), 'to': s.get('to'), 'ingestedAt': s.get('ingestedAt')}
+
+    def shipped_by_customer(self):
+        """shipped.byCustomer (contract C14): lifetime invoices per account and style. History codes fold
+        into their account (hist_code). Each row is costed like an order line (C11) at the style's cost
+        of today, with the account's chargeback rate and duty regime (C12, no warehouse). Only rows with
+        units. A style with no cost keeps every amount after cost empty. The style key is the history's
+        own key, as in shipped.byStyle."""
+        fold = defaultdict(lambda: [0.0, 0.0])
+        for st, an in self.an.items():
+            for c, v in an['customers'].items():
+                cell = fold[(self.hist_code(c), st)]
+                cell[0] += v[0]
+                cell[1] += v[1]
+        out = []
+        for cust, st in sorted(fold):
+            u, val = fold[(cust, st)]
+            units = int(round(u))
+            if units <= 0:
+                continue
+            an = self.an[st]
+            dec = self.ci.decode(st)
+            label = an.get('label')
+            sc = self.style_cost(st, label)
+            unit = sc['unit'] if sc['priced'] else None
+            fobU = r4(unit)
+            cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
+            brand = self.brand_of(dec, None, label, base=st)
+            qty = units * self.ci.kit_pcs.get(st, 1)
+            rev = r2(val)
+            fob = r2(qty * fobU) if fobU is not None else None
+            regime = self.cust_regime(cust)
+            level = sc['level'] if unit is not None else 'L7'
+            share = r4(sc['fx']) if unit is not None else 0.0
+            row = {'cust': cust, 'base': st, 'brand': brand, 'cat': cat, 'fiber': fiber, 'origin': sc['origin'],
+                   'units': units, 'rev': rev, 'fobU': fobU, 'fob': fob, 'level': level,
+                   'grade': max(grade_of(level), sc['cap']), 'dutyRegime': regime, 'fxShare': share,
+                   'fxRef': _fxref_out(share, sc.get('fxr')), 'pieces': qty}
+            row.update(line_money(rev, fob, qty, cat, fiber, sc['origin'], regime, self.cust_info(cust)[1],
+                                  _roy_pct(brand, self.S), self.S))
+            out.append(row)
+        return out
 
     # ── summaries ──
     def coverage(self):
@@ -2925,15 +3540,47 @@ class _Build:
 
     def assumption_blocks(self):
         """[(block key, plain name)] of the unconfirmed assumption blocks, in the UI's order (C4).
-        Canada and direct-import destinations belong to the duty block (confirmed.tariff)."""
+        Canada and direct-import destinations belong to the duty block (confirmed.tariff). With both
+        import multipliers set (C11) no row uses duty and tariffs or freight and fees, so those two
+        blocks are not listed. The destinations still are."""
         conf = self.S.get('confirmed') or {}
+        unused = ('tariff', 'freight') if self.mult_complete() else ()
         out = []
         for k, name in _ASSUMPTION_NAMES:
             if conf.get(k) is not True:
-                out.append((k, name))
+                if k not in unused:
+                    out.append((k, name))
                 if k == 'tariff':
                     out.append(('destinations', _DESTINATIONS_NAME))
         return out
+
+    def mult_complete(self):
+        """True in multiplier mode with both multipliers set (C11)."""
+        L = self.S['landed']
+        return L.get('mode') == 'multiplier' and all(L['multiplier'].get(c) is not None for c in FIBER_CLASSES)
+
+    def mult_gaps(self):
+        """Multiplier mode with an empty multiplier (C11) -> ([fiber classes the rows need], [styles]).
+        Those rows keep the itemized duty, freight and fees."""
+        L = self.S['landed']
+        if L.get('mode') != 'multiplier':
+            return [], []
+        missing = {c for c in FIBER_CLASSES if L['multiplier'].get(c) is None}
+        need, bases = set(), set()
+        if missing:
+            for rows in (self.lines, self.apo, self.inventory, self.production, self.hist_rows):
+                for r in rows:
+                    c = fiber_class(r.get('fiber'))
+                    if (c in missing and r.get('dutyRegime') in ('us', 'ca') and r.get('fob') is not None
+                            and (r.get('units') or 0) > 0):
+                        need.add(c)
+                        bases.add(r['base'])
+            for r in self.styles:
+                c = fiber_class(r.get('fiber'))
+                if c in missing and r.get('dutyRegime') in ('us', 'ca') and r.get('fobU') is not None:
+                    need.add(c)
+                    bases.add(r['base'])
+        return [c for c in FIBER_CLASSES if c in need], sorted(bases)
 
     def alerts(self):
         """Needs-attention list (contract C4). Every alert carries unit (what count counts, or None)
@@ -2972,8 +3619,9 @@ class _Build:
         if thin:
             thin.sort(key=lambda rs: sum(r['contrib'] for r in rs) / sum(r['net'] for r in rs))
             ids = [r['id'] for rs in thin for r in rs]
-            add('thin_contribution', 'medium', 'Thin contribution POs',
-                'Purchase orders whose contribution after royalty and deductions is under %d percent of net sales.' % round(THIN_CM * 100),
+            add('thin_contribution', 'medium', 'Thin profit POs',
+                'Purchase orders whose profit after royalty, chargebacks and revenue costs is under %d percent '
+                'of net sales.' % round(THIN_CM * 100),
                 None, sum(r['rev'] for rs in thin for r in rs), count=len(thin),
                 refs={'lines': ids[:_REF_CAP]}, total=len(ids), lineCount=len(ids))
         # Needs a cost: firm A2000 lines (high). Bulk forecast lines get their own alert, which is only
@@ -3021,9 +3669,13 @@ class _Build:
             nus = sorted({r['base'] for rows in (self.lines, self.apo, self.inventory, self.production) for r in rows
                           if 'non_us_dest' in (r.get('flags') or ()) and r['units'] > 0})
             if nus:
-                add('non_us_dest', 'info', 'Canada and direct-import costs are assumed',
-                    'Some goods land in Canada or are imported by the customer. Canada uses an assumed Canadian duty rate '
-                    'with no US add-on or fees. Direct imports carry no duty or freight. Confirm this on the Assumptions tab.',
+                detail = ('Some goods land in Canada or are imported by the customer. Canada uses the same import '
+                          'multiplier as the US. Direct imports carry no import costs. Confirm this on the Assumptions tab.'
+                          if self.S['landed'].get('mode') == 'multiplier' else
+                          'Some goods land in Canada or are imported by the customer. Canada uses an assumed Canadian '
+                          'duty rate with no US add-on or fees. Direct imports carry no duty or freight. Confirm this on '
+                          'the Assumptions tab.')
+                add('non_us_dest', 'info', 'Canada and direct-import costs are assumed', detail,
                     count=len(nus), refs={'styles': nus[:_REF_CAP]}, total=len(nus))
         # stale inputs (one feed each: no count unit, no value)
         now = self._parse_now()
@@ -3072,6 +3724,16 @@ class _Build:
                 ' '.join(parts), count=len(bad), refs={'params': bad}, aid='al_costbook_params',
                 missing=list(self.ci.missing_params), invalid=list(self.ci.invalid_params),
                 badRecords=self.ci.bad_records)
+        need, gap_styles = self.mult_gaps()
+        if need:
+            one = len(need) == 1
+            add('settings_incomplete', 'high', ALERT_KINDS['settings_incomplete']['label'],
+                'Import costs are set to use a multiplier on the factory cost, but the %s for %s %s empty. '
+                'Those goods use the itemized duty, freight and fees instead. Set %s on the Assumptions tab.'
+                % ('multiplier' if one else 'multipliers', ' and '.join(_FIBER_CLASS_WORDS[c] for c in need),
+                   'is' if one else 'are', 'it' if one else 'them'),
+                count=len(need), refs={'styles': gap_styles[:_REF_CAP]}, total=len(gap_styles),
+                aid='al_settings_incomplete', missing=list(need))
         blocks = self.assumption_blocks()
         if blocks:
             add('assumption', 'info', 'Assumptions to confirm',
@@ -3147,7 +3809,8 @@ class _Build:
             unpriced = [r for r in rows if r.get('rev') is None]
             t = {'units': sum(pcs(r) for r in rows), 'lines': len(rows),
                  'kitCartons': sum(r['units'] for r in rows if 'kit' in (r.get('flags') or ()))}
-            for f in ('rev', 'deduct', 'net', 'fob', 'duty', 'freight', 'fees', 'cogs', 'gp', 'royalty', 'contrib'):
+            for f in ('rev', 'deduct', 'net', 'fob', 'duty', 'freight', 'fees', 'cogs', 'gp', 'royalty', 'contrib',
+                      'revCost'):
                 t[f] = r2(sum((r.get(f) or 0.0) for r in (priced if f in cost_fields else rows)))
             costed = [r for r in priced if r.get('fob') is not None and r.get('level') != 'L7']
             t['costedRev'] = r2(sum((r.get('rev') or 0.0) for r in costed))
@@ -3158,6 +3821,8 @@ class _Build:
             t['uncostedRev'] = r2(sum((r.get('rev') or 0.0) for r in nogp))
             t['uncostedNet'] = r2(sum((r.get('net') or 0.0) for r in nogp))
             t['uncostedUnits'] = sum(pcs(r) for r in nogp)
+            # Revenue costs of rows with no gross profit (C11): contrib = gp - royalty - (revCost - this).
+            t['uncostedRevCost'] = r2(sum((r.get('revCost') or 0.0) for r in nogp))
             t['unpricedLines'] = len(unpriced)
             t['unpricedUnits'] = sum(pcs(r) for r in unpriced)
             t['unpricedFob'] = r2(sum((r.get('fob') or 0.0) for r in unpriced))
@@ -3203,7 +3868,7 @@ class _Build:
         # the allocation totals when the bulk forecast is shown too, so nothing is counted twice.
         cov = [r for r in self.apo if r.get('coveredBy')]
         apo['coveredByBulk'] = {'lines': len(cov), 'units': sum(r['units'] for r in cov)}
-        for f in ('rev', 'deduct', 'net', 'fob', 'cogs', 'gp', 'royalty', 'contrib'):
+        for f in ('rev', 'deduct', 'net', 'fob', 'cogs', 'gp', 'royalty', 'contrib', 'revCost'):
             apo['coveredByBulk'][f] = r2(sum((r.get(f) or 0.0) for r in cov
                                              if f not in cost_fields or r.get('rev') is not None))
         return {'openBook': ob, 'bulk': tot(bk), 'apo': apo, 'inventory': inv, 'production': prod}
@@ -3215,7 +3880,8 @@ class _Build:
             if c and o.get('customerFull') and c not in names:
                 names[c] = str(o['customerFull']).strip()
         names.update({k: v for k, v in self.apo_names.items() if k not in names})
-        codes = {r['cust'] for r in self.lines} | {r['cust'] for r in self.apo} | set(self.fob_set)
+        codes = ({r['cust'] for r in self.lines} | {r['cust'] for r in self.apo} | set(self.fob_set)
+                 | {r['cust'] for r in self.hist_rows})
         customers = {}
         for c in sorted(x for x in codes if x):
             g = _cust_group(c, self.S, self.fob_set)
@@ -3241,7 +3907,9 @@ class _Build:
                 'categories': dict(CATEGORY_LABELS), 'basis': {v: k for k, v in self.basis_keys.items()},
                 'flags': dict(FLAG_LABELS), 'alertKinds': copy.deepcopy(ALERT_KINDS),
                 'lotTiers': copy.deepcopy(LOT_TIER_LABELS), 'priceBasis': dict(PRICE_BASIS_LABELS),
-                'regimes': dict(REGIME_LABELS)}
+                'regimes': dict(REGIME_LABELS), 'fiberClasses': dict(FIBER_CLASS_LABELS),
+                'dutyLabel': DUTY_LABELS.get(self.S['landed'].get('mode'), DUTY_LABELS['itemized']),
+                'costRules': dict(COST_RULE_LABELS)}
 
     # ── price basis (contract C10) ──
     def fx_inputs(self):
@@ -3314,13 +3982,30 @@ class _Build:
         ls = st.get('lines') or {}
         S = self.S
         fxin = self.fx_inputs()
+        mult = S['landed'].get('mode') == 'multiplier'
         notes = [
             self.fx_note(fxin),
-            'Factory prices are FOB. Duty, freight, fees, royalty and deductions use the Assumptions tab.',
-            'Goods that land in Canada use an assumed Canadian duty rate. Goods the customer imports carry no US duty, freight or fees.',
+            ('Factory prices are FOB. Import costs (tariffs, freight and fees) are a multiplier on the factory cost: '
+             'one for natural fibers and one for synthetic fibers. Royalty, chargebacks and revenue costs use the '
+             'Assumptions tab.' if mult else
+             'Factory prices are FOB. Duty, freight, fees, royalty, chargebacks and revenue costs use the Assumptions tab.'),
+            ('Goods that land in Canada use the same import multiplier. Goods the customer imports carry no import costs.'
+             if mult else
+             'Goods that land in Canada use an assumed Canadian duty rate. Goods the customer imports carry no US duty, freight or fees.'),
             'Supply follows the smart routing engine. Units it cannot place are costed at the style average.',
             "Shipped history is costed at today's costs, not the costs of the time.",
         ]
+        if royalty_base(S) == 'revenue':
+            notes.append('Royalty is a percent of revenue, before chargebacks.')
+        rc_names = [str(it.get('name') or it.get('key') or '').strip() for it in S['revenueCosts']['items']
+                    if (_fnum(it.get('pct')) or 0) > 0]
+        if any(rc_names):
+            notes.append('Profit also takes off revenue costs, each a percent of revenue: %s.'
+                         % ', '.join(n for n in rc_names if n))
+        if self.ci.rule_mode == 'combined':
+            notes.append('When several factories quote a style, its cost is the average of their quotes, or the lowest '
+                         'quote when they differ by more than %s percent. Every row of the style uses that one cost.'
+                         % ('%g' % self.ci.wide_pct))
         if not S['bulk'].get('includeInTotals'):
             notes.append('Bulk lines are a forecast. They are shown apart and left out of the totals.')
         if self.ci.unrated:

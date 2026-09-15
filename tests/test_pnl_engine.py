@@ -397,9 +397,18 @@ def rows(ds, t):
     return [dict(zip(ds[t]['fields'], r)) for r in ds[t]['rows']]
 
 
+def rc_pct(S):
+    """The page's revenue cost percent (contract C11): the item percents summed in list order from 0."""
+    t = 0.0
+    for it in S['revenueCosts']['items']:
+        t += it['pct']
+    return t
+
+
 def client_recalc(r, S, dct, table):
     """Python copy of the frontend's DESIGN 5.6 recompute (pnl.core.js _pnlRecalc, scen null), with
-    the duty regime read from the row (contract C2)."""
+    the duty regime read from the row (contract C2), and the royalty base, revenue costs and
+    contribution of contract C11."""
     kit = 'kit' in (r.get('flags') or [])
     qty = round(r['fob'] / r['fobU']) if kit and r['fobU'] and r['fob'] else r['units']
     d, f, e = E.adders(r['fob'], qty, r['cat'], r['fiber'], r['origin'], S, r['dutyRegime'])
@@ -408,9 +417,10 @@ def client_recalc(r, S, dct, table):
     ded = E.r2(r['rev'] * E._ded_pct(r['cust'], S, grp) / 100)
     net = E.r2(r['rev'] - ded)
     gp = E.r2(net - cogs)
-    roy = E.r2(net * E._roy_pct(r['brand'], S) / 100)
+    roy = E.r2((r['rev'] if S['royalty'].get('base') == 'revenue' else net) * E._roy_pct(r['brand'], S) / 100)
+    rc = E.r2(r['rev'] * rc_pct(S) / 100)
     return {'duty': d, 'freight': f, 'fees': e, 'cogs': cogs, 'deduct': ded, 'net': net, 'gp': gp, 'royalty': roy,
-            'contrib': E.r2(gp - roy)}
+            'revCost': rc, 'contrib': E.r2(gp - roy - rc)}
 
 
 def client_recalc_fx(r, S, dct, rate):
@@ -579,7 +589,8 @@ class Dataset(unittest.TestCase):
     def test_settings_defaults_are_public_only(self):
         d = E.DEFAULT_SETTINGS
         self.assertIsNone(d['fx']['rate'])                   # the rate comes from the cost book
-        self.assertEqual(set(d['confirmed']), {'fx', 'grid', 'tariff', 'freight', 'royalty', 'deductions', 'opex'})
+        self.assertEqual(set(d['confirmed']), {'fx', 'grid', 'tariff', 'freight', 'royalty', 'deductions', 'opex',
+                                               'landed', 'revenueCosts'})       # C11 added the last two
         self.assertFalse(any(d['confirmed'].values()))
         self.assertEqual(d['routing'], {'picksAsWarehouse': False, 'honorAssignments': True, 'gateFallback': 'fifo'})
 
@@ -1180,10 +1191,11 @@ class AlertsC4(unittest.TestCase):
         k = kinds_of(ds)
         self.assertEqual((k['thin_contribution']['unit'], k['thin_contribution']['lineCount']),
                          ('POs', k['thin_contribution']['refsTotal']))
+        # C11: deductions are called chargebacks, and revenue costs and the import cost method are blocks.
         self.assertEqual(k['assumption']['detail'],
-                         'These settings still use public defaults: RMB rate, calculator grid order, customer deductions, '
-                         'freight and fees, operating expenses, royalty, duty and tariffs, '
-                         'Canada and direct-import destinations.')
+                         'These settings still use public defaults: RMB rate, calculator grid order, chargebacks, '
+                         'freight and fees, payroll and monthly costs, royalty, revenue costs, import cost method, '
+                         'duty and tariffs, Canada and direct-import destinations.')
         self.assertIn('Unconfirmed assumptions: RMB rate, calculator grid order', ' '.join(ds['notes']))
         for n in ds['notes'] + [ds['shipped']['note']]:
             self.assertNotRegex(n, '[–—]')
@@ -1397,6 +1409,585 @@ class PriceBasisC10(unittest.TestCase):
                     if 'kit' in r['flags']:
                         self.assertEqual(c['qty'], r['pieces'])
         self.assertGreater(moved, 0)
+
+
+# ── contracts C11, C12 and C14 (Sep 15): cost model, duty regime by customer, history by customer ──
+# Sentinel values only: import multipliers 1.37 and 1.53, royalty 6.5, revenue costs 2.25, 1.75 and 0.8.
+MULTS = {'natural': 1.37, 'synthetic': 1.53}
+REV_ITEMS = [{'key': 'warehouse', 'name': 'Warehouse', 'pct': 2.25},
+             {'key': 'factoring', 'name': 'Factoring', 'pct': 1.75},
+             {'key': 'rent', 'name': 'Rent', 'pct': 0.8}]
+C11 = {'landed': {'mode': 'multiplier', 'multiplier': dict(MULTS)}, 'royalty': {'defaultPct': 6.5},
+       'revenueCosts': {'items': REV_ITEMS}}
+BY_CUSTOMER_FIELDS = ['cust', 'base', 'brand', 'cat', 'fiber', 'origin', 'units', 'rev', 'fobU', 'fob', 'duty',
+                      'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'revCost', 'contrib', 'level',
+                      'grade', 'dutyRegime', 'fxShare', 'fxRef']
+
+
+class FiberClassC11(unittest.TestCase):
+    def test_fiber_groups_map_to_two_classes(self):
+        for f in ('cotton', 'linen', 'wool', ' Cotton '):
+            self.assertEqual(E.fiber_class(f), 'natural', f)
+        for f in ('mmf', 'silk', '', None, 'rayon'):
+            self.assertEqual(E.fiber_class(f), 'synthetic', f)
+
+    def test_predominant_fiber(self):
+        cases = [({'Cotton': 50, 'Polyester': 45, 'Spandex': 5}, 'cotton'),     # the largest share wins
+                 ({'polyester': 60, 'cotton': 40}, 'mmf'),
+                 ({'cotton': 50, 'polyester': 50}, 'cotton'),                     # a tie counts as natural
+                 ({'rayon': 55, 'linen': 45}, 'mmf'),                             # rayon is synthetic
+                 ({'viscose': 50, 'linen': 50}, 'linen'),
+                 ({'lyocell': 70, 'wool': 30}, 'mmf'),
+                 ({'modal': 40, 'tencel': 30, 'cotton': 30}, 'mmf'),
+                 ({'spandex': 60, 'cotton': 40}, 'mmf'),                          # spandex decides only on its own
+                 ({'elastane': 50, 'wool': 50}, 'wool'),
+                 ({'spandex': 50, 'polyester': 50}, 'mmf'),
+                 ([('organic cotton', 70), ('recycled polyester', 30)], 'cotton'),
+                 ({'merino wool': 80, 'nylon': 20}, 'wool'),
+                 ({}, None), ({'cotton': 'x'}, None), ('cotton', None)]
+        for content, want in cases:
+            self.assertEqual(E.fiber_group_of(content), want, content)
+        self.assertEqual(E.fiber_class({'Cotton': 50, 'Polyester': 45, 'Spandex': 5}), 'natural')
+        self.assertEqual(E.fiber_class({'polyester': 95, 'spandex': 5}), 'synthetic')
+
+
+class CostModelC11(unittest.TestCase):
+    S = E.merge_settings(C11, PARAMS)
+    S0 = E.merge_settings({}, PARAMS)
+
+    def test_multiplier_adders_by_fiber_class_and_regime(self):
+        S = self.S
+        nat, syn = (E.r2(100.0 * (1.37 - 1)), 0.0, 0.0), (E.r2(100.0 * (1.53 - 1)), 0.0, 0.0)
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'cotton', 'CN', S, 'us'), nat)
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us'), syn)
+        self.assertEqual(E.adders(100.0, 10, 'polo', 'mmf', 'BD', S, 'ca'), syn)          # Canada: the same multiplier
+        self.assertEqual(E.adders(100.0, 10, 'pants', 'linen', 'CN', S, 'ca'), nat)
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'cotton', 'CN', S, 'none'), (0.0, 0.0, 0.0))
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', None, 'CN', S, 'us'), syn)     # unknown fiber: synthetic
+        duty = E.r2(123.45 * (1.37 - 1))
+        self.assertEqual(E.stock_money(123.45, 10, 'blazer', 'wool', 'CN', 'us', S),
+                         (E.r2(123.45 + duty), E.r4(E.r2(123.45 + duty) / 10)))
+        du = E.r4(2.2222 * (1.53 - 1))
+        self.assertEqual(E.landed(2.2222, {'cat': 'polo', 'fiber': 'mmf'}, S, 'ca', 'CN'),
+                         {'duty': du, 'freight': 0.0, 'fees': 0.0, 'landedU': E.r4(2.2222 + du)})
+        self.assertEqual(E.landed(2.2222, {'cat': 'polo', 'fiber': 'mmf'}, S, 'none', 'CN')['landedU'], 2.2222)
+        raw = 2.22224999                                          # an unrounded style cost: rounded first (C2)
+        du = E.r4(E.r4(raw) * (1.53 - 1))
+        self.assertEqual(E.landed(raw, {'cat': 'polo', 'fiber': 'mmf'}, S, 'us', 'CN')['landedU'], E.r4(E.r4(raw) + du))
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', self.S0, 'us'),          # itemized: today's math
+                         (E.r2(100.0 * (25.9 + 20.0) / 100 + 10 * 0.07), E.r2(10 * 0.285),
+                          E.r2(100.0 * (0.3464 + 0.125) / 100 + 10 * 0.092)))
+
+    def test_royalty_base_revenue_costs_and_contribution(self):
+        S = self.S
+        m = E.line_money(1000.0, 400.0, 100, 'dress_shirt', 'cotton', 'CN', 'us', 7.0, 6.5, S)
+        duty = E.r2(400.0 * (1.37 - 1))
+        cogs = E.r2(400.0 + duty)
+        net = E.r2(1000.0 - E.r2(1000.0 * 7.0 / 100))
+        gp = E.r2(net - cogs)
+        roy = E.r2(net * 6.5 / 100)
+        rc = E.r2(1000.0 * (2.25 + 1.75 + 0.8) / 100)
+        self.assertEqual(E.revenue_cost_pct(S), 2.25 + 1.75 + 0.8)
+        self.assertEqual((m['duty'], m['freight'], m['fees'], m['cogs'], m['net'], m['gp'], m['royalty'], m['revCost'],
+                          m['contrib']), (duty, 0.0, 0.0, cogs, net, gp, roy, rc, E.r2(gp - roy - rc)))
+        R = E.merge_settings(dict(C11, royalty={'defaultPct': 6.5, 'base': 'revenue'}), PARAMS)
+        self.assertEqual(E.royalty_base(R), 'revenue')
+        r = E.line_money(1000.0, 400.0, 100, 'dress_shirt', 'cotton', 'CN', 'us', 7.0, 6.5, R)
+        self.assertEqual((r['royalty'], r['contrib']), (E.r2(1000.0 * 6.5 / 100), E.r2(gp - E.r2(1000.0 * 6.5 / 100) - rc)))
+        u = E.line_money(1000.0, None, 100, 'dress_shirt', 'cotton', 'CN', 'us', 7.0, 6.5, S)          # no cost
+        self.assertEqual((u['net'], u['revCost'], u['royalty'], u['contrib']), (net, rc, None, None))
+        n = E.line_money(None, 400.0, 100, 'dress_shirt', 'cotton', 'CN', 'us', 7.0, 6.5, S)           # no price
+        self.assertEqual((n['cogs'], n['revCost'], n['contrib']), (cogs, None, None))
+
+    def test_defaults_keep_todays_money(self):
+        S0 = self.S0
+        self.assertEqual(S0['landed'], {'mode': 'itemized', 'multiplier': {'natural': None, 'synthetic': None}})
+        self.assertEqual((E.revenue_cost_pct(S0), E.royalty_base(S0), S0['regimeByCustomer']), (0.0, 'net', {}))
+        m = E.line_money(1000.0, 400.0, 100, 'dress_shirt', 'mmf', 'CN', 'us', 7.0, 10.0, S0)
+        self.assertEqual((m['revCost'], m['contrib']), (0.0, E.r2(m['gp'] - m['royalty'])))
+        base = build(src_dest())
+        same = build(src_dest(), settings={'landed': {'mode': 'itemized', 'multiplier': dict(MULTS)},
+                                           'royalty': {'base': 'net'}, 'regimeByCustomer': {},
+                                           'revenueCosts': {'items': [dict(it, pct=0) for it in REV_ITEMS]}})
+        for t in ('lines', 'alloc', 'apo', 'inventory', 'production', 'styles'):
+            self.assertEqual(base[t], same[t], t)
+        for k in ('company', 'byStyle', 'byCustomer'):
+            self.assertEqual(base['shipped'][k], same['shipped'][k], k)
+        self.assertEqual(base['totals'], same['totals'])
+
+    def test_missing_multiplier_keeps_itemized_math_and_alerts(self):
+        half = {'landed': {'mode': 'multiplier', 'multiplier': {'natural': 1.37, 'synthetic': None}}}
+        S = E.merge_settings(half, PARAMS)
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us'),
+                         E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', self.S0, 'us'))
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'cotton', 'CN', S, 'us'), (E.r2(100.0 * (1.37 - 1)), 0.0, 0.0))
+        ds, base = build(settings=half), build()
+        self.assertEqual(by(ds, 'lines', 'id')['1|ROQAQF201SLS']['duty'], by(base, 'lines', 'id')['1|ROQAQF201SLS']['duty'])
+        a = kinds_of(ds)['settings_incomplete']
+        self.assertEqual((a['severity'], a['unit'], a['valueLabel'], a['value'], a['count'], a['missing']),
+                         ('high', 'settings', None, None, 1, ['synthetic']))
+        self.assertIn('ROQAQF201SLS', a['refs']['styles'])
+        self.assertIn('synthetic fibers', a['detail'])
+        self.assertNotRegex(a['title'] + a['detail'], '[–—]')
+        self.assertIn('settings_incomplete', ds['dict']['alertKinds'])
+        self.assertNotIn('settings_incomplete', kinds_of(build(settings=C11)))           # both multipliers set
+        self.assertNotIn('settings_incomplete', kinds_of(base))                           # itemized mode
+        none_set = kinds_of(build(settings={'landed': {'mode': 'multiplier'}}))['settings_incomplete']
+        self.assertEqual(none_set['missing'], ['synthetic'])      # only the classes the rows need are named
+
+    def test_dataset_in_multiplier_mode(self):
+        ds = build(src_dest(), settings=C11)
+        S = ds['settings']
+        seen = set()
+        for t in ('lines', 'apo'):
+            for r in rows(ds, t):
+                if r['fob'] is None:
+                    continue
+                if r['dutyRegime'] == 'none':
+                    self.assertEqual((r['duty'], r['freight'], r['fees']), (0.0, 0.0, 0.0))
+                else:
+                    d = E.r2(r['fob'] * (MULTS[E.fiber_class(r['fiber'])] - 1))
+                    self.assertEqual((r['duty'], r['freight'], r['fees'], r['cogs']), (d, 0.0, 0.0, E.r2(r['fob'] + d)),
+                                     (t, r['id']))
+                    seen.add(r['dutyRegime'])
+                if r['rev'] is None:
+                    continue
+                self.assertEqual(r['revCost'], E.r2(r['rev'] * rc_pct(S) / 100))
+                self.assertEqual(r['contrib'], E.r2(r['gp'] - r['royalty'] - r['revCost']))
+                for k, v in client_recalc(r, S, ds['dict'], t).items():
+                    self.assertEqual(r[k], v, (t, r['id'], k))
+        self.assertEqual(seen, {'us', 'ca'})
+        for t in ('inventory', 'production'):
+            for r in rows(ds, t):
+                if r['fob'] is not None:
+                    d = 0.0 if r['dutyRegime'] == 'none' else E.r2(r['fob'] * (MULTS[E.fiber_class(r['fiber'])] - 1))
+                    self.assertEqual(r['landed'], E.r2(r['fob'] + d), (t, r.get('sku') or r.get('ref')))
+        for s in rows(ds, 'styles'):
+            if s['fobU'] is not None and s['dutyRegime'] != 'none':
+                du = E.r4(s['fobU'] * (MULTS[E.fiber_class(s['fiber'])] - 1))
+                self.assertEqual(s['landedU'], E.r4(s['fobU'] + du), s['base'])
+        self.assertEqual((ds['dict']['dutyLabel'], build()['dict']['dutyLabel']),
+                         ('Import (tariffs, freight and fees)', 'Duty and tariffs'))
+        self.assertIn('Import costs (tariffs, freight and fees)', ' '.join(ds['notes']))
+        for n in ds['notes']:
+            self.assertNotRegex(n, '[–—]')
+
+    def test_summaries_carry_revenue_costs(self):
+        ds = build(settings=C11)
+        L = rows(ds, 'lines')
+        a2 = [r for r in L if r['type'] == 'a2000']
+        ob = ds['totals']['openBook']
+        self.assertEqual(ob['revCost'], E.r2(sum(r['revCost'] or 0.0 for r in a2)))
+        for part in ('openBook', 'bulk', 'apo'):
+            t = ds['totals'][part]
+            self.assertAlmostEqual(t['contrib'], t['gp'] - t['royalty'] - (t['revCost'] - t['uncostedRevCost']), places=2)
+        self.assertIn('revCost', ds['totals']['apo']['coveredByBulk'])
+        byid = {r['id']: r for r in L}
+        for a in rows(ds, 'alloc'):
+            ln = byid[a['line']]
+            want = E.r2(ln['revCost'] * a['units'] / ln['units']) if ln['revCost'] is not None and ln['units'] > 0 else None
+            self.assertEqual(a['revCost'], want)
+        st = by(ds, 'styles', 'base')['ROQAQF201SLS']
+        mine = [r for r in a2 if r['base'] == 'ROQAQF201SLS']
+        self.assertEqual(st['openRevCost'], E.r2(sum(r['revCost'] for r in mine)))
+        self.assertEqual(st['openContrib'], E.r2(sum(r['contrib'] or 0.0 for r in mine)))
+        comp = rows({'c': ds['shipped']['company']}, 'c')
+        by_st = rows({'b': ds['shipped']['byStyle']}, 'b')
+        for c in comp:
+            if c['rev']:
+                self.assertEqual(c['contrib'], E.r2(c['gp'] - c['royalty'] - c['revCost']), c['month'])
+                want = sum(b['months'][c['month']][1] * rc_pct(ds['settings']) / 100 for b in by_st
+                           if c['month'] in b['months'] and b['fobU'] is not None)
+                self.assertAlmostEqual(c['revCost'], want, places=2)
+        rv = build(settings=dict(C11, royalty={'defaultPct': 6.5, 'base': 'revenue'}))
+        jan = [c for c in rows({'c': rv['shipped']['company']}, 'c') if c['month'] == '2026-01'][0]
+        self.assertEqual(jan['royalty'], E.r2(300.0 * 6.5 / 100))                        # on revenue, before chargebacks
+        self.assertIn('Royalty is a percent of revenue, before chargebacks.', rv['notes'])
+
+    def test_assumptions_follow_the_cost_model(self):
+        blocks = kinds_of(build(settings=C11))['assumption']['refs']['blocks']
+        self.assertTrue({'landed', 'revenueCosts', 'destinations'} <= set(blocks))
+        self.assertFalse({'tariff', 'freight'} & set(blocks))           # the multipliers replace them
+        itemized = kinds_of(build())['assumption']['refs']['blocks']
+        self.assertTrue({'tariff', 'freight', 'landed', 'revenueCosts'} <= set(itemized))
+        conf = build(settings=dict(C11, confirmed={'landed': True, 'revenueCosts': True}))
+        self.assertFalse({'landed', 'revenueCosts'} & set(kinds_of(conf)['assumption']['refs']['blocks']))
+
+    def test_settings_merge_backstop(self):
+        S = E.merge_settings({'landed': {'mode': 'bogus', 'multiplier': {'natural': 0.5, 'synthetic': '1.53', 'x': 2}},
+                              'royalty': {'base': 'gross'},
+                              'revenueCosts': {'items': [{'key': 'a', 'name': 'A', 'pct': None}, {'key': 'b', 'pct': 99},
+                                                         'junk', {'key': 'c', 'pct': 2.25}]},
+                              'costRule': {'mode': 'median', 'wideSpreadPct': -1},
+                              'history': {'caveat': '  Synthetic caveat.  '},
+                              'regimeByCustomer': {'zzpeer': 'US', 'zz': 'mars', 'yy': None, ' ': 'us'}})
+        self.assertEqual(S['landed'], {'mode': 'itemized', 'multiplier': {'natural': None, 'synthetic': None}})
+        self.assertEqual(S['royalty']['base'], 'net')
+        self.assertEqual(S['revenueCosts']['items'], [{'key': 'a', 'name': 'A', 'pct': 0}, {'key': 'b', 'name': 'b', 'pct': 0},
+                                                      {'key': 'c', 'name': 'c', 'pct': 2.25}])
+        self.assertEqual(E.revenue_cost_pct(S), 2.25)
+        self.assertEqual((S['costRule'], S['history']), ({'mode': 'combined', 'wideSpreadPct': 10},
+                                                         {'caveat': 'Synthetic caveat.'}))
+        self.assertEqual(S['regimeByCustomer'], {'ZZPEER': 'us'})
+        N = E.merge_settings({'landed': None, 'revenueCosts': None, 'regimeByCustomer': None, 'costRule': None,
+                              'history': None, 'royalty': {'base': None}})
+        for k in ('landed', 'revenueCosts', 'regimeByCustomer', 'costRule', 'history'):
+            self.assertEqual(N[k], E.DEFAULT_SETTINGS[k], k)
+        self.assertEqual(N['royalty']['base'], 'net')
+        P = E.merge_settings({'landed': {'mode': 'multiplier', 'multiplier': {'natural': 1.37}}, 'revenueCosts': {'items': []}})
+        self.assertEqual(P['landed']['multiplier'], {'natural': 1.37, 'synthetic': None})
+        self.assertEqual((P['revenueCosts']['items'], E.revenue_cost_pct(P)), ([], 0.0))   # a saved list replaces the default
+
+    def test_new_defaults_are_public(self):
+        d = E.DEFAULT_SETTINGS
+        self.assertEqual(d['landed'], {'mode': 'itemized', 'multiplier': {'natural': None, 'synthetic': None}})
+        self.assertEqual(d['royalty']['base'], 'net')
+        self.assertEqual([(i['key'], i['name'], i['pct']) for i in d['revenueCosts']['items']],
+                         [('warehouse', 'Warehouse', 0), ('factoring', 'R&R factoring', 0), ('rent', 'Rent', 0)])
+        self.assertEqual((d['regimeByCustomer'], d['costRule'], d['history']),
+                         ({}, {'mode': 'combined', 'wideSpreadPct': 10}, {'caveat': None}))
+        self.assertEqual((d['confirmed']['landed'], d['confirmed']['revenueCosts']), (False, False))
+        ds = build()
+        for k in ('landed', 'revenueCosts', 'regimeByCustomer', 'costRule', 'history'):
+            self.assertEqual(ds['settings'][k], d[k], k)                    # echoed in the dataset
+
+
+class RegimeByCustomerC12(unittest.TestCase):
+    def test_customer_setting_comes_first(self):
+        ds = build(src_dest(), settings=dict(C11, regimeByCustomer={'peer': 'us', 'FOBX': 'ca', 'ZZCA': 'us'},
+                                             destinations={'WALM': 'us'}))
+        L = by(ds, 'lines', 'id')
+        ch = L['9|ROQAQF201SLS']                               # a Peerless-like account on factory direct (CH)
+        self.assertEqual((ch['dutyRegime'], ch['fobLine']), ('us', 1))       # still in the FOB segment filter
+        self.assertEqual((ch['duty'], ch['freight'], ch['fees']), (E.r2(ch['fob'] * (1.53 - 1)), 0.0, 0.0))
+        self.assertGreater(ch['duty'], 0)
+        self.assertIn('customer_regime', ch['flags'])
+        self.assertFalse({'fob_line', 'non_us_dest'} & set(ch['flags']))
+        fx = L['3|ROQAQF203SLS']                               # an FOB customer set to Canada
+        self.assertEqual((fx['dutyRegime'], fx['duty']), ('ca', E.r2(fx['fob'] * (1.53 - 1))))
+        self.assertEqual(L['8|ROQAQF211SLS']['dutyRegime'], 'us')             # beats the AE destination
+        self.assertEqual(L['1|ROQAQF201SLS']['dutyRegime'], 'us')
+        self.assertNotIn('customer_regime', L['1|ROQAQF201SLS']['flags'])
+        peer = [r for r in rows(ds, 'apo') if r['cust'] == 'PEER'][0]
+        self.assertEqual(peer['dutyRegime'], 'us')
+        self.assertIn('customer_regime', peer['flags'])
+        self.assertNotIn('regime_from_orders', peer['flags'])
+        self.assertEqual(by(ds, 'production', 'ref')['TT26011']['dutyRegime'], 'us')   # stock rows: destinations only
+        self.assertEqual([r['dutyRegime'] for r in rows(ds, 'inventory') if r['wh'] == 'ABFI'], ['ca'])
+        for t in ('lines', 'apo'):
+            for r in rows(ds, t):
+                if r['fob'] is not None and r['rev'] is not None:
+                    for k, v in client_recalc(r, ds['settings'], ds['dict'], t).items():
+                        self.assertEqual(r[k], v, (t, r['id'], k))
+        for f in ds['dict']['flags']:
+            self.assertNotRegex(ds['dict']['flags'][f], '[–—]')
+        base = by(build(src_dest()), 'lines', 'id')                           # no setting: as before
+        self.assertEqual((base['9|ROQAQF201SLS']['dutyRegime'], base['3|ROQAQF203SLS']['dutyRegime']), ('none', 'none'))
+
+    def test_shipped_history_follows_the_customer_setting(self):
+        def shipped(settings):
+            ds = build(settings=settings)
+            return by({'b': ds['shipped']['byStyle']}, 'b', 'base')['ROQAQF201SLS'], rows({'c': ds['shipped']['company']}, 'c')
+        st, _ = shipped({})
+        self.assertEqual((st['fobShare'], st['caShare']), (0.2, 0.0))          # FOBX is an FOB customer
+        st, _ = shipped({'regimeByCustomer': {'FOBX': 'us'}})
+        self.assertEqual((st['fobShare'], st['caShare']), (0.0, 0.0))
+        st, comp = shipped(dict(C11, regimeByCustomer={'ROSS': 'ca'}))
+        self.assertEqual((st['fobShare'], st['caShare']), (0.2, 0.8))
+        S = E.merge_settings(C11, PARAMS)
+        fob = E.r2(30 * st['fobU'])
+        du = E.adders(fob, 30, st['cat'], st['fiber'], st['origin'], S, 'us')[0]
+        dc = E.adders(fob, 30, st['cat'], st['fiber'], st['origin'], S, 'ca')[0]
+        jan = [c for c in comp if c['month'] == '2026-01'][0]
+        self.assertEqual(jan['duty'], E.r2(du * (1 - 0.2 - 0.8) + dc * 0.8))
+
+
+class ShippedByCustomerC14(unittest.TestCase):
+    @staticmethod
+    def src_hist():
+        s = src()
+        s['sales_analytics']['styles'][0][7] = {'KOHLSDROP': [4, 40.0], 'KOHL': [6, 66.0], 'FOBX': [10, 100.0],
+                                                'AMAZON_DROP': [2, 30.0], 'ROSS': [0, 0.0], 'TJMX': [-3, -30.0]}
+        s['sales_analytics']['styles'].append(['ZZLEGACY9', 'SYN', 7, 70.0, '2025-01-05', '2026-02-10',
+                                               {'2026-01': [7, 70.0, 0, 0.0]}, {'ROSS1': [7, 70.0]}, 'RED'])
+        return s
+
+    def test_rows_fold_history_codes_and_use_line_math(self):
+        ds = build(self.src_hist(), settings=C11)
+        bc = ds['shipped']['byCustomer']
+        self.assertEqual(bc['fields'][:len(BY_CUSTOMER_FIELDS)], BY_CUSTOMER_FIELDS)
+        R = {(r['cust'], r['base']): r for r in rows({'b': bc}, 'b')}
+        self.assertEqual(set(R), {('KOHL', 'ROQAQF201SLS'), ('FOBX', 'ROQAQF201SLS'), ('AMAZ', 'ROQAQF201SLS'),
+                                  ('ROSS', 'ZZLEGACY9')})                     # units > 0 only
+        S = ds['settings']
+        k = R[('KOHL', 'ROQAQF201SLS')]                                        # KOHLSDROP folds into KOHL
+        self.assertEqual((k['units'], k['rev'], k['pieces'], k['dutyRegime']), (10, 106.0, 10, 'us'))
+        st = by({'b': ds['shipped']['byStyle']}, 'b', 'base')['ROQAQF201SLS']
+        self.assertEqual((k['fobU'], k['level'], k['grade'], k['origin'], k['fxShare']),
+                         (st['fobU'], st['level'], st['grade'], st['origin'], st['fxShare']))
+        want = E.line_money(106.0, E.r2(10 * k['fobU']), 10, k['cat'], k['fiber'], k['origin'], 'us',
+                            E._ded_pct('KOHL', S, 'department'), E._roy_pct(k['brand'], S), S)
+        for f, v in want.items():
+            self.assertEqual(k[f], v, f)
+        self.assertEqual((k['duty'], k['freight']), (E.r2(k['fob'] * (1.53 - 1)), 0.0))
+        f = R[('FOBX', 'ROQAQF201SLS')]
+        self.assertEqual((f['dutyRegime'], f['duty'], f['freight'], f['fees']), ('none', 0.0, 0.0, 0.0))
+        u = R[('ROSS', 'ZZLEGACY9')]                                           # ROSS1 folds into ROSS; no cost
+        self.assertEqual((u['fob'], u['cogs'], u['gp'], u['royalty'], u['contrib'], u['level']),
+                         (None, None, None, None, None, 'L7'))
+        self.assertEqual((u['deduct'], u['revCost']), (E.r2(70.0 * 1.0 / 100), E.r2(70.0 * rc_pct(S) / 100)))
+        self.assertIn('AMAZ', ds['dict']['customers'])                         # a history-only account is named
+        self.assertEqual(ds['shipped']['range'], {'from': '2025-01-01', 'to': '2026-02-20',
+                                                  'ingestedAt': '2026-02-21T00:00:00'})
+        ca = {(r['cust'], r['base']): r for r in rows({'b': build(self.src_hist(), settings=dict(
+            C11, regimeByCustomer={'KOHL': 'ca'}))['shipped']['byCustomer']}, 'b')}
+        self.assertEqual(ca[('KOHL', 'ROQAQF201SLS')]['dutyRegime'], 'ca')
+
+    def test_history_not_loaded(self):
+        b2 = build(src(analytics=False))
+        self.assertEqual((b2['shipped']['byCustomer']['rows'], b2['shipped']['byCustomer']['fields'][:3]),
+                         ([], ['cust', 'base', 'brand']))
+        self.assertEqual(b2['shipped']['range'], {'from': None, 'to': None, 'ingestedAt': None})
+
+
+# ── contract C13 (Sep 15): one cost per style, from every factory's direct quote ──
+# Sentinel prices only. Grid order: factory TT reads grid GY first; every other factory reads grid GN first.
+LO, AT10, OVER10 = 2.8282, 3.11102, 3.1111            # AT10 is exactly LO x 1.1; OVER10 is just above it
+C13_EXTRA = [
+    rec('AA!J8', 'PC', 'ref_price_list', 7.1111, factory_code='AA', production_ref='AA26003', style='ROQAQF101SLS',
+        fabric_codes=['QF'], scope='ref_style'),
+    rec('AA!J5', 'PC', 'ref_price_list', 6.1616, factory_code='AA', production_ref='AA26004', style='ROQAQG701SLS',
+        fabric_codes=['QG'], scope='ref_style'),
+    rec('AA!J6', 'PC', 'ref_price_list', 3.3434, factory_code='AA', production_ref='AA26005', style='ROQAQE702SLS',
+        fabric_codes=['QE'], scope='ref_style'),
+    rec('AA!J7', 'PC', 'ref_price_list', 5.3535, factory_code='AA', production_ref='AA26006', style='ROQAQD703SLS',
+        fabric_codes=['QD'], scope='ref_style'),
+    rec('CC!G3', 'KY', 'ref_price_list', 2.9393, factory_code='CC', production_ref_resolved='CC26001', pattern='SOLID',
+        fit_class='REGULAR', customer_group='ROSS', fabric_codes=['QS'], scope='ref'),
+    calc('GN!T1', 'GN:BASE', LO, 'QA', ['QT'], 'SLIM', 'SOLID'), calc('GY!T1', 'GY:BASE', AT10, 'QA', ['QT'], 'SLIM', 'SOLID'),
+    calc('GN!W1', 'GN:BASE', LO, 'QA', ['QW'], 'SLIM', 'SOLID'), calc('GY!W1', 'GY:BASE', OVER10, 'QA', ['QW'], 'SLIM', 'SOLID'),
+    calc('GN!G1', 'GN:BASE', 6.4646, 'QA', ['QG'], 'SLIM', 'SOLID'),
+    calc('GN!E1', 'GN:BASE', 4.3434, 'QA', ['QE'], 'SLIM', 'SOLID'),
+    calc('GN!D1', 'GN:BASE', 3.5353, 'QA', ['QD'], 'SLIM', 'SOLID'),
+    calc('GN!R1', 'GN:BASE', 4.2323, 'QA', ['QR'], 'SLIM', 'SOLID', e1=R2),
+    calc('GY!R1', 'GY:BASE', 4.5454, 'QA', ['QR'], 'SLIM', 'SOLID', e1=FXB)]
+C13_BOOK = basis_book(C13_EXTRA)
+CASCADE = {'costRule': {'mode': 'cascade'}}
+
+
+def c13(ledger=(), settings=None, overrides=None):
+    return ci(ledger, settings, overrides, costbook=C13_BOOK)
+
+
+def src_c13():
+    """src() with ROQAQF201SLS also made on a second factory's ref (NN26009), a tailored style on a KinYun-type
+    ref, a style on a list factory's unlisted ref (a fallback) and a style on a list and a grid factory."""
+    s = src()
+    s['ledger']['rows'] = s['ledger']['rows'] + [
+        led('NN26009', 'ROQAQF201SLS', 400, etd='2026-04-01'), led('CC26001', 'ROQAQS803TFS', 200),
+        led('AA26009', 'ROQAQF605SLS', 120), led('AA26004', 'ROQAQG701SLS', 150), led('NN26003', 'ROQAQG701SLS', 150)]
+    return s
+
+
+def style_rows(ds, base):
+    """(table, row) for every row of one base style: lines, apo, stock, production, styles, the line's
+    allocations and both shipped tables."""
+    out = [(t, r) for t in ('lines', 'apo', 'inventory', 'production', 'styles') for r in rows(ds, t) if r['base'] == base]
+    ids = {r['id'] for t, r in out if t == 'lines'}
+    out += [('alloc', r) for r in rows(ds, 'alloc') if r['line'] in ids]
+    out += [('byStyle', r) for r in rows({'b': ds['shipped']['byStyle']}, 'b') if r['base'] == base]
+    out += [('byCustomer', r) for r in rows({'b': ds['shipped']['byCustomer']}, 'b') if r['base'] == base]
+    return out
+
+
+class CombinedCostC13(unittest.TestCase):
+    def test_single_quotes(self):
+        c = c13([led('NN26001', 'ROQAQF601SLS', 100), led('BB26001', 'ROQAQK105SLS', 50),
+                 led('BB26099', 'ROQAQK106SLS', 50), led('CC26009', 'ROQAQF804SLS', 50)])
+        g = c.style_quote('ROQAQF601SLS')                         # one factory, priced by its own grid
+        self.assertEqual((g['rule'], g['fobU'], g['level'], g['grade'], g['spread'], g['fxShare'], g['fxRef']),
+                         ('single', 4.4444, 'L4a', 'B', 0.0, 1.0, FXB))
+        self.assertEqual(g['costByFactory'], [['NN', 'GN', 'S', 4.4444, 'L4a']])
+        p = c.style_quote('TMQAQF102SLS')                         # a list names the exact style (no ledger ref needed)
+        self.assertEqual((p['rule'], p['fobU'], p['level'], p['grade'], p['fxShare'], p['fxRef']),
+                         ('single', 6.6666, 'L1', 'A', 0.0, None))
+        self.assertEqual(p['costByFactory'], [['AA', 'PC', 'AA26002', 6.6666, 'L1']])
+        m = c.style_quote('ROQAQF101SLS')                         # one factory on two refs: the median of its quotes
+        self.assertEqual((m['rule'], m['fobU'], m['spread'], m['rangeLo'], m['rangeHi']),
+                         ('single', E.r4((7.1111 + 7.7777) / 2), 0.0, 7.1111, 7.7777))
+        self.assertEqual([q[2] for q in m['costByFactory']], ['AA26003', 'AA26001'])          # sorted by price
+        d = c.style_quote('ROQAQK105SLS')                         # ref and pattern list, for a ref carrying the style
+        self.assertEqual((d['rule'], d['fobU'], d['level'], d['costByFactory']),
+                         ('single', 3.3333, 'L2', [['BB', 'DP', 'BB26001', 3.3333, 'L2']]))
+        self.assertIsNone(c.style_quote('ROQAQK106SLS'))          # ref not on the list: a sibling rate is no quote
+        k = c.style_quote('ROQAQF804SLS')                         # a list factory whose list does not answer: its grid
+        self.assertEqual(k['costByFactory'], [['CC', 'GN', 'S', 4.4444, 'L4a']])
+        u = c.style_quote('ROQAQF609SLS')                         # no factory known: the default grid order
+        self.assertEqual((u['rule'], u['fobU'], u['costByFactory']), ('single', 4.4444, [['UNKNOWN', 'GN', 'S', 4.4444, 'L4a']]))
+        self.assertTrue(c.combined('ROQAQF609SLS')['res']['basis'].startswith('No factory is known for this style.'))
+
+    def test_average_threshold_and_lowest(self):
+        def both(st):
+            return [led('TT26001', st, 100), led('NN26002', st, 100)]
+        c = c13(both('ROQAQF602SLS') + both('ROQAQT603SLS') + both('ROQAQW604SLS'))
+        a = c.style_quote('ROQAQF602SLS')
+        self.assertEqual((a['rule'], a['fobU'], a['level'], a['grade'], a['spread']),
+                         ('average', E.r4((4.1717 + 4.4444) / 2), 'L4a', 'B', E.r4(4.4444 / 4.1717 - 1)))
+        self.assertEqual(a['costByFactory'], [['TT', 'GY', 'S', 4.1717, 'L4a'], ['NN', 'GN', 'S', 4.4444, 'L4a']])
+        self.assertTrue({'cost_average', 'price_conflict'} <= set(a['flags']))
+        self.assertEqual((a['rangeLo'], a['rangeHi'], sorted(a['evidence'])), (4.1717, 4.4444, ['GN!F1', 'GY!F1']))
+        t = c.style_quote('ROQAQT603SLS')                         # exactly 10 percent apart: still the average
+        self.assertEqual((t['rule'], t['fobU'], t['spread']), ('average', E.r4((LO + AT10) / 2), 0.1))
+        w = c.style_quote('ROQAQW604SLS')                         # just above: the lowest, with its own evidence
+        self.assertEqual((w['rule'], w['fobU'], w['level'], w['rangeLo'], w['rangeHi'], w['evidence']),
+                         ('lowest', LO, 'L4a', LO, OVER10, ['GN!W1']))
+        self.assertIn('cost_lowest', w['flags'])
+        self.assertIn('Lowest of 2 factory quotes', c.combined('ROQAQW604SLS')['res']['basis'])
+        narrow = c13(both('ROQAQF602SLS'), settings={'costRule': {'wideSpreadPct': 5}}).style_quote('ROQAQF602SLS')
+        self.assertEqual((narrow['rule'], narrow['fobU']), ('lowest', 4.1717))
+        wide = c13(both('ROQAQW604SLS'), settings={'costRule': {'wideSpreadPct': 12.5}}).style_quote('ROQAQW604SLS')
+        self.assertEqual(wide['rule'], 'average')
+        for text in (c.combined(s)['res']['basis'] for s in ('ROQAQF602SLS', 'ROQAQW604SLS')):
+            self.assertNotRegex(text, '[–—]')
+
+    def test_grade_rule(self):
+        c = c13([led('AA26004', 'ROQAQG701SLS', 100), led('NN26003', 'ROQAQG701SLS', 100),
+                 led('AA26005', 'ROQAQE702SLS', 100), led('NN26003', 'ROQAQE702SLS', 100),
+                 led('AA26006', 'ROQAQD703SLS', 100), led('NN26003', 'ROQAQD703SLS', 100)])
+        a = c.style_quote('ROQAQG701SLS')        # a list price (grade A) and a calculator price (grade B), averaged
+        self.assertEqual((a['rule'], a['level'], a['grade'], a['fobU']),
+                         ('average', 'L1', 'B', E.r4((6.1616 + 6.4646) / 2)))           # best level, worst grade
+        lo_list = c.style_quote('ROQAQE702SLS')  # far apart, the list is lower: its level and grade
+        self.assertEqual((lo_list['rule'], lo_list['level'], lo_list['grade'], lo_list['fobU']), ('lowest', 'L1', 'A', 3.3434))
+        lo_grid = c.style_quote('ROQAQD703SLS')  # far apart, the calculator is lower: its level and grade
+        self.assertEqual((lo_grid['rule'], lo_grid['level'], lo_grid['grade'], lo_grid['fobU']), ('lowest', 'L4a', 'B', 3.5353))
+        ds = build(src_c13(), cb=C13_BOOK)
+        for r in rows(ds, 'production'):
+            if r['base'] == 'ROQAQG701SLS':                       # both rows carry the combined grade
+                self.assertEqual((r['level'], r['grade'], r['fobU']), ('L1', 'B', a['fobU']), r['ref'])
+
+    def test_value_weighted_fx_ref_and_the_what_if(self):
+        both = [led('TT26001', 'ROQAQR705SLS', 100), led('NN26002', 'ROQAQR705SLS', 100)]
+        tt, nn = 4.5454, 4.2323                   # TT's grid prints at FXB, NN's at R2
+        q = c13(both).style_quote('ROQAQR705SLS')
+        self.assertEqual((q['rule'], q['fobU'], q['fxShare'], q['fxRef']),
+                         ('average', E.r4((tt + nn) / 2), 1.0, E.r4((tt * FXB + nn * R2) / (tt + nn))))
+        at = c13(both, settings={'fx': {'rate': 7.7}}).style_quote('ROQAQR705SLS')
+        exact = (tt * FXB / 7.7 + nn * R2 / 7.7) / 2
+        self.assertEqual((at['rule'], at['fobU'], at['fxRef']), ('average', E.r4(exact), 7.7))
+        self.assertAlmostEqual(E.fx_what_if_unit(q['fobU'], q['fxShare'], q['fxRef'], 7.7), at['fobU'], delta=0.00015)
+        med, ref = (tt + nn) / 2, (tt * FXB + nn * R2) / (tt + nn)
+        self.assertAlmostEqual(med * ref / 7.7, exact, places=12)          # exact before the 4-decimal rounding
+
+    def test_manual_cost_wins_outright(self):
+        base = {'reason': 'synthetic', 'effective': '', 'by': 'x@example.com', 'at': '2026-01-01'}
+        ov = [dict(base, id='o1', scope='style', key={'style': 'ROQAQF201SLS'}, fobU=9.2222),
+              dict(base, id='o2', scope='ref', key={'ref': 'NN26003'}, fobU=9.3333)]
+        ds = build(src_c13(), cb=C13_BOOK, overrides=ov)
+        seen = style_rows(ds, 'ROQAQF201SLS')
+        self.assertTrue(seen)
+        for t, r in seen:
+            self.assertEqual((r['fobU'], r['level']), (9.2222, 'L0'), t)
+        st = by(ds, 'styles', 'base')['ROQAQF201SLS']
+        self.assertEqual((st['costRule'], len(st['costByFactory'])), ('manual', 2))        # the quotes are still listed
+        P = {r['ref']: r for r in rows(ds, 'production') if r['base'] == 'ROQAQG701SLS'}
+        self.assertEqual((P['NN26003']['fobU'], P['NN26003']['level']), (9.3333, 'L0'))      # a ref override: its rows only
+        self.assertEqual((P['AA26004']['level'], P['AA26004']['fobU']), ('L1', E.r4((6.1616 + 6.4646) / 2)))
+
+    def test_fallback_keeps_the_ladder(self):
+        ds = build(src_c13(), cb=C13_BOOK)
+        st = by(ds, 'styles', 'base')['ROQAQF605SLS']
+        lad = c13(src_c13()['ledger']['rows']).resolve('ROQAQF605SLS', 'AA', 'AA26009')
+        self.assertEqual((st['costRule'], st['fobU'], st['level'], st['costByFactory'], st['costSpread']),
+                         ('fallback', lad['fobU'], 'L3', [], None))
+        self.assertIn('fabric_median', lad['flags'])
+
+    def test_modern_and_tailored_take_the_regular_price(self):
+        self.assertEqual([E.price_fit(f) for f in ('MODERN', 'TAILORED', 'SLIM', 'REGULAR', 'BIG_TALL', None)],
+                         ['REGULAR', 'REGULAR', 'SLIM', 'REGULAR', 'BIG_TALL', None])
+        mf, tf = E.decode_sku('ROQAQF801MFS'), E.decode_sku('ROQAQF802TFS')
+        self.assertEqual((mf['fitCode'], mf['fit'], tf['fitCode'], tf['fit']), ('MF', 'MODERN', 'TF', 'TAILORED'))
+        c = c13([led('NN26004', 'ROQAQF801MFS', 100), led('NN26005', 'ROQAQF802TFS', 100), led('CC26001', 'ROQAQS803TFS', 100)])
+        for st in ('ROQAQF801MFS', 'ROQAQF802TFS'):
+            q = c.style_quote(st)                                   # the grid's regular column, an exact match
+            self.assertEqual((q['rule'], q['fobU'], q['level'], q['costByFactory']),
+                             ('single', 4.6666, 'L4a', [['NN', 'GN', 'S', 4.6666, 'L4a']]), st)
+            self.assertIn('fit_as_regular', q['flags'])
+            self.assertEqual(c.resolve(st, 'NN')['level'], 'L4d')    # the ladder alone derives it
+        k = c.style_quote('ROQAQS803TFS')                           # the KinYun-type regular fit column
+        self.assertEqual((k['rule'], k['fobU'], k['level'], k['costByFactory']),
+                         ('single', 2.9393, 'L2', [['CC', 'KY', 'CC26001', 2.9393, 'L2']]))
+        self.assertIn('fit_as_regular', k['flags'])
+        lad = c.resolve('ROQAQS803TFS', 'CC', 'CC26001')
+        self.assertEqual((lad['level'], lad['fobU']), ('L3', 2.2222))  # the ladder reads the slim rate
+        now, old = build(src_c13(), cb=C13_BOOK), build(src_c13(), cb=C13_BOOK, settings=CASCADE)
+        self.assertEqual((by(now, 'production', 'style')['ROQAQS803TFS']['fobU'],
+                          by(old, 'production', 'style')['ROQAQS803TFS']['fobU']), (2.9393, 2.2222))
+
+    def test_one_cost_for_a_style_everywhere(self):
+        ds = build(src_c13(), cb=C13_BOOK)
+        want = E.r4((4.1717 + 4.4444) / 2)
+        seen = style_rows(ds, 'ROQAQF201SLS')
+        self.assertEqual({t for t, _ in seen}, {'lines', 'alloc', 'apo', 'inventory', 'production', 'styles', 'byStyle',
+                                                'byCustomer'})
+        for t, r in seen:
+            self.assertEqual((r['fobU'], r['level']), (want, 'L4a'), t)
+            if 'grade' in r:
+                self.assertNotEqual(r['grade'], 'A', t)
+        P = [r for r in rows(ds, 'production') if r['base'] == 'ROQAQF201SLS']
+        self.assertEqual(sorted(r['factory'] for r in P), ['NN', 'TT'])           # each row keeps its factory
+        st = by(ds, 'styles', 'base')['ROQAQF201SLS']
+        self.assertEqual((st['costRule'], st['costSpread'], st['factories']),
+                         ('average', E.r4(4.4444 / 4.1717 - 1), ['NN', 'TT']))
+        self.assertEqual(ds['styles']['fields'][-3:], ['costByFactory', 'costRule', 'costSpread'])
+        self.assertEqual(set(ds['dict']['costRules']), set(E.COST_RULES))
+        for t in ('lines', 'apo'):                                               # the page recompute still matches
+            for r in rows(ds, t):
+                if r['fob'] is not None and r['rev'] is not None:
+                    for k, v in client_recalc(r, ds['settings'], ds['dict'], t).items():
+                        self.assertEqual(r[k], v, (t, r['id'], k))
+        for t in ('lines', 'apo', 'inventory', 'production'):
+            for r in rows(ds, t):
+                for f in r['flags']:
+                    self.assertIn(f, ds['dict']['flags'], (t, f))
+        for v in list(ds['dict']['costRules'].values()) + [ds['dict']['flags'][f] for f in ('cost_average', 'cost_lowest',
+                                                                                            'fit_as_regular')]:
+            self.assertNotRegex(v, '[–—]')
+
+    def test_cascade_mode_equals_the_old_result(self):
+        keep = E.CostIndex.final
+        try:
+            E.CostIndex.final = lambda self, b, res: res              # the engine without the C13 choke point
+            before = build(src_c13(), cb=C13_BOOK)
+        finally:
+            E.CostIndex.final = keep
+        cas = build(src_c13(), cb=C13_BOOK, settings=CASCADE)
+        for k in ('lines', 'alloc', 'apo', 'inventory', 'production', 'shipped', 'coverage', 'unresolved', 'conflicts',
+                  'evidence', 'totals', 'alerts', 'dict'):
+            self.assertEqual(cas[k], before[k], k)
+        i = cas['styles']['fields'].index('costRule')
+        self.assertEqual([r[:i] + r[i + 1:] for r in cas['styles']['rows']],
+                         [r[:i] + r[i + 1:] for r in before['styles']['rows']])
+        self.assertTrue(all(r[i] in ('cascade', 'manual') for r in cas['styles']['rows']))
+        c = c13(src_c13()['ledger']['rows'])
+        for r in rows(cas, 'production'):                          # each row at its own factory's ladder cost
+            self.assertEqual(r['fobU'], c.resolve(r['style'], r['factory'], r['ref'], r['poName'])['fobU'], r['ref'])
+        comb = {(r['ref'], r['style']): r['fobU'] for r in rows(build(src_c13(), cb=C13_BOOK), 'production')}
+        self.assertNotEqual(comb[('TT26001', 'ROQAQF201SLS')], by(cas, 'production', 'ref')['TT26001']['fobU'])
+
+
+class FiberMapC11(unittest.TestCase):
+    def test_fabric_codes_follow_the_predominant_fiber(self):
+        # The fabric names below are the public FABRIC_RULES text of the platform.
+        cases = {'PY': {'cotton': 50, 'polyester': 47, 'spandex': 3}, 'CL': {'lyocell': 35, 'cotton': 35, 'nylon': 27,
+                 'spandex': 3}, 'LC': {'cotton': 51, 'poly': 49}, 'LT': {'cotton': 45, 'linen': 55},
+                 'SN': {'cotton': 75, 'rayon': 15, 'polyester': 10}, 'OX': {'poly': 65, 'cotton': 35},
+                 'SP': {'poly': 52, 'cotton': 45, 'spand': 3}, 'MR': {'microfiber': 50, 'rayon': 50},
+                 'VP': {'viscose': 50, 'polyester': 50}, 'TD': {'polyester': 60, 'cotton': 40}}
+        for code, content in cases.items():
+            self.assertEqual(E.FIBER_BY_FABRIC.get(code, 'mmf'), E.fiber_group_of(content), code)
+        self.assertEqual((E.decode_sku('ROQAPY101SLS')['fiber'], E.decode_sku('ROQACL101SLS')['fiber']), ('cotton', 'cotton'))
+        self.assertEqual(E.fiber_class(E.decode_sku('ROQAPY101SLS')['fiber']), 'natural')
 
 
 if __name__ == '__main__':

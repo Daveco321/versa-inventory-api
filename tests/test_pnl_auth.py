@@ -1738,5 +1738,123 @@ class TestBuildStateAndTransport(PnlTestCase):
         self.assertEqual(r0.get_data(), plain.get_data())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Contract C14: the '@admins' allowlist entry.
+class TestAdminsAllowlistC14(PnlTestCase):
+    LOOKALIKE = 'eyJx.pay.lookalike'           # an admin whose email merely contains '@admins'
+
+    def setUp(self):
+        super().setUp()
+        IDENTITIES[self.LOOKALIKE] = {'role': 'staff', 'is_admin': True, 'email': 'x@admins.com', 'uid': 'u-look'}
+        self.addCleanup(IDENTITIES.pop, self.LOOKALIKE, None)
+
+    def status(self, h, token=None, headers=None):
+        return h.req('GET', '/api/pnl/status', token=token, headers=headers)
+
+    def test_admins_entry_admits_every_admin(self):
+        for allow in ('@admins', ' @ADMINS ', 'someone@example.test, @Admins', ',@admins,'):
+            h = self.harness(allow=allow)
+            for token in (T_ADMIN, 'eyJx.pay.admin2', 'eyJx.pay.admincase', self.LOOKALIKE):
+                self.assertEqual(self.status(h, token).status_code, 200, '%r %s' % (allow, token))
+            for name, token in NON_ADMIN:
+                self.assert_error(self.status(h, token), 403, 'ADMIN_ONLY', '%r %s' % (allow, name))
+            self.assert_error(self.status(h, 'eyJx.pay.noemail'), 403, 'ADMIN_ONLY', 'an admin with no email')
+            for name, headers in DENY_401:
+                self.assert_error(self.status(h, headers=headers), 401, 'AUTH_REQUIRED', '%r %s' % (allow, name))
+        h = self.harness(allow='@admins')
+        for path, method, body in ROUTE_CALLS:               # an admin who is not listed by email
+            r = h.req(method, path, token='eyJx.pay.admin2', body=body)
+            self.assertNotIn(r.status_code, (401, 403), '%s %s' % (method, path))
+            self.assertLess(r.status_code, 500, '%s %s: %s' % (method, path, r.get_data(as_text=True)[:200]))
+            self.assert_pnl_headers(r, path)
+        self.assertIn('allowlist all admins', self._out.getvalue())
+
+    def test_lookalikes_are_ordinary_entries(self):
+        for allow in ('x@admins.com', '@admins.com', 'admins', '@admins;x', 'admins@', '"@admins"'):
+            h = self.harness(allow=allow)
+            for token in (T_ADMIN, 'eyJx.pay.admin2'):
+                self.assert_error(self.status(h, token), 403, 'ADMIN_ONLY', '%r %s' % (allow, token))
+        self.assertEqual(self.status(self.harness(allow='x@admins.com'), self.LOOKALIKE).status_code, 200)
+        self.assert_error(self.status(self.harness(allow='@admins.com'), self.LOOKALIKE), 403, 'ADMIN_ONLY', 'suffix')
+
+    def test_still_mandatory_and_the_machine_key_never_opens_it(self):
+        for allow in (None, '', ' , ,'):
+            h = self.harness(allow=allow)
+            self.assert_error(self.status(h, T_ADMIN), 503, 'PNL_NOT_CONFIGURED', repr(allow), reason='allowlist')
+        h = self.harness(allow='@admins')
+        for headers in ({'X-Api-Key': MACHINE_KEY}, {'X-Api-Key': MACHINE_KEY, 'Authorization': 'Bearer ' + T_ADMIN}):
+            self.assert_error(self.status(h, headers=headers), 401, 'AUTH_REQUIRED', 'machine key')
+        self.assertEqual(h.backend.puts, [])
+        off = self.harness(allow='@admins', enabled='off')
+        self.assert_error(self.status(off, T_ADMIN), 503, 'PNL_NOT_CONFIGURED', 'disabled', reason='disabled')
+
+
+# Contracts C11 to C14: the new settings blocks. Sentinel values only.
+class TestSettingsC11ToC14(PnlTestCase):
+    GOOD = {'landed': {'mode': 'multiplier', 'multiplier': {'natural': 1.37, 'synthetic': 1.53}},
+            'royalty': {'defaultPct': 6.5, 'base': 'revenue'},
+            'revenueCosts': {'items': [{'key': 'warehouse', 'name': 'Warehouse', 'pct': 2.25},
+                                       {'key': 'factoring', 'name': 'Factoring', 'pct': 1.75},
+                                       {'key': 'rent', 'name': 'Rent', 'pct': 0.8}]},
+            'regimeByCustomer': {'zzpeer': 'us', 'ZZ SHOP': 'none', 'YY': None},
+            'costRule': {'mode': 'cascade', 'wideSpreadPct': 12.5},
+            'history': {'caveat': 'Synthetic caveat.'},
+            'confirmed': {'landed': True, 'revenueCosts': False},
+            'opex': {'items': [{'name': 'Payroll', 'monthly': 111111}]}}
+
+    def test_new_blocks_round_trip(self):
+        h = self.harness()
+        r = h.admin('POST', '/api/pnl/settings', body={'settings': self.GOOD, 'expected_etag': None})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:300])
+        out = r.get_json()
+        s = out['settings']
+        for k in ('landed', 'revenueCosts', 'costRule', 'history', 'confirmed', 'opex'):
+            self.assertEqual(s[k], self.GOOD[k], k)
+        self.assertEqual(s['royalty'], {'defaultPct': 6.5, 'base': 'revenue'})
+        self.assertEqual(s['regimeByCustomer'], {'ZZPEER': 'us', 'ZZ SHOP': 'none', 'YY': None})
+        self.assertEqual(out['dropped'], [])
+        self.assertEqual(h.admin('GET', '/api/pnl/settings').get_json()['settings'], s)
+        unset = {'landed': {'mode': 'multiplier', 'multiplier': {'natural': None, 'synthetic': 1.53}},
+                 'history': {'caveat': None}, 'revenueCosts': {'items': []}}
+        r = h.admin('POST', '/api/pnl/settings', body={'settings': unset, 'expected_etag': out['etag']})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:300])  # an empty multiplier is allowed
+        self.assertIsNone(r.get_json()['settings']['landed']['multiplier']['natural'])
+
+    def test_bad_values_are_refused(self):
+        h = self.harness()
+        etag = h.admin('POST', '/api/pnl/settings', body={'settings': {}, 'expected_etag': None}).get_json()['etag']
+        item = {'key': 'rent', 'name': 'Rent', 'pct': 0.8}
+        bad = [({'landed': {'mode': 'factor'}}, 'landed.mode', 'invalid_choice'),
+               ({'landed': {'multiplier': {'natural': 0.99}}}, 'landed.multiplier.natural', 'out_of_range'),
+               ({'landed': {'multiplier': {'synthetic': 3.01}}}, 'landed.multiplier.synthetic', 'out_of_range'),
+               ({'landed': {'multiplier': {'natural': '1.37'}}}, 'landed.multiplier.natural', 'not_a_finite_number'),
+               ({'landed': {'multiplier': 1.37}}, 'landed.multiplier', 'not_an_object'),
+               ({'royalty': {'base': 'gross'}}, 'royalty.base', 'invalid_choice'),
+               ({'royalty': {'base': None}}, 'royalty.base', 'invalid_choice'),
+               ({'revenueCosts': {'items': [dict(item, pct=50.01)]}}, 'revenueCosts.items[0].pct', 'out_of_range'),
+               ({'revenueCosts': {'items': [dict(item, pct=-0.8)]}}, 'revenueCosts.items[0].pct', 'out_of_range'),
+               ({'revenueCosts': {'items': [dict(item, pct=True)]}}, 'revenueCosts.items[0].pct', 'not_a_finite_number'),
+               ({'revenueCosts': {'items': [{'key': 'rent', 'name': 'Rent'}]}}, 'revenueCosts.items[0].pct', 'missing'),
+               ({'revenueCosts': {'items': [{'name': 'Rent', 'pct': 0.8}]}}, 'revenueCosts.items[0].key', 'missing'),
+               ({'revenueCosts': {'items': [item, dict(item, pct=2.25)]}}, 'revenueCosts.items[1].key', 'duplicate'),
+               ({'revenueCosts': {'items': [dict(item, key='bad key!')]}}, 'revenueCosts.items[0].key', 'invalid_token'),
+               ({'revenueCosts': {'items': 'rent'}}, 'revenueCosts.items', 'not_a_list'),
+               ({'regimeByCustomer': {'ZZPEER': 'mars'}}, 'regimeByCustomer.ZZPEER', 'invalid_choice'),
+               ({'regimeByCustomer': {'ZZ.SHOP': 'us'}}, 'regimeByCustomer.ZZ.SHOP', 'invalid_custkey'),
+               ({'costRule': {'mode': 'median'}}, 'costRule.mode', 'invalid_choice'),
+               ({'costRule': {'wideSpreadPct': 101}}, 'costRule.wideSpreadPct', 'out_of_range'),
+               ({'costRule': {'wideSpreadPct': -1}}, 'costRule.wideSpreadPct', 'out_of_range'),
+               ({'history': {'caveat': 5}}, 'history.caveat', 'invalid_text'),
+               ({'history': {'caveat': 'x' * 501}}, 'history.caveat', 'invalid_text'),
+               ({'confirmed': {'landed': 'yes'}}, 'confirmed.landed', 'not_a_boolean')]
+        for settings, path, issue in bad:
+            b = self.assert_error(h.admin('POST', '/api/pnl/settings', body={'settings': settings, 'expected_etag': etag}),
+                                  422, 'INVALID_SETTINGS', path)
+            self.assertIn({'path': path, 'issue': issue}, b['problems'])
+        self.assertEqual(h.admin('GET', '/api/pnl/settings').get_json()['etag'], etag)    # nothing saved
+        text = h.admin('GET', '/api/pnl/settings').get_data(as_text=True)
+        self.assertNotIn('50.01', text)
+
+
 if __name__ == '__main__':
     unittest.main()

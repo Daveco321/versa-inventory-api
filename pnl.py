@@ -33,6 +33,10 @@ ACCESS (inline on every route, independent of the global gate and AUTH_MODE)
     4. role != 'staff' or is_admin is not True gives 403 ADMIN_ONLY.
     5. PNL_ALLOWED_EMAILS (comma separated, case-insensitive) is mandatory. Empty gives
        503 PNL_NOT_CONFIGURED reason 'allowlist'. An admin not listed gets 403 ADMIN_ONLY.
+       The entry '@admins' (the whole entry after trimming, any case, alone or in the list)
+       admits every caller who passed step 4 and has an email (contract C14). Listed emails
+       keep working. An email that only contains it (x@admins.com) is an ordinary entry, and
+       the machine key never gets in (step 2).
     6. PNL_ENABLED=off gives 503 PNL_NOT_CONFIGURED reason 'disabled'.
     OPTIONS answers 204 with no body and no auth (CORS preflight).
 
@@ -225,6 +229,7 @@ ROUTE_TABLE = (
 _SERVICES = []   # every registered service (diagnostics and tests)
 
 _DISABLED_WORDS = ('off', '0', 'false', 'no', 'disabled')
+ALLOW_ALL_ADMINS = '@admins'     # PNL_ALLOWED_EMAILS entry that admits every admin (contract C14)
 _BIG_INT = 2 ** 53              # larger integers are refused before any float conversion
 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 _CODE_RE = re.compile(r'^(?:_default|[A-Z0-9][A-Z0-9_]{0,11})$')
@@ -839,7 +844,9 @@ SETTINGS_SCHEMA = {
                        'mpfPct': _n(0, 10), 'hmfPct': _n(0, 10)}),
     'freight': ('obj', {'oceanPerUnit': ('map', ('token',), _nullable(_n(0, 100))),
                         'inlandPerUnit': ('map', ('token',), _nullable(_n(0, 100)))}),
-    'royalty': ('obj', {'defaultPct': _n(0, 50), 'byBrand': ('map', ('code',), _nullable(_n(0, 50)))}),
+    # base: royalty on net sales or on revenue (contract C11).
+    'royalty': ('obj', {'defaultPct': _n(0, 50), 'base': ('enum', ('net', 'revenue')),
+                        'byBrand': ('map', ('code',), _nullable(_n(0, 50)))}),
     # Customer keys are A2000 codes, or the allocation sheet's customer text (it can hold spaces).
     'deductions': ('obj', {'byGroup': ('map', ('token',), _nullable(_n(0, 50))),
                            'byCustomer': ('map', ('custkey',), _nullable(_n(0, 50)))}),
@@ -849,6 +856,17 @@ SETTINGS_SCHEMA = {
     'routing': ('obj', {'picksAsWarehouse': _BOOL, 'honorAssignments': _BOOL,
                         'gateFallback': ('enum', ('fifo', 'engine'))}),
     'bulk': ('obj', {'includeInTotals': _BOOL}),
+    # Cost model (contract C11): 'itemized' duty, freight and fees, or one import multiplier per fiber
+    # class (1 to 3; null = not set yet). Revenue costs: items, each a percent of revenue from 0 to 50.
+    'landed': ('obj', {'mode': ('enum', ('itemized', 'multiplier')),
+                       'multiplier': ('obj', {'natural': _nullable(_n(1, 3)), 'synthetic': _nullable(_n(1, 3))})}),
+    'revenueCosts': ('obj', {'items': ('list', ('obj', {'key': ('token',), 'name': _TEXT80, 'pct': _n(0, 50)}), 50)}),
+    # Duty regime by A2000 customer code (contract C12). It beats the FOB list and the destinations.
+    'regimeByCustomer': ('map', ('custkey',), _nullable(('enum', _REGIMES))),
+    # How a style's cost combines the prices of its factories (contract C13).
+    'costRule': ('obj', {'mode': ('enum', ('combined', 'cascade')), 'wideSpreadPct': _n(0, 100)}),
+    # A note shown next to the shipped history (contract C14).
+    'history': ('obj', {'caveat': _nullable(('text', 500))}),
     'confirmed': ('map', ('token',), _BOOL),
     'updatedAt': ('server',),
     'updatedBy': ('server',),
@@ -988,11 +1006,35 @@ def _sanitize(value, spec, path, problems, dropped):
     return _INVALID
 
 
+def _revenue_cost_problems(raw):
+    """Every revenue cost item names its key and its percent, and keys are unique (contract C11).
+    Types and bands are the schema's job."""
+    out = []
+    items = raw.get('items') if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return out
+    seen = set()
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        for f in ('key', 'pct'):
+            if f not in it:
+                out.append(_problem('revenueCosts.items[%d].%s' % (i, f), 'missing'))
+        k = it.get('key')
+        if isinstance(k, str) and k.strip():
+            if k.strip() in seen:
+                out.append(_problem('revenueCosts.items[%d].key' % i, 'duplicate'))
+            seen.add(k.strip())
+    return out
+
+
 def validate_settings(settings, defaults=None):
     """-> (clean | None, problems, dropped). Section 5.2 keys with type and plausibility
     checks. Unknown keys are dropped, except top-level keys that also exist in the
     engine's DEFAULT_SETTINGS (kept after a finite-number check). Null values inside maps
-    are kept (they mean "use the default"). The server stamps v, updatedAt and updatedBy."""
+    are kept (they mean "use the default"). The server stamps v, updatedAt and updatedBy.
+    Contracts C11 to C14 add landed, royalty.base, revenueCosts, regimeByCustomer, costRule
+    and history."""
     problems, dropped = [], []
     if not isinstance(settings, dict):
         return None, [_problem('settings', 'not_an_object')], dropped
@@ -1003,6 +1045,8 @@ def validate_settings(settings, defaults=None):
             if spec[0] == 'server':
                 continue
             r = _sanitize(v, spec, _safe_key(k), problems, dropped)
+            if k == 'revenueCosts':
+                problems.extend(_revenue_cost_problems(v))
             if r is not _INVALID:
                 out[k] = r
         elif isinstance(defaults, dict) and k in defaults:
@@ -1283,7 +1327,9 @@ class _PnlService:
         allow = self._allowlist()
         if not allow:
             return None, self._err(503, 'PNL_NOT_CONFIGURED', reason='allowlist')
-        if not email or email not in allow:
+        # '@admins' (C14) admits every admin that passed the check above. An email is still required,
+        # so every P&L action names its user.
+        if not email or (ALLOW_ALL_ADMINS not in allow and email not in allow):
             return None, self._err(403, 'ADMIN_ONLY')
         if self._disabled():
             return None, self._err(503, 'PNL_NOT_CONFIGURED', reason='disabled')
@@ -1854,8 +1900,10 @@ def register_pnl_routes(app, *, store, caller_identity, sources, env=os.environ,
                                                  getattr(store, 'fingerprint', None) or '-')
     else:
         state = 'NOT CONFIGURED (%s)' % _code_str(getattr(store, 'reason', ''))
-    print('[PnL] routes registered | store %s | allowlist %d | %s' % (
-        state, len(svc._allowlist()), 'DISABLED by PNL_ENABLED' if svc._disabled() else 'enabled'), flush=True)
+    allow = svc._allowlist()
+    print('[PnL] routes registered | store %s | allowlist %s | %s' % (
+        state, 'all admins' if ALLOW_ALL_ADMINS in allow else len(allow),
+        'DISABLED by PNL_ENABLED' if svc._disabled() else 'enabled'), flush=True)
     if store_check and svc._store_ready():
         # A valid but wrong key passes the store self-test, so "store ready" above cannot prove
         # the keys open the saved data. Check once in the background; never at import time.
