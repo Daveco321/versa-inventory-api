@@ -17,3 +17,7 @@ anthropic
 reportlab
 pymupdf
 opencv-python-headless
+# Admin-only P&L (pnl_store.py): every P&L object is encrypted in-process with
+# MultiFernet before it reaches S3. Pinned to the version tested locally. If it
+# is missing, the P&L answers 503 and the rest of the API boots normally.
+cryptography==50.0.1

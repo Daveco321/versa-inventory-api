@@ -46,6 +46,18 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app, resources={
+    # Admin-only P&L (pnl.py): readable cross-origin only from the inventory app's own origin
+    # (PNL_CORS_ORIGINS, comma separated, overrides it), never with cookies. The local review
+    # server answers /api/pnl itself, so no local origin is listed here. flask-cors tries this
+    # more specific pattern before the catch-all below.
+    r"/api/pnl(/.*)?$": {
+        "origins": [o.strip() for o in (os.environ.get('PNL_CORS_ORIGINS') or
+                                        'https://versainventory.netlify.app').split(',') if o.strip()],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": False,
+        "max_age": 600,
+    },
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
@@ -13386,7 +13398,7 @@ _IDENTITY_TTL = 300           # 5 minutes
 
 
 def _caller_identity(token):
-    """Resolve a Versa-Docs access token to {'role','factory_prefix'}.
+    """Resolve a Versa-Docs access token to {'role','factory_prefix','is_admin','uid','email'}.
 
     Returns None when the token is missing/invalid/unverifiable. Cached
     briefly so polling doesn't hit Supabase on every request."""
@@ -13403,7 +13415,8 @@ def _caller_identity(token):
                               headers=hdr, timeout=10)
         if u.status_code != 200:
             return None
-        uid = (u.json() or {}).get('id')
+        user = u.json() or {}
+        uid = user.get('id')
         if not uid:
             return None
         p = http_requests.get(
@@ -13418,7 +13431,10 @@ def _caller_identity(token):
         prof = {'role': (rows[0].get('role') or '').strip().lower(),
                 'factory_prefix': (rows[0].get('factory_prefix') or '').strip().upper(),
                 # Versa-Docs admin flag (profiles.is_admin) — the factory scorecard is admin-only
-                'is_admin': rows[0].get('is_admin') is True}
+                'is_admin': rows[0].get('is_admin') is True,
+                # Account id and sign-in email: the P&L allowlist and audit lines (pnl.py)
+                'uid': str(uid),
+                'email': str(user.get('email') or '').strip().lower()}
         with _identity_lock:
             _identity_cache[token] = (now + _IDENTITY_TTL, prof)
             if len(_identity_cache) > 500:      # bound the cache
@@ -18175,6 +18191,197 @@ register_scorecard_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
                           caller_identity=_caller_identity,
                           machine_key=INVENTORY_API_KEY,
                           load_master=load_production_from_dropbox)
+
+
+# ── Profit & Loss (ADMIN ONLY): /api/pnl/* ───────────────────────────────────
+# pnl.py checks every request inline: a Versa-Docs staff session with is_admin
+# whose email is on PNL_ALLOWED_EMAILS. The machine key is refused. No /api/pnl
+# path may ever be added to _AUTHZ_OPEN_PREFIXES, any allow-list or _SCOPE_FILTERS.
+# Stored objects are encrypted in-process (pnl_store.py, PNL_DATA_KEYS) because
+# the bucket is publicly readable. The getters below are READ ONLY: pnl.py copies
+# rows and never writes cost or margin keys back into app state, /production,
+# /inventory, /apo or any AI tool. Boot never fails because of the P&L.
+_pnl_sa_cache = {'body': None, 'at': 0.0, 'fail_until': 0.0, 'poll_after': 0.0, 'refreshing': False}
+_pnl_sa_lock = threading.Lock()
+_PNL_SA_TTL = 900             # 15 min: invoice history changes only on a manual ingest
+_PNL_SA_FAIL_BACKOFF = 120    # after a failure, leave the open-orders service alone for 2 min
+_PNL_SA_BUILDING_POLL = 20    # while it builds upstream, ask again at most every 20 s
+
+
+def _pnl_sa_fetch():
+    """One GET of open-orders /api/sales-analytics (machine credential, server side).
+    Returns the payload, {'building': True} while the upstream build runs, or None."""
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-analytics",
+                                 headers=_oo_api_headers(), timeout=(5, 20))
+        if resp.status_code != 200:
+            raise RuntimeError('upstream status')
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError('upstream shape')
+        if data.get('building'):
+            with _pnl_sa_lock:
+                _pnl_sa_cache['poll_after'] = time.time() + _PNL_SA_BUILDING_POLL
+            return {'building': True}
+        if not data.get('ready') or not isinstance(data.get('styles'), list):
+            raise ValueError('upstream not ready')
+        with _pnl_sa_lock:
+            _pnl_sa_cache.update(body=resp.content, at=time.time(), fail_until=0.0, poll_after=0.0)
+        return data
+    except Exception as e:
+        print(f"[PnL] sales-analytics fetch failed: {type(e).__name__}", flush=True)
+        with _pnl_sa_lock:
+            _pnl_sa_cache['fail_until'] = time.time() + _PNL_SA_FAIL_BACKOFF
+        return None
+    finally:
+        with _pnl_sa_lock:
+            _pnl_sa_cache['refreshing'] = False
+
+
+def _pnl_sales_analytics():
+    """Cached invoice analytics for the P&L shipped lens (TTL 15 min, 120 s failure
+    backoff, {'building': True} passed through). Once warm, a stale copy is served
+    at once while one refresh runs in the background, so a build never waits on
+    it. Every call returns its own parsed copy."""
+    now = time.time()
+    with _pnl_sa_lock:
+        body = _pnl_sa_cache['body']
+        if body is not None:
+            if (now - _pnl_sa_cache['at'] >= _PNL_SA_TTL and not _pnl_sa_cache['refreshing']
+                    and now >= _pnl_sa_cache['fail_until'] and now >= _pnl_sa_cache['poll_after']):
+                _pnl_sa_cache['refreshing'] = True
+                threading.Thread(target=_pnl_sa_fetch, daemon=True, name='pnl-sa-refresh').start()
+        elif now < _pnl_sa_cache['poll_after']:
+            return {'building': True}
+        elif now < _pnl_sa_cache['fail_until'] or _pnl_sa_cache['refreshing']:
+            return None
+        else:
+            _pnl_sa_cache['refreshing'] = True
+    if body is not None:
+        return json.loads(body)
+    return _pnl_sa_fetch()
+
+
+def _pnl_sources():
+    """Getters for pnl.register_pnl_routes (P&L DESIGN section 3.4). They run on the
+    P&L build thread, never on a request thread, and each returns fresh lists."""
+    def _iso(ts):
+        return datetime.utcfromtimestamp(ts).isoformat(timespec='seconds') + 'Z' if ts else None
+
+    def inventory():
+        with _inv_lock:
+            return {'items': list(_inventory.get('items') or []), 'last_sync': _inventory.get('last_sync')}
+
+    def ledger():
+        # [] means UNAVAILABLE (a load is in flight or just failed): pnl.py aborts the build.
+        return {'rows': _ledger_rows(), 'last_sync': _iso(_production_last_sync)}
+
+    def apo():
+        with _apo_lock:
+            return {'rows': list(_apo_data or []), 'last_sync': _iso(_apo_last_sync)}
+
+    def manual_allocations():
+        try:
+            load_manual_allocations_from_s3()      # another worker may have saved newer ones
+        except Exception:
+            pass
+        with _manual_alloc_lock:
+            return [dict(r) for r in (_manual_allocations or []) if isinstance(r, dict)]
+
+    def vw_allocations():
+        return load_allocation_from_s3() or []
+
+    def open_orders():
+        orders, ok = _fetch_all_open_orders()
+        with _all_open_orders_lock:
+            fetched = _all_open_orders_cache.get('fetched_at') or 0
+        return {'orders': orders, 'ok': bool(ok), 'fetched_at': _iso(fetched)}
+
+    def fob_customers():
+        return list(_fetch_fob_customers() or [])
+
+    def routing_inputs():
+        # Reloaded per call exactly like _pres_stock_cards: other workers may hold newer copies.
+        for loader in (load_deduction_assignments_from_s3, load_suppression_overrides_from_s3):
+            try:
+                loader()
+            except Exception:
+                pass
+        # Exact shape: pnl_routing.py docstring, "routing_inputs (exact definition)".
+        with _deduction_assign_lock:
+            assignments = dict(_deduction_assignments or {})
+        with _suppression_overrides_lock:
+            no_suppress = list(_suppression_overrides or [])
+        return {'suppression_overrides': no_suppress,        # SKUs exempt from arrival suppression
+                'deduction_assignments': assignments,        # {SKU: 'warehouse' | 'overseas'}
+                'now': _pres_now_et().isoformat(timespec='seconds')}   # naive US Eastern wall clock
+
+    def today():
+        return _pres_now_et().date().isoformat()
+
+    return {'inventory': inventory, 'ledger': ledger, 'apo': apo,
+            'manual_allocations': manual_allocations, 'vw_allocations': vw_allocations,
+            'open_orders': open_orders, 'fob_customers': fob_customers,
+            'routing_inputs': routing_inputs, 'sales_analytics': _pnl_sales_analytics,
+            'today': today}
+
+
+# Identity for the P&L only. The shared _caller_identity cache keeps a profile for 300 s; for
+# the P&L an admin's access is re-checked at least every 60 s, so a removed is_admin flag or a
+# sign-out takes effect within a minute. A refused token is remembered for 30 s, so repeating
+# a bad token costs no extra Supabase lookup. Keyed by a hash of the token, never the token.
+import hashlib as _pnl_hashlib
+
+_PNL_IDENTITY_TTL = 60
+_PNL_IDENTITY_FAIL_TTL = 30
+_PNL_IDENTITY_MAX = 2000
+_pnl_ident_cache = {}         # sha256(token) -> (expires_at, profile dict | None)
+_pnl_ident_lock = threading.Lock()
+
+
+def _pnl_caller_identity(token):
+    """caller_identity for pnl.py: _caller_identity at most 60 s old (30 s for a refusal)."""
+    if not isinstance(token, str) or not token:
+        return None
+    th = _pnl_hashlib.sha256(token.encode('utf-8', 'replace')).hexdigest()
+    now = time.time()
+    with _pnl_ident_lock:
+        hit = _pnl_ident_cache.get(th)
+    if hit and hit[0] > now:
+        return dict(hit[1]) if hit[1] else None
+    fetched_at, prof = now, None
+    with _identity_lock:
+        shared = _identity_cache.get(token)
+        if shared and shared[0] > now and shared[0] - _IDENTITY_TTL >= now - _PNL_IDENTITY_TTL:
+            prof, fetched_at = shared[1], shared[0] - _IDENTITY_TTL   # fetched moments ago (the gate)
+        else:
+            _identity_cache.pop(token, None)                          # too old for the P&L: ask again
+    if prof is None:
+        prof = _caller_identity(token)
+    ok = isinstance(prof, dict)
+    until = (fetched_at + _PNL_IDENTITY_TTL) if ok else (now + _PNL_IDENTITY_FAIL_TTL)
+    with _pnl_ident_lock:
+        if len(_pnl_ident_cache) >= _PNL_IDENTITY_MAX:
+            for k in [k for k, v in _pnl_ident_cache.items() if v[0] <= now]:
+                _pnl_ident_cache.pop(k, None)
+            if len(_pnl_ident_cache) >= _PNL_IDENTITY_MAX:
+                _pnl_ident_cache.clear()
+        _pnl_ident_cache[th] = (until, dict(prof) if ok else None)
+    return dict(prof) if ok else None
+
+
+try:
+    from pnl import register_pnl_routes
+    from pnl_store import EncryptedStore, S3Store
+    register_pnl_routes(
+        app,
+        store=EncryptedStore(S3Store(get_s3, os.environ.get('PNL_S3_BUCKET') or S3_BUCKET,
+                                     prefix=os.environ.get('PNL_S3_PREFIX') or 'inventory/pnl/'),
+                             os.environ.get('PNL_DATA_KEYS', '')),
+        caller_identity=_pnl_caller_identity,
+        sources=_pnl_sources())
+except Exception as _pnl_exc:   # boot must never fail because of the P&L
+    print(f"[PnL] disabled: {type(_pnl_exc).__name__}", flush=True)
 
 
 if __name__ == '__main__':
