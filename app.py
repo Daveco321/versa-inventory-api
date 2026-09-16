@@ -4661,7 +4661,8 @@ def export_single():
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
             # NJ stock + hidden-landing (NJ/AE/AW) productions out — see
             # _customer_export_scrub for the order and the double-deduct guard.
-            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'), req.get('abfi_stripped'))
+            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'), req.get('abfi_stripped'),
+                                          req.get('hidden_landing_stripped'))
             if getattr(g, '_catalog_scope', None) is None:
                 # Staff "Customer View" export (authenticated, no catalog scope):
                 # styles only, never by-size rows (David, Sep 4 2026).
@@ -4719,7 +4720,8 @@ def export_pdf():
         if (getattr(g, '_catalog_scope', None) is not None or bool(req.get('catalog_mode'))) and isinstance(data, list):
             # NJ stock + hidden-landing (NJ/AE/AW) productions out — see
             # _customer_export_scrub for the order and the double-deduct guard.
-            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'), req.get('abfi_stripped'))
+            data = _customer_export_scrub(data, req.get('view_mode'), req.get('nj_stripped'), req.get('abfi_stripped'),
+                                          req.get('hidden_landing_stripped'))
             if getattr(g, '_catalog_scope', None) is None:
                 # Staff "Customer View" export (authenticated, no catalog scope):
                 # styles only, never by-size rows (David, Sep 4 2026).
@@ -4757,7 +4759,8 @@ def export_multi():
                 if isinstance(_b, dict) and isinstance(_b.get('items'), list):
                     _b['items'] = _customer_export_scrub(_b['items'], _b.get('view_mode') or req.get('view_mode'),
                                                          req.get('nj_stripped') or _b.get('nj_stripped'),
-                                                         req.get('abfi_stripped') or _b.get('abfi_stripped'))
+                                                         req.get('abfi_stripped') or _b.get('abfi_stripped'),
+                                                         req.get('hidden_landing_stripped') or _b.get('hidden_landing_stripped'))
                     if getattr(g, '_catalog_scope', None) is None:
                         _b['items'] = _drop_sized_rows(_b['items'])   # staff Customer View: styles only
         s3_url = req.get('s3_base_url', S3_PHOTOS_URL)
@@ -9126,7 +9129,11 @@ def _strip_nj_rows(rows, lookup_nj=False, lookup_abfi=None):
             it = dict(it)
             if nj:
                 it['total_warehouse'] = max(0, int(it.get('total_warehouse') or 0) - nj)
-                it['total_ats'] = int(it.get('total_ats') or 0) - nj
+                # Floored the same way total_warehouse is, one line up. When allocations
+                # have already consumed the restricted units this subtraction goes below
+                # zero and a customer sheet printed a negative Total ATS (Sep 16 2026).
+                # The honest customer answer is 0, and the drop rule below still fires.
+                it['total_ats'] = max(0, int(it.get('total_ats') or 0) - nj)
             for k in _RESTRICTED_KEYS:
                 it.pop(k, None)
             it.pop('nj_sizes', None)
@@ -9346,7 +9353,8 @@ def _strip_hidden_prod_export_rows(rows, style_rows=False):
         out.append(it)
     return out
 
-def _customer_export_scrub(rows, view_mode, nj_stripped, abfi_stripped=None):
+def _customer_export_scrub(rows, view_mode, nj_stripped, abfi_stripped=None,
+                           landing_stripped=None):
     """Every customer-format export payload (anonymous catalog links AND staff /
     phone Customer View) passes through here before the workbook / PDF is built.
     1. Restricted warehouse stock (NJ, ABFI) out (_strip_nj_rows). The by-SKU
@@ -9359,16 +9367,29 @@ def _customer_export_scrub(rows, view_mode, nj_stripped, abfi_stripped=None):
        printed understated / negative Total ATS (Sep 4 2026 audit).
     2. Hidden-landing productions (NJ/AE/AW/ABFI): per-PO rows dropped; All
        Inventory style rows re-pointed to the next visible production, then the
-       hidden units cut from incoming + Total ATS (_strip_hidden_landing_rows)."""
+       hidden units cut from incoming + Total ATS (_strip_hidden_landing_rows).
+       That cut is a SUBTRACTION, so it has to run exactly ONCE. It has the same
+       already-stripped contract restricted stock has: a client that cut those
+       units itself says so (landing_stripped), and catalog-scoped rows come from
+       a feed _flt_inventory already cut. Cutting either of those again removed
+       the same units twice: a style with 1,044 sellable units exported as 72 and
+       four styles vanished (Sep 16 2026 audit). A payload that claims nothing is
+       still cut here, so an old build stays safe.
+       Without the ledger no row can be trusted either way, so the cut runs
+       regardless and the sheet fails closed."""
     vm = str(view_mode or '').lower()
-    authed_customer_view = (vm in ('all', 'ats') and getattr(g, '_catalog_scope', None) is None)
+    scoped = getattr(g, '_catalog_scope', None) is not None
+    authed_customer_view = (vm in ('all', 'ats') and not scoped)
     rows = _strip_nj_rows(rows,
                           lookup_nj=authed_customer_view and not bool(nj_stripped),
                           lookup_abfi=authed_customer_view and not bool(abfi_stripped))
     rows = _strip_hidden_prod_export_rows(rows, style_rows=(vm == 'all'))
+    ledger_ok = bool(_ledger_rows())
+    already_cut = ledger_ok and (bool(landing_stripped) or scoped)
     if vm == 'all':
-        rows = _strip_hidden_landing_rows(rows)
-    elif vm == 'incoming' and not _ledger_rows():
+        if not already_cut:
+            rows = _strip_hidden_landing_rows(rows)
+    elif vm == 'incoming' and not ledger_ok:
         # Ledger unavailable: hidden-landing units cannot be told apart from
         # visible ones, so an overseas sheet fails closed too (Sep 10 2026).
         rows = _strip_hidden_landing_rows(rows)
