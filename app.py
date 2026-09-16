@@ -46,13 +46,18 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app, resources={
-    # Admin-only P&L (pnl.py): readable cross-origin only from the inventory app's own origin
+    # Admin-only P&L (pnl.py): readable cross-origin only from the inventory app's own origins
     # (PNL_CORS_ORIGINS, comma separated, overrides it), never with cookies. The local review
     # server answers /api/pnl itself, so no local origin is listed here. flask-cors tries this
     # more specific pattern before the catch-all below.
+    # EVERY live domain must be listed. The app is served both from the Netlify address and from
+    # the custom domain. An origin missing here gets a reply with no Access-Control-Allow-Origin
+    # header at all, so the browser discards it and the page reports "could not reach the server",
+    # which reads like an outage but is a CORS refusal. Add any new domain here.
     r"/api/pnl(/.*)?$": {
         "origins": [o.strip() for o in (os.environ.get('PNL_CORS_ORIGINS') or
-                                        'https://versainventory.netlify.app').split(',') if o.strip()],
+                                        'https://versainventory.netlify.app,'
+                                        'https://rossversacatalog.com').split(',') if o.strip()],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": False,
