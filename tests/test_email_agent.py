@@ -537,5 +537,144 @@ class EndToEndTests(unittest.TestCase):
                                                json={'enabled': False}).status_code)
 
 
+# ── The chat route still answers the way the browser expects ─────────────────
+class ChatRouteRegressionTests(unittest.TestCase):
+    """The tool loop moved out of /api/ai-agent into _ai_agent_run. The page
+    parses the reply envelope field by field, so the envelope is the contract."""
+
+    class Block:
+        def __init__(self, type_, **kw):
+            self.type = type_
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class Usage:
+        input_tokens = 11
+        output_tokens = 22
+        cache_read_input_tokens = 33
+        cache_creation_input_tokens = 0
+
+    class Resp:
+        def __init__(self, content, stop_reason='end_turn'):
+            self.content = content
+            self.stop_reason = stop_reason
+            self.usage = ChatRouteRegressionTests.Usage()
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _support import load_app
+        cls.app = load_app()
+        cls.client = cls.app.app.test_client()
+
+    def stub_client(self, script):
+        """script: a list of responses to hand back, one per model call."""
+        calls = []
+        turns = list(script)
+
+        class Messages:
+            def create(inner, **kw):
+                calls.append(kw)
+                return turns.pop(0)
+
+        class Client:
+            messages = Messages()
+
+            def with_options(inner, **kw):
+                return inner
+
+        self.addCleanup(setattr, self.app, '_ai_agent_client', self.app._ai_agent_client)
+        self.app._ai_agent_client = lambda: Client()
+        return calls
+
+    def test_a_plain_answer_keeps_the_whole_envelope(self):
+        self.stub_client([self.Resp([self.Block('text', text='{"message":"1,200 units","actions":[]}')])])
+        r = self.client.post('/api/ai-agent', json={'messages': [{'role': 'user', 'content': 'how many'}]})
+        self.assertEqual(200, r.status_code)
+        body = r.get_json()
+        self.assertEqual('1,200 units', json.loads(body['content'][0]['text'])['message'])
+        self.assertEqual('end_turn', body['stop_reason'])
+        self.assertEqual(11, body['usage']['input_tokens'])
+        self.assertEqual(33, body['usage']['cache_read_input_tokens'])
+        self.assertEqual(1, body['agent']['iterations'])
+        self.assertEqual([], body['agent']['tools'])
+        self.assertIn('elapsed_seconds', body['agent'])
+        self.assertIn('model', body)
+
+    def test_a_tool_turn_runs_the_tool_and_reports_it(self):
+        self.addCleanup(self.app._AI_AGENT_TOOL_FNS.update, dict(self.app._AI_AGENT_TOOL_FNS))
+        self.app._AI_AGENT_TOOL_FNS['query_inventory'] = lambda params: {'total_ats': 4242}
+        self.stub_client([
+            self.Resp([self.Block('tool_use', id='tu_1', name='query_inventory', input={})]),
+            self.Resp([self.Block('text', text='{"message":"4,242","actions":[]}')]),
+        ])
+        r = self.client.post('/api/ai-agent', json={'messages': [{'role': 'user', 'content': 'nautica'}]})
+        body = r.get_json()
+        self.assertEqual(['query_inventory'], body['agent']['tools'])
+        self.assertEqual(2, body['agent']['iterations'])
+        self.assertEqual(44, body['usage']['output_tokens'], 'usage adds up across both turns')
+
+    def test_a_non_admin_never_gets_the_history_tools(self):
+        calls = self.stub_client([self.Resp([self.Block('text', text='{}')])])
+        self.client.post('/api/ai-agent', json={'messages': [{'role': 'user', 'content': 'past selling'}]})
+        names = {t['name'] for t in calls[0]['tools']}
+        for gated in self.app._AI_AGENT_ADMIN_TOOLS:
+            self.assertNotIn(gated, names)
+
+    def test_an_api_failure_is_a_502_not_a_traceback(self):
+        class Boom:
+            def with_options(inner, **kw):
+                return inner
+
+            class messages:
+                @staticmethod
+                def create(**kw):
+                    raise RuntimeError('z-fake upstream failure')
+
+        self.addCleanup(setattr, self.app, '_ai_agent_client', self.app._ai_agent_client)
+        self.app._ai_agent_client = lambda: Boom()
+        r = self.client.post('/api/ai-agent', json={'messages': [{'role': 'user', 'content': 'x'}]})
+        self.assertEqual(502, r.status_code)
+        self.assertIn('AI agent failed', r.get_json()['error'])
+
+    def test_a_leading_assistant_turn_is_still_dropped(self):
+        calls = self.stub_client([self.Resp([self.Block('text', text='{}')])])
+        self.client.post('/api/ai-agent', json={'messages': [
+            {'role': 'assistant', 'content': 'earlier'}, {'role': 'user', 'content': 'now'}]})
+        self.assertEqual('user', calls[0]['messages'][0]['role'])
+
+    def test_no_messages_is_still_a_400(self):
+        self.stub_client([self.Resp([self.Block('text', text='{}')])])
+        r = self.client.post('/api/ai-agent', json={'messages': []})
+        self.assertEqual(400, r.status_code)
+
+    def test_an_unconfigured_server_says_unavailable_before_anything_else(self):
+        # The route builds the SDK client before it validates the body, the way
+        # it always has: with no ANTHROPIC_API_KEY that is a 503, not a 400.
+        r = self.client.post('/api/ai-agent', json={'messages': [{'role': 'user', 'content': 'x'}]})
+        self.assertEqual(503, r.status_code)
+
+    def test_the_runner_reports_built_files_to_its_caller(self):
+        """The mailbox attaches whatever this list names."""
+        self.addCleanup(self.app._AI_AGENT_TOOL_FNS.update, dict(self.app._AI_AGENT_TOOL_FNS))
+        self.app._AI_AGENT_TOOL_FNS['build_presentation'] = lambda params: {
+            'download_url': 'https://z-fake.test/Deck.pdf', 'format': 'PDF presentation (photo cards)'}
+        self.stub_client([
+            self.Resp([self.Block('tool_use', id='tu_1', name='build_presentation', input={})]),
+            self.Resp([self.Block('text', text='done')]),
+        ])
+
+        class Client:
+            def with_options(inner, **kw):
+                return inner
+
+        run = self.app._ai_agent_run(self.app._ai_agent_client(),
+                                     [{'role': 'user', 'content': 'deck'}], [],
+                                     self.app._AI_AGENT_TOOLS, 'z-fake-model', 1000, True)
+        self.assertEqual([{'tool': 'build_presentation', 'url': 'https://z-fake.test/Deck.pdf',
+                           'format': 'PDF presentation (photo cards)'}], run['artifacts'])
+        self.assertEqual('done', run['final_text'])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
