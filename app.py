@@ -5198,8 +5198,10 @@ def _apo_fabrication(base):
         name = '77% Poly / 20% Cotton / 3% Spandex'
     if brand == 'US' and fab == 'CD':
         name = '65% Polyester / 35% Cotton'
+    # David, Sep 17 2026: "Woven Pant" -> "Woven Dress Pant" on every PP pant, so the same garment
+    # reads the same on every account. Keep in step with getFabricFromSKU in the frontend index.html.
     if fab == 'PP' and len(base) >= 9 and base[6] == 'P' and base[7].isdigit():
-        name = '100% Polyester Woven Pant'
+        name = '100% Polyester Woven Dress Pant'
     if not name:
         return 'Standard Fabric'
     return _apo_format_fabric(name)
