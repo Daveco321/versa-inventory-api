@@ -1,0 +1,541 @@
+"""
+Synthetic tests for the inbound email agent (email_agent.py) and its app.py wiring.
+
+Covers the parts that decide whether a stranger can drive the agent: the Svix
+signature on the webhook (including the published Svix test vector, so a change
+here fails loudly instead of quietly accepting forged posts), the sender
+allow-list, the refusal of any tier other than admin/staff, the auto-reply and
+loop guards, the per-sender rate limit, once-only delivery, and the attachment
+size cap. Then static checks that app.py still wires it up the way the design
+assumes.
+
+SYNTHETIC ONLY. Made-up addresses (all @example.test or @z-fake.test), made-up
+ids, no network: requests and S3 are stubbed. Run from the repo root:
+    python -B -m unittest tests.test_email_agent -v
+"""
+import ast
+import base64
+import hashlib
+import hmac
+import io
+import json
+import os
+import sys
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import email_agent as EA  # noqa: E402
+
+
+# ── Stubs ────────────────────────────────────────────────────────────────────
+class FakeS3:
+    """Enough S3 for the config object and the dedupe markers."""
+
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+        self.puts = []
+
+    def get_object(self, Bucket=None, Key=None):
+        if Key not in self.objects:
+            raise Exception('NoSuchKey: ' + Key)
+        return {'Body': io.BytesIO(self.objects[Key])}
+
+    def head_object(self, Bucket=None, Key=None):
+        if Key not in self.objects:
+            raise Exception('404 Not Found')
+        return {'ContentLength': len(self.objects[Key])}
+
+    def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+        self.objects[Key] = Body if isinstance(Body, bytes) else str(Body).encode()
+        self.puts.append(Key)
+        return {}
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, content=b'', payload=None):
+        self.status_code = status_code
+        self.content = content
+        self.text = content.decode('utf-8', 'replace')
+        self._payload = payload
+
+    def json(self):
+        return self._payload or {}
+
+
+def use_s3(test, objects=None):
+    """Point the module at a fake bucket and clear every cache it keeps."""
+    s3 = FakeS3(objects)
+    EA._HOOKS['get_s3'] = lambda: s3
+    EA._HOOKS['s3_bucket'] = 'z-fake-bucket'
+    EA._cfg_cache['data'] = None
+    EA._cfg_cache['at'] = 0.0
+    EA._seen_ids.clear()
+    EA._rate_hits.clear()
+    test.addCleanup(EA._seen_ids.clear)
+    test.addCleanup(EA._rate_hits.clear)
+    return s3
+
+
+def cfg_object(payload):
+    return {EA.EMAIL_AGENT_CONFIG_KEY: json.dumps(payload).encode()}
+
+
+# ── The webhook signature is the only credential on an open route ────────────
+class SignatureTests(unittest.TestCase):
+    SECRET = 'whsec_' + base64.b64encode(b'z-fake-signing-key-0123456789').decode()
+
+    def sign(self, msg_id, ts, body, secret=None):
+        key = base64.b64decode((secret or self.SECRET).split('_', 1)[1])
+        signed = f'{msg_id}.{ts}.'.encode() + body
+        return 'v1,' + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+
+    def test_svix_published_vector(self):
+        """The documented Svix vector. Resend signs with Svix, so if this stops
+        matching, real webhooks are being rejected (or worse, forgeries are
+        being accepted) and the failure must not be silent."""
+        secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+        msg_id = 'msg_p5jXN8AQM9LWM0D4loKWxJek'
+        ts = 1614265330
+        body = b'{"test": 2432232314}'
+        header = 'v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE='
+        # The vector is from 2021, so stand the clock next to it and run the
+        # real verifier: this proves the shipped function accepts what Svix
+        # actually signs, not just that two copies of the same maths agree.
+        real_time = EA.time.time
+        self.addCleanup(setattr, EA.time, 'time', real_time)
+        EA.time.time = lambda: float(ts)
+        ok, why = EA._verify_signature(secret, msg_id, ts, header, body)
+        self.assertTrue(ok, why)
+        self.assertFalse(EA._verify_signature(secret, msg_id, ts, header, body + b'!')[0])
+
+    def test_good_signature_passes(self):
+        body = b'{"type":"email.received"}'
+        ts = int(time.time())
+        ok, why = EA._verify_signature(self.SECRET, 'msg_1', ts, self.sign('msg_1', ts, body), body)
+        self.assertTrue(ok, why)
+
+    def test_multiple_signatures_one_valid(self):
+        body = b'{"type":"email.received"}'
+        ts = int(time.time())
+        header = 'v1,AAAAinvalid= ' + self.sign('msg_1', ts, body)
+        self.assertTrue(EA._verify_signature(self.SECRET, 'msg_1', ts, header, body)[0])
+
+    def test_tampered_body_fails(self):
+        body = b'{"type":"email.received"}'
+        ts = int(time.time())
+        sig = self.sign('msg_1', ts, body)
+        ok, why = EA._verify_signature(self.SECRET, 'msg_1', ts, sig, body + b' ')
+        self.assertFalse(ok)
+        self.assertIn('mismatch', why)
+
+    def test_other_id_or_timestamp_fails(self):
+        body = b'{}'
+        ts = int(time.time())
+        sig = self.sign('msg_1', ts, body)
+        self.assertFalse(EA._verify_signature(self.SECRET, 'msg_2', ts, sig, body)[0])
+        self.assertFalse(EA._verify_signature(self.SECRET, 'msg_1', ts - 1, sig, body)[0])
+
+    def test_stale_timestamp_fails(self):
+        body = b'{}'
+        ts = int(time.time()) - 3600
+        ok, why = EA._verify_signature(self.SECRET, 'msg_1', ts, self.sign('msg_1', ts, body), body)
+        self.assertFalse(ok)
+        self.assertIn('tolerance', why)
+
+    def test_unknown_version_tag_fails(self):
+        body = b'{}'
+        ts = int(time.time())
+        sig = self.sign('msg_1', ts, body).replace('v1,', 'v0,')
+        self.assertFalse(EA._verify_signature(self.SECRET, 'msg_1', ts, sig, body)[0])
+
+    def test_no_secret_refuses_everything(self):
+        body = b'{}'
+        ts = int(time.time())
+        ok, why = EA._verify_signature('', 'msg_1', ts, self.sign('msg_1', ts, body), body)
+        self.assertFalse(ok)
+        self.assertIn('missing', why)
+
+    def test_missing_headers_refuse(self):
+        self.assertFalse(EA._verify_signature(self.SECRET, None, None, None, b'{}')[0])
+
+
+# ── Who is allowed to drive it ───────────────────────────────────────────────
+class AllowListTests(unittest.TestCase):
+    def test_address_beats_domain(self):
+        use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+                                 'domains': [{'domain': 'example.test', 'tier': 'staff'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertEqual('admin', EA._identify_sender('boss@example.test', cfg)['tier'])
+        self.assertEqual('staff', EA._identify_sender('rep@example.test', cfg)['tier'])
+
+    def test_unknown_sender_is_none(self):
+        use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertIsNone(EA._identify_sender('stranger@z-fake.test', cfg))
+        self.assertIsNone(EA._identify_sender('', cfg))
+
+    def test_case_and_spacing_do_not_open_a_hole(self):
+        use_s3(self, cfg_object({'senders': [{'email': '  BOSS@Example.TEST ', 'tier': 'admin'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertIsNotNone(EA._identify_sender('Boss@EXAMPLE.test', cfg))
+
+    def test_lookalike_domain_is_not_a_match(self):
+        use_s3(self, cfg_object({'domains': [{'domain': 'example.test', 'tier': 'staff'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertIsNone(EA._identify_sender('rep@notexample.test', cfg))
+        self.assertIsNone(EA._identify_sender('rep@example.test.z-fake.test', cfg))
+
+    def test_customer_tier_is_refused_and_reported(self):
+        """The data tools have no customer view, so an external customer must
+        not be able to reach them by being listed in the config."""
+        use_s3(self, cfg_object({'senders': [{'email': 'buyer@z-fake.test', 'tier': 'customer'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertEqual([], cfg['senders'])
+        self.assertIsNone(EA._identify_sender('buyer@z-fake.test', cfg))
+        self.assertEqual(1, len(cfg['_rejected']))
+        self.assertIn('customer', cfg['_rejected'][0]['reason'])
+
+    def test_unknown_tier_on_a_domain_is_refused(self):
+        use_s3(self, cfg_object({'domains': [{'domain': 'z-fake.test', 'tier': 'everyone'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertEqual([], cfg['domains'])
+        self.assertEqual(1, len(cfg['_rejected']))
+
+    def test_junk_rows_are_dropped_not_fatal(self):
+        use_s3(self, cfg_object({'senders': ['not-a-dict', {'email': 'no-at-sign', 'tier': 'admin'},
+                                             {'email': 'ok@example.test', 'tier': 'staff'}]}))
+        cfg = EA._load_config(force=True)
+        self.assertEqual(['ok@example.test'], [r['email'] for r in cfg['senders']])
+
+    def test_missing_config_object_is_the_empty_allow_list(self):
+        use_s3(self, {})
+        cfg = EA._load_config(force=True)
+        self.assertEqual([], cfg['senders'])
+        self.assertEqual([], cfg['domains'])
+        self.assertIsNone(EA._identify_sender('anyone@z-fake.test', cfg))
+
+
+# ── Loops, robots and floods ─────────────────────────────────────────────────
+class GuardTests(unittest.TestCase):
+    def test_our_own_reply_is_not_answered_again(self):
+        self.assertEqual('our own mail', EA._is_machine_mail({}, {'X-Versa-Agent': '1'}))
+
+    def test_auto_replies_and_lists_are_skipped(self):
+        self.assertIsNotNone(EA._is_machine_mail({}, {'Auto-Submitted': 'auto-replied'}))
+        self.assertIsNotNone(EA._is_machine_mail({}, {'Precedence': 'bulk'}))
+        self.assertIsNotNone(EA._is_machine_mail({}, {'List-Id': '<x.example.test>'}))
+        self.assertIsNotNone(EA._is_machine_mail({}, {'X-Autoreply': 'yes'}))
+
+    def test_auto_submitted_no_is_a_real_person(self):
+        self.assertIsNone(EA._is_machine_mail({'from': 'rep@example.test'}, {'Auto-Submitted': 'no'}))
+
+    def test_bounces_and_out_of_office_are_skipped(self):
+        self.assertIsNotNone(EA._is_machine_mail({'from': 'MAILER-DAEMON@z-fake.test'}, {}))
+        self.assertIsNotNone(EA._is_machine_mail({'from': 'a@b.test', 'subject': 'Out of office'}, {}))
+        self.assertIsNotNone(EA._is_machine_mail({'from': 'a@b.test', 'subject': 'Undeliverable: x'}, {}))
+
+    def test_a_normal_request_passes(self):
+        self.assertIsNone(EA._is_machine_mail(
+            {'from': 'Rep <rep@example.test>', 'subject': 'Nautica B&T deck please'}, {}))
+
+    def test_rate_limit_per_sender(self):
+        use_s3(self, {})
+        for _ in range(3):
+            self.assertTrue(EA._rate_ok('rep@example.test', 3))
+        self.assertFalse(EA._rate_ok('rep@example.test', 3))
+        self.assertTrue(EA._rate_ok('other@example.test', 3), 'the limit is per sender')
+
+    def test_delivery_is_claimed_once(self):
+        """Svix retries a delivery it thinks failed; the second one must not
+        run the agent (or bill for it) again."""
+        s3 = use_s3(self, {})
+        self.assertTrue(EA._claim('em_1'))
+        self.assertFalse(EA._claim('em_1'))
+        self.assertIn('email-agent/seen/em_1.json', s3.objects)
+
+    def test_claim_survives_a_restart(self):
+        s3 = use_s3(self, {})
+        EA._claim('em_2')
+        EA._seen_ids.clear()          # a new process, same bucket
+        self.assertFalse(EA._claim('em_2'))
+        self.assertIsNotNone(s3)
+
+
+# ── Attachments ──────────────────────────────────────────────────────────────
+class AttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.real_get = EA.requests.get
+        self.addCleanup(setattr, EA.requests, 'get', self.real_get)
+
+    def test_file_under_the_cap_is_attached_with_its_name(self):
+        EA.requests.get = lambda url, timeout=None: FakeResponse(200, b'PDFBYTES')
+        out, skipped = EA._collect_attachments(
+            [{'url': 'https://z-fake.test/claude%20uploaded/Nautica%20B%26T%20Presentation.pdf'}], 15)
+        self.assertEqual([], skipped)
+        self.assertEqual('Nautica B&T Presentation.pdf', out[0]['filename'])
+        self.assertEqual(b'PDFBYTES', base64.b64decode(out[0]['content']))
+
+    def test_oversized_file_falls_back_to_the_link(self):
+        EA.requests.get = lambda url, timeout=None: FakeResponse(200, b'x' * (2 * 1024 * 1024))
+        out, skipped = EA._collect_attachments([{'url': 'https://z-fake.test/big.pdf'}], 1)
+        self.assertEqual([], out)
+        self.assertIn('over the cap', skipped[0]['reason'])
+
+    def test_a_failed_download_does_not_sink_the_reply(self):
+        EA.requests.get = lambda url, timeout=None: FakeResponse(404, b'no')
+        out, skipped = EA._collect_attachments([{'url': 'https://z-fake.test/gone.pdf'}], 15)
+        self.assertEqual([], out)
+        self.assertIn('404', skipped[0]['reason'])
+
+    def test_the_same_file_is_attached_once(self):
+        EA.requests.get = lambda url, timeout=None: FakeResponse(200, b'ok')
+        out, _ = EA._collect_attachments([{'url': 'https://z-fake.test/a.pdf'},
+                                          {'url': 'https://z-fake.test/a.pdf'}], 15)
+        self.assertEqual(1, len(out))
+
+
+# ── Reading the message ──────────────────────────────────────────────────────
+class BodyTests(unittest.TestCase):
+    def test_html_only_mail_becomes_readable_text(self):
+        txt = EA._plain_from_html(
+            '<style>p{color:red}</style><p>Can I get a <b>Nautica</b> deck</p><br>thanks')
+        self.assertIn('Nautica', txt)
+        self.assertIn('thanks', txt)
+        self.assertNotIn('color:red', txt)
+        self.assertNotIn('<', txt)
+
+    def test_entities_are_decoded(self):
+        self.assertIn('B&T', EA._plain_from_html('<p>B&amp;T</p>'))
+
+
+# ── Wiring in app.py ─────────────────────────────────────────────────────────
+class WiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with io.open(os.path.join(ROOT, 'app.py'), encoding='utf-8') as fh:
+            cls.src = fh.read()
+        cls.tree = ast.parse(cls.src)
+
+    def test_webhook_path_is_open_and_registered(self):
+        self.assertIn("'/inbound-email',", self.src)
+        self.assertIn('from email_agent import register_email_routes', self.src)
+        self.assertIn('register_email_routes(app,', self.src)
+
+    def test_pnl_is_never_opened_by_this_change(self):
+        """The P&L must stay off every open prefix and allow-list."""
+        i = self.src.index('_AUTHZ_OPEN_PREFIXES = (')
+        self.assertNotIn('/api/pnl', self.src[i:self.src.index(')', i)])
+
+    def test_the_shared_loop_exists_and_the_chat_route_uses_it(self):
+        names = [n.name for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)]
+        self.assertIn('_ai_agent_run', names)
+        route = self.src[self.src.index('def api_ai_agent('):]
+        route = route[:route.index('\ndef ')]
+        self.assertIn('_ai_agent_run(client, convo, system, agent_tools', route)
+        self.assertNotIn('messages.create(', route, 'the chat route must not keep its own loop')
+
+    def test_email_surface_inherits_the_tool_rules_not_the_ui_rules(self):
+        i = self.src.index('_AI_AGENT_TOOL_GUIDANCE_CORE = """')
+        core = self.src[i:self.src.index('"""', i + 40)]
+        self.assertIn('build_presentation', core)
+        self.assertIn('CURATED SELECTIONS', core)
+        self.assertNotIn('required JSON format', core)
+        self.assertNotIn('chat bubble', core)
+        self.assertIn('_AI_AGENT_TOOL_GUIDANCE = _AI_AGENT_TOOL_GUIDANCE_CORE + _AI_AGENT_PLATFORM_TAIL',
+                      self.src)
+
+    def test_admin_only_tools_are_still_gated_in_the_shared_loop(self):
+        body = self.src[self.src.index('def _ai_agent_run('):]
+        body = body[:body.index('\n@app.route')]
+        self.assertIn('_AI_AGENT_ADMIN_TOOLS and not admin_ok', body)
+        self.assertIn("artifacts.append(", body)
+
+
+class PromptTests(unittest.TestCase):
+    def test_the_email_prompt_names_the_sender_and_their_tier(self):
+        EA._HOOKS['guidance_core'] = '<<CORE>>'
+        sys_text = EA._build_system({'email': 'rep@example.test', 'name': 'Rep', 'tier': 'staff'}, {})
+        self.assertIn('rep@example.test', sys_text)
+        self.assertIn('<<CORE>>', sys_text)
+        self.assertIn('not available to them', sys_text)
+        self.assertIn('UNTRUSTED', sys_text)
+
+    def test_an_admin_prompt_opens_the_history_tools(self):
+        EA._HOOKS['guidance_core'] = ''
+        sys_text = EA._build_system({'email': 'boss@example.test', 'name': '', 'tier': 'admin'}, {})
+        self.assertIn('every tool is available', sys_text)
+
+
+# ── The whole path, through the real Flask route ─────────────────────────────
+class EndToEndTests(unittest.TestCase):
+    """Posts a signed webhook at the live route and follows it to the reply."""
+
+    SECRET = 'whsec_' + base64.b64encode(b'z-fake-e2e-signing-key-0000').decode()
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _support import load_app
+        cls.app = load_app()
+        cls.client = cls.app.app.test_client()
+
+    def setUp(self):
+        self.s3 = use_s3(self, cfg_object({
+            'enabled': True,
+            'senders': [{'email': 'boss@example.test', 'tier': 'admin', 'name': 'Boss'}],
+            'notify': ['boss@example.test'],
+        }))
+        for name, value in (('RESEND_WEBHOOK_SECRET', self.SECRET),
+                            ('RESEND_API_KEY', 'z-fake-resend-key'),
+                            ('EMAIL_AGENT_FROM', 'Versa Inventory <ats@z-fake.test>')):
+            self.addCleanup(setattr, EA, name, getattr(EA, name))
+            setattr(EA, name, value)
+        self.sent = []
+        self.addCleanup(setattr, EA.requests, 'post', EA.requests.post)
+        self.addCleanup(setattr, EA.requests, 'get', EA.requests.get)
+        EA.requests.post = lambda url, headers=None, json=None, timeout=None: (
+            self.sent.append(json) or FakeResponse(200, b'{}', {'id': 'sent_1'}))
+        EA.requests.get = lambda url, headers=None, timeout=None: FakeResponse(200, b'PDF')
+
+    def post(self, payload, secret=None, msg_id='msg_e2e'):
+        body = json.dumps(payload).encode()
+        ts = int(time.time())
+        key = base64.b64decode((secret or self.SECRET).split('_', 1)[1])
+        sig = 'v1,' + base64.b64encode(
+            hmac.new(key, f'{msg_id}.{ts}.'.encode() + body, hashlib.sha256).digest()).decode()
+        return self.client.post('/inbound-email', data=body,
+                                content_type='application/json',
+                                headers={'svix-id': msg_id, 'svix-timestamp': str(ts),
+                                         'svix-signature': sig})
+
+    @staticmethod
+    def event(sender='boss@example.test', subject='Nautica deck please', email_id='em_e2e'):
+        return {'type': 'email.received',
+                'data': {'email_id': email_id, 'from': f'Boss <{sender}>', 'to': ['ats@z-fake.test'],
+                         'subject': subject, 'text': 'Can I get a presentation of Nautica B&T in stock'}}
+
+    def stub_agent(self, answer='<p>Here it is.</p>', artifacts=None):
+        self.addCleanup(EA._HOOKS.update, dict(EA._HOOKS))
+        EA._HOOKS['agent_client'] = lambda: object()
+        EA._HOOKS['model'] = lambda: 'z-fake-model'
+        EA._HOOKS['guidance_core'] = '<<CORE>>'
+        seen = {}
+
+        def run(client, convo, system, tools, model, max_tokens, admin_ok, label=''):
+            seen.update(convo=convo, system=system, tools=tools, admin_ok=admin_ok)
+            return {'final_text': answer, 'tools_used': ['build_presentation'],
+                    'artifacts': artifacts or [], 'usage': {}, 'elapsed_seconds': 1.0,
+                    'iterations': 1}
+
+        EA._HOOKS['agent_run'] = run
+        return seen
+
+    def test_unsigned_post_never_reaches_the_agent(self):
+        calls = []
+        self.addCleanup(setattr, EA, '_handle', EA._handle)
+        EA._handle = lambda ev: calls.append(ev)
+        r = self.client.post('/inbound-email', json=self.event())
+        self.assertEqual(401, r.status_code)
+        self.assertEqual([], calls)
+
+    def test_wrong_secret_is_refused(self):
+        calls = []
+        self.addCleanup(setattr, EA, '_handle', EA._handle)
+        EA._handle = lambda ev: calls.append(ev)
+        other = 'whsec_' + base64.b64encode(b'z-fake-attacker-key-000000').decode()
+        self.assertEqual(401, self.post(self.event(), secret=other).status_code)
+        self.assertEqual([], calls)
+
+    def test_signed_post_is_queued_once(self):
+        calls = []
+        self.addCleanup(setattr, EA, '_handle', EA._handle)
+        EA._handle = lambda ev: calls.append(ev)
+        self.assertEqual(200, self.post(self.event()).status_code)
+        second = self.post(self.event(), msg_id='msg_retry')
+        self.assertEqual(200, second.status_code)
+        self.assertTrue(second.get_json().get('duplicate'))
+        for _ in range(100):
+            if calls:
+                break
+            time.sleep(0.01)
+        self.assertEqual(1, len(calls), 'a retried delivery must not run the agent twice')
+
+    def test_other_event_types_are_ignored(self):
+        r = self.post({'type': 'email.delivered', 'data': {'email_id': 'em_x'}})
+        self.assertEqual(200, r.status_code)
+        self.assertEqual('email.delivered', r.get_json().get('ignored'))
+
+    def test_an_allowed_sender_gets_the_answer_and_the_file(self):
+        seen = self.stub_agent(artifacts=[{'url': 'https://z-fake.test/claude%20uploaded/Deck.pdf',
+                                           'tool': 'build_presentation'}])
+        EA._handle(self.event())
+        self.assertEqual(1, len(self.sent), 'exactly one reply')
+        msg = self.sent[0]
+        self.assertEqual(['boss@example.test'], msg['to'])
+        self.assertEqual('Re: Nautica deck please', msg['subject'])
+        self.assertIn('Here it is.', msg['html'])
+        self.assertEqual('Deck.pdf', msg['attachments'][0]['filename'])
+        self.assertEqual('1', msg['headers']['X-Versa-Agent'])
+        self.assertTrue(seen['admin_ok'], 'an admin sender keeps the history tools')
+        self.assertIn('Nautica B&T in stock', seen['convo'][0]['content'])
+
+    def test_a_staff_sender_loses_the_history_tools(self):
+        use_s3(self, cfg_object({'senders': [{'email': 'rep@example.test', 'tier': 'staff'}]}))
+        seen = self.stub_agent()
+        EA._handle(self.event(sender='rep@example.test'))
+        self.assertFalse(seen['admin_ok'])
+        names = {t['name'] for t in seen['tools']}
+        self.assertNotIn('past_orders_lookup', names)
+        self.assertNotIn('sales_history_lookup', names)
+        self.assertIn('build_presentation', names)
+
+    def test_an_unknown_sender_gets_silence_and_david_gets_a_heads_up(self):
+        self.stub_agent()
+        EA._handle(self.event(sender='stranger@z-fake.test'))
+        recipients = [addr for msg in self.sent for addr in msg['to']]
+        self.assertNotIn('stranger@z-fake.test', recipients,
+                         'never bounce to an address that may be forged')
+        self.assertEqual(['boss@example.test'], recipients)
+
+    def test_a_refusal_envelope_is_unwrapped_for_email(self):
+        self.stub_agent(answer=json.dumps({'message': "I can't help with that request.",
+                                           'actions': []}))
+        EA._handle(self.event())
+        self.assertIn("I can't help with that request.", self.sent[0]['html'])
+        self.assertNotIn('actions', self.sent[0]['html'])
+
+    def test_an_oversized_file_is_explained_not_dropped_silently(self):
+        EA.requests.get = lambda url, headers=None, timeout=None: FakeResponse(
+            200, b'x' * (3 * 1024 * 1024))
+        use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+                                 'attach_max_mb': 1}))
+        self.stub_agent(answer='<p><a href="https://z-fake.test/Deck.pdf">Download</a></p>',
+                        artifacts=[{'url': 'https://z-fake.test/Deck.pdf'}])
+        EA._handle(self.event())
+        html = self.sent[0]['html']
+        self.assertNotIn('attachments', self.sent[0])
+        self.assertIn('linked above rather than attached', html)
+        self.assertIn('href', html)
+
+    def test_a_run_is_logged_for_the_status_page(self):
+        self.stub_agent()
+        EA._handle(self.event(email_id='em_logged'))
+        with EA._runs_lock:
+            latest = EA._runs[0]
+        self.assertEqual('answered', latest['status'])
+        self.assertEqual('boss@example.test', latest['from'])
+        self.assertTrue(any('email-agent/log/' in k for k in self.s3.puts))
+
+    def test_status_and_config_need_a_credential(self):
+        self.assertEqual(401, self.client.get('/inbound-email/status').status_code)
+        self.assertEqual(401, self.client.get('/inbound-email/config').status_code)
+        self.assertEqual(401, self.client.post('/inbound-email/config',
+                                               json={'enabled': False}).status_code)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

@@ -8832,6 +8832,10 @@ _AUTHZ_OPEN_EXACT = {'/', '/health', '/favicon.ico',
                      '/dropbox-photos', '/sportswear-photos'}
 _AUTHZ_OPEN_PREFIXES = ('/image/', '/mcp', '/factory-view', '/factory-report',
                         '/factory-scorecard',   # inline auth: Versa-Docs admin or machine key (factory_scorecard.py)
+                        # inline auth: the Resend webhook signature, then a sender
+                        # allow-list — an unsigned POST never reaches the agent
+                        # (email_agent.py). /inbound-email/status is machine-key only.
+                        '/inbound-email',
                         '/sportswear-match/', '/catalog/')
 # GET endpoints a customer catalog page needs. Anonymous access requires a valid
 # catalog_slug and the response is scoped; staff/machine/oo tiers get them full.
@@ -17999,20 +18003,98 @@ _AI_AGENT_TOOL_FNS = {
     'build_presentation': _ai_tool_build_presentation,
 }
 
-_AI_AGENT_TOOL_GUIDANCE = """
+# The tool rules split in two. CORE is true wherever these tools run — the
+# platform chat, the MCP connector and the email agent — so the three surfaces
+# never drift on which tool answers which request. The PLATFORM tail is the
+# browser-only part: UI actions and the JSON envelope the chat bubble expects.
+# email_agent.py imports CORE and adds its own tail (plain email, no actions).
+_AI_AGENT_TOOL_GUIDANCE_CORE = """
 LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
 PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "lookbook", "photo cards" or "N tiles/cards per page" ALWAYS means build_presentation (a print-ready PDF of photo cards), never build_line_sheet and never a spreadsheet. Map the request straight onto its parameters. Example: "B&T in stock and incoming for everything but Shaq, one for warehouse and one for overseas, 8 tiles per page" = two calls, {source:'warehouse', category:'big_tall', exclude_brands:['SHAQ']} and {source:'overseas', category:'big_tall', exclude_brands:['SHAQ']}. Example: "Ross's big and tall styles on order with PO #, units, cost and ship window" = {source:'open_orders', customer:'Ross', category:'big_tall'}. Put each link in your final message as <a href="URL" target="_blank">Download the presentation</a>.
-CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus, or the saveLineSheetViews action's skus param. Never ask the user to paste style numbers you can look up.
+CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
+"""
+
+_AI_AGENT_PLATFORM_TAIL = """A curated selection also goes through the saveLineSheetViews action's skus param.
 UI actions (navigate, filters, saveLineSheetViews, etc.) still work exactly as documented; use tools for DATA and actions for controlling the UI. Never emit a queryInventory action — it is retired; its output rendered only in the user's browser and never came back to you. After your tools finish, respond in the required JSON format.
 The message field renders as raw HTML in the chat bubble. Format with HTML only: <b>, <br>, &bull; lists, <a> links. NEVER markdown (**bold**, ##, tables) — it shows as literal asterisks.
 """
+
+_AI_AGENT_TOOL_GUIDANCE = _AI_AGENT_TOOL_GUIDANCE_CORE + _AI_AGENT_PLATFORM_TAIL
 
 _AI_AGENT_DEFAULT_SYSTEM = (
     'You are the Versa Group inventory assistant with live data tools. Answer questions about inventory, '
     'production, and orders using the tools. Be concise and concrete; cite real numbers from tool results.'
     + _AI_AGENT_TOOL_GUIDANCE)
+
+
+# ── The tool loop, shared by every surface ───────────────────────────
+# /api/ai-agent (platform chat) and email_agent.py (the mailbox) both run THIS
+# function, so an answer that arrives by email is the same answer the chat and
+# the MCP connector give. Raises on an API failure; the caller decides the HTTP
+# shape. artifacts collects the download_url of every file a tool built, in the
+# order they were built, so the email agent can attach them to its reply.
+def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_ok, label='AI-Agent'):
+    started = time.time()
+    iterations = 0
+    tools_used = []
+    artifacts = []
+    usage_tot = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+    force_final = False
+    final_text = ''
+    while True:
+        iterations += 1
+        kwargs = {}
+        if force_final:
+            kwargs['tool_choice'] = {'type': 'none'}
+        resp = client.with_options(timeout=90.0).messages.create(
+            model=model, max_tokens=max_tokens, system=system, messages=convo,
+            tools=agent_tools, output_config={'effort': AI_AGENT_EFFORT}, **kwargs)
+        u = getattr(resp, 'usage', None)
+        if u:
+            for k in usage_tot:
+                usage_tot[k] += int(getattr(u, k, 0) or 0)
+        if resp.stop_reason == 'refusal':
+            final_text = json.dumps({'message': "I can't help with that request.", 'actions': []})
+            break
+        if resp.stop_reason == 'pause_turn':
+            convo.append({'role': 'assistant', 'content': resp.content})
+            continue
+        tool_uses = [b for b in resp.content if getattr(b, 'type', '') == 'tool_use']
+        if not tool_uses:
+            final_text = ''.join(getattr(b, 'text', '') for b in resp.content if getattr(b, 'type', '') == 'text')
+            break
+        convo.append({'role': 'assistant', 'content': resp.content})
+        results = []
+        for tu in tool_uses:
+            tools_used.append(tu.name)
+            fn = _AI_AGENT_TOOL_FNS.get(tu.name)
+            try:
+                if fn is None:
+                    raise ValueError(f'unknown tool {tu.name}')
+                if tu.name in _AI_AGENT_ADMIN_TOOLS and not admin_ok:
+                    raise PermissionError('Past Orders and sales history are available to admins only')
+                out = fn(tu.input or {})
+                if isinstance(out, dict) and out.get('download_url'):
+                    artifacts.append({'tool': tu.name, 'url': str(out['download_url']),
+                                      'format': str(out.get('format') or '')})
+                content = json.dumps(out, default=str)
+                if len(content) > 60000:
+                    content = content[:60000] + '... [truncated]'
+                results.append({'type': 'tool_result', 'tool_use_id': tu.id, 'content': content})
+            except Exception as te:
+                results.append({'type': 'tool_result', 'tool_use_id': tu.id,
+                                'content': f'Tool error: {te}', 'is_error': True})
+        convo.append({'role': 'user', 'content': results})
+        if iterations >= _AI_AGENT_MAX_ITER or (time.time() - started) > _AI_AGENT_WALL_SECONDS:
+            force_final = True
+    elapsed = round(time.time() - started, 1)
+    print(f"[{label}] {iterations} iterations, tools={tools_used}, "
+          f"in={usage_tot['input_tokens']} cached={usage_tot['cache_read_input_tokens']} "
+          f"out={usage_tot['output_tokens']}, {elapsed}s", flush=True)
+    return {'final_text': final_text, 'iterations': iterations, 'tools_used': tools_used,
+            'artifacts': artifacts, 'usage': usage_tot, 'elapsed_seconds': elapsed}
 
 
 @app.route('/api/ai-agent', methods=['POST', 'OPTIONS'])
@@ -18054,68 +18136,16 @@ def api_ai_agent():
     if system_dynamic:
         system.append({'type': 'text', 'text': system_dynamic})
 
-    started = time.time()
-    iterations = 0
-    tools_used = []
-    usage_tot = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
-    force_final = False
-    final_text = ''
     try:
-        while True:
-            iterations += 1
-            kwargs = {}
-            if force_final:
-                kwargs['tool_choice'] = {'type': 'none'}
-            resp = client.with_options(timeout=90.0).messages.create(
-                model=model, max_tokens=max_tokens, system=system, messages=convo,
-                tools=agent_tools, output_config={'effort': AI_AGENT_EFFORT}, **kwargs)
-            u = getattr(resp, 'usage', None)
-            if u:
-                for k in usage_tot:
-                    usage_tot[k] += int(getattr(u, k, 0) or 0)
-            if resp.stop_reason == 'refusal':
-                final_text = json.dumps({'message': 'I can\'t help with that request.', 'actions': []})
-                break
-            if resp.stop_reason == 'pause_turn':
-                convo.append({'role': 'assistant', 'content': resp.content})
-                continue
-            tool_uses = [b for b in resp.content if getattr(b, 'type', '') == 'tool_use']
-            if not tool_uses:
-                final_text = ''.join(getattr(b, 'text', '') for b in resp.content if getattr(b, 'type', '') == 'text')
-                break
-            convo.append({'role': 'assistant', 'content': resp.content})
-            results = []
-            for tu in tool_uses:
-                tools_used.append(tu.name)
-                fn = _AI_AGENT_TOOL_FNS.get(tu.name)
-                try:
-                    if fn is None:
-                        raise ValueError(f'unknown tool {tu.name}')
-                    if tu.name in _AI_AGENT_ADMIN_TOOLS and not admin_ok:
-                        raise PermissionError('Past Orders and sales history are available to admins only')
-                    out = fn(tu.input or {})
-                    content = json.dumps(out, default=str)
-                    if len(content) > 60000:
-                        content = content[:60000] + '... [truncated]'
-                    results.append({'type': 'tool_result', 'tool_use_id': tu.id, 'content': content})
-                except Exception as te:
-                    results.append({'type': 'tool_result', 'tool_use_id': tu.id,
-                                    'content': f'Tool error: {te}', 'is_error': True})
-            convo.append({'role': 'user', 'content': results})
-            if iterations >= _AI_AGENT_MAX_ITER or (time.time() - started) > _AI_AGENT_WALL_SECONDS:
-                force_final = True
+        run = _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_ok)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': f'AI agent failed: {e}'}), 502
-
-    print(f"[AI-Agent] {iterations} iterations, tools={tools_used}, "
-          f"in={usage_tot['input_tokens']} cached={usage_tot['cache_read_input_tokens']} "
-          f"out={usage_tot['output_tokens']}, {time.time() - started:.1f}s")
-    return jsonify({'content': [{'type': 'text', 'text': final_text}], 'model': model,
-                    'stop_reason': 'end_turn', 'usage': usage_tot,
-                    'agent': {'iterations': iterations, 'tools': tools_used,
-                              'elapsed_seconds': round(time.time() - started, 1)}})
+    return jsonify({'content': [{'type': 'text', 'text': run['final_text']}], 'model': model,
+                    'stop_reason': 'end_turn', 'usage': run['usage'],
+                    'agent': {'iterations': run['iterations'], 'tools': run['tools_used'],
+                              'elapsed_seconds': run['elapsed_seconds']}})
 
 
 # ============================================================
@@ -18219,6 +18249,27 @@ register_scorecard_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
                           caller_identity=_caller_identity,
                           machine_key=INVENTORY_API_KEY,
                           load_master=load_production_from_dropbox)
+
+
+# ── Inbound email agent: POST /inbound-email (Resend webhook) ────────────────
+# The mailbox surface of the same assistant. It hands email_agent.py the shared
+# tool loop, the same tool table and the same tool rules, so a request that
+# arrives by email is answered exactly the way the platform chat answers it.
+# Wrapped because a mailbox is not worth a boot failure: if this raises, the
+# rest of the API comes up and only the mailbox is missing.
+try:
+    from email_agent import register_email_routes
+    register_email_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
+                          agent_client=_ai_agent_client,
+                          agent_run=_ai_agent_run,
+                          tools=_AI_AGENT_TOOLS,
+                          admin_tools=_AI_AGENT_ADMIN_TOOLS,
+                          guidance_core=_AI_AGENT_TOOL_GUIDANCE_CORE,
+                          model=lambda: AI_AGENT_MODEL,
+                          machine_key=INVENTORY_API_KEY,
+                          caller_identity=_caller_identity)
+except Exception as _email_agent_err:
+    print(f'[EmailAgent] NOT registered: {_email_agent_err}', flush=True)
 
 
 # ── Profit & Loss (ADMIN ONLY): /api/pnl/* ───────────────────────────────────
