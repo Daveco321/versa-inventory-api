@@ -16656,7 +16656,7 @@ def _ai_tool_build_line_sheet(params):
             import traceback
             traceback.print_exc()
             return {'error': f'could not work out per-warehouse availability: {e}'}
-        _inferred = []
+        _inferred, _dropped = [], 0
         for t in tabs_out:
             for it in t['items']:
                 rec = _split.get(it['sku'])
@@ -16666,7 +16666,18 @@ def _ai_tool_build_line_sheet(params):
                 it['wh_ats_total'] = int((rec or {}).get('total', 0) or 0)
                 if rec and not rec.get('exact', True):
                     _inferred.append(it['sku'])
+        for t in tabs_out:
+            keep = [it for it in t['items']
+                    if it['wh_ats_total'] > 0
+                    or (t.get('view_mode') != 'ats' and int(it.get('incoming') or 0) > 0)]
+            _dropped += len(t['items']) - len(keep)
+            t['items'] = keep
+        tabs_out = [t for t in tabs_out if t['items']]
+        if not tabs_out:
+            return {'error': 'nothing is available from a warehouse for these filters'}
         summary.append({'warehouse_breakdown': True,
+                        'by_size_rows_excluded': True,
+                        'styles_dropped_no_warehouse_stock': _dropped,
                         'columns': 'JTW ATS / TR ATS / DCW ATS / QA ATS add up to Warehouse ATS',
                         'styles_split_exactly': sum(1 for t in tabs_out for it in t['items']) - len(_inferred),
                         'styles_where_the_warehouse_was_inferred': sorted(set(_inferred))})
@@ -17161,6 +17172,11 @@ def _wh_split_by_base(bases, customer_view=True):
     today = now.date()
     out = {}
     for sku, m in ctx['merged'].items():
+        # A by-size row is not a customer-facing style (David, Sep 18 2026), and
+        # the photo decks have always skipped them. Counting them here is what
+        # made a deck and a sheet disagree by up to 146 units on one style.
+        if _is_sized_sku(sku):
+            continue
         base = sku.split('-')[0]
         if base not in wanted:
             continue

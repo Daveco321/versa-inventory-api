@@ -1107,5 +1107,207 @@ class LineSheetSurfaceTests(unittest.TestCase):
         self.assertIn("assigned to overseas", body)
 
 
+# ── Everything leaving the mailbox is a customer sheet ───────────────────────
+class CustomerViewIsForcedTests(unittest.TestCase):
+    """David, Sep 18 2026: a sheet that leaves this mailbox is a sheet someone
+    forwards to a customer, so it can never carry committed, allocated or NJ."""
+
+    def setUp(self):
+        self.seen = {}
+        EA._HOOKS['tool_fns'] = {
+            'build_line_sheet': lambda p: self.seen.setdefault('sheet', p) or {'ok': 1},
+            'build_presentation': lambda p: self.seen.setdefault('deck', p) or {'ok': 1},
+        }
+        self.addCleanup(EA._HOOKS.pop, 'tool_fns', None)
+
+    def test_a_line_sheet_is_always_customer_view(self):
+        EA._email_tool_fns()['build_line_sheet']({'tabs': [], 'customer_view': False})
+        self.assertIs(True, self.seen['sheet']['customer_view'],
+                      'the model must not be able to ask for an internal sheet')
+        self.assertTrue(self.seen['sheet']['warehouse_breakdown'])
+
+    def test_a_presentation_is_always_customer_view(self):
+        EA._email_tool_fns()['build_presentation']({'source': 'warehouse', 'customer_view': False})
+        self.assertIs(True, self.seen['deck']['customer_view'])
+
+    def test_the_rest_of_the_request_survives(self):
+        EA._email_tool_fns()['build_presentation']({'source': 'overseas', 'brands': ['NAUTICA']})
+        self.assertEqual('overseas', self.seen['deck']['source'])
+        self.assertEqual(['NAUTICA'], self.seen['deck']['brands'])
+
+
+# ── Reply-all ────────────────────────────────────────────────────────────────
+class ReplyAllTests(unittest.TestCase):
+    """If the sender copied people in, the answer goes to them too."""
+
+    CFG = {'always_cc': [], 'reply_to': ''}
+
+    def setUp(self):
+        for name, value in (('EMAIL_AGENT_FROM', 'Versa Inventory <ats@z-fake.test>'),
+                            ('EMAIL_AGENT_REPLY_TO', 'ats@z-fake.test')):
+            self.addCleanup(setattr, EA, name, getattr(EA, name))
+            setattr(EA, name, value)
+
+    def test_cc_and_other_recipients_are_copied(self):
+        data = {'to': ['ats@z-fake.test', 'rep@example.test'],
+                'cc': ['Buyer <buyer@z-customer.test>']}
+        self.assertEqual(['rep@example.test', 'buyer@z-customer.test'],
+                         EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+
+    def test_the_mailbox_never_copies_itself(self):
+        data = {'to': ['ATS@Z-Fake.test'], 'cc': ['ats@z-fake.test']}
+        self.assertEqual([], EA._reply_recipients(data, self.CFG, 'boss@example.test'),
+                         'a reply addressed at the mailbox is how a loop starts')
+
+    def test_the_address_the_mail_was_received_for_is_not_copied(self):
+        data = {'to': ['someone-else@z-fake.test'], 'received_for': ['someone-else@z-fake.test']}
+        self.assertEqual([], EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+
+    def test_the_sender_is_never_also_a_cc(self):
+        data = {'to': ['boss@example.test'], 'cc': ['Boss <boss@example.test>']}
+        self.assertEqual([], EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+
+    def test_duplicates_collapse(self):
+        data = {'to': ['rep@example.test'], 'cc': ['REP@example.test', 'rep@example.test']}
+        self.assertEqual(['rep@example.test'], EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+
+    def test_a_runaway_cc_list_is_bounded(self):
+        data = {'cc': [f'p{i}@z-fake-many.test' for i in range(200)]}
+        self.assertEqual(EA._MAX_CC, len(EA._reply_recipients(data, self.CFG, 'boss@example.test')))
+
+    def test_always_cc_still_applies(self):
+        cfg = {'always_cc': ['watcher@example.test'], 'reply_to': ''}
+        self.assertEqual(['watcher@example.test'], EA._reply_recipients({}, cfg, 'boss@example.test'))
+
+
+class ReplyAllDeliveryTests(unittest.TestCase):
+    """The same thing, through the worker, and where it must NOT happen."""
+
+    def setUp(self):
+        self.s3 = use_s3(self, cfg_object({
+            'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+            'notify': ['boss@example.test'],
+        }))
+        for name, value in (('RESEND_API_KEY', 'z-fake'),
+                            ('EMAIL_AGENT_FROM', 'Versa Inventory <ats@z-fake.test>'),
+                            ('EMAIL_AGENT_REPLY_TO', 'ats@z-fake.test')):
+            self.addCleanup(setattr, EA, name, getattr(EA, name))
+            setattr(EA, name, value)
+        self.sent = []
+        self.addCleanup(setattr, EA.requests, 'post', EA.requests.post)
+        EA.requests.post = lambda url, headers=None, json=None, timeout=None: (
+            self.sent.append(json) or FakeResponse(200, b'{}', {'id': 'x'}))
+        self.addCleanup(EA._HOOKS.update, dict(EA._HOOKS))
+        EA._HOOKS.update({'agent_client': lambda: object(), 'model': lambda: 'z-fake',
+                          'guidance_core': '', 'tools': [{'name': 'query_inventory'}],
+                          'admin_tools': set(), 'tool_fns': {},
+                          'agent_run': lambda *a, **k: {'final_text': '<p>ok</p>', 'tools_used': [],
+                                                        'artifacts': [], 'usage': {},
+                                                        'elapsed_seconds': 1}})
+
+    def event(self, **extra):
+        data = {'email_id': f'em_cc_{len(self.sent)}_{id(extra)}',
+                'from': 'Boss <boss@example.test>', 'subject': 'deck', 'text': 'nautica deck',
+                'to': ['ats@z-fake.test'],
+                'headers': {'Authentication-Results': 'dkim=pass header.i=@example.test'}}
+        data.update(extra)
+        return {'type': 'email.received', 'data': data}
+
+    def test_the_answer_reaches_everyone_who_was_copied(self):
+        EA._handle(self.event(cc=['colleague@example.test', 'Buyer <buyer@z-customer.test>']))
+        msg = self.sent[0]
+        self.assertEqual(['boss@example.test'], msg['to'])
+        self.assertEqual(['colleague@example.test', 'buyer@z-customer.test'], msg['cc'])
+
+    def test_no_cc_means_no_cc_field(self):
+        EA._handle(self.event())
+        self.assertNotIn('cc', self.sent[0])
+
+    def test_a_blocked_sender_heads_up_is_never_copied_to_anyone(self):
+        """The notification names who tried; it must not go to them."""
+        EA._handle(self.event(**{'from': 'stranger@z-fake.test',
+                                 'cc': ['someone@z-fake.test']}))
+        for msg in self.sent:
+            self.assertEqual(['boss@example.test'], msg['to'])
+            self.assertEqual([], msg.get('cc', []))
+
+
+class BySizeRowsTests(unittest.TestCase):
+    """By-size rows are not customer-facing styles, so they do not count."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _support import load_app
+        cls.app = load_app()
+
+    def ctx(self, merged, **over):
+        base = {'merged': merged, 'virt': {}, 'vw_by_sku': {}, 'assign': {}, 'no_suppress': set(),
+                'lots_by_sku': {}, 'orders_by_sku': {}, 'styles_by_po': {}, 'apo_by_sku': {},
+                'styles_by_apo_cust': {}, 'single_wh': {}, 'sku_units': {}}
+        base.update(over)
+        return base
+
+    def row(self, **kw):
+        r = {k: 0 for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming',
+                            'committed', 'allocated')}
+        r.update(kw)
+        return r
+
+    def split(self, ctx, bases):
+        self.addCleanup(setattr, self.app, '_wh_supply_context', self.app._wh_supply_context)
+        self.app._wh_supply_context = lambda: ctx
+        return self.app._wh_split_by_base(bases)
+
+    def test_a_size_row_does_not_add_to_the_style(self):
+        ctx = self.ctx({'ZZTEST001SLS': self.row(tr=100),
+                        'ZZTEST001SLS-M': self.row(tr=500)})
+        out = self.split(ctx, ['ZZTEST001SLS'])
+        self.assertEqual(100, out['ZZTEST001SLS']['total'], 'the -M row is not a style')
+        self.assertEqual(100, out['ZZTEST001SLS']['tr'])
+
+    def test_a_style_that_exists_only_as_size_rows_has_nothing_to_show(self):
+        ctx = self.ctx({'ZZTEST002SLS-M': self.row(tr=500)})
+        self.assertEqual({}, self.split(ctx, ['ZZTEST002SLS']))
+
+    def test_one_warehouse_is_exact(self):
+        ctx = self.ctx({'ZZTEST003SLS': self.row(tr=2000, allocated=-500)})
+        out = self.split(ctx, ['ZZTEST003SLS'])
+        self.assertEqual(1500, out['ZZTEST003SLS']['tr'])
+        self.assertTrue(out['ZZTEST003SLS']['exact'], 'no guess was needed')
+
+    def test_a_split_row_follows_the_po_anchor(self):
+        ctx = self.ctx(
+            {'ZZTEST004SLS': self.row(jtw=200, tr=2000, committed=-1000),
+             'ZZANCHOR1SLS': self.row(jtw=900)},
+            orders_by_sku={'ZZTEST004SLS': [{'orderNo': 'ZPO1'}]},
+            styles_by_po={'ZPO1': {'ZZTEST004SLS', 'ZZANCHOR1SLS'}},
+            single_wh={'ZZANCHOR1SLS': 'jtw'}, sku_units={'ZZANCHOR1SLS': 900})
+        rec = self.split(ctx, ['ZZTEST004SLS'])['ZZTEST004SLS']
+        self.assertEqual(0, rec['jtw'], 'JTW paid first, then spilled')
+        self.assertEqual(1200, rec['tr'])
+        self.assertEqual(1200, rec['total'])
+        self.assertFalse(rec['exact'])
+        self.assertTrue(any('PO' in r for r in rec['rules']))
+
+    def test_with_no_signal_the_largest_pile_pays(self):
+        ctx = self.ctx({'ZZTEST005SLS': self.row(jtw=200, tr=2000, committed=-1000)})
+        rec = self.split(ctx, ['ZZTEST005SLS'])['ZZTEST005SLS']
+        self.assertEqual({'jtw': 200, 'tr': 1000}, {k: rec[k] for k in ('jtw', 'tr')})
+        self.assertIn('largest pile first', rec['rules'])
+
+    def test_a_deduction_larger_than_the_stock_empties_it_and_stops(self):
+        ctx = self.ctx({'ZZTEST006SLS': self.row(jtw=36, tr=756, allocated=-5000)})
+        rec = self.split(ctx, ['ZZTEST006SLS'])['ZZTEST006SLS']
+        self.assertEqual(0, rec['total'])
+        self.assertTrue(all(rec[k] >= 0 for k in ('jtw', 'tr', 'dcw', 'qa')))
+
+    def test_rows_of_the_same_base_add_up(self):
+        ctx = self.ctx({'ZZTEST007SLS': self.row(tr=100),
+                        'ZZTEST007SLS-V': self.row(jtw=50)})
+        rec = self.split(ctx, ['ZZTEST007SLS'])['ZZTEST007SLS']
+        self.assertEqual(150, rec['total'], 'a bare -V is a variant, not a size')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

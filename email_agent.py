@@ -71,6 +71,7 @@ _MAX_BODY_CHARS = 12000           # how much of the email (incl. quoted thread) 
 _DEFAULT_ATTACH_MB = 15           # bigger than this goes as a link only
 _DEFAULT_RATE_PER_HOUR = 12       # per sender; each request is an Opus run with tools
 _RUN_LOG_MAX = 40                 # recent runs kept in memory for /inbound-email/status
+_MAX_CC = 25                      # reply-all, bounded: a huge CC list is a mistake, not a request
 
 _TIERS = ('admin', 'staff')
 
@@ -349,7 +350,8 @@ def _fetch_received(email_id, data):
     return {'text': '', 'html': '', 'headers': {}, 'via': 'none'}
 
 
-def _send_reply(to_addr, subject, html, attachments, cfg, in_reply_to=None, references=None):
+def _send_reply(to_addr, subject, html, attachments, cfg, in_reply_to=None, references=None,
+                cc=None):
     if not RESEND_API_KEY:
         return False, 'RESEND_API_KEY not configured on the server'
     sender = EMAIL_AGENT_FROM or cfg.get('reply_from') or ''
@@ -362,7 +364,11 @@ def _send_reply(to_addr, subject, html, attachments, cfg, in_reply_to=None, refe
     reply_to = EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or ''
     if reply_to:
         payload['reply_to'] = reply_to
-    if cfg.get('always_cc'):
+    # cc is worked out by the caller (reply-all); always_cc is the fallback for
+    # the notification path, which has no incoming message to reply to.
+    if cc:
+        payload['cc'] = list(cc)
+    elif cc is None and cfg.get('always_cc'):
         payload['cc'] = list(cfg['always_cc'])
     if in_reply_to:
         payload['headers']['In-Reply-To'] = in_reply_to
@@ -389,7 +395,7 @@ def _notify(cfg, subject, html):
     sender: an automatic bounce back to a forged address is how a mailbox turns
     into someone else's spam problem."""
     for addr in (cfg.get('notify') or []):
-        _send_reply(addr, subject, html, None, {'always_cc': [], 'reply_to': ''})
+        _send_reply(addr, subject, html, None, {'always_cc': [], 'reply_to': ''}, cc=[])
 
 
 # ── Attachments ──────────────────────────────────────────────────────────────
@@ -427,6 +433,7 @@ ANSWERING BY EMAIL
 You are answering an EMAIL, not the platform chat. There is no UI to drive and no JSON envelope: what you write IS the body of the reply.
 Write simple HTML: <p>, <b>, <br>, <ul>/<li>, <a href>. No markdown, no <html>/<head>/<body> wrapper, no CSS, no tables wider than about six columns. Do not use em dashes; split the sentence instead.
 Lead with one sentence that answers the question, then the detail. Keep it to the length of an email, not a report.
+Everything you build here is CUSTOMER VIEW, always, and by-size rows never appear. Do not offer an internal or admin version; it is not available from this mailbox.
 A line sheet you build here shows availability PER WAREHOUSE: JTW, TR, DCW and QA columns that add up to Warehouse ATS. If the result names styles where the warehouse had to be inferred, say so in one line and name them.
 Every file a tool builds is attached to this reply automatically. Say in one line that it is attached AND keep the <a href> link in the body, because a very large file is sent as a link only.
 The sender wrote in their own words and may be vague. Make the obvious call, do it, and say what you assumed in one line. Never reply asking them to supply parameters you could choose yourself.
@@ -459,12 +466,51 @@ def _email_tool_fns():
     inside the data layer: a number must not mean different things depending on
     which person triggered it."""
     fns = dict(_HOOKS.get('tool_fns') or {})
-    inner = fns.get('build_line_sheet')
-    if inner is not None:
+    # Customer view, always. A sheet that leaves this mailbox is a sheet someone
+    # forwards to a customer, so it must never carry committed, allocated, NJ or
+    # ABFI (David, Sep 18 2026). The model cannot opt out of it.
+    line_sheet = fns.get('build_line_sheet')
+    if line_sheet is not None:
         def _line_sheet(params):
-            return inner({**(params or {}), 'warehouse_breakdown': True})
+            return line_sheet({**(params or {}), 'customer_view': True,
+                               'warehouse_breakdown': True})
         fns['build_line_sheet'] = _line_sheet
+    deck = fns.get('build_presentation')
+    if deck is not None:
+        def _presentation(params):
+            return deck({**(params or {}), 'customer_view': True})
+        fns['build_presentation'] = _presentation
     return fns
+
+
+def _reply_recipients(data, cfg, sender):
+    """Reply-all: everyone the sender put on the message, minus ourselves.
+
+    David, Sep 18 2026. If he CCs a colleague or a customer when he writes in,
+    the answer should land with them too instead of only coming back to him.
+    Our own addresses are stripped so a reply can never be addressed at the
+    mailbox and start a loop, and the sender is never also a CC."""
+    mine = {a for a in (_addr(EMAIL_AGENT_FROM), _addr(EMAIL_AGENT_REPLY_TO),
+                        _addr(cfg.get('reply_to') or '')) if a}
+    for row in (data.get('received_for') or []):
+        a = _addr(row)
+        if a:
+            mine.add(a)
+    out = []
+    for field in ('to', 'cc'):
+        for row in (data.get(field) or []):
+            a = _addr(row)
+            if a and a != sender and a not in mine and a not in out:
+                out.append(a)
+    for a in (cfg.get('always_cc') or []):
+        a = _addr(a)
+        if a and a != sender and a not in mine and a not in out:
+            out.append(a)
+    return out[:_MAX_CC]
+
+
+def _addr(value):
+    return (parseaddr(str(value or ''))[1] or '').strip().lower()
 
 
 def _build_system(ident, cfg):
@@ -658,7 +704,7 @@ def _handle(event):
             entry.update(status='rate_limited')
             _send_reply(from_addr, f'Re: {subject}',
                         '<p>That is more requests than this mailbox answers in an hour. '
-                        'Please try again shortly.</p><p>Versa Inventory</p>', None, cfg)
+                        'Please try again shortly.</p><p>Versa Inventory</p>', None, cfg, cc=[])
             return
 
         body = _fetch_received(email_id, data)
@@ -721,10 +767,11 @@ def _handle(event):
                 break
         prefix = cfg.get('subject_prefix') or ''
         reply_subject = subject if subject.lower().startswith('re:') else f'Re: {subject}'
+        cc = _reply_recipients(data, cfg, from_addr)
         ok, detail = _send_reply(from_addr, f'{prefix}{reply_subject}', answer, attachments, cfg,
-                                 in_reply_to=msg_id)
+                                 in_reply_to=msg_id, cc=cc)
         entry.update(status='answered' if ok else 'send_failed', detail=detail,
-                     tier=ident['tier'], tools=run.get('tools_used'),
+                     tier=ident['tier'], tools=run.get('tools_used'), cc=cc,
                      files=[a['filename'] for a in attachments],
                      links=[a.get('url') for a in (run.get('artifacts') or [])],
                      agent_seconds=run.get('elapsed_seconds'),
@@ -738,7 +785,7 @@ def _handle(event):
         try:
             _send_reply(from_addr, f'Re: {subject}',
                         '<p>Something went wrong putting that answer together. '
-                        'David has been notified.</p><p>Versa Inventory</p>', None, cfg)
+                        'David has been notified.</p><p>Versa Inventory</p>', None, cfg, cc=[])
             _notify(cfg, f'[Versa Inventory] Email agent error for {from_addr}',
                     f'<p><b>Subject:</b> {subject}</p><pre>{str(e)[:1500]}</pre>')
         except Exception:
