@@ -521,6 +521,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn('linked above rather than attached', html)
         self.assertIn('href', html)
 
+    def test_the_reply_points_back_at_the_mailbox(self):
+        """Replies are sent FROM a domain verified for sending, which is not
+        the receive-only inbound domain. Without Reply-To, hitting Reply on an
+        answer writes to an address nobody reads."""
+        self.addCleanup(setattr, EA, 'EMAIL_AGENT_REPLY_TO', EA.EMAIL_AGENT_REPLY_TO)
+        EA.EMAIL_AGENT_REPLY_TO = 'ats@z-fake-inbox.test'
+        self.stub_agent()
+        EA._handle(self.event())
+        self.assertEqual('ats@z-fake-inbox.test', self.sent[0]['reply_to'])
+
+    def test_no_reply_to_configured_leaves_the_field_off(self):
+        self.addCleanup(setattr, EA, 'EMAIL_AGENT_REPLY_TO', EA.EMAIL_AGENT_REPLY_TO)
+        EA.EMAIL_AGENT_REPLY_TO = ''
+        self.stub_agent()
+        EA._handle(self.event())
+        self.assertNotIn('reply_to', self.sent[0])
+
     def test_a_run_is_logged_for_the_status_page(self):
         self.stub_agent()
         EA._handle(self.event(email_id='em_logged'))

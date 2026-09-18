@@ -51,6 +51,11 @@ RESEND_WEBHOOK_SECRET = (os.environ.get('RESEND_WEBHOOK_SECRET', '') or '').stri
 # Envelope sender of the replies. Must be a domain verified for SENDING in
 # Resend (the inbound domain and the sending domain can be the same one).
 EMAIL_AGENT_FROM = (os.environ.get('EMAIL_AGENT_FROM', '') or '').strip()
+# Where a reply to our reply should land: the mailbox itself. Resend will only
+# send FROM a domain verified for sending, and the inbound address lives on a
+# different (receive-only) domain, so without this a colleague who hits Reply
+# to refine a request writes to an address that answers nobody.
+EMAIL_AGENT_REPLY_TO = (os.environ.get('EMAIL_AGENT_REPLY_TO', '') or '').strip()
 EMAIL_AGENT_CONFIG_KEY = os.environ.get('EMAIL_AGENT_CONFIG_KEY', 'email-agent/config.json')
 
 _RESEND_API = 'https://api.resend.com'
@@ -84,6 +89,7 @@ _DEFAULT_CONFIG = {
     'domains': [],                # [{'domain': 'versamens.com', 'tier': 'staff'}]
     'notify': [],                 # who hears about a blocked or failed request
     'always_cc': [],
+    'reply_to': '',
     'attach_max_mb': _DEFAULT_ATTACH_MB,
     'max_per_sender_per_hour': _DEFAULT_RATE_PER_HOUR,
     'subject_prefix': '',
@@ -272,6 +278,9 @@ def _send_reply(to_addr, subject, html, attachments, cfg, in_reply_to=None, refe
                # X-Versa-Agent marks our own mail so a reply that loops back
                # into the mailbox is dropped instead of answered again.
                'headers': {'X-Versa-Agent': '1', 'Auto-Submitted': 'auto-replied'}}
+    reply_to = EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or ''
+    if reply_to:
+        payload['reply_to'] = reply_to
     if cfg.get('always_cc'):
         payload['cc'] = list(cfg['always_cc'])
     if in_reply_to:
@@ -299,7 +308,7 @@ def _notify(cfg, subject, html):
     sender: an automatic bounce back to a forged address is how a mailbox turns
     into someone else's spam problem."""
     for addr in (cfg.get('notify') or []):
-        _send_reply(addr, subject, html, None, {'always_cc': []})
+        _send_reply(addr, subject, html, None, {'always_cc': [], 'reply_to': ''})
 
 
 # ── Attachments ──────────────────────────────────────────────────────────────
@@ -589,7 +598,8 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
             'enabled': bool(cfg.get('enabled', True)),
             'ready': {'resend_key': bool(RESEND_API_KEY),
                       'webhook_secret': bool(RESEND_WEBHOOK_SECRET),
-                      'reply_from': EMAIL_AGENT_FROM or None},
+                      'reply_from': EMAIL_AGENT_FROM or None,
+                      'reply_to': EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or None},
             'senders': cfg['senders'], 'domains': cfg['domains'],
             'rejected_config_rows': cfg.get('_rejected') or [],
             'notify': cfg.get('notify') or [],
@@ -608,7 +618,7 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
             return jsonify(_load_config(force=True))
         body = request.get_json(silent=True) or {}
         cfg = {k: v for k, v in _load_config(force=True).items() if not k.startswith('_')}
-        for k in ('enabled', 'senders', 'domains', 'notify', 'always_cc',
+        for k in ('enabled', 'senders', 'domains', 'notify', 'always_cc', 'reply_to',
                   'attach_max_mb', 'max_per_sender_per_hour', 'subject_prefix'):
             if k in body:
                 cfg[k] = body[k]
