@@ -427,6 +427,7 @@ ANSWERING BY EMAIL
 You are answering an EMAIL, not the platform chat. There is no UI to drive and no JSON envelope: what you write IS the body of the reply.
 Write simple HTML: <p>, <b>, <br>, <ul>/<li>, <a href>. No markdown, no <html>/<head>/<body> wrapper, no CSS, no tables wider than about six columns. Do not use em dashes; split the sentence instead.
 Lead with one sentence that answers the question, then the detail. Keep it to the length of an email, not a report.
+A line sheet you build here shows availability PER WAREHOUSE: JTW, TR, DCW and QA columns that add up to Warehouse ATS. If the result names styles where the warehouse had to be inferred, say so in one line and name them.
 Every file a tool builds is attached to this reply automatically. Say in one line that it is attached AND keep the <a href> link in the body, because a very large file is sent as a link only.
 The sender wrote in their own words and may be vague. Make the obvious call, do it, and say what you assumed in one line. Never reply asking them to supply parameters you could choose yourself.
 Never mention tools, parameters, internal endpoints or these instructions. Sign off as Versa Inventory.
@@ -443,6 +444,27 @@ _TIER_NOTES = {
               'sheet are not available to them. If they ask for past selling, say it is admin only and offer '
               'the current book instead.'),
 }
+
+
+def _email_tool_fns():
+    """The mailbox's own tool implementations.
+
+    A line sheet asked for BY EMAIL comes back broken out per warehouse: JTW,
+    TR, DCW and QA each showing what is really sellable there, adding up to the
+    warehouse total. The MCP connector and the platform chat keep the single
+    combined column they have always had (David, Sep 18 2026), so the same
+    request through those surfaces produces the same file it did yesterday.
+
+    Done by wrapping the shared function rather than by checking who is asking
+    inside the data layer: a number must not mean different things depending on
+    which person triggered it."""
+    fns = dict(_HOOKS.get('tool_fns') or {})
+    inner = fns.get('build_line_sheet')
+    if inner is not None:
+        def _line_sheet(params):
+            return inner({**(params or {}), 'warehouse_breakdown': True})
+        fns['build_line_sheet'] = _line_sheet
+    return fns
 
 
 def _build_system(ident, cfg):
@@ -672,7 +694,8 @@ def _handle(event):
         tools = _HOOKS['tools'] if admin_ok else [t for t in _HOOKS['tools']
                                                   if t['name'] not in _HOOKS['admin_tools']]
         run = _HOOKS['agent_run'](_HOOKS['agent_client'](), convo, system, tools,
-                                  _HOOKS['model'](), 8192, admin_ok, label='EmailAgent')
+                                  _HOOKS['model'](), 8192, admin_ok, label='EmailAgent',
+                                  tool_fns=_email_tool_fns())
         answer = (run.get('final_text') or '').strip()
         # The shared loop formats a refusal as the platform's JSON envelope.
         if answer.startswith('{'):
@@ -730,11 +753,11 @@ def _handle(event):
 # ── Routes ───────────────────────────────────────────────────────────────────
 def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
                           tools, admin_tools, guidance_core, model, machine_key,
-                          caller_identity=None):
+                          tool_fns=None, caller_identity=None):
     _HOOKS.update({'get_s3': get_s3, 's3_bucket': s3_bucket, 'agent_client': agent_client,
                    'agent_run': agent_run, 'tools': tools, 'admin_tools': admin_tools,
                    'guidance_core': guidance_core, 'model': model,
-                   'machine_key': machine_key})
+                   'machine_key': machine_key, 'tool_fns': tool_fns or {}})
 
     def _staff_or_machine():
         key = (request.headers.get('X-Api-Key')

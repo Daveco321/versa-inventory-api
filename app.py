@@ -2491,7 +2491,8 @@ def _factory_label(production_ref, full_name=False):
 
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
-                     flow_mode=False, headers_override=None, tjx_layout=False):
+                     flow_mode=False, headers_override=None, tjx_layout=False,
+                     wh_breakdown=False):
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -2560,7 +2561,16 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             headers.extend(['Fit', 'Fabrication'])
             if is_order:
                 headers.append('Qty Selected')
-            headers.extend(['Warehouse', 'Total ATS'])
+            if wh_breakdown:
+                # Emailed line sheets only (David, Sep 18 2026): say WHERE the
+                # sellable units are instead of naming the warehouses and giving
+                # one combined number. Every other caller keeps the two columns
+                # below, so no sheet a customer already has changes meaning.
+                headers.extend(['JTW ATS', 'TR ATS', 'DCW ATS', 'QA ATS', 'Warehouse ATS'])
+                if view_mode == 'all':
+                    headers.append('Incoming')
+            else:
+                headers.extend(['Warehouse', 'Total ATS'])
             # All Inventory catalog view: include date columns for items with incoming stock
             if view_mode == 'all':
                 headers.extend(['Ex-Factory', 'Arrival'])
@@ -2637,6 +2647,8 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Total Warehouse': 14, 'Total ATS': 12, 'Overseas ATS': 14,
         'Committed': 12, 'Allocated': 12, 'Ex-Factory': 14, 'Arrival': 14,
         'Warehouse': 18,
+        # Per-warehouse availability (emailed line sheets)
+        'JTW ATS': 12, 'TR ATS': 12, 'DCW ATS': 12, 'QA ATS': 12, 'Warehouse ATS': 15,
         # Ship-plan line-sheet columns (Confirm Pre-PO exports)
         'Units to Ship': 13, 'Shortfall': 12, 'Can Ship': 15,
         'Held By / Source': 34,
@@ -2702,6 +2714,13 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Ex-Factory': lambda item: item.get('ex_factory', ''),
         'Arrival': lambda item: item.get('arrival', ''),
         'Warehouse': lambda item: item.get('warehouse', ''),
+        # Per-warehouse AVAILABLE units: stock at that warehouse minus its share
+        # of the deduction, so the four columns add up to Warehouse ATS.
+        'JTW ATS': lambda item: item.get('wh_ats_jtw', 0),
+        'TR ATS': lambda item: item.get('wh_ats_tr', 0),
+        'DCW ATS': lambda item: item.get('wh_ats_dcw', 0),
+        'QA ATS': lambda item: item.get('wh_ats_qa', 0),
+        'Warehouse ATS': lambda item: item.get('wh_ats_total', 0),
         # Ship-plan line-sheet columns (Confirm Pre-PO exports)
         'Units to Ship': lambda item: item.get('units_ship', 0),
         'Shortfall': lambda item: item.get('shortfall', 0),
@@ -2731,6 +2750,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     NUMERIC_HEADERS = {
         'Qty Selected', 'JTW', 'TR', 'DCW', 'QA', 'NJ', 'ABFI', 'Incoming',
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
+        'JTW ATS', 'TR ATS', 'DCW ATS', 'QA ATS', 'Warehouse ATS',
         'Committed', 'Allocated', 'Units to Ship', 'Shortfall',
         'Units'
     }
@@ -3304,7 +3324,7 @@ def _safe_multi_sheet_name(raw, seen, idx, fallback_prefix='Brand'):
     return name
 
 
-def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None, tjx_layout=False):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None, tjx_layout=False, wh_breakdown=False):
     # Per-tab overrides (line-sheet cart): an entry may carry its own tab_name,
     # view_mode, flow_mode and keep_order. Anything missing falls back to the
     # workbook-global arguments, so pre-existing callers behave byte-identically.
@@ -3363,7 +3383,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         ws.write = _safe_ws_write
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                          catalog_mode=catalog_mode, view_mode=_tab_view(brand),
-                                         flow_mode=_tab_flow(brand), tjx_layout=tjx_layout)
+                                         flow_mode=_tab_flow(brand), tjx_layout=tjx_layout,
+                                         wh_breakdown=wh_breakdown)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -3396,7 +3417,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             ws = wb.add_worksheet(safe)
             fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                              catalog_mode=catalog_mode, view_mode=_tab_view(brand),
-                                             flow_mode=_tab_flow(brand), tjx_layout=tjx_layout)
+                                             flow_mode=_tab_flow(brand), tjx_layout=tjx_layout,
+                                             wh_breakdown=wh_breakdown)
             start, count = offsets[bi]
             local_imgs = {}
             for li in range(count):
@@ -16471,10 +16493,16 @@ def _ai_tool_build_sales_sheet(params):
 
 
 def _ai_tool_build_line_sheet(params):
+    # warehouse_breakdown is set by the mailbox (email_agent.py), never by the
+    # MCP connector or the platform chat, so their sheets are byte-identical to
+    # what they produced before this option existed (David, Sep 18 2026).
     tabs_in = params.get('tabs') or []
     if not isinstance(tabs_in, list) or not tabs_in:
         return {'error': 'tabs required: a list of filter objects, one per tab'}
     customer_view = bool(params.get('customer_view'))
+    # Per-warehouse availability columns. Customer view only: an admin sheet
+    # already prints every warehouse gross, which is a different question.
+    wh_breakdown = bool(params.get('warehouse_breakdown')) and customer_view
     # Customer view: NJ/AE/AW-landing productions are admin-only — their units
     # come out of incoming / Total ATS below (Sep 4 2026).
     _hl_hidden, _hl_visible = _hidden_landing_maps() if customer_view else ({}, {})
@@ -16620,12 +16648,35 @@ def _ai_tool_build_line_sheet(params):
         summary.append(entry)
     if not tabs_out:
         return {'error': 'no styles matched any tab filters', 'tabs': summary}
+    if wh_breakdown:
+        try:
+            _split = _wh_split_by_base([it['sku'] for t in tabs_out for it in t['items']])
+        except Exception as e:
+            # A sheet that silently loses its quantities is worse than no sheet.
+            import traceback
+            traceback.print_exc()
+            return {'error': f'could not work out per-warehouse availability: {e}'}
+        _inferred = []
+        for t in tabs_out:
+            for it in t['items']:
+                rec = _split.get(it['sku'])
+                for col, key in (('jtw', 'wh_ats_jtw'), ('tr', 'wh_ats_tr'),
+                                 ('dcw', 'wh_ats_dcw'), ('qa', 'wh_ats_qa')):
+                    it[key] = int((rec or {}).get(col, 0) or 0)
+                it['wh_ats_total'] = int((rec or {}).get('total', 0) or 0)
+                if rec and not rec.get('exact', True):
+                    _inferred.append(it['sku'])
+        summary.append({'warehouse_breakdown': True,
+                        'columns': 'JTW ATS / TR ATS / DCW ATS / QA ATS add up to Warehouse ATS',
+                        'styles_split_exactly': sum(1 for t in tabs_out for it in t['items']) - len(_inferred),
+                        'styles_where_the_warehouse_was_inferred': sorted(set(_inferred))})
     try:
         pd_snap = _fresh_prepack_defaults()
     except Exception:
         pd_snap = None
     xl = build_multi_brand_excel(tabs_out, S3_PHOTOS_URL, catalog_mode=customer_view,
-                                 view_mode='all', flow_mode=False, prepack_defaults=pd_snap)
+                                 view_mode='all', flow_mode=False, prepack_defaults=pd_snap,
+                                 wh_breakdown=wh_breakdown)
     fname = re.sub(r'[^A-Za-z0-9 _.-]+', '', str(params.get('filename') or 'AI Line Sheet')).strip() or 'AI Line Sheet'
     key = f"claude uploaded/{fname} {datetime.now().strftime('%Y-%m-%d %H%M%S')}.xlsx"
     get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=xl,
@@ -16871,6 +16922,273 @@ def _pres_route_sku(q, lots, orders, apos, vws, today):
     return {'wh': sum(sl['used'] for sl in slots if sl['type'] == 'warehouse'),
             'os': sum(sl['used'] for sl in slots if sl['type'] == 'production'),
             'os_visible': sum(sl['used'] for sl in slots if sl['type'] == 'production' and not sl['nj'])}
+
+
+# ── Per-warehouse availability, for the EMAILED line sheet ONLY ──────────────
+# David, Sep 18 2026. A customer sheet that says "JTW, TR" next to one number
+# hides which warehouse the goods are in, and a commitment makes it unknowable:
+# AMNASU249SLS reads "JTW, TR - 36" when the truth is 36 at JTW and nothing at
+# TR. These columns say where the sellable units actually are.
+#
+# SCOPE: this runs only for a line sheet built from the mailbox. The MCP
+# connector, the platform chat, catalog pages and every existing export keep
+# their numbers byte for byte, so nothing a customer already holds changes
+# meaning. That is why this is a separate computation and not a change to
+# _ai_agent_agg_inventory, which those surfaces share.
+#
+# TWO THINGS MAKE IT TRACTABLE
+#  1. Work per FEED ROW, never per base style. A row is one exact SKU and its
+#     warehouse is already known, so on live data 2,168 of 2,197 rows holding
+#     stock need no inference at all; only 29 rows sit in two warehouses at
+#     once. Aggregating to the base style first and then guessing backwards is
+#     what made this look like a hard problem. It also avoids the base-level
+#     max()-magnitude merge, which understates the deduction on styles whose
+#     allocation is genuinely per size (the Amazon families: AMNASU201SLS holds
+#     4,932 units at TR, every one of them allocated, and the merge keeps only
+#     1,800 of the deduction).
+#  2. The amount being split is the WAREHOUSE SHARE of the deduction, taken
+#     from smart routing, never the raw committed+allocated. Up to 100% of a
+#     deduction can be charged to production instead: ROJNAW051SLS carries
+#     18,612 of commitment against 241,226 incoming units, and routing puts all
+#     of it overseas, so both its warehouses stay whole.
+#
+# Where a single row IS split across warehouses, David's rule decides which
+# warehouse pays: a hard PO deducts from the warehouse its OTHER styles ship
+# from, an APO from where that customer's other styles sit, and otherwise the
+# largest pile goes first. Only styles that sit in exactly one warehouse are
+# allowed to anchor a PO, because a style whose own location is unknown cannot
+# tell us anything. The deduction is always taken in full while stock lasts; it
+# never evaporates because the warehouse a PO pointed at happens to be empty.
+
+_WH_KEYS = ('jtw', 'tr', 'dcw', 'qa')
+
+
+def _wh_take(stock, applied, preferred):
+    """Remove `applied` units from `stock` (a per-warehouse dict).
+
+    The preferred warehouse pays first, then the largest remaining pile, and the
+    take spills onward until the deduction is satisfied or the stock runs out.
+    Returns (what is left per warehouse, units that could not be taken)."""
+    left = dict(stock)
+    ranked = [k for k in sorted(left, key=lambda w: (-left[w], w)) if left[k] > 0]
+    if preferred and left.get(preferred, 0) > 0:
+        ranked = [preferred] + [k for k in ranked if k != preferred]
+    remaining = max(0, int(applied))
+    for k in ranked:
+        if remaining <= 0:
+            break
+        take = min(remaining, left[k])
+        left[k] -= take
+        remaining -= take
+    return left, remaining
+
+
+def _wh_anchor(sku, stock, ctx):
+    """The warehouse David's rule says should absorb this row's deduction.
+
+    Pass one of the two-pass idea: only co-styles that sit in exactly ONE
+    warehouse vote, because a co-style that is itself split knows no more than
+    we do. Returns (warehouse key or None, a short reason for the log)."""
+    for index, by_key, label in (
+            (ctx['styles_by_po'], ctx['orders_by_sku'].get(sku, []), 'PO'),
+            (ctx['styles_by_apo_cust'], ctx['apo_by_sku'].get(sku, []), 'APO')):
+        votes = {}
+        for row in by_key:
+            key = str((row.get('orderNo') if label == 'PO' else row.get('customer')) or '').strip().upper()
+            if not key:
+                continue
+            for co in index.get(key, ()):  # co-styles on the same PO / same APO customer
+                if co == sku:
+                    continue
+                home = ctx['single_wh'].get(co)
+                if home:
+                    votes[home] = votes.get(home, 0) + ctx['sku_units'].get(co, 0)
+        if votes:
+            best = max(sorted(votes), key=lambda w: votes[w])
+            if stock.get(best, 0) > 0:
+                return best, f'{label} co-styles sit in {best.upper()}'
+    return None, ''
+
+
+def _wh_supply_context():
+    """Everything the split reads, assembled the way _pres_stock_cards does.
+
+    Deliberately its own copy rather than a refactor of the presentation path:
+    this is an email-only feature and it must not be able to change what a deck
+    or a catalog prints."""
+    for loader in (load_deduction_assignments_from_s3, load_suppression_overrides_from_s3):
+        try:
+            loader()
+        except Exception:
+            pass
+    try:
+        virtual_rows = load_allocation_from_s3() or []
+    except Exception:
+        virtual_rows = []
+    with _manual_alloc_lock:
+        manual_rows = list(_manual_allocations)
+    virt, vw_by_sku = {}, {}
+    for a in list(virtual_rows) + manual_rows:
+        sk = str((a or {}).get('sku') or '').strip().upper()
+        if sk:
+            virt[sk] = virt.get(sk, 0) + _pres_int(a.get('qty'))
+    for a in virtual_rows:
+        sk = str((a or {}).get('sku') or '').strip().upper()
+        if sk:
+            vw_by_sku.setdefault(sk, []).append(a)
+    with _deduction_assign_lock:
+        assign = dict(_deduction_assignments or {})
+    with _suppression_overrides_lock:
+        no_suppress = {str(x).strip().upper() for x in (_suppression_overrides or [])}
+    lots_by_sku = {}
+    for pr in _ledger_rows():
+        st = str(pr.get('style') or '').strip().upper()
+        if st:
+            lots_by_sku.setdefault(st, []).append(pr)
+    orders, _ok = _fetch_all_open_orders()
+    orders_by_sku, styles_by_po = {}, {}
+    for o in orders or []:
+        st = str(o.get('style') or '').strip().upper()
+        po = str(o.get('orderNo') or '').strip().upper()
+        if st:
+            orders_by_sku.setdefault(st, []).append(o)
+            if po:
+                styles_by_po.setdefault(po, set()).add(st)
+    with _apo_lock:
+        apo_rows = list(_apo_data or [])
+    apo_by_sku, styles_by_apo_cust = {}, {}
+    for a in apo_rows:
+        st = str((a or {}).get('style') or '').strip().upper()
+        cu = str((a or {}).get('customer') or '').strip().upper()
+        if st:
+            apo_by_sku.setdefault(st, []).append(a)
+            if cu:
+                styles_by_apo_cust.setdefault(cu, set()).add(st)
+    # One record per EXACT sku: stock sums, committed/allocated keep the largest
+    # magnitude. That max() is right here and wrong at base level: it exists to
+    # fold a duplicate row of the SAME sku (BUGBSA002SLS), not to merge sizes.
+    with _inv_lock:
+        raw_items = list(_inventory.get('items') or [])
+    merged = {}
+    for it in raw_items:
+        sk = str(it.get('sku') or '').strip().upper()
+        if not sk:
+            continue
+        m = merged.get(sk)
+        if m is None:
+            m = {k: 0 for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming',
+                                'committed', 'allocated')}
+            merged[sk] = m
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming'):
+            m[k] += _pres_int(it.get(k))
+        for k in ('committed', 'allocated'):
+            v = _pres_int(it.get(k))
+            if abs(v) > abs(m[k]):
+                m[k] = v
+    # Anchors for the PO rule, and the size of each anchor's vote.
+    single_wh, sku_units = {}, {}
+    for sk, m in merged.items():
+        present = [k for k in _WH_KEYS if m[k] > 0]
+        sku_units[sk] = sum(m[k] for k in _WH_KEYS)
+        if len(present) == 1:
+            single_wh[sk] = present[0]
+    return {'merged': merged, 'virt': virt, 'vw_by_sku': vw_by_sku, 'assign': assign,
+            'no_suppress': no_suppress, 'lots_by_sku': lots_by_sku,
+            'orders_by_sku': orders_by_sku, 'styles_by_po': styles_by_po,
+            'apo_by_sku': apo_by_sku, 'styles_by_apo_cust': styles_by_apo_cust,
+            'single_wh': single_wh, 'sku_units': sku_units}
+
+
+def _wh_applied_for_sku(sku, q, ctx, now, today):
+    """How much of this row's deduction comes out of WAREHOUSE stock.
+
+    The ladder is _pres_stock_cards' own (app.py, the source == 'warehouse'
+    branch): an explicit deduction assignment wins, then smart routing, then the
+    clamp against warehouse stock when there is production to absorb the rest,
+    and finally the whole deduction when there is nothing overseas to put it on."""
+    wh_all = sum(q[k] for k in _WH_KEYS) + q['nj'] + q['abfi']
+    deductions = abs(q['committed']) + abs(q['allocated'])
+    if deductions <= 0:
+        return 0, 'no deduction'
+    a = ctx['assign'].get(sku)
+    if a == 'overseas':
+        return 0, 'assigned to overseas'
+    if a == 'warehouse':
+        return deductions, 'assigned to warehouse'
+    inc = q['incoming']
+    lots = []
+    pants = False
+    try:
+        pants = bool(_py_is_bottom(sku.split('-')[0]))
+    except Exception:
+        pass
+    for pr in ctx['lots_by_sku'].get(sku, []):
+        units = _pres_int(pr.get('units'))
+        try:
+            arr = _apo_prod_arrival(pr, pants)
+        except Exception:
+            arr = None
+        landing = str(pr.get('warehouse') or '').strip().upper()
+        hidden = landing in _HIDDEN_LANDING_WH
+        sup = False
+        if sku not in ctx['no_suppress'] and arr and units > 0:
+            gap = abs((now - datetime(arr.year, arr.month, arr.day)).total_seconds())
+            if gap <= _PRES_SUPPRESS_SECONDS:
+                twin = (q['nj'] if landing == 'NJ' else q['abfi']) if hidden else max(0, wh_all - q['nj'] - q['abfi'])
+                sup = abs(twin - units) / units <= _PRES_SUPPRESS_TOL
+        lots.append({'units': units, 'arr': arr, 'etd': _apo_parse_date(pr.get('etd')),
+                     'fob_flag': bool(pr.get('fob_flag')), 'hidden': hidden, 'sup': sup})
+    if inc > 0:
+        smart = _pres_route_sku(q, lots, ctx['orders_by_sku'].get(sku, []),
+                                ctx['apo_by_sku'].get(sku, []), ctx['vw_by_sku'].get(sku, []), today)
+        if smart:
+            return smart['wh'], 'smart routing'
+        return min(deductions, wh_all), 'clamped against warehouse stock'
+    return deductions, 'no production to absorb it'
+
+
+def _wh_split_by_base(bases, customer_view=True):
+    """Per-warehouse AVAILABLE units for each base style.
+
+    Returns {base: {'jtw':n,'tr':n,'dcw':n,'qa':n,'total':n,'exact':bool,'rules':[...]}}.
+    'total' is what the four columns add up to, and the columns can never exceed
+    the stock actually standing in that warehouse."""
+    wanted = {str(b or '').strip().upper() for b in (bases or [])}
+    if not wanted:
+        return {}
+    ctx = _wh_supply_context()
+    now = _pres_now_et()
+    today = now.date()
+    out = {}
+    for sku, m in ctx['merged'].items():
+        base = sku.split('-')[0]
+        if base not in wanted:
+            continue
+        stock = {k: max(0, m[k]) for k in _WH_KEYS}
+        if sum(stock.values()) <= 0:
+            continue
+        rec = out.setdefault(base, {k: 0 for k in _WH_KEYS} |
+                             {'total': 0, 'exact': True, 'rules': [], 'unmet': 0})
+        q = dict(m)
+        q['committed'] = m['committed'] - ctx['virt'].get(sku, 0)   # manual + virtual join committed
+        applied, why = _wh_applied_for_sku(sku, q, ctx, now, today)
+        # Only the visible warehouses are on a customer sheet, and only their
+        # stock can pay. Anything left over is genuinely oversold, not hidden.
+        applied = max(0, min(int(applied), sum(stock.values())))
+        present = [k for k in _WH_KEYS if stock[k] > 0]
+        preferred, reason = (None, '')
+        if applied > 0 and len(present) > 1:
+            preferred, reason = _wh_anchor(sku, stock, ctx)
+            rec['exact'] = False
+            rec['rules'].append(reason or 'largest pile first')
+        left, unmet = _wh_take(stock, applied, preferred)
+        for k in _WH_KEYS:
+            rec[k] += left[k]
+        rec['unmet'] += unmet
+    for base, rec in out.items():
+        rec['total'] = sum(rec[k] for k in _WH_KEYS)
+        rec['rules'] = sorted(set(r for r in rec['rules'] if r))
+    return out
 
 
 def _pres_brand_name(key):
@@ -18035,7 +18353,8 @@ _AI_AGENT_DEFAULT_SYSTEM = (
 # the MCP connector give. Raises on an API failure; the caller decides the HTTP
 # shape. artifacts collects the download_url of every file a tool built, in the
 # order they were built, so the email agent can attach them to its reply.
-def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_ok, label='AI-Agent'):
+def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_ok, label='AI-Agent',
+                  tool_fns=None):
     started = time.time()
     iterations = 0
     tools_used = []
@@ -18043,6 +18362,10 @@ def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_o
     usage_tot = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     force_final = False
     final_text = ''
+    # A surface may hand in its own implementations (the mailbox does, to get
+    # per-warehouse columns on an emailed line sheet). Everyone else gets the
+    # shared table and behaves exactly as before.
+    fns = tool_fns or _AI_AGENT_TOOL_FNS
     while True:
         iterations += 1
         kwargs = {}
@@ -18069,7 +18392,7 @@ def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_o
         results = []
         for tu in tool_uses:
             tools_used.append(tu.name)
-            fn = _AI_AGENT_TOOL_FNS.get(tu.name)
+            fn = fns.get(tu.name)
             try:
                 if fn is None:
                     raise ValueError(f'unknown tool {tu.name}')
@@ -18265,6 +18588,7 @@ try:
                           tools=_AI_AGENT_TOOLS,
                           admin_tools=_AI_AGENT_ADMIN_TOOLS,
                           guidance_core=_AI_AGENT_TOOL_GUIDANCE_CORE,
+                          tool_fns=_AI_AGENT_TOOL_FNS,
                           model=lambda: AI_AGENT_MODEL,
                           machine_key=INVENTORY_API_KEY,
                           caller_identity=_caller_identity)

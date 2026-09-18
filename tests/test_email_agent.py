@@ -450,8 +450,10 @@ class EndToEndTests(unittest.TestCase):
         EA._HOOKS['guidance_core'] = '<<CORE>>'
         seen = {}
 
-        def run(client, convo, system, tools, model, max_tokens, admin_ok, label=''):
-            seen.update(convo=convo, system=system, tools=tools, admin_ok=admin_ok)
+        def run(client, convo, system, tools, model, max_tokens, admin_ok, label='',
+                tool_fns=None):
+            seen.update(convo=convo, system=system, tools=tools, admin_ok=admin_ok,
+                        tool_fns=tool_fns)
             return {'final_text': answer, 'tools_used': ['build_presentation'],
                     'artifacts': artifacts or [], 'usage': {}, 'elapsed_seconds': 1.0,
                     'iterations': 1}
@@ -828,8 +830,8 @@ class AuthenticationEnforcementTests(unittest.TestCase):
         EA._HOOKS['admin_tools'] = {'past_orders_lookup'}
         self.ran = []
         EA._HOOKS['agent_run'] = lambda *a, **k: (
-            self.ran.append(1) or {'final_text': '<p>ok</p>', 'tools_used': [],
-                                   'artifacts': [], 'usage': {}, 'elapsed_seconds': 1})
+            self.ran.append(k.get('tool_fns')) or {'final_text': '<p>ok</p>', 'tools_used': [],
+                                                   'artifacts': [], 'usage': {}, 'elapsed_seconds': 1})
 
     def event(self, headers):
         return {'type': 'email.received',
@@ -847,14 +849,14 @@ class AuthenticationEnforcementTests(unittest.TestCase):
     def test_a_verified_sender_is_answered(self):
         EA._handle(self.event({'Authentication-Results': 'spf=pass smtp.mailfrom=example.test; '
                                                          'dkim=pass header.i=@example.test'}))
-        self.assertEqual([1], self.ran)
+        self.assertEqual(1, len(self.ran))
         self.assertIn('ok', self.sent[0]['html'])
 
     def test_the_check_can_be_turned_off_deliberately(self):
         use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
                                  'require_authentication': False}))
         EA._handle(self.event({}))
-        self.assertEqual([1], self.ran)
+        self.assertEqual(1, len(self.ran))
 
 
 class StorageProtectionTests(unittest.TestCase):
@@ -946,6 +948,163 @@ class StorageProtectionTests(unittest.TestCase):
         EA._claim('em_private')
         self.assertTrue(any(k.startswith(EA._private_prefix()) for k in s3.objects))
         self.assertNotIn('email-agent/seen/em_private.json', s3.objects)
+
+
+# ── Per-warehouse columns are the mailbox's, and only the mailbox's ──────────
+class WarehouseBreakdownScopeTests(unittest.TestCase):
+    """David, Sep 18 2026: emailed line sheets break out by warehouse; the MCP
+    connector and the platform chat must produce the same file they did before."""
+
+    def test_the_mailbox_forces_the_option_on(self):
+        seen = {}
+        EA._HOOKS['tool_fns'] = {'build_line_sheet': lambda p: seen.update(p) or {'ok': 1}}
+        self.addCleanup(EA._HOOKS.pop, 'tool_fns', None)
+        EA._email_tool_fns()['build_line_sheet']({'tabs': [{'brand': 'NAUTICA'}]})
+        self.assertTrue(seen.get('warehouse_breakdown'))
+        self.assertEqual([{'brand': 'NAUTICA'}], seen.get('tabs'), 'the rest of the call is untouched')
+
+    def test_it_does_not_mutate_the_callers_params(self):
+        EA._HOOKS['tool_fns'] = {'build_line_sheet': lambda p: {'ok': 1}}
+        self.addCleanup(EA._HOOKS.pop, 'tool_fns', None)
+        original = {'tabs': []}
+        EA._email_tool_fns()['build_line_sheet'](original)
+        self.assertNotIn('warehouse_breakdown', original)
+
+    def test_every_other_tool_is_passed_through_untouched(self):
+        marker = object()
+        EA._HOOKS['tool_fns'] = {'build_line_sheet': lambda p: None, 'query_inventory': marker}
+        self.addCleanup(EA._HOOKS.pop, 'tool_fns', None)
+        self.assertIs(marker, EA._email_tool_fns()['query_inventory'])
+
+    def test_a_missing_line_sheet_tool_is_not_an_error(self):
+        EA._HOOKS['tool_fns'] = {'query_inventory': lambda p: None}
+        self.addCleanup(EA._HOOKS.pop, 'tool_fns', None)
+        self.assertNotIn('build_line_sheet', EA._email_tool_fns())
+
+
+class WarehouseSplitTests(unittest.TestCase):
+    """The arithmetic of the split itself, from app.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _support import load_app
+        cls.app = load_app()
+
+    def test_the_preferred_warehouse_pays_first(self):
+        left, unmet = self.app._wh_take({'jtw': 200, 'tr': 2000}, 1000, 'jtw')
+        self.assertEqual({'jtw': 0, 'tr': 1200}, left)
+        self.assertEqual(0, unmet, 'the deduction is taken in full')
+
+    def test_it_spills_when_the_preferred_warehouse_runs_out(self):
+        left, unmet = self.app._wh_take({'jtw': 200, 'tr': 2000}, 1500, 'jtw')
+        self.assertEqual(0, left['jtw'])
+        self.assertEqual(700, left['tr'])
+        self.assertEqual(0, unmet)
+
+    def test_an_empty_preferred_warehouse_does_not_swallow_the_deduction(self):
+        """David: if the warehouse has none, still deduct it."""
+        left, unmet = self.app._wh_take({'jtw': 0, 'tr': 2000}, 500, 'jtw')
+        self.assertEqual({'jtw': 0, 'tr': 1500}, left)
+        self.assertEqual(0, unmet)
+
+    def test_largest_pile_first_with_no_signal(self):
+        left, _ = self.app._wh_take({'jtw': 200, 'tr': 2000, 'dcw': 50}, 1000, None)
+        self.assertEqual({'jtw': 200, 'tr': 1000, 'dcw': 50}, left)
+
+    def test_a_deduction_bigger_than_every_warehouse_empties_them_and_reports_it(self):
+        left, unmet = self.app._wh_take({'jtw': 200, 'tr': 300}, 900, None)
+        self.assertEqual({'jtw': 0, 'tr': 0}, left)
+        self.assertEqual(400, unmet, 'the shortfall is reported, never negative columns')
+
+    def test_no_column_can_go_negative(self):
+        for applied in (0, 1, 99, 100, 101, 10 ** 6):
+            left, _ = self.app._wh_take({'jtw': 100, 'tr': 0, 'dcw': 1}, applied, 'tr')
+            self.assertTrue(all(v >= 0 for v in left.values()), f'negative at {applied}')
+
+    def test_the_take_is_exact(self):
+        stock = {'jtw': 47412, 'tr': 13536}
+        for applied in (0, 1, 13536, 13537, 47412, 60948):
+            left, unmet = self.app._wh_take(stock, applied, 'tr')
+            self.assertEqual(sum(stock.values()) - applied + unmet, sum(left.values()),
+                             'every unit is accounted for')
+
+    def test_only_single_warehouse_co_styles_anchor_a_po(self):
+        ctx = {'orders_by_sku': {'A': [{'orderNo': 'PO1'}]},
+               'styles_by_po': {'PO1': {'A', 'B', 'C'}},
+               'apo_by_sku': {}, 'styles_by_apo_cust': {},
+               'single_wh': {'B': 'tr'},          # C is split, so it gets no vote
+               'sku_units': {'B': 900, 'C': 5000}}
+        wh, why = self.app._wh_anchor('A', {'jtw': 100, 'tr': 100}, ctx)
+        self.assertEqual('tr', wh)
+        self.assertIn('PO', why)
+
+    def test_an_anchor_with_no_stock_here_is_not_used(self):
+        ctx = {'orders_by_sku': {'A': [{'orderNo': 'PO1'}]},
+               'styles_by_po': {'PO1': {'A', 'B'}}, 'apo_by_sku': {},
+               'styles_by_apo_cust': {}, 'single_wh': {'B': 'dcw'}, 'sku_units': {'B': 900}}
+        wh, _ = self.app._wh_anchor('A', {'jtw': 100, 'tr': 100}, ctx)
+        self.assertIsNone(wh, 'falls through to largest-pile-first')
+
+    def test_the_apo_customer_anchors_when_there_is_no_po(self):
+        ctx = {'orders_by_sku': {}, 'styles_by_po': {},
+               'apo_by_sku': {'A': [{'customer': 'ROSS'}]},
+               'styles_by_apo_cust': {'ROSS': {'A', 'B'}},
+               'single_wh': {'B': 'jtw'}, 'sku_units': {'B': 400}}
+        wh, why = self.app._wh_anchor('A', {'jtw': 100, 'tr': 100}, ctx)
+        self.assertEqual('jtw', wh)
+        self.assertIn('APO', why)
+
+    def test_the_po_beats_the_apo(self):
+        ctx = {'orders_by_sku': {'A': [{'orderNo': 'PO1'}]},
+               'styles_by_po': {'PO1': {'A', 'B'}},
+               'apo_by_sku': {'A': [{'customer': 'ROSS'}]},
+               'styles_by_apo_cust': {'ROSS': {'A', 'C'}},
+               'single_wh': {'B': 'tr', 'C': 'jtw'}, 'sku_units': {'B': 10, 'C': 9999}}
+        wh, _ = self.app._wh_anchor('A', {'jtw': 100, 'tr': 100}, ctx)
+        self.assertEqual('tr', wh, 'a hard PO is better evidence than an APO')
+
+
+class LineSheetSurfaceTests(unittest.TestCase):
+    """The option must be invisible unless a caller asks for it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _support import load_app
+        cls.src = io.open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
+        cls.app = load_app()
+
+    def test_the_shared_tool_schema_never_advertises_it(self):
+        """If MCP could see the parameter, an MCP sheet could change shape."""
+        tool = next(t for t in self.app._AI_AGENT_TOOLS if t['name'] == 'build_line_sheet')
+        self.assertNotIn('warehouse_breakdown', tool['input_schema']['properties'])
+        self.assertNotIn('warehouse_breakdown', json.dumps(tool))
+
+    def test_the_columns_are_off_by_default(self):
+        i = self.src.index('def _setup_worksheet')
+        block = self.src[i:i + 12000]
+        self.assertIn('wh_breakdown=False', block, 'default off')
+        self.assertIn("headers.extend(['Warehouse', 'Total ATS'])", block,
+                      'the old two columns still exist for every other caller')
+
+    def test_admin_sheets_never_get_the_breakdown(self):
+        i = self.src.index('wh_breakdown = bool(params.get(')
+        self.assertIn('and customer_view', self.src[i:i + 160])
+
+    def test_the_new_columns_are_formatted_as_numbers(self):
+        i = self.src.index('NUMERIC_HEADERS = {')
+        block = self.src[i:i + 400]
+        for col in ('JTW ATS', 'TR ATS', 'DCW ATS', 'QA ATS', 'Warehouse ATS'):
+            self.assertIn(col, block)
+
+    def test_the_split_only_distributes_the_warehouse_share(self):
+        """Up to 100% of a deduction can be charged to production; splitting the
+        raw committed+allocated would delete warehouse stock that is really there."""
+        body = self.src[self.src.index('def _wh_applied_for_sku'):]
+        body = body[:body.index('\ndef ')]
+        self.assertIn("smart['wh']", body)
+        self.assertIn("assigned to overseas", body)
 
 
 if __name__ == '__main__':
