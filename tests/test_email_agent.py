@@ -30,6 +30,8 @@ if ROOT not in sys.path:
 
 import email_agent as EA  # noqa: E402
 
+EA._HOOKS['machine_key'] = 'z-fake-machine-key-for-tests'
+
 
 # ── Stubs ────────────────────────────────────────────────────────────────────
 class FakeS3:
@@ -38,6 +40,7 @@ class FakeS3:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.puts = []
+        self.deletes = []
 
     def get_object(self, Bucket=None, Key=None):
         if Key not in self.objects:
@@ -54,6 +57,11 @@ class FakeS3:
         self.puts.append(Key)
         return {}
 
+    def delete_object(self, Bucket=None, Key=None):
+        self.objects.pop(Key, None)
+        self.deletes.append(Key)
+        return {}
+
 
 class FakeResponse:
     def __init__(self, status_code=200, content=b'', payload=None):
@@ -68,6 +76,7 @@ class FakeResponse:
 
 def use_s3(test, objects=None):
     """Point the module at a fake bucket and clear every cache it keeps."""
+    EA._HOOKS['machine_key'] = 'z-fake-machine-key-for-tests'
     s3 = FakeS3(objects)
     EA._HOOKS['get_s3'] = lambda: s3
     EA._HOOKS['s3_bucket'] = 'z-fake-bucket'
@@ -81,7 +90,15 @@ def use_s3(test, objects=None):
 
 
 def cfg_object(payload):
-    return {EA.EMAIL_AGENT_CONFIG_KEY: json.dumps(payload).encode()}
+    """The stored allow-list, written the way the module writes it."""
+    return {EA._config_key(): EA._seal(payload)}
+
+
+# SES writes this on every message it receives; it is what proves a From address
+# was not simply typed by whoever sent the mail.
+PASS_HEADERS = {'Authentication-Results': ('mx.amazonses.com; spf=pass '
+                                           'smtp.mailfrom=example.test; dkim=pass '
+                                           'header.i=@example.test; dmarc=pass')}
 
 
 # ── The webhook signature is the only credential on an open route ────────────
@@ -255,7 +272,7 @@ class GuardTests(unittest.TestCase):
         s3 = use_s3(self, {})
         self.assertTrue(EA._claim('em_1'))
         self.assertFalse(EA._claim('em_1'))
-        self.assertIn('email-agent/seen/em_1.json', s3.objects)
+        self.assertIn(f'{EA._private_prefix()}/seen/em_1.json', s3.objects)
 
     def test_claim_survives_a_restart(self):
         s3 = use_s3(self, {})
@@ -414,9 +431,13 @@ class EndToEndTests(unittest.TestCase):
 
     @staticmethod
     def event(sender='boss@example.test', subject='Nautica deck please', email_id='em_e2e'):
+        domain = sender.rsplit('@', 1)[-1]
         return {'type': 'email.received',
                 'data': {'email_id': email_id, 'from': f'Boss <{sender}>', 'to': ['ats@z-fake.test'],
-                         'subject': subject, 'text': 'Can I get a presentation of Nautica B&T in stock'}}
+                         'subject': subject, 'text': 'Can I get a presentation of Nautica B&T in stock',
+                         'headers': {'Authentication-Results': (
+                             f'mx.amazonses.com; spf=pass smtp.mailfrom={domain}; '
+                             f'dkim=pass header.i=@{domain}; dmarc=pass')}}}
 
     def stub_agent(self, answer='<p>Here it is.</p>', artifacts=None):
         self.addCleanup(EA._HOOKS.update, dict(EA._HOOKS))
@@ -545,7 +566,8 @@ class EndToEndTests(unittest.TestCase):
             latest = EA._runs[0]
         self.assertEqual('answered', latest['status'])
         self.assertEqual('boss@example.test', latest['from'])
-        self.assertTrue(any('email-agent/log/' in k for k in self.s3.puts))
+        self.assertTrue(any(k.startswith(EA._private_prefix()) and '/log/' in k
+                                for k in self.s3.puts))
 
     def test_status_and_config_need_a_credential(self):
         self.assertEqual(401, self.client.get('/inbound-email/status').status_code)
@@ -691,6 +713,157 @@ class ChatRouteRegressionTests(unittest.TestCase):
         self.assertEqual([{'tool': 'build_presentation', 'url': 'https://z-fake.test/Deck.pdf',
                            'format': 'PDF presentation (photo cards)'}], run['artifacts'])
         self.assertEqual('done', run['final_text'])
+
+
+# ── The From header is a claim, not proof ────────────────────────────────────
+class SenderAuthenticityTests(unittest.TestCase):
+    """An allow-list keyed on a From address is worthless if anyone can type
+    that address. These are the checks that make the allow-list mean something."""
+
+    def ar(self, results):
+        return {'Authentication-Results': results}
+
+    def test_dmarc_pass_is_enough(self):
+        ok, why = EA._sender_is_authentic(
+            'boss@example.test', self.ar('mx.amazonses.com; dmarc=pass'))
+        self.assertTrue(ok, why)
+
+    def test_aligned_dkim_is_enough(self):
+        ok, why = EA._sender_is_authentic(
+            'boss@example.test', self.ar('mx.amazonses.com; dkim=pass header.i=@example.test'))
+        self.assertTrue(ok, why)
+
+    def test_aligned_spf_is_enough(self):
+        ok, why = EA._sender_is_authentic(
+            'boss@example.test',
+            self.ar('mx.amazonses.com; spf=pass smtp.mailfrom=bounce@example.test'))
+        self.assertTrue(ok, why)
+
+    def test_a_subdomain_still_aligns(self):
+        ok, why = EA._sender_is_authentic(
+            'boss@mail.example.test', self.ar('dkim=pass header.d=example.test'))
+        self.assertTrue(ok, why)
+
+    def test_someone_elses_dkim_does_not_vouch_for_this_sender(self):
+        """The forgery that matters: valid DKIM for the attacker's own domain,
+        From: rewritten to a trusted address."""
+        ok, why = EA._sender_is_authentic(
+            'boss@example.test', self.ar('dkim=pass header.i=@z-attacker.test; spf=pass '
+                                         'smtp.mailfrom=z-attacker.test'))
+        self.assertFalse(ok)
+        self.assertIn('nothing authenticates', why)
+
+    def test_a_failed_check_is_not_a_pass(self):
+        self.assertFalse(EA._sender_is_authentic(
+            'boss@example.test', self.ar('dkim=fail header.i=@example.test; spf=softfail'))[0])
+
+    def test_no_header_at_all_is_refused(self):
+        ok, why = EA._sender_is_authentic('boss@example.test', {})
+        self.assertFalse(ok)
+        self.assertIn('no Authentication-Results', why)
+
+    def test_a_lookalike_domain_does_not_align(self):
+        self.assertFalse(EA._sender_is_authentic(
+            'boss@example.test', self.ar('dkim=pass header.i=@notexample.test'))[0])
+
+
+class AuthenticationEnforcementTests(unittest.TestCase):
+    """The gate, exercised through the worker."""
+
+    def setUp(self):
+        self.s3 = use_s3(self, cfg_object({
+            'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+            'notify': ['boss@example.test'],
+        }))
+        for name, value in (('RESEND_API_KEY', 'z-fake'), ('EMAIL_AGENT_FROM', 'x@z-fake.test')):
+            self.addCleanup(setattr, EA, name, getattr(EA, name))
+            setattr(EA, name, value)
+        self.sent = []
+        self.addCleanup(setattr, EA.requests, 'post', EA.requests.post)
+        EA.requests.post = lambda url, headers=None, json=None, timeout=None: (
+            self.sent.append(json) or FakeResponse(200, b'{}', {'id': 'x'}))
+        self.addCleanup(EA._HOOKS.update, dict(EA._HOOKS))
+        EA._HOOKS['agent_client'] = lambda: object()
+        EA._HOOKS['model'] = lambda: 'z-fake-model'
+        EA._HOOKS['guidance_core'] = ''
+        EA._HOOKS['tools'] = [{'name': 'query_inventory'}]
+        EA._HOOKS['admin_tools'] = {'past_orders_lookup'}
+        self.ran = []
+        EA._HOOKS['agent_run'] = lambda *a, **k: (
+            self.ran.append(1) or {'final_text': '<p>ok</p>', 'tools_used': [],
+                                   'artifacts': [], 'usage': {}, 'elapsed_seconds': 1})
+
+    def event(self, headers):
+        return {'type': 'email.received',
+                'data': {'email_id': f'em_{len(self.ran)}_{id(headers)}',
+                         'from': 'Boss <boss@example.test>', 'subject': 'deck',
+                         'text': 'nautica deck', 'headers': headers}}
+
+    def test_a_spoofed_from_never_reaches_the_agent(self):
+        EA._handle(self.event({'Authentication-Results': 'dkim=pass header.i=@z-attacker.test'}))
+        self.assertEqual([], self.ran, 'the agent must not run for an unverified sender')
+        recipients = [a for m in self.sent for a in m['to']]
+        self.assertEqual(['boss@example.test'], recipients, 'only the heads-up, to David')
+        self.assertIn('could not be verified', self.sent[0]['html'])
+
+    def test_a_verified_sender_is_answered(self):
+        EA._handle(self.event({'Authentication-Results': 'spf=pass smtp.mailfrom=example.test; '
+                                                         'dkim=pass header.i=@example.test'}))
+        self.assertEqual([1], self.ran)
+        self.assertIn('ok', self.sent[0]['html'])
+
+    def test_the_check_can_be_turned_off_deliberately(self):
+        use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+                                 'require_authentication': False}))
+        EA._handle(self.event({}))
+        self.assertEqual([1], self.ran)
+
+
+class StorageProtectionTests(unittest.TestCase):
+    """The allow-list was readable at a guessable public URL. It must not be."""
+
+    def test_the_config_key_is_not_guessable(self):
+        use_s3(self, {})
+        key = EA._config_key()
+        self.assertNotEqual('email-agent/config.json', key)
+        self.assertTrue(key.startswith('email-agent/'))
+        self.assertNotIn('config.json', key.split('/')[1])
+
+    def test_the_key_depends_on_the_secret(self):
+        EA._HOOKS['machine_key'] = 'z-fake-key-one'
+        first = EA._config_key()
+        EA._HOOKS['machine_key'] = 'z-fake-key-two'
+        self.addCleanup(EA._HOOKS.update, {'machine_key': 'z-fake-machine-key-for-tests'})
+        self.assertNotEqual(first, EA._config_key())
+
+    def test_stored_bytes_do_not_contain_the_allow_list(self):
+        s3 = use_s3(self, {})
+        EA._save_config({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}]})
+        blob = s3.objects[EA._config_key()]
+        self.assertNotIn(b'boss@example.test', blob, 'the allow-list is readable at rest')
+        self.assertEqual([{'email': 'boss@example.test', 'tier': 'admin', 'name': ''}],
+                         EA._load_config(force=True)['senders'], 'and still round-trips')
+
+    def test_run_logs_are_sealed_too(self):
+        s3 = use_s3(self, {})
+        EA._record({'email_id': 'em_x', 'from': 'boss@example.test', 'subject': 'secret plans'})
+        key = next(k for k in s3.objects if '/log/' in k)
+        self.assertNotIn(b'boss@example.test', s3.objects[key])
+        self.assertNotIn(b'secret plans', s3.objects[key])
+
+    def test_the_old_public_copy_is_migrated_and_deleted(self):
+        s3 = use_s3(self, {EA._LEGACY_CONFIG_KEY: json.dumps(
+            {'senders': [{'email': 'boss@example.test', 'tier': 'admin'}]}).encode()})
+        cfg = EA._load_config(force=True)
+        self.assertEqual('boss@example.test', cfg['senders'][0]['email'], 'nothing lost')
+        self.assertNotIn(EA._LEGACY_CONFIG_KEY, s3.objects, 'the public copy is gone')
+        self.assertIn(EA._config_key(), s3.objects, 'and lives behind the private key')
+
+    def test_dedupe_markers_are_private_too(self):
+        s3 = use_s3(self, {})
+        EA._claim('em_private')
+        self.assertTrue(any(k.startswith(EA._private_prefix()) for k in s3.objects))
+        self.assertNotIn('email-agent/seen/em_private.json', s3.objects)
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@ until then a config row with tier 'customer' is refused at load and reported on
 """
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -56,7 +57,13 @@ EMAIL_AGENT_FROM = (os.environ.get('EMAIL_AGENT_FROM', '') or '').strip()
 # different (receive-only) domain, so without this a colleague who hits Reply
 # to refine a request writes to an address that answers nobody.
 EMAIL_AGENT_REPLY_TO = (os.environ.get('EMAIL_AGENT_REPLY_TO', '') or '').strip()
-EMAIL_AGENT_CONFIG_KEY = os.environ.get('EMAIL_AGENT_CONFIG_KEY', 'email-agent/config.json')
+# The bucket is publicly readable (listing is denied, but any key that can be
+# guessed can be read). The allow-list must not be a guessable key: knowing who
+# is allowed is half of impersonating them. So the config and the run logs live
+# under a prefix derived from the machine key, and the config is encrypted on
+# top of that. EMAIL_AGENT_CONFIG_KEY still overrides, for a migration or a test.
+_LEGACY_CONFIG_KEY = 'email-agent/config.json'
+_CONFIG_KEY_OVERRIDE = (os.environ.get('EMAIL_AGENT_CONFIG_KEY', '') or '').strip()
 
 _RESEND_API = 'https://api.resend.com'
 _SVIX_TOLERANCE = 5 * 60          # accept a webhook within 5 minutes of its timestamp
@@ -82,6 +89,63 @@ _runs = deque(maxlen=_RUN_LOG_MAX)
 _HOOKS = {}                       # filled by register_email_routes
 
 
+# ── Where this module's objects live, and how they are protected ─────────────
+def _secret():
+    """The machine key doubles as the secret for the private prefix and the
+    at-rest key. It is already required to administer this mailbox, so there is
+    no new credential to manage. With no machine key set there is nothing to
+    derive from, and the module says so rather than pretending to be private."""
+    return (_HOOKS.get('machine_key') or '').strip()
+
+
+def _private_prefix():
+    sec = _secret()
+    if not sec:
+        return 'email-agent'
+    digest = hashlib.sha256(f'versa-email-agent-prefix::{sec}'.encode()).hexdigest()[:32]
+    return f'email-agent/{digest}'
+
+
+def _config_key():
+    return _CONFIG_KEY_OVERRIDE or f'{_private_prefix()}/config.json'
+
+
+def _fernet():
+    """Fernet keyed off the machine key. Returns None when either the machine
+    key or the cryptography package is missing; the caller then stores plain
+    JSON under the private prefix and the status route reports it."""
+    sec = _secret()
+    if not sec:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+    except Exception:
+        return None
+    raw = hashlib.sha256(f'versa-email-agent-at-rest::{sec}'.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(raw))
+
+
+def _seal(obj):
+    body = json.dumps(obj, indent=2, default=str).encode('utf-8')
+    f = _fernet()
+    return f.encrypt(body) if f else body
+
+
+def _unseal(blob):
+    if not blob:
+        return {}
+    f = _fernet()
+    if f:
+        try:
+            return json.loads(f.decrypt(blob).decode('utf-8'))
+        except Exception:
+            pass          # written before encryption, or a rotated key
+    try:
+        return json.loads(blob.decode('utf-8'))
+    except Exception:
+        return {}
+
+
 # ── Config in S3 ─────────────────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
     'enabled': True,
@@ -90,6 +154,7 @@ _DEFAULT_CONFIG = {
     'notify': [],                 # who hears about a blocked or failed request
     'always_cc': [],
     'reply_to': '',
+    'require_authentication': True,
     'attach_max_mb': _DEFAULT_ATTACH_MB,
     'max_per_sender_per_hour': _DEFAULT_RATE_PER_HOUR,
     'subject_prefix': '',
@@ -102,15 +167,32 @@ def _load_config(force=False):
         if not force and _cfg_cache['data'] is not None and (now - _cfg_cache['at']) < _CFG_TTL:
             return _cfg_cache['data']
     cfg = dict(_DEFAULT_CONFIG)
-    try:
-        obj = _HOOKS['get_s3']().get_object(Bucket=_HOOKS['s3_bucket'], Key=EMAIL_AGENT_CONFIG_KEY)
-        stored = json.loads(obj['Body'].read().decode('utf-8')) or {}
-        if isinstance(stored, dict):
-            cfg.update(stored)
-    except Exception as e:
-        # No config object yet is the normal first-run state, not an error.
-        if 'NoSuchKey' not in str(e) and 'Not Found' not in str(e):
-            print(f'[EmailAgent] config read failed: {e}', flush=True)
+    stored, found_at = None, None
+    for key in (_config_key(), _LEGACY_CONFIG_KEY):
+        try:
+            obj = _HOOKS['get_s3']().get_object(Bucket=_HOOKS['s3_bucket'], Key=key)
+            candidate = _unseal(obj['Body'].read())
+            if isinstance(candidate, dict) and candidate:
+                stored, found_at = candidate, key
+                break
+        except Exception as e:
+            # No object yet is the normal first-run state, not an error.
+            if 'NoSuchKey' not in str(e) and 'NoSuchBucket' not in str(e) and 'Not Found' not in str(e):
+                print(f'[EmailAgent] config read failed ({key}): {e}', flush=True)
+    if stored:
+        cfg.update(stored)
+    if found_at == _LEGACY_CONFIG_KEY and _config_key() != _LEGACY_CONFIG_KEY:
+        # Found the old world-readable copy: move it behind the private key and
+        # delete the exposed one, so the allow-list stops being a public URL.
+        try:
+            s3 = _HOOKS['get_s3']()
+            s3.put_object(Bucket=_HOOKS['s3_bucket'], Key=_config_key(),
+                          Body=_seal({k: v for k, v in cfg.items() if not k.startswith('_')}),
+                          ContentType='application/octet-stream')
+            s3.delete_object(Bucket=_HOOKS['s3_bucket'], Key=_LEGACY_CONFIG_KEY)
+            print('[EmailAgent] allow-list migrated off the public key', flush=True)
+        except Exception as e:
+            print(f'[EmailAgent] allow-list migration failed: {e}', flush=True)
     cfg['_rejected'] = []
     clean_senders = []
     for row in (cfg.get('senders') or []):
@@ -149,9 +231,8 @@ def _load_config(force=False):
 
 
 def _save_config(cfg):
-    body = json.dumps(cfg, indent=2).encode('utf-8')
-    _HOOKS['get_s3']().put_object(Bucket=_HOOKS['s3_bucket'], Key=EMAIL_AGENT_CONFIG_KEY,
-                                  Body=body, ContentType='application/json')
+    _HOOKS['get_s3']().put_object(Bucket=_HOOKS['s3_bucket'], Key=_config_key(),
+                                  Body=_seal(cfg), ContentType='application/octet-stream')
     with _cfg_lock:
         _cfg_cache['data'] = None
     return _load_config(force=True)
@@ -207,7 +288,7 @@ def _claim(email_id):
         if email_id in _seen_ids:
             return False
         _seen_ids.append(email_id)
-    key = f'email-agent/seen/{email_id}.json'
+    key = f'{_private_prefix()}/seen/{email_id}.json'
     try:
         s3 = _HOOKS['get_s3']()
         try:
@@ -410,17 +491,55 @@ def _is_machine_mail(data, headers):
     return None
 
 
+# ── Is the sender really the sender? ─────────────────────────────────────────
+# An allow-list keyed on a From address is worth nothing on its own: From is a
+# string anyone can type. Every message Resend receives carries SES's
+# Authentication-Results, so require that header to show the mail really came
+# from the sender's own domain before the address is trusted. Fail closed: an
+# unverifiable message is refused, not answered.
+def _auth_domains(results, mechanism):
+    out = set()
+    for m in re.finditer(mechanism + r'=pass([^;]*)', results):
+        for field in ('header\.d=', 'header\.i=@?', 'smtp\.mailfrom=(?:[^@\s;]*@)?'):
+            for d in re.finditer(field + r'([a-z0-9.\-]+)', m.group(1)):
+                out.add(d.group(1).strip('.').lower())
+    return out
+
+
+def _aligned(claimed, authenticated):
+    """Same domain, or one is a subdomain of the other (mail.versamens.com)."""
+    return any(a == claimed or claimed.endswith('.' + a) or a.endswith('.' + claimed)
+               for a in authenticated)
+
+
+def _sender_is_authentic(from_addr, headers):
+    results = ' '.join(str(v) for k, v in (headers or {}).items()
+                       if str(k).lower() == 'authentication-results').lower()
+    if not results:
+        return False, 'no Authentication-Results header on the message'
+    claimed = (from_addr or '').rsplit('@', 1)[-1].lower()
+    if not claimed:
+        return False, 'no sender domain'
+    if re.search(r'dmarc=pass', results):
+        return True, 'dmarc=pass'
+    if _aligned(claimed, _auth_domains(results, 'dkim')):
+        return True, 'dkim=pass, aligned'
+    if _aligned(claimed, _auth_domains(results, 'spf')):
+        return True, 'spf=pass, aligned'
+    return False, f'nothing authenticates {claimed} in: {results[:160]}'
+
+
 # ── The worker ───────────────────────────────────────────────────────────────
 def _record(entry):
     with _runs_lock:
         _runs.appendleft(entry)
     try:
         day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        # Sealed as well: a run record names who wrote in and what they asked.
         _HOOKS['get_s3']().put_object(
             Bucket=_HOOKS['s3_bucket'],
-            Key=f"email-agent/log/{day}/{entry.get('email_id') or int(time.time())}.json",
-            Body=json.dumps(entry, indent=2, default=str).encode('utf-8'),
-            ContentType='application/json')
+            Key=f"{_private_prefix()}/log/{day}/{entry.get('email_id') or int(time.time())}.json",
+            Body=_seal(entry), ContentType='application/octet-stream')
     except Exception as e:
         print(f'[EmailAgent] run log write failed: {e}', flush=True)
 
@@ -456,6 +575,16 @@ def _handle(event):
             return
 
         body = _fetch_received(email_id, data)
+        if cfg.get('require_authentication', True):
+            ok, why = _sender_is_authentic(from_addr, body.get('headers'))
+            entry['auth'] = why
+            if not ok:
+                entry.update(status='unauthenticated', reason=why)
+                _notify(cfg, f'[Versa Inventory] Unverified mail claiming to be {from_addr}',
+                        f'<p>A message claiming to come from {from_addr} could not be verified '
+                        f'as really coming from that domain, so it was not answered.</p>'
+                        f'<p><b>Subject:</b> {subject}</p><p>{why}</p>')
+                return
         skip = _is_machine_mail(data, body.get('headers'))
         if skip:
             entry.update(status='skipped', reason=skip)
@@ -539,7 +668,8 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
                           caller_identity=None):
     _HOOKS.update({'get_s3': get_s3, 's3_bucket': s3_bucket, 'agent_client': agent_client,
                    'agent_run': agent_run, 'tools': tools, 'admin_tools': admin_tools,
-                   'guidance_core': guidance_core, 'model': model})
+                   'guidance_core': guidance_core, 'model': model,
+                   'machine_key': machine_key})
 
     def _staff_or_machine():
         key = (request.headers.get('X-Api-Key')
@@ -599,7 +729,10 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
             'ready': {'resend_key': bool(RESEND_API_KEY),
                       'webhook_secret': bool(RESEND_WEBHOOK_SECRET),
                       'reply_from': EMAIL_AGENT_FROM or None,
-                      'reply_to': EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or None},
+                      'reply_to': EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or None,
+                      'sender_authentication': bool(cfg.get('require_authentication', True)),
+                      'config_private': _config_key() != _LEGACY_CONFIG_KEY,
+                      'config_encrypted': _fernet() is not None},
             'senders': cfg['senders'], 'domains': cfg['domains'],
             'rejected_config_rows': cfg.get('_rejected') or [],
             'notify': cfg.get('notify') or [],
@@ -619,7 +752,8 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
         body = request.get_json(silent=True) or {}
         cfg = {k: v for k, v in _load_config(force=True).items() if not k.startswith('_')}
         for k in ('enabled', 'senders', 'domains', 'notify', 'always_cc', 'reply_to',
-                  'attach_max_mb', 'max_per_sender_per_hour', 'subject_prefix'):
+                  'require_authentication', 'attach_max_mb', 'max_per_sender_per_hour',
+                  'subject_prefix'):
             if k in body:
                 cfg[k] = body[k]
         saved = _save_config(cfg)
@@ -627,4 +761,6 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
 
     print(f'[EmailAgent] mailbox route ready (Resend key {"SET" if RESEND_API_KEY else "MISSING"}, '
           f'webhook secret {"SET" if RESEND_WEBHOOK_SECRET else "MISSING — webhook refuses everything"}, '
-          f'from {EMAIL_AGENT_FROM or "UNSET"})', flush=True)
+          f'from {EMAIL_AGENT_FROM or "UNSET"}, '
+          f'store {"private" if _config_key() != _LEGACY_CONFIG_KEY else "PUBLIC KEY — set INVENTORY_API_KEY"}'
+          f'{"/encrypted" if _fernet() else "/PLAIN"})', flush=True)
