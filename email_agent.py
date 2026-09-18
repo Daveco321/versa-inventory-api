@@ -491,6 +491,52 @@ def _is_machine_mail(data, headers):
     return None
 
 
+# ── Clearing up after the unprotected first day ──────────────────────────────
+# Before the allow-list moved behind a private key, this module wrote its run
+# logs and dedupe markers to email-agent/log/ and email-agent/seen/ in a bucket
+# anyone can read from. Those objects name who wrote in and what they asked, so
+# they are swept once at startup. Anything the sweep cannot do (no delete right,
+# no list right) is logged and left; it never blocks the mailbox from running.
+_LEGACY_PREFIXES = ('email-agent/log/', 'email-agent/seen/')
+_swept = threading.Event()
+
+
+def _sweep_legacy_objects():
+    if _swept.is_set():
+        return
+    _swept.set()
+    private = _private_prefix()
+    if private == 'email-agent':
+        return                      # nothing private to move to yet
+    s3, bucket = _HOOKS['get_s3'](), _HOOKS['s3_bucket']
+    removed = 0
+    for prefix in _LEGACY_PREFIXES:
+        token = None
+        while True:
+            try:
+                kw = {'Bucket': bucket, 'Prefix': prefix, 'MaxKeys': 1000}
+                if token:
+                    kw['ContinuationToken'] = token
+                page = s3.list_objects_v2(**kw)
+            except Exception as e:
+                print(f'[EmailAgent] legacy sweep could not list {prefix}: {e}', flush=True)
+                break
+            for obj in (page.get('Contents') or []):
+                key = obj['Key']
+                if key.startswith(private):
+                    continue        # already behind the private prefix
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                    removed += 1
+                except Exception as e:
+                    print(f'[EmailAgent] legacy sweep could not delete {key}: {e}', flush=True)
+            if not page.get('IsTruncated'):
+                break
+            token = page.get('NextContinuationToken')
+    if removed:
+        print(f'[EmailAgent] legacy sweep removed {removed} world-readable object(s)', flush=True)
+
+
 # ── Is the sender really the sender? ─────────────────────────────────────────
 # An allow-list keyed on a From address is worth nothing on its own: From is a
 # string anyone can type. Every message Resend receives carries SES's
@@ -758,6 +804,10 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
                 cfg[k] = body[k]
         saved = _save_config(cfg)
         return jsonify({'ok': True, 'config': saved})
+
+    # Off the request path: a slow or refused S3 list must not delay boot.
+    threading.Thread(target=_sweep_legacy_objects, daemon=True,
+                     name='email-agent-sweep').start()
 
     print(f'[EmailAgent] mailbox route ready (Resend key {"SET" if RESEND_API_KEY else "MISSING"}, '
           f'webhook secret {"SET" if RESEND_WEBHOOK_SECRET else "MISSING — webhook refuses everything"}, '

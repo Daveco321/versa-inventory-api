@@ -57,6 +57,10 @@ class FakeS3:
         self.puts.append(Key)
         return {}
 
+    def list_objects_v2(self, Bucket=None, Prefix='', MaxKeys=None, ContinuationToken=None):
+        keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        return {'Contents': [{'Key': k} for k in keys], 'IsTruncated': False}
+
     def delete_object(self, Bucket=None, Key=None):
         self.objects.pop(Key, None)
         self.deletes.append(Key)
@@ -858,6 +862,50 @@ class StorageProtectionTests(unittest.TestCase):
         self.assertEqual('boss@example.test', cfg['senders'][0]['email'], 'nothing lost')
         self.assertNotIn(EA._LEGACY_CONFIG_KEY, s3.objects, 'the public copy is gone')
         self.assertIn(EA._config_key(), s3.objects, 'and lives behind the private key')
+
+    def test_the_first_days_public_objects_are_swept(self):
+        """Run logs written before the fix named the sender and the subject."""
+        s3 = use_s3(self, {
+            'email-agent/log/2026-09-18/em_old.json': b'{"from": "boss@example.test"}',
+            'email-agent/seen/em_old.json': b'{}',
+            'inventory/keep-me.json': b'{}',
+        })
+        EA._swept.clear()
+        self.addCleanup(EA._swept.clear)
+        EA._sweep_legacy_objects()
+        self.assertNotIn('email-agent/log/2026-09-18/em_old.json', s3.objects)
+        self.assertNotIn('email-agent/seen/em_old.json', s3.objects)
+        self.assertIn('inventory/keep-me.json', s3.objects, 'nothing else is touched')
+
+    def test_the_sweep_leaves_the_private_objects_alone(self):
+        s3 = use_s3(self, {})
+        EA._claim('em_private')
+        EA._record({'email_id': 'em_private', 'from': 'boss@example.test'})
+        before = set(s3.objects)
+        EA._swept.clear()
+        self.addCleanup(EA._swept.clear)
+        EA._sweep_legacy_objects()
+        self.assertEqual(before, set(s3.objects))
+
+    def test_the_sweep_runs_once(self):
+        s3 = use_s3(self, {'email-agent/seen/em_old.json': b'{}'})
+        EA._swept.clear()
+        self.addCleanup(EA._swept.clear)
+        EA._sweep_legacy_objects()
+        s3.objects['email-agent/seen/em_later.json'] = b'{}'
+        EA._sweep_legacy_objects()
+        self.assertIn('email-agent/seen/em_later.json', s3.objects, 'second call is a no-op')
+
+    def test_a_refused_list_does_not_raise(self):
+        s3 = use_s3(self, {})
+
+        def boom(**kw):
+            raise Exception('AccessDenied')
+
+        s3.list_objects_v2 = boom
+        EA._swept.clear()
+        self.addCleanup(EA._swept.clear)
+        EA._sweep_legacy_objects()      # must not raise
 
     def test_dedupe_markers_are_private_too(self):
         s3 = use_s3(self, {})
