@@ -727,6 +727,40 @@ class SenderAuthenticityTests(unittest.TestCase):
     def ar(self, results):
         return {'Authentication-Results': results}
 
+    # The header SES actually wrote for a Gmail-sent message to the mailbox on
+    # 2026-09-18. The first parser looked for smtp.mailfrom= beside the verdict,
+    # SES writes envelope-from= in the next segment, and real mail was refused.
+    SES_REAL = ('amazonses.com; spf=pass (spfcheck: domain of versamens.com designates '
+                '74.125.228.76 as permitted sender) client-ip=74.125.228.76; '
+                'envelope-from=david@versamens.com')
+
+    def test_the_header_ses_really_sends(self):
+        ok, why = EA._sender_is_authentic('david@versamens.com', self.ar(self.SES_REAL))
+        self.assertTrue(ok, why)
+
+    def test_that_same_header_does_not_vouch_for_anyone_else(self):
+        ok, why = EA._sender_is_authentic('boss@z-attacker.test', self.ar(self.SES_REAL))
+        self.assertFalse(ok, why)
+
+    def test_a_comment_naming_a_domain_is_not_a_verdict(self):
+        """The SPF comment quotes a domain. Read as a verdict it would let
+        anyone in who mentions the right name."""
+        ok, why = EA._sender_is_authentic('boss@example.test', self.ar(
+            'amazonses.com; spf=fail (spfcheck: domain of example.test designates '
+            '1.2.3.4 as permitted sender) client-ip=1.2.3.4; envelope-from=boss@example.test'))
+        self.assertFalse(ok, why)
+
+    def test_a_failing_spf_cannot_borrow_a_passing_envelope_from(self):
+        ok, why = EA._sender_is_authentic('boss@example.test', self.ar(
+            'amazonses.com; spf=fail smtp.mailfrom=z-attacker.test; spf=pass; '
+            'envelope-from=boss@example.test'))
+        self.assertFalse(ok, why)
+
+    def test_a_failed_dkim_does_not_lend_its_domain_to_a_passing_one(self):
+        ok, why = EA._sender_is_authentic('boss@example.test', self.ar(
+            'dkim=pass header.i=@z-attacker.test; dkim=fail header.i=@example.test'))
+        self.assertFalse(ok, why)
+
     def test_dmarc_pass_is_enough(self):
         ok, why = EA._sender_is_authentic(
             'boss@example.test', self.ar('mx.amazonses.com; dmarc=pass'))

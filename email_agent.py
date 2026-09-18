@@ -543,36 +543,55 @@ def _sweep_legacy_objects():
 # Authentication-Results, so require that header to show the mail really came
 # from the sender's own domain before the address is trusted. Fail closed: an
 # unverifiable message is refused, not answered.
-def _auth_domains(results, mechanism):
-    out = set()
-    for m in re.finditer(mechanism + r'=pass([^;]*)', results):
-        for field in ('header\.d=', 'header\.i=@?', 'smtp\.mailfrom=(?:[^@\s;]*@)?'):
-            for d in re.finditer(field + r'([a-z0-9.\-]+)', m.group(1)):
-                out.add(d.group(1).strip('.').lower())
-    return out
-
-
 def _aligned(claimed, authenticated):
     """Same domain, or one is a subdomain of the other (mail.versamens.com)."""
     return any(a == claimed or claimed.endswith('.' + a) or a.endswith('.' + claimed)
-               for a in authenticated)
+               for a in authenticated if a)
+
+
+def _domains(text, field):
+    return {m.group(1).strip('.') for m in re.finditer(field, text)}
 
 
 def _sender_is_authentic(from_addr, headers):
-    results = ' '.join(str(v) for k, v in (headers or {}).items()
-                       if str(k).lower() == 'authentication-results').lower()
-    if not results:
+    raw = ' '.join(str(v) for k, v in (headers or {}).items()
+                   if str(k).lower() == 'authentication-results')
+    if not raw.strip():
         return False, 'no Authentication-Results header on the message'
     claimed = (from_addr or '').rsplit('@', 1)[-1].lower()
     if not claimed:
         return False, 'no sender domain'
-    if re.search(r'dmarc=pass', results):
+    # Comments are free text and they quote domain names of their own
+    # ("spfcheck: domain of versamens.com designates ..."). Strip them, or a
+    # sentence could be read as a verdict.
+    text = re.sub(r'\([^)]*\)', ' ', raw.lower())
+    segments = [seg.strip() for seg in text.split(';')]
+
+    if any(re.search(r'\bdmarc=pass\b', seg) for seg in segments):
         return True, 'dmarc=pass'
-    if _aligned(claimed, _auth_domains(results, 'dkim')):
-        return True, 'dkim=pass, aligned'
-    if _aligned(claimed, _auth_domains(results, 'spf')):
-        return True, 'spf=pass, aligned'
-    return False, f'nothing authenticates {claimed} in: {results[:160]}'
+
+    # DKIM: verdict and signing domain must sit in the SAME segment, so a
+    # signature that passed for one domain can never vouch for another.
+    for seg in segments:
+        if re.search(r'\bdkim=pass\b', seg):
+            if _aligned(claimed, _domains(seg, r'header\.(?:d|i)=@?([a-z0-9.\-]+)')):
+                return True, 'dkim=pass, aligned'
+
+    # SPF the same way when the identity is in the verdict's own segment.
+    for seg in segments:
+        if re.search(r'\bspf=pass\b', seg):
+            if _aligned(claimed, _domains(seg, r'smtp\.mailfrom=(?:[^@\s]*@)?([a-z0-9.\-]+)')):
+                return True, 'spf=pass, aligned'
+
+    # SES splits it: "spf=pass (comment) client-ip=...; envelope-from=a@b.com".
+    # Crossing that boundary is only safe when the header carries exactly ONE
+    # SPF verdict and it passed. With a pass and a fail present, a failing
+    # check could otherwise borrow the passing one's identity.
+    if re.findall(r'\bspf=([a-z]+)', text) == ['pass']:
+        if _aligned(claimed, _domains(text, r'envelope-from=(?:[^@\s]*@)?([a-z0-9.\-]+)')):
+            return True, 'spf=pass, envelope-from aligned'
+
+    return False, f'nothing authenticates {claimed} in: {raw[:400]}'
 
 
 # ── The worker ───────────────────────────────────────────────────────────────
