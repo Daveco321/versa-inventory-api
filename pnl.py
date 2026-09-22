@@ -222,6 +222,7 @@ ROUTE_TABLE = (
     ('/api/pnl/overrides', ('GET', 'POST')),
     ('/api/pnl/audit', ('POST',)),
     ('/api/pnl/rotate', ('POST',)),
+    ('/api/pnl/analytics', ('GET',)),
     ('/api/pnl', ('GET', 'POST')),
     ('/api/pnl/<path:rest>', ('GET', 'POST')),
 )
@@ -1184,6 +1185,8 @@ class _PnlService:
         self._last_error = None     # {'key', 'at', 'code', 'cls', 'missing', 'reason'}
         self._last_forced = 0.0
         self._cb_summary = {}
+        self._an_memo = None        # {'key', 'builtAt', 'alias', 'byCust', 'byStyle', 'grades'}
+        self.sales_matrix = None    # set by the host app after registration (invoiced-history cube getter)
         # tunables (instance attributes so tests can shorten them)
         self.wait_seconds = WAIT_SECONDS
         self.refresh_window = REFRESH_WINDOW
@@ -1752,6 +1755,101 @@ class _PnlService:
             return self._err(409, 'NO_COSTBOOK')
         return self._dataset_for(key, request.args.get('refresh') == '1')
 
+    def h_analytics(self, ident):
+        """GET /api/pnl/analytics: the invoiced-history cube (customer x base
+        style x month, uncapped, from the open-orders service) joined with the
+        factory cost maps derived from the built dataset. Feeds the admin-only
+        Inventory Analytics tool. The cube itself carries no cost (units and
+        invoiced selling value); the cost maps come from the encrypted cost
+        book through the dataset memo, so this route shares the dataset's
+        freshness and never builds or fetches on the request thread."""
+        self._require_store()
+        for kind in ('engine', 'routing'):
+            if self._module(kind) is None:
+                return self._err(503, 'PNL_NOT_CONFIGURED', reason=kind)
+        key = tuple(self.store.head(n) for n in OBJECTS)
+        if key[0] is None:
+            return self._err(409, 'NO_COSTBOOK')
+        get_matrix = self.sales_matrix
+        matrix = get_matrix() if callable(get_matrix) else None
+        if matrix is None:
+            return self._err(503, 'INPUTS_UNAVAILABLE', missing=['sales_matrix'], reason='sales_matrix')
+        if matrix.get('building'):
+            return _json({'building': True, 'part': 'matrix'}, 202)
+        cost = self._analytics_cost_maps(key)
+        if cost is None:
+            r = self._dataset_for(key, False)
+            if r.status_code == 200:
+                cost = self._analytics_cost_maps(key)
+            elif r.status_code != 202:
+                return r
+            if cost is None:
+                return _json({'building': True, 'part': 'dataset'}, 202)
+        out = {'ready': True,
+               'matrix': {'customers': matrix.get('customers') or {},
+                          'source': matrix.get('source') or {}},
+               'pending': matrix.get('pending'),
+               'pendingReady': bool(matrix.get('pendingReady')),
+               'history': matrix.get('history'),
+               'custAlias': cost['alias'],
+               'costByCustomer': cost['byCust'],
+               'costByStyle': cost['byStyle'],
+               'costGrades': cost['grades'],
+               'datasetBuiltAt': cost['builtAt']}
+        body = json.dumps(out, separators=(',', ':'), allow_nan=False, default=_json_default).encode('utf-8')
+        gz = gzip.compress(body, compresslevel=6, mtime=0)
+        try:
+            use_gz = request.accept_encodings.quality('gzip') > 0
+        except Exception:
+            use_gz = False
+        resp = Response(gz if use_gz else body, status=200, mimetype='application/json')
+        if use_gz:
+            resp.headers['Content-Encoding'] = 'gzip'
+        resp.vary.add('Accept-Encoding')
+        return resp
+
+    def _analytics_cost_maps(self, key):
+        """Cost joins for h_analytics, derived at most once per dataset build:
+        fobU per (account, base) from shipped.byCustomer (covers every
+        historically invoiced pair, including customer-group price grids),
+        base-level fobU and grade from the styles table (current activity),
+        and the history customer alias fold. None when no dataset memo for
+        this key exists yet."""
+        with self._lock:
+            memo = self._memo
+            hit = self._an_memo
+            if memo is None or memo['key'] != key:
+                return hit if (hit is not None and hit['key'] == key) else None
+            if hit is not None and hit['key'] == key and hit['builtAt'] == memo['builtAt']:
+                return hit
+            body, built_at = memo['body'], memo['builtAt']
+        ds = json.loads(body)
+        eng = self._module('engine')
+        alias = dict(getattr(eng, 'HISTORY_CUSTOMER_ALIAS', None) or {})
+        by_cust = {}
+        bc = (ds.get('shipped') or {}).get('byCustomer') or {}
+        f = {n: i for i, n in enumerate(bc.get('fields') or [])}
+        if 'cust' in f and 'base' in f and 'fobU' in f:
+            for row in bc.get('rows') or []:
+                fob = row[f['fobU']]
+                if fob is not None:
+                    by_cust.setdefault(row[f['cust']], {})[row[f['base']]] = fob
+        by_style, grades = {}, {}
+        st = ds.get('styles') or {}
+        sf = {n: i for i, n in enumerate(st.get('fields') or [])}
+        if 'base' in sf and 'fobU' in sf:
+            for row in st.get('rows') or []:
+                fob = row[sf['fobU']]
+                if fob is not None:
+                    by_style[row[sf['base']]] = fob
+                    if 'grade' in sf:
+                        grades[row[sf['base']]] = row[sf['grade']]
+        hit = {'key': key, 'builtAt': built_at, 'alias': alias, 'byCust': by_cust,
+               'byStyle': by_style, 'grades': grades}
+        with self._lock:
+            self._an_memo = hit
+        return hit
+
     def h_costbook(self, ident):
         self._require_store()
         if request.method != 'POST':
@@ -1877,6 +1975,7 @@ class _PnlService:
             '/api/pnl/overrides': ('pnl_overrides', self.h_overrides),
             '/api/pnl/audit': ('pnl_audit', self.h_audit),
             '/api/pnl/rotate': ('pnl_rotate', self.h_rotate),
+            '/api/pnl/analytics': ('pnl_analytics', self.h_analytics),
             '/api/pnl': ('pnl_root', self.h_not_found),
             '/api/pnl/<path:rest>': ('pnl_unknown', self.h_not_found),
         }

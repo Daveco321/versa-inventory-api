@@ -18930,6 +18930,67 @@ def _pnl_sales_analytics():
     return _pnl_sa_fetch()
 
 
+# The invoiced-history cube for /api/pnl/analytics. Unlike _pnl_sales_analytics
+# (a build-thread getter) this one runs on REQUEST threads, so its cold path
+# never blocks: it kicks one background fetch and reports building. Warm, a
+# stale copy serves at once while a single refresh runs in the background.
+_pnl_mx_cache = {'body': None, 'at': 0.0, 'fail_until': 0.0, 'poll_after': 0.0, 'refreshing': False}
+_pnl_mx_lock = threading.Lock()
+
+
+def _pnl_mx_fetch():
+    """One GET of open-orders /api/sales-history/matrix (machine credential)."""
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history/matrix",
+                                 headers=_oo_api_headers(), timeout=(5, 30))
+        if resp.status_code != 200:
+            raise RuntimeError('upstream status')
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError('upstream shape')
+        if data.get('building'):
+            with _pnl_mx_lock:
+                _pnl_mx_cache['poll_after'] = time.time() + _PNL_SA_BUILDING_POLL
+            return {'building': True}
+        if not data.get('ready') or not isinstance(data.get('customers'), dict):
+            raise ValueError('upstream not ready')
+        with _pnl_mx_lock:
+            _pnl_mx_cache.update(body=resp.content, at=time.time(), fail_until=0.0, poll_after=0.0)
+        return data
+    except Exception as e:
+        print(f"[PnL] sales-matrix fetch failed: {type(e).__name__}", flush=True)
+        with _pnl_mx_lock:
+            _pnl_mx_cache['fail_until'] = time.time() + _PNL_SA_FAIL_BACKOFF
+        return None
+    finally:
+        with _pnl_mx_lock:
+            _pnl_mx_cache['refreshing'] = False
+
+
+def _pnl_sales_matrix():
+    """Cube getter for pnl.h_analytics: the payload, {'building': True} while a
+    fetch or the upstream build runs, or None after a recent failure."""
+    now = time.time()
+    with _pnl_mx_lock:
+        body = _pnl_mx_cache['body']
+        if body is not None:
+            if (now - _pnl_mx_cache['at'] >= _PNL_SA_TTL and not _pnl_mx_cache['refreshing']
+                    and now >= _pnl_mx_cache['fail_until'] and now >= _pnl_mx_cache['poll_after']):
+                _pnl_mx_cache['refreshing'] = True
+                threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-refresh').start()
+        elif now < _pnl_mx_cache['fail_until']:
+            return None
+        elif _pnl_mx_cache['refreshing'] or now < _pnl_mx_cache['poll_after']:
+            return {'building': True}
+        else:
+            _pnl_mx_cache['refreshing'] = True
+            threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-fetch').start()
+            return {'building': True}
+    if body is not None:
+        return json.loads(body)
+    return None
+
+
 def _pnl_sources():
     """Getters for pnl.register_pnl_routes (P&L DESIGN section 3.4). They run on the
     P&L build thread, never on a request thread, and each returns fresh lists."""
@@ -19041,13 +19102,14 @@ def _pnl_caller_identity(token):
 try:
     from pnl import register_pnl_routes
     from pnl_store import EncryptedStore, S3Store
-    register_pnl_routes(
+    _pnl_svc = register_pnl_routes(
         app,
         store=EncryptedStore(S3Store(get_s3, os.environ.get('PNL_S3_BUCKET') or S3_BUCKET,
                                      prefix=os.environ.get('PNL_S3_PREFIX') or 'inventory/pnl/'),
                              os.environ.get('PNL_DATA_KEYS', '')),
         caller_identity=_pnl_caller_identity,
         sources=_pnl_sources())
+    _pnl_svc.sales_matrix = _pnl_sales_matrix   # request-thread-safe getter, not a build source
 except Exception as _pnl_exc:   # boot must never fail because of the P&L
     print(f"[PnL] disabled: {type(_pnl_exc).__name__}", flush=True)
 

@@ -154,6 +154,7 @@ ROUTE_CALLS = [
     ('/api/pnl/overrides', 'POST', {'overrides': []}),
     ('/api/pnl/audit', 'POST', {'action': 'export', 'detail': 'tab=orders'}),
     ('/api/pnl/rotate', 'POST', {}),
+    ('/api/pnl/analytics', 'GET', None),
     ('/api/pnl', 'GET', None),
     ('/api/pnl', 'POST', {}),
     ('/api/pnl/some/unknown/path', 'GET', None),
@@ -162,7 +163,8 @@ ROUTE_CALLS = [
 STORE_ROUTES = {('/api/pnl/dataset', 'GET'), ('/api/pnl/costbook', 'GET'), ('/api/pnl/costbook', 'POST'),
                 ('/api/pnl/costbook/versions', 'GET'), ('/api/pnl/costbook/restore', 'POST'),
                 ('/api/pnl/settings', 'GET'), ('/api/pnl/settings', 'POST'),
-                ('/api/pnl/overrides', 'GET'), ('/api/pnl/overrides', 'POST'), ('/api/pnl/rotate', 'POST')}
+                ('/api/pnl/overrides', 'GET'), ('/api/pnl/overrides', 'POST'), ('/api/pnl/rotate', 'POST'),
+                ('/api/pnl/analytics', 'GET')}
 
 
 def new_key():
@@ -312,6 +314,9 @@ class Harness:
                                            sources=sources if sources is not None else make_sources(),
                                            env=env, engine=self.engine, routing=self.routing,
                                            store_check=False)
+        # the host app wires this after registration (app.py does the same)
+        self.svc.sales_matrix = lambda: {'ready': True, 'customers': {}, 'source': {},
+                                         'history': None, 'pending': None, 'pendingReady': False}
         self.client = self.app.test_client()
 
     def req(self, method, path, token=None, headers=None, body=None, raw=None, query=None):
@@ -1080,6 +1085,91 @@ class _IdentityHttp:
         if url.endswith('/auth/v1/user'):
             return _FakeResp(self.user_status, self.user)
         return _FakeResp(self.prof_status, self.rows)
+
+
+class TestAnalyticsRoute(PnlTestCase):
+    """/api/pnl/analytics (Sep 22 2026): the invoiced-history cube joined with
+    the dataset's factory-cost maps for the Inventory Analytics tool."""
+
+    CUBE = {'ready': True, 'v': 1,
+            'customers': {'ROSS': {'ZZAAAA001': {'2026-08': [10, 95.0]}},
+                          'NORD_DROP': {'ZZBBBB002': {'2026-07': [3, 30.0]}}},
+            'source': {'rows': 13, 'from': '2019-11-01', 'to': '2026-08-21', 'ingestedAt': 'stamp1'},
+            'history': {'label': 'Invoices through Aug 21, 2026.'},
+            'pending': {'ready': True, 'basis': 'estimate', 'totals': {'units': 5},
+                        'byMonth': [], 'customers': {'ROSS': {'units': 5}}},
+            'pendingReady': True}
+
+    def eng_with_history(self):
+        eng = make_engine()
+        eng.HISTORY_CUSTOMER_ALIAS = {'NORD_DROP': 'NORD'}
+
+        def build_dataset(src, costbook, settings, overrides, now_iso, routing_module):
+            return {'v': 1, 'builtAt': now_iso, 'asOf': src['today'],
+                    'shipped': {'byCustomer': {'fields': ['cust', 'base', 'fobU', 'grade'],
+                                               'rows': [['ROSS', 'ZZAAAA001', SENTINEL_COST, 'A'],
+                                                        ['NORD', 'ZZBBBB002', None, 'D']]}},
+                    'styles': {'fields': ['base', 'fobU', 'grade'],
+                               'rows': [['ZZAAAA001', SENTINEL_COST + 1, 'A'],
+                                        ['ZZBBBB002', SENTINEL_COST + 2, 'B']]}}
+        eng.build_dataset = build_dataset
+        return eng
+
+    def cube(self):
+        return json.loads(json.dumps(self.CUBE))
+
+    def test_states_and_the_joined_payload(self):
+        h = self.harness(engine=self.eng_with_history())
+        h.upload()
+        h.svc.sales_matrix = None                                   # getter not wired
+        self.assert_error(h.admin('GET', '/api/pnl/analytics'), 503, 'INPUTS_UNAVAILABLE',
+                          reason='sales_matrix')
+        h.svc.sales_matrix = lambda: {'building': True}
+        r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 202)
+        self.assertEqual(r.get_json(), {'building': True, 'part': 'matrix'})
+        h.svc.sales_matrix = self.cube
+        deadline = time.time() + 10
+        r = h.admin('GET', '/api/pnl/analytics')
+        while r.status_code == 202 and time.time() < deadline:
+            h.wait_idle()
+            r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        self.assert_pnl_headers(r)
+        d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+        self.assertTrue(d['ready'])
+        self.assertEqual(d['matrix']['customers']['ROSS']['ZZAAAA001']['2026-08'], [10, 95.0])
+        self.assertEqual(d['custAlias']['NORD_DROP'], 'NORD')
+        self.assertEqual(d['costByCustomer'], {'ROSS': {'ZZAAAA001': SENTINEL_COST}})   # a None fobU is dropped
+        self.assertEqual(d['costByStyle'], {'ZZAAAA001': SENTINEL_COST + 1, 'ZZBBBB002': SENTINEL_COST + 2})
+        self.assertEqual(d['costGrades'], {'ZZAAAA001': 'A', 'ZZBBBB002': 'B'})
+        self.assertEqual(d['history']['label'], 'Invoices through Aug 21, 2026.')
+        self.assertTrue(d['pendingReady'])
+        self.assertTrue(d['datasetBuiltAt'])
+
+    def test_gzip_when_accepted(self):
+        h = self.harness(engine=self.eng_with_history())
+        h.upload()
+        h.svc.sales_matrix = self.cube
+        self.assertEqual(h.dataset().status_code, 200)              # warm the dataset memo
+        r = h.admin('GET', '/api/pnl/analytics', headers={'Accept-Encoding': 'gzip'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get('Content-Encoding'), 'gzip')
+        self.assertIn('Accept-Encoding', r.headers.get('Vary', ''))
+        self.assertTrue(json.loads(gzip.decompress(r.data))['ready'])
+
+    def test_cost_maps_follow_a_rebuild(self):
+        h = self.harness(engine=self.eng_with_history())
+        h.upload()
+        h.svc.sales_matrix = self.cube
+        self.assertEqual(h.dataset().status_code, 200)
+        maps1 = h.svc._analytics_cost_maps(tuple(h.store.head(n) for n in pnl.OBJECTS))
+        self.assertEqual(maps1['byStyle'], {'ZZAAAA001': SENTINEL_COST + 1, 'ZZBBBB002': SENTINEL_COST + 2})
+        h.upload(4)                                                 # a new costbook: new key, new build
+        self.assertEqual(h.dataset().status_code, 200)
+        key2 = tuple(h.store.head(n) for n in pnl.OBJECTS)
+        maps2 = h.svc._analytics_cost_maps(key2)
+        self.assertEqual(maps2['key'], key2)
 
 
 class TestAppWiring(unittest.TestCase):
