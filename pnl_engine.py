@@ -2681,7 +2681,8 @@ STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 
                 'ats', 'committed', 'allocated', 'openUnits', 'openRev', 'openGp', 'openContrib', 'apoUnits', 'apoRev',
                 't12Units', 't12Rev', 't12Cogs', 't12Gp', 'lifeUnits', 'lifeRev', 'expPrice', 'atsPotentialGp', 'ladder',
                 'basis', 'ev', 't12Net', 'dutyRegime', 'dedPct', 'atsFreeStock', 'atsFreeProd', 'fxShare', 'fxRef',
-                'openRevCost', 'costByFactory', 'costRule', 'costSpread', 'costRow', 'costRowsSkipped', 'costFlags')
+                'openRevCost', 'costByFactory', 'costRule', 'costSpread', 'costRow', 'costRowsSkipped', 'costFlags',
+                'kitPcs')
 SHIPPED_COMPANY_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
                           'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost')
 SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', 'months', 'fobU', 'level', 'grade',
@@ -3668,8 +3669,10 @@ class _Build:
             ats = fb[0] if fb else 0
             free_prod = pb[3] if pb else 0
             # Potential gross profit of the free units at the expected price, after deductions. The
-            # published rounded inputs are used, so the client gets the same cents.
-            pot = (r2(max(0, ats) * (exp4 * (1 - ded4 / 100) - lu)) if exp4 is not None and lu is not None else None)
+            # published rounded inputs are used, so the client gets the same cents. The feed's ats
+            # counts kit CARTONS while exp4 and lu are per piece, so a kit base scales by its pieces
+            # per carton; kitPcs is published so the client's what-if applies the same factor.
+            pot = (r2(max(0, ats) * pcs * (exp4 * (1 - ded4 / 100) - lu)) if exp4 is not None and lu is not None else None)
             facs = set(sc['facs']) | (pb[2] if pb else set())
             row = {'base': b, 'brand': brand, 'cat': cat, 'fab': dec['fab'] if dec else None,
                    'fiber': fiber, 'fit': dec['fitClass'] if dec else None, 'sleeve': dec['sleeve'] if dec else None,
@@ -3685,7 +3688,7 @@ class _Build:
                    'apoUnits': ab[0] if ab else 0, 'apoRev': r2(ab[1]) if ab else 0.0,
                    't12Units': int(round(t12[0])), 't12Rev': r2(t12[1]), 't12Cogs': sh['cogs'], 't12Gp': sh['gp'],
                    'lifeUnits': int(round(an.get('qty', 0))), 'lifeRev': r2(an.get('value', 0.0)),
-                   'expPrice': exp4, 'atsPotentialGp': pot,
+                   'expPrice': exp4, 'atsPotentialGp': pot, 'kitPcs': pcs if pcs > 1 else None,
                    'ladder': sorted(([c, v[0], r4(v[1] / v[0])] for c, v in ob['lad'].items() if v[0] > 0),
                                     key=lambda x: (-x[2], x[0])) if ob else [],
                    'basis': self.bkey(sc['basis']), 'ev': self.ev(sc['ids']), 't12Net': sh['net'],

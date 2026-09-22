@@ -1967,8 +1967,8 @@ class CombinedCostC13(unittest.TestCase):
         st = by(ds, 'styles', 'base')['ROQAQF201SLS']
         self.assertEqual((st['costRule'], st['costSpread'], st['factories']),
                          ('average', E.r4(4.4444 / 4.1717 - 1), ['NN', 'TT']))
-        self.assertEqual(ds['styles']['fields'][-6:], ['costByFactory', 'costRule', 'costSpread', 'costRow',
-                                                       'costRowsSkipped', 'costFlags'])
+        self.assertEqual(ds['styles']['fields'][-7:], ['costByFactory', 'costRule', 'costSpread', 'costRow',
+                                                       'costRowsSkipped', 'costFlags', 'kitPcs'])
         self.assertEqual(set(ds['dict']['costRules']), set(E.COST_RULES))
         for t in ('lines', 'apo'):                                               # the page recompute still matches
             for r in rows(ds, t):
@@ -2423,8 +2423,15 @@ class KitShippedMoney(unittest.TestCase):
         s2['open_orders']['orders'] = s2['open_orders']['orders'] + [order('13', 'ZZKIT01', 5, 108.0, cust='BJS')]
         st2 = by(build(s2), 'styles', 'base')['ZZKIT01']
         self.assertEqual(st2['expPrice'], E.r4(5 * 108.0 / (5 * 12)))     # open-lines branch
+        # Pinned independently: the feed's ats counts CARTONS, exp/landed are per piece, so the
+        # dollar figure scales by the 12 pieces per carton (kitPcs is published for the client).
+        self.assertEqual(st2['kitPcs'], 12)
         self.assertEqual(st2['atsPotentialGp'],
-                         E.r2(max(0, st2['ats']) * (st2['expPrice'] * (1 - st2['dedPct'] / 100) - st2['landedU'])))
+                         E.r2(max(0, st2['ats']) * 12 * (st2['expPrice'] * (1 - st2['dedPct'] / 100) - st2['landedU'])))
+        self.assertGreater(st2['atsPotentialGp'], 0)                      # the margin is real, not rounding noise
+        st3 = by(build(src()), 'styles', 'base').get('ROQAQF221SLS')
+        if st3 is not None:
+            self.assertIsNone(st3.get('kitPcs'))                          # non-kit styles publish no factor
 
     def test_kit_apo_price_skips_the_carton_t12(self):
         s = src_kit_hist()
