@@ -18918,7 +18918,10 @@ def _pnl_sales_analytics():
             if (now - _pnl_sa_cache['at'] >= _PNL_SA_TTL and not _pnl_sa_cache['refreshing']
                     and now >= _pnl_sa_cache['fail_until'] and now >= _pnl_sa_cache['poll_after']):
                 _pnl_sa_cache['refreshing'] = True
-                threading.Thread(target=_pnl_sa_fetch, daemon=True, name='pnl-sa-refresh').start()
+                try:
+                    threading.Thread(target=_pnl_sa_fetch, daemon=True, name='pnl-sa-refresh').start()
+                except Exception:
+                    _pnl_sa_cache['refreshing'] = False   # a failed spawn must not wedge the refresh
         elif now < _pnl_sa_cache['poll_after']:
             return {'building': True}
         elif now < _pnl_sa_cache['fail_until'] or _pnl_sa_cache['refreshing']:
@@ -18977,14 +18980,22 @@ def _pnl_sales_matrix():
             if (now - _pnl_mx_cache['at'] >= _PNL_SA_TTL and not _pnl_mx_cache['refreshing']
                     and now >= _pnl_mx_cache['fail_until'] and now >= _pnl_mx_cache['poll_after']):
                 _pnl_mx_cache['refreshing'] = True
-                threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-refresh').start()
+                try:
+                    threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-refresh').start()
+                except Exception:
+                    _pnl_mx_cache['refreshing'] = False   # a failed spawn must not wedge the refresh
         elif now < _pnl_mx_cache['fail_until']:
             return None
         elif _pnl_mx_cache['refreshing'] or now < _pnl_mx_cache['poll_after']:
             return {'building': True}
         else:
             _pnl_mx_cache['refreshing'] = True
-            threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-fetch').start()
+            try:
+                threading.Thread(target=_pnl_mx_fetch, daemon=True, name='pnl-mx-fetch').start()
+            except Exception:
+                _pnl_mx_cache['refreshing'] = False       # report the failure instead of building forever
+                _pnl_mx_cache['fail_until'] = now + _PNL_SA_FAIL_BACKOFF
+                return None
             return {'building': True}
     if body is not None:
         return json.loads(body)
