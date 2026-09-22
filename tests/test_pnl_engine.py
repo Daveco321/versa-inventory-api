@@ -1763,7 +1763,7 @@ class ShippedByCustomerC14(unittest.TestCase):
         self.assertEqual((u['deduct'], u['revCost']), (E.r2(70.0 * 1.0 / 100), E.r2(70.0 * rc_pct(S) / 100)))
         self.assertIn('AMAZ', ds['dict']['customers'])                         # a history-only account is named
         self.assertEqual(ds['shipped']['range'], {'from': '2025-01-01', 'to': '2026-02-20',
-                                                  'ingestedAt': '2026-02-21T00:00:00'})
+                                                  'ingestedAt': '2026-02-21T00:00:00', 'byDiv': None})
         ca = {(r['cust'], r['base']): r for r in rows({'b': build(self.src_hist(), settings=dict(
             C11, regimeByCustomer={'KOHL': 'ca'}))['shipped']['byCustomer']}, 'b')}
         self.assertEqual(ca[('KOHL', 'ROQAQF201SLS')]['dutyRegime'], 'ca')
@@ -1772,7 +1772,7 @@ class ShippedByCustomerC14(unittest.TestCase):
         b2 = build(src(analytics=False))
         self.assertEqual((b2['shipped']['byCustomer']['rows'], b2['shipped']['byCustomer']['fields'][:3]),
                          ([], ['cust', 'base', 'brand']))
-        self.assertEqual(b2['shipped']['range'], {'from': None, 'to': None, 'ingestedAt': None})
+        self.assertEqual(b2['shipped']['range'], {'from': None, 'to': None, 'ingestedAt': None, 'byDiv': None})
 
 
 # ── contract C13 (Sep 15): one cost per style, from every factory's direct quote ──
@@ -2384,6 +2384,123 @@ class FiberMapC11(unittest.TestCase):
             self.assertEqual(E.FIBER_BY_FABRIC.get(code, 'mmf'), E.fiber_group_of(content), code)
         self.assertEqual((E.decode_sku('ROQAPY101SLS')['fiber'], E.decode_sku('ROQACL101SLS')['fiber']), ('cotton', 'cotton'))
         self.assertEqual(E.fiber_class(E.decode_sku('ROQAPY101SLS')['fiber']), 'natural')
+
+
+# ── Sep 22 defect fixes: kit money, suppressed supply, raw stock cells, PO-aware KinYun rate,
+# per-division shipped dates. Sentinel numbers only. ──
+def src_kit_hist():
+    """src() plus invoice history for the kit program (10 cartons of 12 pieces, one customer)."""
+    s = src()
+    s['sales_analytics']['styles'].append(['ZZKIT01', 'SYN', 10, 1200.0, '2025-06-01', '2026-02-10',
+                                           {'2026-01': [10, 1200.0, 0, 0.0]}, {'BJS': [10, 1200.0]}, 'NAVY'])
+    return s
+
+
+class KitShippedMoney(unittest.TestCase):
+    """Invoice-history units of a kit program are cartons; its cost is per piece. The shipped lens
+    costs the pieces, exactly as shipped.byCustomer does."""
+
+    def test_shipped_cogs_count_kit_pieces(self):
+        ds = build(src_kit_hist())
+        st = by(ds, 'styles', 'base')['ZZKIT01']
+        bc = {(r['cust'], r['base']): r for r in rows({'b': ds['shipped']['byCustomer']}, 'b')}
+        row = bc[('BJS', 'ZZKIT01')]
+        self.assertEqual((row['units'], row['pieces']), (10, 120))
+        # The one month is inside the trailing 12, so the style's t12 cost is the customer row's cost.
+        self.assertEqual(st['t12Cogs'], row['cogs'])
+        self.assertEqual(st['t12Gp'], row['gp'])
+        fob = E.r2(120 * st['fobU'])
+        d, f, x = E.adders(fob, 120, 'dress_shirt', 'mmf', row['origin'], ds['settings'], 'us')
+        self.assertEqual(st['t12Cogs'], E.r2(fob + d + f + x))
+        Y = by({'b': ds['shipped']['byStyle']}, 'b', 'base')['ZZKIT01']
+        self.assertEqual(Y['months'], {'2026-01': [10, 1200.0]})          # months stay invoiced cartons
+
+    def test_kit_expected_price_is_per_piece(self):
+        st = by(build(src_kit_hist()), 'styles', 'base')['ZZKIT01']
+        self.assertEqual(st['expPrice'], E.r4(1200.0 / (10 * 12)))        # history branch
+        s2 = src_kit_hist()
+        s2['inventory']['items'] = s2['inventory']['items'] + [inv('ZZKIT01', tr=240)]
+        s2['open_orders']['orders'] = s2['open_orders']['orders'] + [order('13', 'ZZKIT01', 5, 108.0, cust='BJS')]
+        st2 = by(build(s2), 'styles', 'base')['ZZKIT01']
+        self.assertEqual(st2['expPrice'], E.r4(5 * 108.0 / (5 * 12)))     # open-lines branch
+        self.assertEqual(st2['atsPotentialGp'],
+                         E.r2(max(0, st2['ats']) * (st2['expPrice'] * (1 - st2['dedPct'] / 100) - st2['landedU'])))
+
+    def test_kit_apo_price_skips_the_carton_t12(self):
+        s = src_kit_hist()
+        s['apo']['rows'] = s['apo']['rows'] + [{'style': 'ZZKIT01', 'qty': 24, 'customer': 'MEN WARHOUSE',
+                                               'po': 'SYNTH KIT T12'}]
+        a = [r for r in rows(build(s), 'apo') if r['po'] == 'SYNTH KIT T12'][0]
+        self.assertNotEqual(a['priceBasis'], 'style_t12')                 # a carton price, never per piece
+        self.assertEqual((a['priceBasis'], a['estPrice']), ('offprice_brand', E.r4((300 * 9.99 + 600 * 11.0) / 900)))
+
+
+class SuppressedSupplyStyles(unittest.TestCase):
+    def test_suppressed_batches_are_not_incoming(self):
+        s = src()
+        # Arrival lands on the build day and the warehouse holds the same units: routing suppresses it.
+        s['inventory']['items'] = s['inventory']['items'] + [inv('ROQAQF221SLS', tr=200)]
+        s['ledger']['rows'] = s['ledger']['rows'] + [led('TT26021', 'ROQAQF221SLS', 200, etd='2026-01-16')]
+        ds = build(s)
+        p = by(ds, 'production', 'ref')['TT26021']
+        self.assertIn('suppressed', p['flags'])
+        st = by(ds, 'styles', 'base')['ROQAQF221SLS']
+        self.assertEqual((st['incoming'], st['incomingFob'], st['atsFreeProd']), (0, 0.0, 0))
+        self.assertEqual((st['onHand'], st['atsFreeStock']), (200, st['ats']))
+        self.assertIn('TT', st['factories'])                              # the maker is still named
+        self.assertEqual(ds['totals']['production']['suppressedUnits'], 200)   # totals keep them apart
+
+
+class RawStockCells(unittest.TestCase):
+    def test_duplicate_feed_rows_sum_raw(self):
+        s = src()
+        s['inventory']['items'] = s['inventory']['items'] + [inv('ROQAQF223SLS', tr=100), inv('ROQAQF223SLS', tr=-40),
+                                                             inv('ROQAQF224SLS', tr=-15)]
+        ds = build(s)
+        I = [r for r in rows(ds, 'inventory') if r['sku'] == 'ROQAQF223SLS']
+        self.assertEqual([(r['wh'], r['units']) for r in I], [('TR', 60)])     # not 100: the negative row counts
+        self.assertEqual(by(ds, 'styles', 'base')['ROQAQF223SLS']['onHand'], 60)
+        self.assertEqual([r for r in rows(ds, 'inventory') if r['sku'] == 'ROQAQF224SLS'], [])
+
+
+class KinYunPoAware(unittest.TestCase):
+    AMZ = rec('CC!F9', 'KY', 'ref_price_list', 2.4444, factory_code='CC', production_ref_resolved='CC26002',
+              pattern='SOLID', fit_class='SLIM', customer_group='AMAZON', fabric_codes=['QS'], scope='ref')
+
+    def test_rate_rung_reads_the_po_prefix(self):
+        c = ci(costbook=basis_book([self.AMZ]))
+        am = c.resolve('ROQAQS110SLS', 'CC', 'CC26099', poName='AM SYNTH PO')
+        self.assertEqual((am['level'], am['fobU']), ('L3', 2.4444))       # the Amazon rate for an AM PO
+        other = c.resolve('ROQAQS110SLS', 'CC', 'CC26099', poName='SYNTH PO')
+        self.assertEqual((other['level'], other['fobU']), ('L3', 2.2222))
+        self.assertEqual(c.resolve('ROQAQS110SLS', 'CC', 'CC26099')['fobU'], 2.2222)
+
+
+class ShippedDivDates(unittest.TestCase):
+    def test_range_carries_by_div_and_the_note_names_both_dates(self):
+        s = src()
+        bd = {'OB': {'from': '2025-01-01', 'to': '2026-02-20', 'rows': 500},
+              'DS': {'from': '2025-01-01', 'to': '2026-02-10', 'rows': 200}}
+        s['sales_analytics']['source']['byDiv'] = bd
+        ds = build(s)
+        self.assertEqual(ds['shipped']['range']['byDiv'], bd)
+        note = ds['shipped']['note']
+        self.assertIn('Invoices run through Feb 20, 2026.', note)
+        self.assertIn('Dropship invoices run through Feb 10, 2026.', note)
+        self.assertNotRegex(note, r'\d{4}-\d{2}-\d{2}')
+        s2 = src()
+        s2['sales_analytics']['source']['byDiv'] = {'OB': {'to': '2026-02-20'}, 'DS': {'to': '2026-02-20'}}
+        self.assertNotIn('Dropship', build(s2)['shipped']['note'])        # same date: one sentence
+
+    def test_stale_alert_considers_the_dropship_date(self):
+        s = src()
+        s['sales_analytics']['source']['byDiv'] = {'OB': {'to': '2026-02-20'}, 'DS': {'to': '2026-01-10'}}
+        al = {a['id']: a for a in build(s)['alerts']}
+        self.assertIn('al_stale_analytics', al)
+        self.assertEqual(al['al_stale_analytics']['title'], 'Shipped history is old')
+        self.assertIn('Dropship invoice history ends on Jan 10, 2026.', al['al_stale_analytics']['detail'])
+        self.assertNotIn('The invoice history ends', al['al_stale_analytics']['detail'])
+        self.assertNotIn('al_stale_analytics', {a['id'] for a in build()['alerts']})   # fresh dates: no alert
 
 
 if __name__ == '__main__':

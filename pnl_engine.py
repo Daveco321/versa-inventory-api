@@ -2427,7 +2427,8 @@ class CostIndex:
                               'its list.' + (many if fl else ''), (rid,), fac, rng=rng, flags=('sibling',) + fl,
                               row=self._lrow(rid, sku), skip=sk)
         if sku and fac in self.ky_facs and sku['fab'] in self.ky_fabs and sku['pat'] in ('SOLID', 'PRINT'):
-            for am in (False, True):
+            amazon = str(poName or '').upper().startswith('AM')
+            for am in (amazon, not amazon):
                 ps = [x[:2] for x in self.ky_rate.get((sku['pat'], fcl, am), ()) if _brand_ok(x[2], brand)]
                 if ps:
                     p, rid, fl, rng, sk = _lowest(ps)
@@ -2942,8 +2943,11 @@ class _Build:
                 m = inv[sku] = {'sku': sku, 'b': base_of(sku), 'label': None, 'lot': None, 'rd': None, 'ats': 0,
                                 'committed': 0, 'allocated': 0, 'incoming': 0, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0,
                                 'nj': 0, 'abfi': 0}
+            # Raw sums, as pnl_routing.merge_inventory and the presentation stock cards do, so the
+            # P&L shows and costs the same stock its own routing routes. A cell that nets negative
+            # yields no stock row (build_inventory keeps positive cells only).
             for k, _ in _STOCK_KEYS:
-                m[k] += max(0, _int(it.get(k)))
+                m[k] += _int(it.get(k))
             m['incoming'] += _int(it.get('incoming'))
             m['ats'] += _int(it.get('total_ats'))
             for k in ('committed', 'allocated'):
@@ -3279,8 +3283,9 @@ class _Build:
             if price is None and spp[b][0] > 0:
                 price, basis = spp[b][1] / spp[b][0], 'style_open'
                 pflags.add('price_proxy')
-            # 6. The style's invoices in the last 12 months.
-            if price is None:
+            # 6. The style's invoices in the last 12 months. Kit programs are invoiced per carton,
+            # so they skip this rung, as the lifetime maps above do.
+            if price is None and b not in self.ci.kit_pcs:
                 e = self.an.get(b)
                 if e and e.get('t12') and e['t12'][0] > 0 and e['t12'][1] > 0:
                     price, basis = e['t12'][1] / e['t12'][0], 'style_t12'
@@ -3583,10 +3588,13 @@ class _Build:
         prod_b = defaultdict(lambda: [0, 0.0, set(), 0])
         for r in self.production:
             e = prod_b[r['base']]
-            e[0] += r['units']
-            e[1] += r['fob'] or 0.0
+            # A suppressed batch already sits in warehouse stock (routing skipped it), so it is not
+            # incoming or free supply here; totals.production reports suppressed units apart.
+            if 'suppressed' not in r['flags']:
+                e[0] += r['units']
+                e[1] += r['fob'] or 0.0
+                e[3] += r['free']
             e[2].add(r['factory'])
-            e[3] += r['free']
             if r['units'] > 0:
                 reg_b[r['base']].add(r['dutyRegime'])
         feed_b = defaultdict(lambda: [0, 0, 0, None])
@@ -3638,18 +3646,21 @@ class _Build:
             t12 = an.get('t12') or [0.0, 0.0]
             sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand)
             # Expected price and the deduction percent of the same customer mix (contract C8).
+            # Open lines and invoice history count kit cartons, so a kit base divides by its pieces
+            # per carton (build_lines' convention); the landed cost it meets below is per piece.
+            pcs = self.ci.kit_pcs.get(b, 1)
             exp = ded = None
             if ob and ob['u'] > 0:
-                exp = ob['rev'] / ob['u']
+                exp = ob['rev'] / (ob['u'] * pcs)
                 ded = 100 * ob['ded'] / ob['rev'] if ob['rev'] else None
             elif t12[0] > 0 and t12[1] > 0:
-                exp = t12[1] / t12[0]
+                exp = t12[1] / (t12[0] * pcs)
                 ded = self.mix_of(an)[0]
             elif an.get('qty', 0) > 0 and an.get('value', 0) > 0:
-                exp = an['value'] / an['qty']
+                exp = an['value'] / (an['qty'] * pcs)
                 ded = self.mix_of(an)[0]
             elif ab and ab[0] > 0 and ab[1] > 0:
-                exp = ab[1] / ab[0]
+                exp = ab[1] / ab[0]          # allocation revenue is built from per-piece prices
                 ded = 100 * ab[2] / ab[1]
             if exp is not None and ded is None:
                 ded = _ded_pct('', self.S, 'other')
@@ -3718,24 +3729,28 @@ class _Build:
         on_rev = royalty_base(self.S) == 'revenue'
         rcp = revenue_cost_pct(self.S)
         unit4 = r4(unit)
+        # Kit programs are invoiced per carton while the style cost is per piece, so the factory
+        # cost and every adder count pieces, the same convention as shipped_by_customer.
+        pcs = self.ci.kit_pcs.get(b, 1)
         rev = cogs = dsum = rsum = 0.0
         for ym in self.months:
             e = an['months'].get(ym)
             if not e or (not e[0] and not e[1]):
                 continue
             u, v = e[0], e[1]
+            qty = u * pcs
             rev += v
             dd = v * ded / 100
             dsum += dd
             rec = {'u': u, 'v': v, 'ded': dd, 'rc': v * rcp / 100}
             if unit is not None:
-                fob = r2(u * unit4)
-                d, f, x = adders(fob, u, cat, fiber, origin, self.S, 'us')
+                fob = r2(qty * unit4)
+                d, f, x = adders(fob, qty, cat, fiber, origin, self.S, 'us')
                 k = 1 - fobs
                 if cas:
                     # The Canada share (C12) pays the Canadian adders on the same factory cost.
                     k -= cas
-                    dc, fc, xc = adders(fob, u, cat, fiber, origin, self.S, 'ca')
+                    dc, fc, xc = adders(fob, qty, cat, fiber, origin, self.S, 'ca')
                     rec.update(fob=fob, duty=d * k + dc * cas, freight=f * k + fc * cas, fees=x * k + xc * cas)
                     cogs += fob + (d + f + x) * k + (dc + fc + xc) * cas
                 else:
@@ -3806,8 +3821,13 @@ class _Build:
                          'royalty': roy, 'contrib': r2(gp - roy - rc),
                          'costedShare': round(c['costedRev'] / c['rev'], 3) if c['rev'] else 0.0,
                          'costedRev': r2(c['costedRev']), 'revCost': rc})
-        when = friendly_date(self.sa_src.get('to'))
-        note = ((('Invoices run through %s. ' % when) if when else '')
+        ob_to = self._div_to('OB') or _d10(self.sa_src.get('to'))
+        ds_to = self._div_to('DS')
+        head = ('Invoices run through %s. ' % friendly_date(ob_to)) if ob_to else ''
+        if ob_to and ds_to and ds_to < ob_to:
+            # Dropship invoices arrive on their own schedule; when they stop earlier, say so.
+            head += 'Dropship invoices run through %s. ' % friendly_date(ds_to)
+        note = (head
                 + 'Gross profit, royalty, revenue costs and profit count only styles that have a cost. '
                   'The Revenue with a cost row shows that share.')
         self.hist_rows = self.shipped_by_customer()
@@ -3816,9 +3836,18 @@ class _Build:
                         'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, self.hist_rows), 'range': self.shipped_range()}
 
     def shipped_range(self):
-        """shipped.range (contract C14): the invoice history's own dates, from sales_analytics.source."""
+        """shipped.range (contract C14): the invoice history's own dates, from sales_analytics.source.
+        byDiv carries the feed's per-division dates (OB wholesale, DS dropship) when it sends them."""
         s = self.sa_src if isinstance(getattr(self, 'sa_src', None), dict) else {}
-        return {'from': s.get('from'), 'to': s.get('to'), 'ingestedAt': s.get('ingestedAt')}
+        return {'from': s.get('from'), 'to': s.get('to'), 'ingestedAt': s.get('ingestedAt'),
+                'byDiv': s.get('byDiv') if isinstance(s.get('byDiv'), dict) else None}
+
+    def _div_to(self, div):
+        """The invoice history's end date for one division (source.byDiv), else None."""
+        s = self.sa_src if isinstance(getattr(self, 'sa_src', None), dict) else {}
+        bd = s.get('byDiv') if isinstance(s.get('byDiv'), dict) else {}
+        e = bd.get(div) if isinstance(bd.get(div), dict) else {}
+        return _d10(e.get('to'))
 
     def shipped_by_customer(self):
         """shipped.byCustomer (contract C14): lifetime invoices per account and style. History codes fold
@@ -4081,9 +4110,18 @@ class _Build:
                 'The invoice history is not available yet. The Statement shows booked months only.',
                 count=1, refs={}, aid='al_stale_analytics')
         else:
-            to = _d10(self.sa_src.get('to'))
-            if to and (self.today_d - date.fromisoformat(to)).days > STALE_ANALYTICS_DAYS:
-                add('stale_input', 'info', 'Shipped history is old', 'The invoice history ends on %s.' % friendly_date(to),
+            to = self._div_to('OB') or _d10(self.sa_src.get('to'))
+            ds_to = self._div_to('DS')
+
+            def _hist_old(d):
+                return bool(d) and (self.today_d - date.fromisoformat(d)).days > STALE_ANALYTICS_DAYS
+            hist_parts = []
+            if _hist_old(to):
+                hist_parts.append('The invoice history ends on %s.' % friendly_date(to))
+            if _hist_old(ds_to) and ds_to != to:
+                hist_parts.append('Dropship invoice history ends on %s.' % friendly_date(ds_to))
+            if hist_parts:
+                add('stale_input', 'info', 'Shipped history is old', ' '.join(hist_parts),
                     count=1, refs={}, aid='al_stale_analytics')
             if self.an_skipped:
                 add('stale_input', 'info', 'Shipped history partly unreadable',
