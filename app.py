@@ -18157,6 +18157,205 @@ def _ai_tool_build_presentation(params):
     return out
 
 
+# --- Colour categories SOLD (David, Sep 22 2026) -----------------------------------
+# "How many White Solids / Black Solids / Navy Solids / Other Solids / Fancies sold in a
+# period, and to whom". Reads the SAME colour block the desktop Past Selling Colours tab
+# reads (open-orders /api/sales-analytics, bucketed per invoice line by
+# colour_buckets.py), so the platform chat, the MCP connector, the email agent and the
+# screen always give one answer. sales_history_lookup cannot do this: it has no colour
+# dimension, and it drops month/from/to whenever no customer is named.
+_COLOUR_ORDER = ('white', 'black', 'navy', 'other_solids', 'fancies', 'uncategorised')
+_COLOUR_LABEL = {'white': 'White Solids', 'black': 'Black Solids', 'navy': 'Navy Solids',
+                 'other_solids': 'Other Solids', 'fancies': 'Fancies',
+                 'uncategorised': 'Uncategorised'}
+_COLOUR_ALIAS = {
+    'white': 'white', 'whites': 'white', 'white solid': 'white', 'white solids': 'white',
+    'black': 'black', 'blacks': 'black', 'black solid': 'black', 'black solids': 'black',
+    'navy': 'navy', 'navy solid': 'navy', 'navy solids': 'navy',
+    'blue': 'navy', 'blues': 'navy', 'blue solid': 'navy', 'blue solids': 'navy',
+    'other': 'other_solids', 'other solid': 'other_solids', 'other solids': 'other_solids',
+    'other_solids': 'other_solids',
+    'fancy': 'fancies', 'fancies': 'fancies', 'pattern': 'fancies', 'patterns': 'fancies',
+    'print': 'fancies', 'prints': 'fancies',
+    'uncategorised': 'uncategorised', 'uncategorized': 'uncategorised', 'unknown': 'uncategorised',
+}
+
+
+def _colour_ym(v):
+    v = str(v or '').strip()
+    return v[:7] if re.match(r'^\d{4}-\d{2}', v) else ''
+
+
+def _colour_shift(ym, n):
+    y, m = int(ym[:4]), int(ym[5:7]) - 1 + n
+    y += m // 12
+    m %= 12
+    return '%04d-%02d' % (y, m + 1)
+
+
+def _colour_span(a, b):
+    return (int(b[:4]) - int(a[:4])) * 12 + (int(b[5:7]) - int(a[5:7]))
+
+
+def _ai_tool_colour_sales(params):
+    """White / Black / Navy / Other Solids / Fancies SOLD in a period, by customer, with an
+    optional comparison period and the customers who bought them."""
+    try:
+        month = _colour_ym(params.get('month'))
+        year = str(params.get('year') or '').strip()
+        frm, to = _colour_ym(params.get('from')), _colour_ym(params.get('to'))
+        if month:
+            frm = to = month
+        elif re.match(r'^\d{4}$', year):
+            frm, to = year + '-01', year + '-12'
+        elif frm and not to:
+            to = frm
+        elif to and not frm:
+            frm = to
+        rng_a = (min(frm, to), max(frm, to)) if (frm and to) else None
+
+        code = None
+        cust_q = (params.get('customer') or '').strip()
+        if cust_q:
+            code, err = _sales_resolve_customer(cust_q)
+            if err:
+                return err
+
+        cat_q = str(params.get('category') or '').strip().lower().replace('-', ' ').replace('_', ' ')
+        cat = (_COLOUR_ALIAS.get(cat_q) or _COLOUR_ALIAS.get(cat_q.replace(' ', '_'))) if cat_q else None
+        if cat_q and not cat:
+            return {'error': 'Unknown colour category "%s". Use one of: %s.'
+                             % (params.get('category'), ', '.join(_COLOUR_LABEL.values()))}
+
+        div = {'wholesale': 'OB', 'ob': 'OB', 'dropship': 'DS', 'ds': 'DS'}.get(
+            str(params.get('division') or 'all').strip().lower(), 'all')
+
+        data, err = _oo_json('GET', '/api/sales-analytics', timeout=120)
+        if err:
+            return err
+        if isinstance(data, dict) and data.get('building'):
+            return {'error': 'The sales analytics are being rebuilt on the server right now. '
+                             'Ask again in about a minute.'}
+        col = (data or {}).get('colour') if isinstance(data, dict) else None
+        if not col:
+            return {'error': 'Colour categories are not available on the sales server yet.'}
+        c_months = col.get('months') or {}
+        c_cust = col.get('cust') or {}
+
+        def in_rng(mk, rng):
+            return rng is None or rng[0] <= mk <= rng[1]
+
+        def sums(rng):
+            out = {b: [0, 0.0] for b in _COLOUR_ORDER}
+            if code:
+                # customer months carry [units, value] only: no wholesale/dropship split
+                for b in _COLOUR_ORDER:
+                    for mk, uv in ((c_cust.get(b) or {}).get(code) or {}).items():
+                        if in_rng(mk, rng):
+                            out[b][0] += uv[0] or 0
+                            out[b][1] += uv[1] or 0
+                return out
+            for b in _COLOUR_ORDER:
+                for mk, m in (c_months.get(b) or {}).items():
+                    if not in_rng(mk, rng):
+                        continue
+                    u, v = (m[0] or 0), (m[1] or 0)
+                    if div == 'DS':
+                        u, v = (m[2] or 0), (m[3] or 0)
+                    elif div == 'OB':
+                        u, v = u - (m[2] or 0), v - (m[3] or 0)
+                    out[b][0] += u
+                    out[b][1] += v
+            return out
+
+        def as_rows(sm):
+            tu = sum(sm[b][0] for b in _COLOUR_ORDER)
+            tv = sum(sm[b][1] for b in _COLOUR_ORDER)
+            rows = [{'category': _COLOUR_LABEL[b], 'key': b, 'units': int(sm[b][0]),
+                     'value': round(sm[b][1], 2),
+                     'share_pct': round(sm[b][0] / tu * 100, 1) if tu else 0.0}
+                    for b in _COLOUR_ORDER]
+            return rows, int(tu), round(tv, 2)
+
+        a_rows, a_u, a_v = as_rows(sums(rng_a))
+
+        cmp_q = str(params.get('compare') or 'none').strip().lower()
+        cf, ct = _colour_ym(params.get('compare_from')), _colour_ym(params.get('compare_to'))
+        rng_b = None
+        if cf or ct:
+            b0, b1 = (cf or ct), (ct or cf)
+            rng_b = (min(b0, b1), max(b0, b1))
+        elif rng_a and cmp_q in ('last_year', 'year', 'prior_year', 'yoy', 'same_months_last_year'):
+            rng_b = (_colour_shift(rng_a[0], -12), _colour_shift(rng_a[1], -12))
+        elif rng_a and cmp_q in ('previous_period', 'prev', 'previous', 'period_before'):
+            span = _colour_span(rng_a[0], rng_a[1])
+            b_to = _colour_shift(rng_a[0], -1)
+            rng_b = (_colour_shift(b_to, -span), b_to)
+        compare = None
+        if rng_b:
+            b_rows, b_u, b_v = as_rows(sums(rng_b))
+            for ra, rb in zip(a_rows, b_rows):
+                ra['units_then'] = rb['units']
+                ra['value_then'] = rb['value']
+                ra['change_units'] = ra['units'] - rb['units']
+                ra['change_pct'] = (round((ra['units'] - rb['units']) / rb['units'] * 100, 1)
+                                    if rb['units'] else None)
+            compare = {'from': rng_b[0], 'to': rng_b[1], 'total_units': b_u, 'total_value': b_v,
+                       'change_units': a_u - b_u,
+                       'change_pct': round((a_u - b_u) / b_u * 100, 1) if b_u else None}
+
+        names = {}
+        summ = _sales_summary_quiet()
+        for c in ((summ or {}).get('customers') or []):
+            if not isinstance(c, dict):
+                continue
+            cc = str(c.get('customer') or c.get('code') or '').upper()
+            nm = c.get('name') or c.get('customerName')
+            if cc and nm:
+                names[cc] = nm
+        agg = {}
+        for b in ([cat] if cat else list(_COLOUR_ORDER)):
+            for cc, months in (c_cust.get(b) or {}).items():
+                if code and cc != code:
+                    continue
+                for mk, uv in months.items():
+                    if in_rng(mk, rng_a):
+                        e = agg.setdefault(cc, [0, 0.0])
+                        e[0] += uv[0] or 0
+                        e[1] += uv[1] or 0
+        top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:25]
+        top_customers = [{'customer': cc, 'name': names.get(cc, cc), 'units': int(uv[0]),
+                          'value': round(uv[1], 2)} for cc, uv in top if uv[0] or uv[1]]
+
+        src = col.get('source') or {}
+        st = sum(v for v in src.values() if isinstance(v, (int, float))) or 1
+        notes = []
+        if code and div != 'all':
+            notes.append('Customer figures have no wholesale/dropship split, so the division was ignored.')
+        if rng_a is None or rng_a[0] < '2023-01' or (rng_b and rng_b[0] < '2023-01'):
+            notes.append('Invoices before 2023 are still inflated by a known import error until the '
+                         'history reload runs. Say so whenever a number or comparison reaches before 2023.')
+        return {
+            'period': ({'from': rng_a[0], 'to': rng_a[1]} if rng_a
+                       else {'from': None, 'to': None, 'all_history': True}),
+            'customer': code, 'customer_name': names.get(code, code) if code else None,
+            'division': {'OB': 'wholesale', 'DS': 'dropship'}.get(div, 'all'),
+            'categories': a_rows, 'total_units': a_u, 'total_value': a_v,
+            'compare': compare,
+            'top_customers_for': _COLOUR_LABEL[cat] if cat else 'every category',
+            'top_customers': top_customers,
+            'colour_source_pct': {'from_style_number': round(src.get('style', 0) / st * 100, 1),
+                                  'from_invoice_colour': round(src.get('invoice', 0) / st * 100, 1),
+                                  'uncategorised': round(src.get('none', 0) / st * 100, 1)},
+            'definitions': ('Navy Solids = every shade of blue. Assortment codes count as Fancies. '
+                            'Uncategorised = no colour could be determined, never guessed.'),
+            'notes': notes,
+            **_history_info(data, sales_summary=summ),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {'error': 'colour_sales_lookup failed: %s' % str(e)[:200]}
+
+
 _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
@@ -18233,6 +18432,29 @@ _AI_AGENT_TOOLS = [
          'customer': {'type': 'string'}, 'style': {'type': 'string'},
          'month': {'type': 'string'}, 'from': {'type': 'string'}, 'to': {'type': 'string'},
          'limit': {'type': 'integer'}}}},
+    {'name': 'colour_sales_lookup',
+     'description': ('COLOUR CATEGORIES SOLD (invoiced): units and dollars of White Solids, Black '
+                     'Solids, Navy Solids (every shade of blue), Other Solids, Fancies and '
+                     'Uncategorised sold in a period, optionally for one customer, optionally '
+                     'compared with another period, plus which customers bought them. Use it for ANY '
+                     'question about colour or the solid/fancy mix in PAST SALES ("how many white '
+                     'solids sold in July", "navy this fall vs last fall", "who bought the most black '
+                     'solids"). It reads the same numbers as the Past Selling Colours tab. Period: '
+                     'month (YYYY-MM), or year (YYYY), or from/to (YYYY-MM); none = all history. '
+                     'compare: last_year or previous_period, or compare_from/compare_to for any other '
+                     'period. category narrows top_customers to one category. division: wholesale or '
+                     'dropship (company-wide only). Always state history_label (the invoice cut-off) '
+                     'with the numbers and repeat any note. For colours in CURRENT stock use '
+                     'query_inventory instead.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'month': {'type': 'string'}, 'year': {'type': 'string'},
+         'from': {'type': 'string'}, 'to': {'type': 'string'},
+         'customer': {'type': 'string'},
+         'category': {'type': 'string',
+                      'description': 'white | black | navy | other_solids | fancies | uncategorised'},
+         'compare': {'type': 'string', 'description': 'last_year | previous_period | none'},
+         'compare_from': {'type': 'string'}, 'compare_to': {'type': 'string'},
+         'division': {'type': 'string', 'description': 'all | wholesale | dropship'}}}},
     {'name': 'build_sales_sheet',
      'description': ('Build a downloadable Excel SALES SHEET with photos for ONE customer\'s past selling '
                      'and pipeline: an Invoiced tab (real invoice dates + shipped quantities per PO and '
@@ -18323,7 +18545,8 @@ _AI_AGENT_TOOLS = [
 # Tools that read the Past Orders / sales-history data. The platform chat
 # (/api/ai-agent) hands them only to Versa-Docs admins; the MCP connector keeps
 # them for every caller of its own token (David, Sep 9 2026).
-_AI_AGENT_ADMIN_TOOLS = {'past_orders_lookup', 'sales_history_lookup', 'build_sales_sheet'}
+_AI_AGENT_ADMIN_TOOLS = {'past_orders_lookup', 'sales_history_lookup', 'build_sales_sheet',
+                         'colour_sales_lookup'}
 
 _AI_AGENT_TOOL_FNS = {
     'query_inventory': _ai_tool_query_inventory,
@@ -18332,6 +18555,7 @@ _AI_AGENT_TOOL_FNS = {
     'open_orders_lookup': _ai_tool_open_orders,
     'past_orders_lookup': _ai_tool_past_orders,
     'sales_history_lookup': _ai_tool_sales_history,
+    'colour_sales_lookup': _ai_tool_colour_sales,
     'build_sales_sheet': _ai_tool_build_sales_sheet,
     'build_line_sheet': _ai_tool_build_line_sheet,
     'build_presentation': _ai_tool_build_presentation,
@@ -18347,6 +18571,7 @@ LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
 PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "lookbook", "photo cards" or "N tiles/cards per page" ALWAYS means build_presentation (a print-ready PDF of photo cards), never build_line_sheet and never a spreadsheet. Map the request straight onto its parameters. Example: "B&T in stock and incoming for everything but Shaq, one for warehouse and one for overseas, 8 tiles per page" = two calls, {source:'warehouse', category:'big_tall', exclude_brands:['SHAQ']} and {source:'overseas', category:'big_tall', exclude_brands:['SHAQ']}. Example: "Ross's big and tall styles on order with PO #, units, cost and ship window" = {source:'open_orders', customer:'Ross', category:'big_tall'}. Put each link in your final message as <a href="URL" target="_blank">Download the presentation</a>.
+COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. Give units first, then dollars, name the period exactly, and always state the history_label cut-off. Repeat any note the tool returns, especially that invoices before 2023 are inflated. For colours in CURRENT stock use query_inventory instead.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
 """
 
