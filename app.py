@@ -18204,7 +18204,27 @@ def _ai_tool_colour_sales(params):
         month = _colour_ym(params.get('month'))
         year = str(params.get('year') or '').strip()
         frm, to = _colour_ym(params.get('from')), _colour_ym(params.get('to'))
-        if month:
+        # SEASONS use the platform's own rule, the one behind the Past Selling season chips
+        # (index.html _pastaSeasonList / _pastSeasonWindows): Fall 'YY = Jun-Nov of that
+        # year, Spring 'YY = Dec of the year before through May. Found by an end-to-end test
+        # (Sep 22 2026): left to itself the model read "Fall 2025" as Sep-Nov and answered
+        # 412,275 White Solids while the Fall '25 chip on screen showed 779,683. A season
+        # must never be converted to months by the model; it is parsed here, once.
+        season_q = str(params.get('season') or '').strip()
+        season_label = None
+        if season_q:
+            sm = re.match(r"^(fall|spring|f|s)\s*'?\s*(\d{4}|\d{2})$", season_q, re.I)
+            if not sm:
+                return {'error': 'Could not read the season "%s". Use for example "Fall 2025" or '
+                                 '"Spring 2026".' % season_q}
+            kind, yr = sm.group(1).lower(), sm.group(2)
+            sy = int(yr) if len(yr) == 4 else 2000 + int(yr)
+            if kind.startswith('f'):
+                frm, to, season_label = '%04d-06' % sy, '%04d-11' % sy, "Fall '%02d" % (sy % 100)
+            else:
+                frm, to, season_label = ('%04d-12' % (sy - 1), '%04d-05' % sy,
+                                         "Spring '%02d" % (sy % 100))
+        elif month:
             frm = to = month
         elif re.match(r'^\d{4}$', year):
             frm, to = year + '-01', year + '-12'
@@ -18336,7 +18356,7 @@ def _ai_tool_colour_sales(params):
             notes.append('Invoices before 2023 are still inflated by a known import error until the '
                          'history reload runs. Say so whenever a number or comparison reaches before 2023.')
         return {
-            'period': ({'from': rng_a[0], 'to': rng_a[1]} if rng_a
+            'period': ({'from': rng_a[0], 'to': rng_a[1], 'season': season_label} if rng_a
                        else {'from': None, 'to': None, 'all_history': True}),
             'customer': code, 'customer_name': names.get(code, code) if code else None,
             'division': {'OB': 'wholesale', 'DS': 'dropship'}.get(div, 'all'),
@@ -18440,6 +18460,9 @@ _AI_AGENT_TOOLS = [
                      'question about colour or the solid/fancy mix in PAST SALES ("how many white '
                      'solids sold in July", "navy this fall vs last fall", "who bought the most black '
                      'solids"). It reads the same numbers as the Past Selling Colours tab. Period: '
+                     'season ("Fall 2025", "Spring 2026") WHENEVER the user names a season: Fall = '
+                     'June to November, Spring = December of the year before to May, exactly the '
+                     'Past Selling season chips, so never convert a season to months yourself. Else '
                      'month (YYYY-MM), or year (YYYY), or from/to (YYYY-MM); none = all history. '
                      'compare: last_year or previous_period, or compare_from/compare_to for any other '
                      'period. category narrows top_customers to one category. division: wholesale or '
@@ -18447,6 +18470,7 @@ _AI_AGENT_TOOLS = [
                      'with the numbers and repeat any note. For colours in CURRENT stock use '
                      'query_inventory instead.'),
      'input_schema': {'type': 'object', 'properties': {
+         'season': {'type': 'string', 'description': 'Fall 2025 | Spring 2026 (platform season rule)'},
          'month': {'type': 'string'}, 'year': {'type': 'string'},
          'from': {'type': 'string'}, 'to': {'type': 'string'},
          'customer': {'type': 'string'},
@@ -18571,7 +18595,7 @@ LIVE DATA TOOLS
 You have server-side tools that query the live inventory database directly. They are fresher and more precise than any snapshot in this prompt. Use them for EVERY question about quantities, styles, availability, fabrications, colors, arrivals, customer orders, or dollar values. Never estimate from the snapshot when a tool can answer; run the tool. Chain tools when needed (e.g. query_inventory to find styles, style_detail to drill in). Quantities from tools are per base style with all size rows aggregated; committed/allocated come back as positive magnitudes.
 build_line_sheet creates a real Excel file with photos and returns download_url. When you use it, put the link in your final message as <a href="URL" target="_blank">Download the line sheet</a>.
 PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "lookbook", "photo cards" or "N tiles/cards per page" ALWAYS means build_presentation (a print-ready PDF of photo cards), never build_line_sheet and never a spreadsheet. Map the request straight onto its parameters. Example: "B&T in stock and incoming for everything but Shaq, one for warehouse and one for overseas, 8 tiles per page" = two calls, {source:'warehouse', category:'big_tall', exclude_brands:['SHAQ']} and {source:'overseas', category:'big_tall', exclude_brands:['SHAQ']}. Example: "Ross's big and tall styles on order with PO #, units, cost and ship window" = {source:'open_orders', customer:'Ross', category:'big_tall'}. Put each link in your final message as <a href="URL" target="_blank">Download the presentation</a>.
-COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. Give units first, then dollars, name the period exactly, and always state the history_label cut-off. Repeat any note the tool returns, especially that invoices before 2023 are inflated. For colours in CURRENT stock use query_inventory instead.
+COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. When the user names a season, pass it as season (for example "Fall 2025") and never turn it into months yourself: Fall is June to November and Spring is December to May, the same as the Past Selling season chips, so your number always equals the screen's. Give units first, then dollars, name the period exactly (say which months a season covers), and always state the history_label cut-off. Repeat any note the tool returns, especially that invoices before 2023 are inflated. For colours in CURRENT stock use query_inventory instead.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
 """
 
