@@ -1307,6 +1307,11 @@ def _py_get_item_category(sku, brand_abbr):
         return 'accessories'
     if brand_up == 'SHAQ' and len(base) >= 3 and 'T' in base[:3]:
         return 'accessories'
+    # Blazers/Vests (B##/V## serial) — tailored category, takes precedence over
+    # the sleeve split exactly like the frontend getDetailedCategory (a GB blazer
+    # must say 'blazers', not 'long_sleeve' — David, Sep 23 2026).
+    if _py_is_blazer(sku):
+        return 'blazers'
     # Young Men (fabric-code based)
     if _py_is_young_men(sku):
         return 'young_men'
@@ -1363,10 +1368,13 @@ def _py_is_button_down(sku, brand_abbr=''):
     # sportswear or an accessory (long/short sleeve, big & tall).
     return _py_get_item_category(sku, brand_abbr) not in ('pants', 'sportswear', 'accessories')
 
-def _py_matches_category(sku, brand_abbr, category):
+def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     """Inclusive category matcher. One SKU can match multiple categories
     (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men';
-    a VD shacket with fit SS matches 'young_men', 'sportswear', AND 'short_sleeve')."""
+    a VD shacket with fit SS matches 'young_men', 'sportswear', AND 'short_sleeve').
+    for_prepack keeps the old inclusive long-sleeve read for prepack RULES only:
+    a blazer/vest is not a long-sleeve shirt on any filter (David, Sep 23 2026),
+    but a 'long_sleeve' size-pack rule still reaches blazer SKUs via BR/DB."""
     if not category or category in ('all', 'any'):
         return True
     if category == 'sportswear':
@@ -1382,7 +1390,7 @@ def _py_matches_category(sku, brand_abbr, category):
     if category == 'short_sleeve':
         return _py_is_short_sleeve(sku)
     if category == 'long_sleeve':
-        return _py_is_long_sleeve_shirt(sku)
+        return _py_is_long_sleeve_shirt(sku) and (for_prepack or not _py_is_blazer(sku))
     if category == 'button_down':
         return _py_is_button_down(sku, brand_abbr)
     # Non-overlapping categories fall through to the primary-category equality check
@@ -2979,7 +2987,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     # Category — use INCLUSIVE match so a BC Carpenter (which is pants+sportswear+young_men)
                     # can match a 'pants' rule, a 'sportswear' rule, OR a 'young_men' rule.
                     r_cat = r.get('category', 'any')
-                    if r_cat and r_cat != 'any' and not _py_matches_category(sku, brand_abbr, r_cat):
+                    if r_cat and r_cat != 'any' and not _py_matches_category(sku, brand_abbr, r_cat, for_prepack=True):
                         continue
 
                     # Fits: if specified, item must match
@@ -5236,7 +5244,7 @@ _APO_FIT_LABELS = {  # frontend fitCodeToLabel short forms
     'SE': 'Slim Fit Extended Button', 'SH': 'Slim Fit Hook & Eye',
     'CE': 'Classic Fit Extended Button', 'CH': 'Classic Fit Hook & Eye',
     'CR': 'Classic Fit Reg Button', 'SF': 'Straight Fit', 'SC': 'Straight Fit Hook & Eye',
-    'RR': 'Relaxed Fit', 'BR': 'Single Breaster', 'DB': 'Double Breaster',
+    'RR': 'Relaxed Fit', 'BR': 'Single Breasted', 'DB': 'Double Breasted',
 }
 _APO_PANTS_FIT_FULL = {  # frontend PANTS_FIT_CODES (full labels win on pants)
     'SE': 'Slim Fit / Extended Button', 'SH': 'Slim Fit / Hook & Eye Closure',
