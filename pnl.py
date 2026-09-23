@@ -1793,6 +1793,7 @@ class _PnlService:
                'history': matrix.get('history'),
                'custAlias': cost['alias'],
                'costByCustomer': cost['byCust'],
+               'cost2ByCustomer': cost.get('byCust2') or {},
                'costByStyle': cost['byStyle'],
                'costGrades': cost['grades'],
                'datasetBuiltAt': cost['builtAt']}
@@ -1827,13 +1828,27 @@ class _PnlService:
         eng = self._module('engine')
         alias = dict(getattr(eng, 'HISTORY_CUSTOMER_ALIAS', None) or {})
         by_cust = {}
+        by_cust2 = {}
         bc = (ds.get('shipped') or {}).get('byCustomer') or {}
         f = {n: i for i, n in enumerate(bc.get('fields') or [])}
         if 'cust' in f and 'base' in f and 'fobU' in f:
+            have2 = all(k in f for k in ('units', 'fob', 'duty', 'freight', 'fees'))
             for row in bc.get('rows') or []:
                 fob = row[f['fobU']]
                 if fob is not None:
                     by_cust.setdefault(row[f['cust']], {})[row[f['base']]] = fob
+                # Per HISTORY unit (kit cartons stay cartons: the byCustomer totals
+                # already carry the kit piece scaling), so the client multiplies by
+                # the cube's own units: [factory cost per unit, import add per unit].
+                # The import add is the engine's duty + freight + fees for THIS
+                # customer and style (the customs formula; an FOB account gets 0).
+                if have2:
+                    u = row[f['units']] or 0
+                    tot = row[f['fob']]
+                    if u and tot is not None:
+                        imp = (row[f['duty']] or 0) + (row[f['freight']] or 0) + (row[f['fees']] or 0)
+                        by_cust2.setdefault(row[f['cust']], {})[row[f['base']]] = [
+                            round(tot / u, 4), round(imp / u, 4)]
         by_style, grades = {}, {}
         st = ds.get('styles') or {}
         sf = {n: i for i, n in enumerate(st.get('fields') or [])}
@@ -1845,7 +1860,7 @@ class _PnlService:
                     if 'grade' in sf:
                         grades[row[sf['base']]] = row[sf['grade']]
         hit = {'key': key, 'builtAt': built_at, 'alias': alias, 'byCust': by_cust,
-               'byStyle': by_style, 'grades': grades}
+               'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades}
         with self._lock:
             self._an_memo = hit
         return hit

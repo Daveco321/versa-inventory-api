@@ -1106,9 +1106,12 @@ class TestAnalyticsRoute(PnlTestCase):
 
         def build_dataset(src, costbook, settings, overrides, now_iso, routing_module):
             return {'v': 1, 'builtAt': now_iso, 'asOf': src['today'],
-                    'shipped': {'byCustomer': {'fields': ['cust', 'base', 'fobU', 'grade'],
-                                               'rows': [['ROSS', 'ZZAAAA001', SENTINEL_COST, 'A'],
-                                                        ['NORD', 'ZZBBBB002', None, 'D']]}},
+                    'shipped': {'byCustomer': {'fields': ['cust', 'base', 'fobU', 'grade',
+                                                          'units', 'fob', 'duty', 'freight', 'fees'],
+                                               'rows': [['ROSS', 'ZZAAAA001', SENTINEL_COST, 'A',
+                                                         10, 10 * SENTINEL_COST, SENTINEL_COST, SENTINEL_COST, 0],
+                                                        ['NORD', 'ZZBBBB002', None, 'D',
+                                                         0, None, 0, 0, 0]]}},
                     'styles': {'fields': ['base', 'fobU', 'grade'],
                                'rows': [['ZZAAAA001', SENTINEL_COST + 1, 'A'],
                                         ['ZZBBBB002', SENTINEL_COST + 2, 'B']]}}
@@ -1141,6 +1144,11 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(d['matrix']['customers']['ROSS']['ZZAAAA001']['2026-08'], [10, 95.0])
         self.assertEqual(d['custAlias']['NORD_DROP'], 'NORD')
         self.assertEqual(d['costByCustomer'], {'ROSS': {'ZZAAAA001': SENTINEL_COST}})   # a None fobU is dropped
+        # cost2: [factory cost per history unit, import add per history unit], the
+        # customs formula's dollars from the engine (duty + freight + fees over units).
+        self.assertEqual(d['cost2ByCustomer'],
+                         {'ROSS': {'ZZAAAA001': [round(10 * SENTINEL_COST / 10, 4),
+                                                 round(2 * SENTINEL_COST / 10, 4)]}})
         self.assertEqual(d['costByStyle'], {'ZZAAAA001': SENTINEL_COST + 1, 'ZZBBBB002': SENTINEL_COST + 2})
         self.assertEqual(d['costGrades'], {'ZZAAAA001': 'A', 'ZZBBBB002': 'B'})
         self.assertEqual(d['history']['label'], 'Invoices through Aug 21, 2026.')
