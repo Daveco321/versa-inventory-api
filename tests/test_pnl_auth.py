@@ -1098,6 +1098,7 @@ class TestAnalyticsRoute(PnlTestCase):
             'history': {'label': 'Invoices through Aug 21, 2026.'},
             'pending': {'ready': True, 'basis': 'estimate', 'totals': {'units': 5},
                         'byMonth': [], 'customers': {'ROSS': {'units': 5}}},
+            'pendingCube': {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}},
             'pendingReady': True}
 
     def eng_with_history(self):
@@ -1153,6 +1154,7 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(d['costGrades'], {'ZZAAAA001': 'A', 'ZZBBBB002': 'B'})
         self.assertEqual(d['history']['label'], 'Invoices through Aug 21, 2026.')
         self.assertTrue(d['pendingReady'])
+        self.assertEqual(d['pendingCube'], {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}})
         self.assertTrue(d['datasetBuiltAt'])
 
     def test_gzip_when_accepted(self):

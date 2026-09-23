@@ -1789,6 +1789,7 @@ class _PnlService:
                'matrix': {'customers': matrix.get('customers') or {},
                           'source': matrix.get('source') or {}},
                'pending': matrix.get('pending'),
+               'pendingCube': matrix.get('pendingCube') or {},
                'pendingReady': bool(matrix.get('pendingReady')),
                'history': matrix.get('history'),
                'custAlias': cost['alias'],
