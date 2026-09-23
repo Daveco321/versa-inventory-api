@@ -17737,9 +17737,18 @@ def _pres_order_cards(params, spec):
     ship window). Bulks (pipeline) stay out unless include_bulks, except a line whose
     PO number was asked for by name in pos: an explicit ask beats the default."""
     cust_q = str(params.get('customer') or '').strip().lower()
+    raw_pos = params.get('pos')
+    if isinstance(raw_pos, str):
+        cand = re.findall(r'\d[\d\-]*', raw_pos)       # one string with several numbers
+    elif isinstance(raw_pos, (list, tuple)):
+        cand = [str(p) for p in raw_pos]
+    elif raw_pos is not None:
+        cand = [str(raw_pos)]
+    else:
+        cand = []
     pos_q = []
-    for p in (params.get('pos') or []):
-        d = re.sub(r'\D', '', str(p))
+    for p in cand:
+        d = re.sub(r'\D', '', p)
         if d and d not in pos_q:
             pos_q.append(d)
     if not cust_q and not pos_q:
