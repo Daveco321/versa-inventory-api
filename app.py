@@ -16495,6 +16495,9 @@ def _ai_tool_build_sales_sheet(params):
     return out
 
 
+_LINE_SHEET_TAB_CAP = 2000
+
+
 def _ai_tool_build_line_sheet(params):
     # warehouse_breakdown is set by the mailbox (email_agent.py), never by the
     # MCP connector or the platform chat, so their sheets are byte-identical to
@@ -16546,8 +16549,12 @@ def _ai_tool_build_line_sheet(params):
             rows, _ = _ai_agent_filter(t)
             color_q = (t.get('color') or '').strip().lower() or None
         items = []
-        over_cap = rows[300:]
-        for r in rows[:300]:
+        # David (Sep 23 2026): no more 300-style tabs (Nautica lost 124 styles).
+        # 2,000 is a pure service guard: no single brand comes near it, so a
+        # real sheet never truncates; it only stops a pathological all-brands
+        # single-tab ask from building a giant workbook on a request thread.
+        over_cap = rows[_LINE_SHEET_TAB_CAP:]
+        for r in rows[:_LINE_SHEET_TAB_CAP]:
             color, fit, fab = _ai_agent_enrich(r)
             if color_q:
                 try:
@@ -16646,8 +16653,9 @@ def _ai_tool_build_line_sheet(params):
             # Never let a silent cap read as full coverage: name the dropped styles
             # on the curated path so the model can move them to another tab or warn.
             entry['truncated'] = True
-            entry['styles_dropped_over_300_cap'] = ([r['style'] for r in over_cap]
-                                                    if skus_req else len(over_cap))
+            entry['styles_dropped_over_cap'] = ([r['style'] for r in over_cap]
+                                                if skus_req else len(over_cap))
+            entry['cap'] = _LINE_SHEET_TAB_CAP
         summary.append(entry)
     if not tabs_out:
         return {'error': 'no styles matched any tab filters', 'tabs': summary}
@@ -18604,7 +18612,9 @@ _AI_AGENT_TOOLS = [
                      'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
                      'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
-                     'Max 4 tabs, 300 styles per tab. Takes up to a minute. Present the returned download_url '
+                     'Max 4 tabs; a tab holds every matching style (service guard at 2,000, which no single '
+                     'brand reaches, so never warn about a style cap unless the result says truncated). '
+                     'Takes up to a minute, longer for very large tabs. Present the returned download_url '
                      'to the user as a clickable link. Excel only: when the user asks for a presentation, '
                      'deck, print-out or photo cards, use build_presentation instead.'),
      'input_schema': {'type': 'object', 'properties': {
