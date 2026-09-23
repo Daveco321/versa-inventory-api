@@ -17579,7 +17579,9 @@ def _pres_stock_cards(source, customer_view, spec, params):
     today = now.date()
     d_before = _apo_parse_date(params.get('arrive_before')) if params.get('arrive_before') else None
     d_after = _apo_parse_date(params.get('arrive_after')) if params.get('arrive_after') else None
-    windowed = source != 'warehouse' and bool(d_before or d_after)
+    x_before = _apo_parse_date(params.get('exfactory_before')) if params.get('exfactory_before') else None
+    x_after = _apo_parse_date(params.get('exfactory_after')) if params.get('exfactory_after') else None
+    windowed = source != 'warehouse' and bool(d_before or d_after or x_before or x_after)
     min_units = _pres_int(params.get('min_units'))
     stats = {'size_rows_skipped': 0, 'smart_routed': 0, 'fifo_fallback': 0, 'assigned': 0,
              'orders_feed_ok': bool(orders_ok)}
@@ -17676,13 +17678,17 @@ def _pres_stock_cards(source, customer_view, spec, params):
         chip_lots = lots
         if windowed:
             # The desktop's arrival-window rule (applyCatalogFilters / applySegmentFilters):
-            # only lots arriving inside the window count, undated lots pass, a style with no
+            # only lots inside the window count, undated lots pass, a style with no
             # qualifying lot drops, and a partial match scales the number by the qualifying
             # share of the style's production units. Customer View never counts hidden lots.
+            # The ex-factory window (David, Sep 23 2026) works the same way on the lot's ETD.
             pool = [l for l in lots if not (customer_view and l['hidden'])]
             if pool and any(l['arr'] or l['etd'] for l in pool):
-                chip_lots = [l for l in pool if not (l['arr'] and ((d_before and l['arr'] > d_before)
-                                                                   or (d_after and l['arr'] < d_after)))]
+                chip_lots = [l for l in pool
+                             if not (l['arr'] and ((d_before and l['arr'] > d_before)
+                                                   or (d_after and l['arr'] < d_after)))
+                             and not (l['etd'] and ((x_before and l['etd'] > x_before)
+                                                    or (x_after and l['etd'] < x_after)))]
                 if not chip_lots:
                     continue
                 if len(chip_lots) < len(pool):
@@ -18049,7 +18055,7 @@ def _ai_tool_build_presentation(params):
     spec = _pres_filter_spec(params)
     cv_raw = params.get('customer_view')
     customer_view = not (cv_raw is False or str(cv_raw).strip().lower() in ('false', '0', 'no'))
-    for k in ('arrive_before', 'arrive_after'):
+    for k in ('arrive_before', 'arrive_after', 'exfactory_before', 'exfactory_after'):
         if params.get(k) and not _apo_parse_date(params.get(k)):
             return {'error': f"{k} must be a date like 2026-10-01 (got {params.get(k)!r})"}
     if src == 'open_orders':
@@ -18106,7 +18112,8 @@ def _ai_tool_build_presentation(params):
     else:
         view = _PRES_VIEW_LABELS[src]
         title = _pres_title_core(params.get('title'), _PRES_VIEW_WORDS[src]) or cat_title
-        headline = ' · '.join(x for x in ('Versa Group', title, view,
+        win = _pres_window_label(params) if src != 'warehouse' else ''
+        headline = ' · '.join(x for x in ('Versa Group', title, view, win,
                                           '' if customer_view else 'Internal view') if x)
         stem = f"{title + ' ' if title else ''}{view} Presentation"
     from html import unescape
@@ -18152,9 +18159,38 @@ def _ai_tool_build_presentation(params):
                                                              if customer_view else ''))
         if not st['orders_feed_ok']:
             out['routing_warning'] = 'open orders feed was unavailable, so styles with orders fell back to FIFO'
-        if src == 'warehouse' and (params.get('arrive_before') or params.get('arrive_after')):
-            out['date_filter_ignored'] = 'arrival dates only apply to overseas and all decks'
+        if src == 'warehouse' and (params.get('arrive_before') or params.get('arrive_after')
+                                   or params.get('exfactory_before') or params.get('exfactory_after')):
+            out['date_filter_ignored'] = 'arrival and ex-factory dates only apply to overseas and all decks'
+        elif src != 'warehouse':
+            wl = _pres_window_label(params)
+            if wl:
+                out['date_window'] = wl
     return out
+
+
+def _pres_window_label(params):
+    """Human label of the deck's date window, for the PDF headline and the tool
+    result ('Ex-factory Oct 5, 2026 to Nov 5, 2026 . Arriving by Dec 1, 2026')."""
+    def fmt(k):
+        d = _apo_parse_date(params.get(k)) if params.get(k) else None
+        return _apo_fmt_date(d) if d else None
+    ab, aa = fmt('arrive_before'), fmt('arrive_after')
+    xb, xa = fmt('exfactory_before'), fmt('exfactory_after')
+    bits = []
+    if xa and xb:
+        bits.append(f"Ex-factory {xa} to {xb}")
+    elif xb:
+        bits.append(f"Ex-factory by {xb}")
+    elif xa:
+        bits.append(f"Ex-factory from {xa}")
+    if aa and ab:
+        bits.append(f"Arriving {aa} to {ab}")
+    elif ab:
+        bits.append(f"Arriving by {ab}")
+    elif aa:
+        bits.append(f"Arriving from {aa}")
+    return ' · '.join(bits)
 
 
 # --- Colour categories SOLD (David, Sep 22 2026) -----------------------------------
@@ -18538,7 +18574,12 @@ _AI_AGENT_TOOLS = [
                      "showing PO #, units, cost and ship window; never arrival or ex-factory dates; bulks excluded "
                      "unless include_bulks. Filters work like query_inventory: brands, exclude_brands ('everything "
                      "except Shaq' = exclude_brands ['SHAQ']), category, fabric_codes, color, search, skus (an exact "
-                     "curated list), min_units, arrive_before/arrive_after (YYYY-MM-DD, overseas and all). category 'big_tall' keeps "
+                     "curated list), min_units, arrive_before/arrive_after (YYYY-MM-DD, overseas and all). "
+                     "exfactory_before/exfactory_after filter the production lots by EX-FACTORY date the same way: "
+                     "'only styles with ex-factories between 10/5 and 11/5' = exfactory_after 2026-10-05 plus "
+                     "exfactory_before 2026-11-05 (slash dates are US month/day; pick the upcoming occurrence). "
+                     "A style with lots on both sides of a window keeps only the qualifying lots' share of its "
+                     "units, undated lots pass, and the deck's header names the window. category 'big_tall' keeps "
                      "ONLY Big & Tall fits: use it whenever the user says big & tall or B&T, including on open_orders "
                      "(a big account like Ross has many orders that are not B&T). customer_view defaults to true "
                      "(Customer View rules: NJ/ABFI stock and NJ/AE/AW/ABFI-landing lots never appear); set it false "
@@ -18556,6 +18597,7 @@ _AI_AGENT_TOOLS = [
          'color': {'type': 'string'}, 'search': {'type': 'string'},
          'skus': {'type': 'array', 'items': {'type': 'string'}},
          'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
+         'exfactory_before': {'type': 'string'}, 'exfactory_after': {'type': 'string'},
          'customer_view': {'type': 'boolean'},
          'cards_per_page': {'type': 'integer', 'enum': [4, 6, 8, 10]},
          'show_cost': {'type': 'boolean'},
