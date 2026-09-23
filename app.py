@@ -14831,6 +14831,7 @@ def _ai_tool_open_orders(params):
         return {'error': 'open orders feed unavailable right now'}
     cust_q = (params.get('customer') or '').strip().lower() or None
     style_q = _ai_agent_base(params.get('style')) if params.get('style') else None
+    po_q = re.sub(r'\D', '', str(params.get('po') or '')) or None
     limit = max(1, min(int(params.get('limit') or 30), 200))
     rows, tot_qty, tot_val, matched = [], 0, 0.0, 0
     for o in orders:
@@ -14841,6 +14842,8 @@ def _ai_tool_open_orders(params):
         if cust_q and cust_q not in cust.lower() and cust_q not in str(o.get('customer') or '').lower():
             continue
         if style_q and _ai_agent_base(o.get('style') or o.get('baseStyle')) != style_q:
+            continue
+        if po_q and not _pres_po_match([po_q], o.get('orderNo')):
             continue
         matched += 1
         tot_qty += open_qty
@@ -17716,12 +17719,32 @@ def _pres_stock_cards(source, customer_view, spec, params):
     return {'cards': cards, 'stats': stats}
 
 
+def _pres_po_match(queries, order_no):
+    """The queried number this order's PO means, else None. Every non-digit is
+    ignored, so '50005391' finds TK Maxx '50-005391'; a 7+ digit number also
+    matches as a prefix either way, the way suffixed line numbers extend a
+    base PO ('4504253' finds 450425301)."""
+    po = re.sub(r'\D', '', str(order_no or ''))
+    if po:
+        for q in queries:
+            if po == q or (len(q) >= 7 and po.startswith(q)) or (len(po) >= 7 and q.startswith(po)):
+                return q
+    return None
+
+
 def _pres_order_cards(params, spec):
     """One card per style on the customer's open POs, a row per PO (PO #, units, cost,
-    ship window). Bulks (pipeline) stay out unless include_bulks."""
+    ship window). Bulks (pipeline) stay out unless include_bulks, except a line whose
+    PO number was asked for by name in pos: an explicit ask beats the default."""
     cust_q = str(params.get('customer') or '').strip().lower()
-    if not cust_q:
-        return {'error': "customer is required for source 'open_orders' (for example 'Ross')"}
+    pos_q = []
+    for p in (params.get('pos') or []):
+        d = re.sub(r'\D', '', str(p))
+        if d and d not in pos_q:
+            pos_q.append(d)
+    if not cust_q and not pos_q:
+        return {'error': "customer is required for source 'open_orders' (for example 'Ross'), "
+                         "or pass pos with the exact PO numbers"}
     orders, _ok = _fetch_all_open_orders()
     if not orders:
         return {'error': 'open orders feed unavailable right now'}
@@ -17734,28 +17757,37 @@ def _pres_order_cards(params, spec):
     # Which account: an exact code or name wins ('Ross' = ROSS, 'Costco' = COST + COST1).
     # A partial name must point at ONE customer, so 'TJX' (TJX UK, TJX Australia,
     # Winners/TJX Canada) never merges several accounts' POs into one deck.
-    wanted = {n.lower() for code, n in map(names, orders) if cust_q in (code, n.lower())}
-    if not wanted:
-        partial = {}
-        for code, n in map(names, orders):
-            if cust_q in code or cust_q in n.lower():
-                partial.setdefault(n.lower(), f"{n} ({code.upper()})" if code else n)
-        if len(partial) > 1 and not params.get('combine_customers'):
-            return {'error': 'several customers match that name', 'customers_matched': sorted(partial.values()),
-                    'hint': ('call again with one exact name or code from customers_matched, or set '
-                             'combine_customers true for one combined deck')}
-        wanted = set(partial)
+    # A pos list alone needs no customer: the named POs say exactly what to show.
+    wanted = None
+    if cust_q:
+        wanted = {n.lower() for code, n in map(names, orders) if cust_q in (code, n.lower())}
+        if not wanted:
+            partial = {}
+            for code, n in map(names, orders):
+                if cust_q in code or cust_q in n.lower():
+                    partial.setdefault(n.lower(), f"{n} ({code.upper()})" if code else n)
+            if len(partial) > 1 and not params.get('combine_customers'):
+                return {'error': 'several customers match that name', 'customers_matched': sorted(partial.values()),
+                        'hint': ('call again with one exact name or code from customers_matched, or set '
+                                 'combine_customers true for one combined deck')}
+            wanted = set(partial)
     stats = {'customer_lines': 0, 'bulk_lines_skipped': 0}
     by_sku, custs = {}, {}
+    hit_pos = set()
     for o in orders:
         units = _pres_int(o.get('openQty')) + _pres_int(o.get('pickQty'))
         if units <= 0:
             continue
         code, cust = names(o)
-        if cust.lower() not in wanted:
+        if wanted is not None and cust.lower() not in wanted:
             continue
+        hit = _pres_po_match(pos_q, o.get('orderNo')) if pos_q else None
+        if pos_q and not hit:
+            continue
+        if hit:
+            hit_pos.add(hit)
         stats['customer_lines'] += 1
-        if o.get('isPipeline') and not include_bulks:
+        if o.get('isPipeline') and not include_bulks and not hit:
             stats['bulk_lines_skipped'] += 1
             continue
         sku = str(o.get('style') or o.get('baseStyle') or '').strip().upper()
@@ -17788,7 +17820,11 @@ def _pres_order_cards(params, spec):
         cards.append({'sku': card['sku'], 'base': card['base'], 'brand': card['brand'], 'color': color,
                       'fab': fab, 'fit': fit, 'number': total, 'lines': lines,
                       'first': lines[0]['start'] or '9999'})
-    return {'cards': cards, 'stats': stats, 'customers': custs}
+    out = {'cards': cards, 'stats': stats, 'customers': custs}
+    if pos_q:
+        out['pos_found'] = sorted(hit_pos)
+        out['pos_not_found'] = [q for q in pos_q if q not in hit_pos]
+    return out
 
 
 def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_cost=True, doc_title='Presentation'):
@@ -18070,9 +18106,14 @@ def _ai_tool_build_presentation(params):
         out.update(res.get('stats') or {})
         if src == 'open_orders':
             out['customers_matched'] = sorted(res.get('customers') or {})
-            out['hint'] = ('the customer has open orders, but none match the other filters'
-                           if res['stats']['customer_lines'] else
-                           'no open orders for that customer name; check it with open_orders_lookup')
+            if res.get('pos_not_found') is not None:
+                out['pos_not_found'] = res['pos_not_found']
+                out['hint'] = ('none of the requested PO numbers are on the open order book; '
+                               'if they already shipped, look them up with past_orders_lookup instead')
+            else:
+                out['hint'] = ('the customer has open orders, but none match the other filters'
+                               if res['stats']['customer_lines'] else
+                               'no open orders for that customer name; check it with open_orders_lookup')
         return out
     order_idx = {}
     for i, sk in enumerate(spec['skus']):
@@ -18144,6 +18185,12 @@ def _ai_tool_build_presentation(params):
         out['customer'] = cust_label
         out['customers_matched'] = sorted(custs)
         out['pos'] = len({ln['po'] for cd in cards for ln in cd['lines']})
+        if res.get('pos_found') is not None:
+            out['pos_found'] = res['pos_found']
+            if res.get('pos_not_found'):
+                out['pos_not_found'] = res['pos_not_found']
+                out['pos_hint'] = ('these numbers are not on the open order book; if they shipped, '
+                                   'past_orders_lookup has them')
         out['bulk_lines_skipped'] = res['stats']['bulk_lines_skipped']
         out['card_shows'] = 'style details plus PO #, units, cost and ship window per PO (no arrival or ex-factory dates)'
     else:
@@ -18444,9 +18491,13 @@ _AI_AGENT_TOOLS = [
      'input_schema': {'type': 'object', 'properties': {'brand': {'type': 'string'}}}},
     {'name': 'open_orders_lookup',
      'description': ('Open customer orders (A2000 + bulks) with quantities, dollars, and ship windows. '
-                     'Filter by customer name and/or style #.'),
+                     'Filter by customer name, style # and/or po (ONE PO number; every non-digit is '
+                     "ignored when matching, so '50005391' finds a PO stored as '50-005391' and a 7+ digit "
+                     'number also matches suffixed line numbers). Always try the po filter before declaring '
+                     'a PO number missing.'),
      'input_schema': {'type': 'object', 'properties': {
-         'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'limit': {'type': 'integer'}}}},
+         'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'po': {'type': 'string'},
+         'limit': {'type': 'integer'}}}},
     {'name': 'past_orders_lookup',
      'description': ('Order history from the daily order-book archive (since 2026-06-03): every customer PO '
                      'that has left the open-order book. Each PO has a status and a plain status_label. '
@@ -18569,7 +18620,11 @@ _AI_AGENT_TOOLS = [
                      "source 'all' = both in one deck. Stock numbers are the platform's own (smart routing, "
                      "allocations, landed-lot suppression). source 'open_orders' = ONE customer's current open POs "
                      "(customer required, e.g. 'Ross'; a partial name that matches several accounts, like 'TJX', "
-                     "returns customers_matched so you can pick one or pass combine_customers true): one card per "
+                     "returns customers_matched so you can pick one or pass combine_customers true). For a deck of "
+                     "SPECIFIC POs ('make a presentation of these POs: ...'), pass pos with the exact PO numbers "
+                     "instead: customer is then optional, every non-digit is ignored when matching (so '50005391' "
+                     "finds a PO stored as '50-005391'), and a named bulk PO is included. The result reports "
+                     "pos_found / pos_not_found. One card per "
                      "style with the shirt details and a row per PO "
                      "showing PO #, units, cost and ship window; never arrival or ex-factory dates; bulks excluded "
                      "unless include_bulks. Filters work like query_inventory: brands, exclude_brands ('everything "
@@ -18590,6 +18645,8 @@ _AI_AGENT_TOOLS = [
      'input_schema': {'type': 'object', 'properties': {
          'source': {'type': 'string', 'enum': ['warehouse', 'overseas', 'all', 'open_orders']},
          'customer': {'type': 'string'}, 'include_bulks': {'type': 'boolean'},
+         'pos': {'type': 'array', 'items': {'type': 'string'},
+                 'description': 'Exact PO numbers for an open_orders deck of specific POs; customer optional.'},
          'combine_customers': {'type': 'boolean'},
          'brands': {'type': 'array', 'items': {'type': 'string'}},
          'exclude_brands': {'type': 'array', 'items': {'type': 'string'}},
