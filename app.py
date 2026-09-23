@@ -1138,7 +1138,8 @@ def get_base_style(sku):
 
 _PY_SPORTSWEAR_COLLARS = set('ZUMNOR')
 _PY_SPORTSWEAR_FABRICS = {'PH','PJ','PL','PO','PW','TH','HE','RB'}   # RB = Rugby (Style Rules 9-3-2026)
-_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','TB','WB'}  # mirrors frontend BT_FIT_CODES ('TB' = SS Big & Tall, Sep 3 2026 sheet)
+_PY_BT_FIT_CODES       = {'BT','BB','TT','SB','ST','TB','WB',
+                          'TE','TH','TR','BJ','BK','BM'}  # mirrors frontend BT_FIT_CODES ('TB' = SS Big & Tall, Sep 3 2026 sheet; TE/TH/TR = B&T pants and BJ/BK/BM = B&T Bermuda shorts, Sep 18 2026 sheet)
 # Young Men / Sportswear fabric codes — mirrors frontend YOUNG_MEN_FABRIC_CODES.
 # Per Style Rules spreadsheet ("YOUNG MEN / SPORTSWEAR" section), these 18 codes belong
 # to BOTH the Young Men category AND the Sportswear category.
@@ -1166,7 +1167,11 @@ _PY_LONG_SLEEVE_FIT_CODES = {'SL','RF','TF','MF','BT','BB','TT','WB','BR','DB'}
 # prepack rules in export bottom grids that the product tiles never showed —
 # the "export shows a different prepack than the product" bug.
 _PY_ALL_FIT_CODES = {'BB','BR','BT','CE','CH','CR','DB','MF','RF','RR','SB',
-                     'SC','SE','SH','SF','SL','SR','SS','ST','TB','TF','TT','WB'}
+                     'SC','SE','SH','SF','SL','SR','SS','ST','TB','TF','TT','WB',
+                     # Sep 18 2026 sheet: Big & Tall pants (TE/TH/TR) and the nine
+                     # Bermuda-shorts fits. Pants-family codes; the shirt maps
+                     # deliberately do not carry them.
+                     'TE','TH','TR','BE','BH','BA','BD','BC','BF','BJ','BK','BM'}
 
 def _py_extract_fit_code(sku):
     """Extract 2-char fit code — mirrors extractFitCode() in the frontend EXACTLY.
@@ -5179,6 +5184,11 @@ _APO_FABRIC_RULES = {  # frontend FABRIC_RULES, verbatim
     # Style rules Ver 3 (Aug 6, 2026)
     "CQ": "97% Cotton / 3% Spandex - Sateen 135GSM", "CR": "100% Cotton - Sateen 112GSM",
     "CU": "100% Cotton - Knit", "PQ": "65% Polyester / 35% Cotton - TC Twill",
+    # Style rules Sep 18 2026 sheet
+    "CZ": "81% Cotton / 19% Polyester - 245GSM",
+    "CC": "76% Cotton / 22% Nylon / 2% Spandex",
+    "SK": "CVC Seersucker 130GSM 52% Cotton / 48% Polyester",
+    "SM": "96% Polyester / 4% Spandex (Sport Jacket)",
 }
 
 def _apo_format_fabric(raw):
@@ -5245,6 +5255,12 @@ _APO_FIT_LABELS = {  # frontend fitCodeToLabel short forms
     'CE': 'Classic Fit Extended Button', 'CH': 'Classic Fit Hook & Eye',
     'CR': 'Classic Fit Reg Button', 'SF': 'Straight Fit', 'SC': 'Straight Fit Hook & Eye',
     'RR': 'Relaxed Fit', 'BR': 'Single Breasted', 'DB': 'Double Breasted',
+    # Sep 18 2026 sheet: B&T pants and Bermuda shorts (pants full labels win on pants)
+    'TE': 'Big & Tall Extended Button', 'TH': 'Big & Tall Hook & Eye', 'TR': 'Big & Tall Reg Button',
+    'BE': 'Bermuda Slim Extended Button', 'BH': 'Bermuda Slim Hook & Eye', 'BA': 'Bermuda Slim Reg Button',
+    'BD': 'Bermuda Straight Extended Button', 'BC': 'Bermuda Straight Hook & Eye',
+    'BF': 'Bermuda Straight Reg Button', 'BJ': 'Bermuda B&T Extended Button',
+    'BK': 'Bermuda B&T Hook & Eye', 'BM': 'Bermuda B&T Reg Button',
 }
 _APO_PANTS_FIT_FULL = {  # frontend PANTS_FIT_CODES (full labels win on pants)
     'SE': 'Slim Fit / Extended Button', 'SH': 'Slim Fit / Hook & Eye Closure',
@@ -5252,6 +5268,14 @@ _APO_PANTS_FIT_FULL = {  # frontend PANTS_FIT_CODES (full labels win on pants)
     'CH': 'Classic Fit / Hook & Eye Closure', 'CR': 'Classic Fit / Reg Button',
     'SF': 'Straight Fit / Reg Button', 'SC': 'Straight Fit / Hook & Eye Closure',
     'RR': 'Relaxed Fit / Reg Button',
+    # Sep 18 2026 sheet
+    'TE': 'Big & Tall Fit / Extended Button', 'TH': 'Big & Tall Fit / Hook & Eye Closure',
+    'TR': 'Big & Tall Fit / Reg Button',
+    'BE': 'Bermuda Shorts Slim Fit / Extended Button', 'BH': 'Bermuda Shorts Slim Fit / Hook & Eye Closure',
+    'BA': 'Bermuda Shorts Slim Fit / Reg Button', 'BD': 'Bermuda Shorts Straight Fit / Extended Button',
+    'BC': 'Bermuda Shorts Straight Fit / Hook & Eye Closure', 'BF': 'Bermuda Shorts Straight Fit / Reg Button',
+    'BJ': 'Bermuda Shorts Big & Tall Fit / Extended Button', 'BK': 'Bermuda Shorts Big & Tall Fit / Hook & Eye Closure',
+    'BM': 'Bermuda Shorts Big & Tall Fit / Reg Button',
 }
 
 def _apo_fit_label(base):
