@@ -6,7 +6,11 @@ services:
     name: versa-inventory-api
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    # --timeout 300: a full proposed-styles deck (156 photos, cold cache) needs
+    # 2-3 minutes; gunicorn's default 30s was killing the worker mid-build
+    # (David, Sep 24 2026). --threads 8: a long deck request must not freeze
+    # the platform for everyone else (the open-orders build-lock lesson).
+    startCommand: gunicorn app:app --timeout 300 --threads 8
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
