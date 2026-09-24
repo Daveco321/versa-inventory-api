@@ -18130,6 +18130,122 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
 
 _PRES_PROPOSED_CAP = 240   # the deck's own card cap; a full program pitch (DKNY knits = 156 serials) must fit in one deck
 
+def _known_bases():
+    """Every base style the system knows RIGHT NOW: inventory, production
+    ledger and APO bookings."""
+    with _inv_lock:
+        out = {str(i.get('sku') or '').split('-')[0].upper()
+               for i in (_inventory.get('items') or [])}
+    for pr in _ledger_rows():
+        st = str(pr.get('style') or '').strip().upper()
+        if st:
+            out.add(st.split('-')[0])
+    with _apo_lock:
+        for a in (_apo_data or []):
+            st = str((a or {}).get('style') or '').strip().upper()
+            if st:
+                out.add(st.split('-')[0])
+    out.discard('')
+    return out
+
+
+_style_universe_lock = threading.Lock()
+_style_universe_cache = {'body': None, 'at': 0.0, 'fail_until': 0.0}
+_STYLE_UNIVERSE_TTL = 600
+
+def _style_universe_matrix():
+    """The invoiced-history cube for list_style_numbers, cached 10 minutes.
+    Deliberately its OWN fetch: a wiring test walls the cost-and-margin
+    module's names off from the AI-tool area, and this data needs none of
+    that module - it is the sales-history cube, admin-gated exactly like
+    sales_history_lookup. Returns the payload, {'building': True} while the
+    upstream build runs, or None after a recent failure."""
+    now = time.time()
+    with _style_universe_lock:
+        if _style_universe_cache['body'] is not None and now - _style_universe_cache['at'] < _STYLE_UNIVERSE_TTL:
+            return json.loads(_style_universe_cache['body'])
+        if now < _style_universe_cache['fail_until']:
+            return None
+    try:
+        resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/sales-history/matrix",
+                                 headers=_oo_api_headers(), timeout=(5, 45))
+        if resp.status_code != 200:
+            raise RuntimeError(f'upstream {resp.status_code}')
+        data = resp.json()
+        if data.get('building'):
+            return {'building': True}
+        if not data.get('ready') or not isinstance(data.get('customers'), dict):
+            raise ValueError('upstream not ready')
+        with _style_universe_lock:
+            _style_universe_cache.update(body=resp.content, at=now, fail_until=0.0)
+        return data
+    except Exception as e:
+        print(f'[AI-Agent] style-universe fetch failed: {type(e).__name__}', flush=True)
+        with _style_universe_lock:
+            _style_universe_cache['fail_until'] = now + 120
+        return None
+
+
+def _ai_tool_list_style_numbers(params):
+    """One call answers 'every style in this program, ever': base style
+    numbers filtered by brand / fabric code / category / customer prefix,
+    optionally unioned with every base EVER INVOICED (the open-orders history
+    cube) and carrying lifetime units sold for ranking best sellers. Built for
+    composing programs and pitch decks; the Sep 24 2026 MW DKNY email died
+    paging query_inventory 30 rows at a time instead."""
+    params = dict(params or {})
+    want_brands = _pres_brand_keys(params.get('brands') or ([params['brand']] if params.get('brand') else []))
+    fabs = {str(f).strip().upper() for f in (params.get('fabric_codes') or []) if str(f).strip()}
+    fab_text = str(params.get('fabrication') or '').strip().lower()
+    cat = str(params.get('category') or '').strip().lower()
+    cat = _PRES_CATEGORY_ALIASES.get(cat, cat)
+    prefix = str(params.get('customer_prefix') or '').strip().upper()
+    include_past = bool(params.get('include_past'))
+    limit = min(500, _pres_int(params.get('limit')) or 500)
+    bases = {b: 0 for b in _known_bases()}
+    notes = []
+    if include_past:
+        mx = _style_universe_matrix()
+        if isinstance(mx, dict) and mx.get('customers'):
+            for styles in mx['customers'].values():
+                for b, months in styles.items():
+                    base = str(b).split('-')[0].upper()
+                    u = sum(int(v[0] or 0) for v in months.values())
+                    bases[base] = bases.get(base, 0) + u
+        elif isinstance(mx, dict) and mx.get('building'):
+            notes.append('the invoiced history is still loading; retired styles and units_sold '
+                         'are missing from this answer - call again in a minute for the full list')
+        else:
+            notes.append('the invoiced history is unavailable right now; this answer covers '
+                         'current inventory, production and bookings only')
+    rows = []
+    for base, units in bases.items():
+        if len(base) < 11 or not re.fullmatch(r'[A-Z]{6}(\d{3}|[PBV]\d\d)[A-Z]{2}[A-Z]?', base):
+            continue
+        if prefix and not base.startswith(prefix):
+            continue
+        if fabs and base[4:6] not in fabs:
+            continue
+        brand = _pres_card_brand(base)
+        if want_brands and brand not in want_brands:
+            continue
+        if cat and cat not in ('all', 'any') and not _py_matches_category(base, brand, cat):
+            continue
+        color, _fit, fab_name = _pres_details(base, base, brand)
+        if fab_text and fab_text not in (fab_name or '').lower():
+            continue
+        rows.append({'style': base, 'color': color or '', 'fabric': base[4:6],
+                     'units_sold_all_time': int(units)})
+    rows.sort(key=lambda r: (-r['units_sold_all_time'], r['style']))
+    out = {'count': len(rows), 'styles': rows[:limit]}
+    if len(rows) > limit:
+        out['truncated'] = True
+    if include_past and not notes:
+        out['units_basis'] = 'invoiced units across ALL customers, all time'
+    if notes:
+        out['notes'] = notes
+    return out
+
 def _pres_proposed_cards(raw):
     """Cards for a PITCH deck: style numbers that do NOT exist in inventory,
     production or bookings - usually composed minutes ago for a new program
@@ -18139,19 +18255,7 @@ def _pres_proposed_cards(raw):
     under a new customer prefix inherits each serial's registry color and
     photo (MWDKPK001SLS reads DKNY knit serial 001). Styles that DO exist are
     refused here: a pitch card must never shadow a real availability card."""
-    with _inv_lock:
-        existing = {str(i.get('sku') or '').split('-')[0].upper()
-                    for i in (_inventory.get('items') or [])}
-    for pr in _ledger_rows():
-        st = str(pr.get('style') or '').strip().upper()
-        if st:
-            existing.add(st.split('-')[0])
-    with _apo_lock:
-        for a in (_apo_data or []):
-            st = str((a or {}).get('style') or '').strip().upper()
-            if st:
-                existing.add(st.split('-')[0])
-    existing.discard('')
+    existing = _known_bases()
     if isinstance(raw, str):
         # A connector can deliver the array as ONE string (same quirk the pos
         # param hit, Sep 22 2026): JSON text, or entries split by newlines,
@@ -18818,6 +18922,23 @@ _AI_AGENT_TOOLS = [
              'limit': {'type': 'integer'}}}},
          'customer_view': {'type': 'boolean'}, 'filename': {'type': 'string'}},
          'required': ['tabs']}},
+    {'name': 'list_style_numbers',
+     'description': ("ONE call listing base style numbers with color and lifetime units sold - use this INSTEAD of "
+                     "paging query_inventory whenever you need a whole program: 'every DKNY knit ever', 'all Nautica "
+                     "sateen styles', 'best sellers across all customers'. include_past true unions every style EVER "
+                     "invoiced (retired serials included; units_sold_all_time = invoiced units across all customers, "
+                     "all time - rank on it for 'best sellers'). Filters: brands, fabric_codes (2-letter codes, e.g. "
+                     "['PK'] for 100% poly knit), fabrication (text match), category, customer_prefix (first 2 SKU "
+                     "letters). Compact and fast; up to 500 rows. Typical pitch-deck flow: this call once, compose "
+                     "the new style numbers from the serials, then ONE build_presentation with proposed_styles."),
+     'input_schema': {'type': 'object', 'properties': {
+         'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
+         'fabrication': {'type': 'string'},
+         'category': {'type': 'string'},
+         'customer_prefix': {'type': 'string'},
+         'include_past': {'type': 'boolean'},
+         'limit': {'type': 'integer'}}}},
     {'name': 'build_presentation',
      'description': ("Build a print-ready PRESENTATION: a PDF deck of product photo cards, returned as download_url. "
                      "Use this whenever the user asks for a presentation, presentation format, deck, print-out, "
@@ -18856,7 +18977,9 @@ _AI_AGENT_TOOLS = [
                      "where you may have just COMPOSED the numbers yourself following the Style Rules (customer 2 + "
                      "brand 2 + fabric 2 + serial 3 digits + fit 2 + collar 1; cloning an existing program under a "
                      "new customer prefix keeps each serial's color and photo, e.g. MWDKPK001SLS inherits DKNY knit "
-                     "serial 001 White Solid). Use it ONLY when the user says the styles are new / not in inventory "
+                     "serial 001 White Solid). Get the source program in ONE list_style_numbers call (include_past "
+                     "true for 'every style ever' and for best-seller units) - never page query_inventory for this. "
+                     "Use it ONLY when the user says the styles are new / not in inventory "
                      "or asks you to create style numbers. Never mix the two: a deck of EXISTING styles must use the "
                      "normal filters so real availability shows, and the tool bounces any proposed style that "
                      "already exists (already_exist in the result) - present those separately with a normal deck. "
@@ -18895,7 +19018,8 @@ _AI_AGENT_TOOLS = [
 # (/api/ai-agent) hands them only to Versa-Docs admins; the MCP connector keeps
 # them for every caller of its own token (David, Sep 9 2026).
 _AI_AGENT_ADMIN_TOOLS = {'past_orders_lookup', 'sales_history_lookup', 'build_sales_sheet',
-                         'colour_sales_lookup'}
+                         'colour_sales_lookup',
+                         'list_style_numbers'}   # carries lifetime units sold = sales data
 
 _AI_AGENT_TOOL_FNS = {
     'query_inventory': _ai_tool_query_inventory,
@@ -18908,6 +19032,7 @@ _AI_AGENT_TOOL_FNS = {
     'build_sales_sheet': _ai_tool_build_sales_sheet,
     'build_line_sheet': _ai_tool_build_line_sheet,
     'build_presentation': _ai_tool_build_presentation,
+    'list_style_numbers': _ai_tool_list_style_numbers,
 }
 
 # The tool rules split in two. CORE is true wherever these tools run — the
@@ -18944,7 +19069,13 @@ _AI_AGENT_DEFAULT_SYSTEM = (
 # shape. artifacts collects the download_url of every file a tool built, in the
 # order they were built, so the email agent can attach them to its reply.
 def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_ok, label='AI-Agent',
-                  tool_fns=None):
+                  tool_fns=None, max_iter=None, wall_seconds=None):
+    # The mailbox raises max_iter/wall_seconds: an email has no request timeout
+    # and a two-deck build legitimately needs minutes (the Sep 24 2026 MW DKNY
+    # request burned 8 iterations / 110s exploring and never answered). Chat
+    # and the MCP connector keep the tight defaults.
+    max_iter = max_iter or _AI_AGENT_MAX_ITER
+    wall_seconds = wall_seconds or _AI_AGENT_WALL_SECONDS
     started = time.time()
     iterations = 0
     tools_used = []
@@ -19000,8 +19131,27 @@ def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_o
                 results.append({'type': 'tool_result', 'tool_use_id': tu.id,
                                 'content': f'Tool error: {te}', 'is_error': True})
         convo.append({'role': 'user', 'content': results})
-        if iterations >= _AI_AGENT_MAX_ITER or (time.time() - started) > _AI_AGENT_WALL_SECONDS:
+        if iterations >= max_iter or (time.time() - started) > wall_seconds:
             force_final = True
+    if not str(final_text or '').strip():
+        # A forced-final round can come back with no text (huge context, model
+        # ends on nothing). One explicit nudge beats mailing "I could not put
+        # an answer together" for work that actually happened.
+        try:
+            convo.append({'role': 'user', 'content': 'Answer now in plain language with what you '
+                                                     'have. Include any download links your tools '
+                                                     'already produced. Do not call tools.'})
+            resp = client.with_options(timeout=90.0).messages.create(
+                model=model, max_tokens=max_tokens, system=system, messages=convo,
+                tools=agent_tools, tool_choice={'type': 'none'},
+                output_config={'effort': AI_AGENT_EFFORT})
+            u = getattr(resp, 'usage', None)
+            if u:
+                for k in usage_tot:
+                    usage_tot[k] += int(getattr(u, k, 0) or 0)
+            final_text = ''.join(getattr(b, 'text', '') for b in resp.content)
+        except Exception as e:
+            print(f'[{label}] empty-final retry failed: {type(e).__name__}', flush=True)
     elapsed = round(time.time() - started, 1)
     print(f"[{label}] {iterations} iterations, tools={tools_used}, "
           f"in={usage_tot['input_tokens']} cached={usage_tot['cache_read_input_tokens']} "
@@ -19174,7 +19324,12 @@ try:
     from email_agent import register_email_routes
     register_email_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
                           agent_client=_ai_agent_client,
-                          agent_run=_ai_agent_run,
+                          # Email runs on a background thread with no request
+                          # timeout, so it earns a bigger loop budget: heavy
+                          # asks (a full-program pitch deck plus a ranked one)
+                          # take minutes by nature.
+                          agent_run=lambda *a, **k: _ai_agent_run(
+                              *a, **{'max_iter': 14, 'wall_seconds': 480, **k}),
                           tools=_AI_AGENT_TOOLS,
                           admin_tools=_AI_AGENT_ADMIN_TOOLS,
                           guidance_core=_AI_AGENT_TOOL_GUIDANCE_CORE,
