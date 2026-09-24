@@ -740,6 +740,20 @@ class SenderAuthenticityTests(unittest.TestCase):
         ok, why = EA._sender_is_authentic('david@versamens.com', self.ar(self.SES_REAL))
         self.assertTrue(ok, why)
 
+    def test_a_verdict_from_an_untrusted_authserv_counts_for_nothing(self):
+        """Authentication-Results is just text a sender can also write. Only
+        the receiver's own header (amazonses.com / resend.com authserv-id)
+        may vouch (Sep 24 2026 hardening)."""
+        for forged in ('dmarc=pass',
+                       'evil.example; dmarc=pass',
+                       'evilamazonses.com; dmarc=pass',
+                       'amazonses.com.evil.test; dmarc=pass'):
+            ok, why = EA._sender_is_authentic('david@versamens.com', self.ar(forged))
+            self.assertFalse(ok, f'{forged!r} must not authenticate: {why}')
+        ok, _ = EA._sender_is_authentic('david@versamens.com',
+                                        self.ar('mx.amazonses.com; dmarc=pass'))
+        self.assertTrue(ok, 'a subdomain of the trusted receiver still vouches')
+
     def test_that_same_header_does_not_vouch_for_anyone_else(self):
         ok, why = EA._sender_is_authentic('boss@z-attacker.test', self.ar(self.SES_REAL))
         self.assertFalse(ok, why)
@@ -781,15 +795,15 @@ class SenderAuthenticityTests(unittest.TestCase):
 
     def test_a_subdomain_still_aligns(self):
         ok, why = EA._sender_is_authentic(
-            'boss@mail.example.test', self.ar('dkim=pass header.d=example.test'))
+            'boss@mail.example.test', self.ar('amazonses.com; dkim=pass header.d=example.test'))
         self.assertTrue(ok, why)
 
     def test_someone_elses_dkim_does_not_vouch_for_this_sender(self):
         """The forgery that matters: valid DKIM for the attacker's own domain,
         From: rewritten to a trusted address."""
         ok, why = EA._sender_is_authentic(
-            'boss@example.test', self.ar('dkim=pass header.i=@z-attacker.test; spf=pass '
-                                         'smtp.mailfrom=z-attacker.test'))
+            'boss@example.test', self.ar('amazonses.com; dkim=pass header.i=@z-attacker.test; '
+                                         'spf=pass smtp.mailfrom=z-attacker.test'))
         self.assertFalse(ok)
         self.assertIn('nothing authenticates', why)
 
@@ -847,7 +861,7 @@ class AuthenticationEnforcementTests(unittest.TestCase):
         self.assertIn('could not be verified', self.sent[0]['html'])
 
     def test_a_verified_sender_is_answered(self):
-        EA._handle(self.event({'Authentication-Results': 'spf=pass smtp.mailfrom=example.test; '
+        EA._handle(self.event({'Authentication-Results': 'amazonses.com; spf=pass smtp.mailfrom=example.test; '
                                                          'dkim=pass header.i=@example.test'}))
         self.assertEqual(1, len(self.ran))
         self.assertIn('ok', self.sent[0]['html'])
@@ -1152,7 +1166,36 @@ class ReplyAllTests(unittest.TestCase):
         data = {'to': ['ats@z-fake.test', 'rep@example.test'],
                 'cc': ['Buyer <buyer@z-customer.test>']}
         self.assertEqual(['rep@example.test', 'buyer@z-customer.test'],
+                         EA._reply_recipients(data, self.CFG, 'boss@versamens.com'))
+
+    def test_externals_ride_only_for_versamens_senders(self):
+        """David, Sep 24 2026: outside addresses join the reply only when the
+        (DMARC-verified) sender is @versamens.com. Any other allow-listed
+        sender still gets versamens colleagues copied, nothing else."""
+        data = {'to': ['ats@z-fake.test'],
+                'cc': ['Buyer <buyer@z-customer.test>', 'colleague@versamens.com']}
+        self.assertEqual(['colleague@versamens.com'],
                          EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+        self.assertEqual(['buyer@z-customer.test', 'colleague@versamens.com'],
+                         EA._reply_recipients(data, self.CFG, 'boss@versamens.com'))
+
+    def test_a_lookalike_domain_is_not_versamens(self):
+        data = {'cc': ['buyer@z-customer.test']}
+        self.assertEqual([], EA._reply_recipients(data, self.CFG, 'boss@evilversamens.com'))
+        self.assertEqual([], EA._reply_recipients(data, self.CFG, 'boss@mail.versamens.com'),
+                         'the exact domain only, per David')
+
+    def test_header_to_and_cc_lines_are_read(self):
+        """Resend's webhook to/cc usually name just the mailbox; the real
+        recipient list lives in the message headers (the Sep 23 2026 case:
+        an outside To on the header was silently dropped)."""
+        data = {'to': ['ats@z-fake.test']}
+        headers = {'To': 'ATS <ats@z-fake.test>, Michael <mm@z-burlington.test>',
+                   'Cc': 'Colleague <colleague@versamens.com>'}
+        self.assertEqual(['mm@z-burlington.test', 'colleague@versamens.com'],
+                         EA._reply_recipients(data, self.CFG, 'boss@versamens.com', headers=headers))
+        self.assertEqual(['colleague@versamens.com'],
+                         EA._reply_recipients(data, self.CFG, 'boss@example.test', headers=headers))
 
     def test_the_mailbox_never_copies_itself(self):
         data = {'to': ['ATS@Z-Fake.test'], 'cc': ['ats@z-fake.test']}
@@ -1169,11 +1212,11 @@ class ReplyAllTests(unittest.TestCase):
 
     def test_duplicates_collapse(self):
         data = {'to': ['rep@example.test'], 'cc': ['REP@example.test', 'rep@example.test']}
-        self.assertEqual(['rep@example.test'], EA._reply_recipients(data, self.CFG, 'boss@example.test'))
+        self.assertEqual(['rep@example.test'], EA._reply_recipients(data, self.CFG, 'boss@versamens.com'))
 
     def test_a_runaway_cc_list_is_bounded(self):
         data = {'cc': [f'p{i}@z-fake-many.test' for i in range(200)]}
-        self.assertEqual(EA._MAX_CC, len(EA._reply_recipients(data, self.CFG, 'boss@example.test')))
+        self.assertEqual(EA._MAX_CC, len(EA._reply_recipients(data, self.CFG, 'boss@versamens.com')))
 
     def test_always_cc_still_applies(self):
         cfg = {'always_cc': ['watcher@example.test'], 'reply_to': ''}
@@ -1185,7 +1228,8 @@ class ReplyAllDeliveryTests(unittest.TestCase):
 
     def setUp(self):
         self.s3 = use_s3(self, cfg_object({
-            'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+            'senders': [{'email': 'boss@example.test', 'tier': 'admin'},
+                        {'email': 'dave@versamens.com', 'tier': 'admin'}],
             'notify': ['boss@example.test'],
         }))
         for name, value in (('RESEND_API_KEY', 'z-fake'),
@@ -1209,15 +1253,26 @@ class ReplyAllDeliveryTests(unittest.TestCase):
         data = {'email_id': f'em_cc_{len(self.sent)}_{id(extra)}',
                 'from': 'Boss <boss@example.test>', 'subject': 'deck', 'text': 'nautica deck',
                 'to': ['ats@z-fake.test'],
-                'headers': {'Authentication-Results': 'dkim=pass header.i=@example.test'}}
+                'headers': {'Authentication-Results': 'amazonses.com; dkim=pass header.i=@example.test'}}
         data.update(extra)
         return {'type': 'email.received', 'data': data}
 
     def test_the_answer_reaches_everyone_who_was_copied(self):
-        EA._handle(self.event(cc=['colleague@example.test', 'Buyer <buyer@z-customer.test>']))
+        EA._handle(self.event(**{
+            'from': 'Dave <dave@versamens.com>',
+            'cc': ['colleague@versamens.com', 'Buyer <buyer@z-customer.test>'],
+            'headers': {'Authentication-Results': 'amazonses.com; dkim=pass header.i=@versamens.com'}}))
+        msg = self.sent[0]
+        self.assertEqual(['dave@versamens.com'], msg['to'])
+        self.assertEqual(['colleague@versamens.com', 'buyer@z-customer.test'], msg['cc'])
+
+    def test_an_outside_sender_never_pulls_outsiders_onto_the_reply(self):
+        """boss@example.test is allow-listed, but only versamens colleagues may
+        be copied on their requests; the customer address is dropped."""
+        EA._handle(self.event(cc=['colleague@versamens.com', 'Buyer <buyer@z-customer.test>']))
         msg = self.sent[0]
         self.assertEqual(['boss@example.test'], msg['to'])
-        self.assertEqual(['colleague@example.test', 'buyer@z-customer.test'], msg['cc'])
+        self.assertEqual(['colleague@versamens.com'], msg['cc'])
 
     def test_no_cc_means_no_cc_field(self):
         EA._handle(self.event())

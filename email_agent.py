@@ -37,7 +37,7 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime, timezone
-from email.utils import parseaddr
+from email.utils import parseaddr, getaddresses
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -483,25 +483,44 @@ def _email_tool_fns():
     return fns
 
 
-def _reply_recipients(data, cfg, sender):
+_REPLY_ALL_DOMAIN = 'versamens.com'   # only a sender here may pull OUTSIDE addresses onto the reply
+
+def _reply_recipients(data, cfg, sender, headers=None):
     """Reply-all: everyone the sender put on the message, minus ourselves.
 
-    David, Sep 18 2026. If he CCs a colleague or a customer when he writes in,
-    the answer should land with them too instead of only coming back to him.
-    Our own addresses are stripped so a reply can never be addressed at the
-    mailbox and start a loop, and the sender is never also a CC."""
+    David, Sep 18 2026, extended Sep 24 2026. If he CCs a colleague or a
+    customer when he writes in, the answer should land with them too instead of
+    only coming back to him. The webhook's own to/cc usually name just the
+    mailbox (Resend reports the routed recipient, not the header line), so the
+    fetched MESSAGE HEADERS are read as well - that is where the real To and Cc
+    live. Outside-the-company addresses ride along ONLY when the sender is
+    @versamens.com (the exact domain; the sender's From is already DMARC/SPF
+    verified before this runs, so the domain cannot be forged). Any other
+    allow-listed sender gets versamens.com colleagues on the reply and nothing
+    else. Our own addresses are stripped so a reply can never be addressed at
+    the mailbox and start a loop, and the sender is never also a CC."""
     mine = {a for a in (_addr(EMAIL_AGENT_FROM), _addr(EMAIL_AGENT_REPLY_TO),
                         _addr(cfg.get('reply_to') or '')) if a}
     for row in (data.get('received_for') or []):
         a = _addr(row)
         if a:
             mine.add(a)
-    out = []
+    sender_internal = sender.endswith('@' + _REPLY_ALL_DOMAIN)
+    candidates = []
     for field in ('to', 'cc'):
         for row in (data.get(field) or []):
-            a = _addr(row)
-            if a and a != sender and a not in mine and a not in out:
-                out.append(a)
+            candidates.append(_addr(row))
+    for key, value in (headers or {}).items():
+        if str(key).lower() in ('to', 'cc'):
+            for _, raw in getaddresses([str(value or '')]):
+                candidates.append(_addr(raw))
+    out = []
+    for a in candidates:
+        if not a or a == sender or a in mine or a in out:
+            continue
+        if not sender_internal and not a.endswith('@' + _REPLY_ALL_DOMAIN):
+            continue   # externals only join when a versamens.com sender asked
+        out.append(a)
     for a in (cfg.get('always_cc') or []):
         a = _addr(a)
         if a and a != sender and a not in mine and a not in out:
@@ -621,11 +640,29 @@ def _domains(text, field):
     return {m.group(1).strip('.') for m in re.finditer(field, text)}
 
 
+_TRUSTED_AUTHSERV = ('amazonses.com', 'resend.com')
+
 def _sender_is_authentic(from_addr, headers):
-    raw = ' '.join(str(v) for k, v in (headers or {}).items()
-                   if str(k).lower() == 'authentication-results')
+    # Only the RECEIVER'S verdict counts. An Authentication-Results header is
+    # ordinary text a sender can also write; SES/Resend prepend their own,
+    # opening with their authserv-id ("amazonses.com; spf=pass ..."). A value
+    # that does not open with a trusted authserv-id is ignored, so a forged
+    # verdict smuggled through ingestion can never vouch for a domain
+    # (hardening from the Sep 24 2026 reply-all security review).
+    values = [str(v) for k, v in (headers or {}).items()
+              if str(k).lower() == 'authentication-results']
+
+    def _ar_trusted(value):
+        head = str(value).strip().lower().split(';', 1)[0].strip().split()
+        tok = head[0] if head else ''
+        # exact id or a subdomain of it; endswith alone would let
+        # evilamazonses.com vouch.
+        return any(tok == t or tok.endswith('.' + t) for t in _TRUSTED_AUTHSERV)
+
+    raw = ' '.join(v for v in values if _ar_trusted(v))
     if not raw.strip():
-        return False, 'no Authentication-Results header on the message'
+        return False, ('no Authentication-Results header on the message' if not values
+                       else 'no Authentication-Results from a trusted receiver on the message')
     claimed = (from_addr or '').rsplit('@', 1)[-1].lower()
     if not claimed:
         return False, 'no sender domain'
@@ -767,7 +804,7 @@ def _handle(event):
                 break
         prefix = cfg.get('subject_prefix') or ''
         reply_subject = subject if subject.lower().startswith('re:') else f'Re: {subject}'
-        cc = _reply_recipients(data, cfg, from_addr)
+        cc = _reply_recipients(data, cfg, from_addr, headers=body.get('headers'))
         ok, detail = _send_reply(from_addr, f'{prefix}{reply_subject}', answer, attachments, cfg,
                                  in_reply_to=msg_id, cc=cc)
         entry.update(status='answered' if ok else 'send_failed', detail=detail,
