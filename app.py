@@ -18127,7 +18127,7 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
     return buf.getvalue(), total
 
 
-_PRES_PROPOSED_CAP = 120
+_PRES_PROPOSED_CAP = 240   # the deck's own card cap; a full program pitch (DKNY knits = 156 serials) must fit in one deck
 
 def _pres_proposed_cards(raw):
     """Cards for a PITCH deck: style numbers that do NOT exist in inventory,
