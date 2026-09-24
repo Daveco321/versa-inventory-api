@@ -18151,6 +18151,18 @@ def _pres_proposed_cards(raw):
             if st:
                 existing.add(st.split('-')[0])
     existing.discard('')
+    if isinstance(raw, str):
+        # A connector can deliver the array as ONE string (same quirk the pos
+        # param hit, Sep 22 2026): JSON text, or entries split by newlines,
+        # commas or semicolons. '|' stays untouched - it carries the color.
+        s = raw.strip()
+        parsed = None
+        if s[:1] in '[{':
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                parsed = None
+        raw = parsed if isinstance(parsed, list) else [p for p in re.split(r'[\n,;]+', s) if p.strip()]
     cards, invalid, already = [], [], []
     seen = set()
     for it in (raw if isinstance(raw, list) else [raw]):

@@ -52,6 +52,15 @@ class ProposedCardsTests(unittest.TestCase):
         self.assertIn('unknown fabric code QQ', reasons['MWDKQQ998SLS'])
         self.assertIn('unknown fit code QQ', reasons['MWDKPK998QQS'])
 
+    def test_a_stringified_list_still_parses(self):
+        """Connectors sometimes deliver the array as one string (the pos-param
+        quirk, Sep 22 2026): JSON text or comma-separated entries both work."""
+        cards, _, _ = self.cards('["MWDKPK998SLS", "MWDKPK997SLS"]')
+        self.assertEqual(['MWDKPK997SLS', 'MWDKPK998SLS'], sorted(c['sku'] for c in cards))
+        cards, _, _ = self.cards('MWDKPK998SLS | Glacier Blue, MWDKPK997SLS')
+        self.assertEqual(2, len(cards))
+        self.assertEqual('Glacier Blue', next(c['color'] for c in cards if c['sku'] == 'MWDKPK998SLS'))
+
     def test_a_color_override_wins(self):
         cards, _, _ = self.cards(['MWDKPK998SLS | Glacier Blue Solid'])
         self.assertEqual('Glacier Blue Solid', cards[0]['color'])
