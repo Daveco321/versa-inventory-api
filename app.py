@@ -17928,7 +17928,9 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
             rows.append(('text', (fit_text(cd['fit'], 'Helvetica-Bold', f_txt, iw), 'Helvetica-Bold', f_txt, MUTED),
                          f_txt * 1.3))
         if not orders_mode:
-            num = f"{int(cd['number']):,}"
+            # A proposed-styles card carries a label instead of an availability
+            # number: nothing about it may read as units.
+            num = str(cd.get('label') or f"{int(cd['number']):,}")
             nw = stringWidth(num, 'Helvetica-Bold', f_num)
             ch_h = f_chip + 4.2
             chip = None
@@ -18089,8 +18091,11 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
         c.drawString(xx, hy + lh / 2 - 5.2, fit_text(g['name'], 'Helvetica-Bold', 15, max(60.0, X1 - xx - 270)),
                      charSpace=0.4)
         n = len(g['cards'])
-        units = sum(int(cd['number']) for cd in g['cards'])
-        meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · {units:,} units"
+        if any(cd.get('label') for cd in g['cards']):
+            meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · proposed, not in inventory"
+        else:
+            units = sum(int(cd['number']) for cd in g['cards'])
+            meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · {units:,} units"
         if orders_mode:
             npo = len({ln['po'] for cd in g['cards'] for ln in cd['lines']})
             meta += f" · {npo} PO{'s' if npo != 1 else ''}"
@@ -18122,10 +18127,143 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
     return buf.getvalue(), total
 
 
+_PRES_PROPOSED_CAP = 120
+
+def _pres_proposed_cards(raw):
+    """Cards for a PITCH deck: style numbers that do NOT exist in inventory,
+    production or bookings - usually composed minutes ago for a new program
+    (customer 2 + brand 2 + fabric 2 + serial 3 + fit 2 + collar 1). Each item
+    is a style string, 'STYLE | Color name', or {style, color}. Everything
+    decodes through the same dictionaries as real styles, so a program cloned
+    under a new customer prefix inherits each serial's registry color and
+    photo (MWDKPK001SLS reads DKNY knit serial 001). Styles that DO exist are
+    refused here: a pitch card must never shadow a real availability card."""
+    with _inv_lock:
+        existing = {str(i.get('sku') or '').split('-')[0].upper()
+                    for i in (_inventory.get('items') or [])}
+    for pr in _ledger_rows():
+        st = str(pr.get('style') or '').strip().upper()
+        if st:
+            existing.add(st.split('-')[0])
+    with _apo_lock:
+        for a in (_apo_data or []):
+            st = str((a or {}).get('style') or '').strip().upper()
+            if st:
+                existing.add(st.split('-')[0])
+    existing.discard('')
+    cards, invalid, already = [], [], []
+    seen = set()
+    for it in (raw if isinstance(raw, list) else [raw]):
+        color_override = ''
+        if isinstance(it, dict):
+            sku = str(it.get('style') or it.get('sku') or '').strip().upper()
+            color_override = str(it.get('color') or '').strip()
+        else:
+            txt = str(it or '').strip()
+            if '|' in txt:
+                sku, color_override = (p.strip() for p in txt.split('|', 1))
+                sku = sku.upper()
+                color_override = color_override
+            else:
+                sku = txt.upper()
+        if not sku or sku in seen:
+            continue
+        seen.add(sku)
+        base = sku.split('-')[0]
+        if not re.fullmatch(r'[A-Z]{6}(\d{3}|[PBV]\d\d)[A-Z]{2}[A-Z]?', base):
+            invalid.append({'style': sku, 'reason': 'does not follow the style number pattern '
+                            '(customer 2 + brand 2 + fabric 2 + serial 3 + fit 2 + collar 1)'})
+            continue
+        problems = []
+        brand = _pres_card_brand(base)
+        if not _apo_style_brand_abbr(base) and brand in ('', 'OTHER'):
+            problems.append(f'unknown brand code {base[2:4]}')
+        if base[4:6] not in _APO_FABRIC_RULES:
+            problems.append(f'unknown fabric code {base[4:6]}')
+        if base[9:11] not in _PY_ALL_FIT_CODES:
+            problems.append(f'unknown fit code {base[9:11]}')
+        if problems:
+            invalid.append({'style': sku, 'reason': '; '.join(problems)})
+            continue
+        if base in existing:
+            already.append(base)
+            continue
+        if len(cards) >= _PRES_PROPOSED_CAP:
+            invalid.append({'style': sku, 'reason': f'over the {_PRES_PROPOSED_CAP}-style pitch cap'})
+            continue
+        color, fit, fab = _pres_details(base, base, brand)
+        cards.append({'sku': base, 'base': base, 'brand': brand,
+                      'color': color_override or color or '', 'fab': fab, 'fit': fit,
+                      'number': 0, 'label': 'PROPOSED', 'chip': ('Not in inventory', 'arr')})
+    return cards, invalid, sorted(set(already))
+
+
+def _pres_proposed_build(params, density):
+    """The pitch-deck branch of build_presentation: no availability anywhere,
+    PROPOSED on every card and in the header, existing styles bounced back."""
+    for k in ('skus', 'customer', 'pos', 'brands', 'brand'):
+        if params.get(k):
+            return {'error': 'proposed_styles is a pitch deck of its own: drop the other filters, '
+                             'or build a normal deck for existing styles instead'}
+    cards, invalid, already = _pres_proposed_cards(params.get('proposed_styles'))
+    if not cards:
+        out = {'error': 'no valid proposed styles to draw'}
+        if invalid:
+            out['invalid_styles'] = invalid
+        if already:
+            out['already_exist'] = already
+            out['hint'] = ('these styles exist in inventory, production or bookings; build them '
+                           'with the normal filters (e.g. skus=[...]) so real availability shows')
+        return out
+    cards.sort(key=lambda cd: (_pres_brand_name(cd['brand']).upper(), cd['sku']))
+    photos = dict(_pres_parallel(lambda cd: (cd['sku'], _pres_photo_jpeg(cd['sku'], cd['brand'])), cards, 12))
+    logos = dict(_pres_parallel(lambda k: (k, _pres_logo_png(k)), sorted({cd['brand'] for cd in cards}), 6))
+    groups = []
+    for cd in cards:
+        cd['photo'] = photos.get(cd['sku'])
+        if not groups or groups[-1]['key'] != cd['brand']:
+            groups.append({'key': cd['brand'], 'name': _pres_brand_name(cd['brand']),
+                           'logo': logos.get(cd['brand']), 'cards': []})
+        groups[-1]['cards'].append(cd)
+    now = _pres_now_et()
+    date_label = _apo_fmt_date(now)
+    title = _pres_title_core(params.get('title'), ['proposed', 'not in inventory'])
+    headline = ' · '.join(x for x in ('Versa Group', title, 'PROPOSED STYLES', 'Not in inventory') if x)
+    from html import unescape
+    fname = unescape(unescape(str(params.get('filename') or ''))).strip() \
+        or f"{title + ' ' if title else ''}Proposed Styles Presentation"
+    if fname.lower().endswith('.pdf'):
+        fname = fname[:-4]
+    fname = re.sub(r'\s{2,}', ' ', re.sub(r'[^A-Za-z0-9 &_.()-]+', '', fname)).strip() or 'Proposed Styles'
+    pdf, page_count = _pres_render_pdf(groups, headline, date_label, density, False,
+                                       show_cost=False, doc_title=fname)
+    key = f"claude uploaded/{fname} {now.strftime('%m.%d.%y %H%M%S')}.pdf"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=pdf, ContentType='application/pdf')
+    from urllib.parse import quote
+    out = {'download_url': f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}",
+           'format': 'PDF presentation (photo cards) of PROPOSED styles - no availability shown',
+           'proposed': True, 'cards_per_page': density, 'pages': page_count, 'styles': len(cards),
+           'brands': [{'brand': g['name'], 'styles': len(g['cards'])} for g in groups],
+           'missing_photos': [cd['sku'] for cd in cards if not cd.get('photo')][:40],
+           'note': ('Give the user this link as a clickable download. Every card and the header say '
+                    'PROPOSED / Not in inventory: these style numbers do not exist yet, and no '
+                    'quantity is shown or implied. Say that plainly when presenting the link.')}
+    if invalid:
+        out['invalid_styles'] = invalid
+    if already:
+        out['already_exist'] = already
+        out['already_exist_hint'] = ('left out of the pitch deck: these exist in inventory, '
+                                     'production or bookings, so present them with a NORMAL deck')
+    return out
+
+
 def _ai_tool_build_presentation(params):
     params = dict(params or {})
     if not HAS_REPORTLAB:
         return {'error': 'PDF rendering is unavailable on this server'}
+    if params.get('proposed_styles'):
+        want0 = _pres_int(params.get('cards_per_page')) or 8
+        return _pres_proposed_build(params, min((4, 6, 8, 10), key=lambda d: (abs(d - want0), d)))
     src = str(params.get('source') or '').strip().lower().replace(' ', '_')
     src = {'stock': 'warehouse', 'wh': 'warehouse', 'ats': 'warehouse', 'in_stock': 'warehouse',
            'incoming': 'overseas', 'on_order': 'open_orders', 'orders': 'open_orders',
@@ -18692,8 +18830,23 @@ _AI_AGENT_TOOLS = [
                      "only when the user explicitly wants an internal deck. When the user wants a warehouse deck AND an "
                      "overseas deck, call this tool twice (one deck each) unless they ask for one combined deck "
                      "(source 'all'). Takes up to a minute or two. Reply with the link and a short per-brand summary "
-                     "(styles, units, pages) from the result."),
+                     "(styles, units, pages) from the result. "
+                     "PROPOSED STYLES are a different thing entirely: proposed_styles builds a PITCH deck for style "
+                     "numbers that do NOT exist in inventory, production or bookings - a new program being offered, "
+                     "where you may have just COMPOSED the numbers yourself following the Style Rules (customer 2 + "
+                     "brand 2 + fabric 2 + serial 3 digits + fit 2 + collar 1; cloning an existing program under a "
+                     "new customer prefix keeps each serial's color and photo, e.g. MWDKPK001SLS inherits DKNY knit "
+                     "serial 001 White Solid). Use it ONLY when the user says the styles are new / not in inventory "
+                     "or asks you to create style numbers. Never mix the two: a deck of EXISTING styles must use the "
+                     "normal filters so real availability shows, and the tool bounces any proposed style that "
+                     "already exists (already_exist in the result) - present those separately with a normal deck. "
+                     "Pitch cards show PROPOSED and 'Not in inventory' instead of any quantity; say that plainly "
+                     "when you hand over the link, and never invent or imply availability for them."),
      'input_schema': {'type': 'object', 'properties': {
+         'proposed_styles': {'type': 'array', 'items': {'type': 'string'},
+                             'description': "Pitch-deck mode: full 12-char style numbers that do not exist yet, "
+                                            "optionally 'STYLE | Color name' to name a colorway the serial registry "
+                                            "cannot. Exclusive: no other filters alongside it."},
          'source': {'type': 'string', 'enum': ['warehouse', 'overseas', 'all', 'open_orders']},
          'customer': {'type': 'string'}, 'include_bulks': {'type': 'boolean'},
          'pos': {'type': 'array', 'items': {'type': 'string'},
