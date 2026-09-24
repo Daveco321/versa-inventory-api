@@ -1364,5 +1364,142 @@ class BySizeRowsTests(unittest.TestCase):
         self.assertEqual(150, rec['total'], 'a bare -V is a variant, not a size')
 
 
+
+class ReactionTests(unittest.TestCase):
+    """A Gmail emoji reaction is not a request (Sep 24 2026: a 😭 reaction got
+    an unrelated account summary mailed to four people)."""
+
+    def test_a_gmail_reaction_is_recognised(self):
+        self.assertTrue(EA._is_reaction(
+            '\U0001f62d David Cohen reacted via Gmail <https://www.google.com/gmail/about/>\n\n'
+            'On Thu, Sep 24, 2026 at 1:26 PM Versa Inventory wrote:\n> I could not put an answer together'))
+
+    def test_a_real_request_quoting_a_reaction_is_not(self):
+        self.assertFalse(EA._is_reaction(
+            'Please build the DKNY deck.\nThanks\n\n> \U0001f44d Jerry reacted via Gmail'))
+
+    def test_plain_requests_are_not_reactions(self):
+        self.assertFalse(EA._is_reaction('Can I get a presentation of Nautica B&T in stock?'))
+
+
+class PendingResumeTests(unittest.TestCase):
+    """An email in flight when the process dies is resumed, not lost
+    (Sep 24 2026: David's request vanished in a deploy restart)."""
+
+    def setUp(self):
+        self.s3 = use_s3(self, cfg_object({'senders': [{'email': 'boss@example.test', 'tier': 'admin'}],
+                                           'notify': ['boss@example.test']}))
+        self.handled = []
+        self.addCleanup(setattr, EA, '_handle', EA._handle)
+        EA._handle = lambda event: self.handled.append(event)
+        self.sent = []
+        for name, value in (('RESEND_API_KEY', 'z-fake'),
+                            ('EMAIL_AGENT_FROM', 'Versa Inventory <ats@z-fake.test>')):
+            self.addCleanup(setattr, EA, name, getattr(EA, name))
+            setattr(EA, name, value)
+        self.addCleanup(setattr, EA.requests, 'post', EA.requests.post)
+        EA.requests.post = lambda url, headers=None, json=None, timeout=None: (
+            self.sent.append(json) or FakeResponse(200, b'{}', {'id': 'x'}))
+
+    def event(self, eid='em_pending_1'):
+        return {'type': 'email.received',
+                'data': {'email_id': eid, 'from': 'boss@example.test', 'subject': 'deck'}}
+
+    def pending_keys(self):
+        return [k for k in self.s3.objects if '/pending/' in k]
+
+    def test_a_finished_run_clears_its_marker(self):
+        EA._run_tracked(self.event())
+        self.assertEqual(1, len(self.handled))
+        self.assertEqual([], self.pending_keys())
+
+    def test_a_stale_marker_is_resumed_once(self):
+        EA._pending_write('em_pending_2', {'event': self.event('em_pending_2'), 'beat': 0,
+                                           'attempts': 1, 'owner': 'dead', 'first': EA.time.time()})
+        self.addCleanup(setattr, EA.time, 'sleep', EA.time.sleep)
+        EA.time.sleep = lambda s: None
+        EA._sweep_pending_once()
+        for th in list(EA.threading.enumerate()):
+            if th.name.startswith('email-resume-'):
+                th.join(5)
+        self.assertEqual(['em_pending_2'], [e['data']['email_id'] for e in self.handled])
+        self.assertEqual([], self.pending_keys())
+
+    def test_an_already_answered_email_is_never_resumed(self):
+        """Killed between the send and the marker delete: the sent marker
+        stops a second email to the whole thread."""
+        EA._pending_write('em_pending_5', {'event': self.event('em_pending_5'), 'beat': 0,
+                                           'attempts': 1, 'owner': 'dead', 'first': EA.time.time()})
+        EA._mark_sent('em_pending_5')
+        EA._sweep_pending_once()
+        self.assertEqual([], self.handled)
+        self.assertEqual([], self.pending_keys())
+
+    def test_a_run_killed_mid_send_is_never_resent(self):
+        """It may already be delivered: David is asked to check, the thread
+        gets nothing (review finding, Sep 24 2026)."""
+        EA._pending_write('em_pending_7', {'event': self.event('em_pending_7'), 'beat': 0,
+                                           'attempts': 1, 'owner': 'dead', 'first': EA.time.time()})
+        EA._mark_sending('em_pending_7')
+        EA._sweep_pending_once()
+        self.assertEqual([], self.handled)
+        self.assertEqual([], self.pending_keys())
+        self.assertTrue(any('check one reply' in m['subject'] for m in self.sent))
+
+    def test_the_reply_carries_an_idempotency_key_and_409_means_sent(self):
+        seen = {}
+
+        def post(url, headers=None, json=None, timeout=None):
+            seen.update(headers or {})
+            return FakeResponse(409, b'{}', {})
+        EA.requests.post = post
+        ok, why = EA._send_reply('boss@example.test', 'Re: x', '<p>x</p>', None,
+                                 {'always_cc': [], 'reply_to': ''}, cc=[],
+                                 idempotency_key='versa-reply-em_1')
+        self.assertEqual('versa-reply-em_1', seen.get('Idempotency-Key'))
+        self.assertTrue(ok, why)
+
+    def test_a_switched_off_mailbox_resumes_nothing(self):
+        use_s3(self, cfg_object({'enabled': False,
+                                 'senders': [{'email': 'boss@example.test', 'tier': 'admin'}]}))
+        EA._pending_write('em_pending_6', {'event': self.event('em_pending_6'), 'beat': 0,
+                                           'attempts': 1, 'owner': 'dead', 'first': EA.time.time()})
+        EA._sweep_pending_once()
+        self.assertEqual([], self.handled)
+
+    def test_a_live_marker_is_left_alone(self):
+        EA._pending_write('em_pending_3', {'event': self.event('em_pending_3'),
+                                           'beat': EA.time.time(), 'attempts': 1,
+                                           'owner': 'alive', 'first': EA.time.time()})
+        EA._sweep_pending_once()
+        self.assertEqual([], self.handled)
+        self.assertEqual(1, len(self.pending_keys()))
+
+    def test_it_gives_up_after_the_last_attempt_and_says_so(self):
+        EA._pending_write('em_pending_4', {'event': self.event('em_pending_4'), 'beat': 0,
+                                           'attempts': EA._PENDING_MAX_ATTEMPTS, 'owner': 'dead',
+                                           'first': EA.time.time()})
+        EA._sweep_pending_once()
+        self.assertEqual([], self.handled)
+        self.assertEqual([], self.pending_keys())
+        self.assertTrue(any('could not be finished' in m['subject'] for m in self.sent))
+
+
+
+class MuteTests(unittest.TestCase):
+    """A muted thread is never answered, whoever writes in on it."""
+
+    def test_subjects_normalise(self):
+        self.assertEqual("men's wearhouse request",
+                         EA._thread_subject('RE: Fwd: Men’s Wearhouse  Request'))
+
+    def test_muted_thread_matches_any_reply_prefix(self):
+        cfg = {'muted_subjects': ["Men's Wearhouse Request"]}
+        self.assertTrue(EA._is_muted("Re: Men's Wearhouse Request", cfg))
+        self.assertTrue(EA._is_muted("FW: RE: Men’s Wearhouse Request", cfg))
+        self.assertFalse(EA._is_muted("Men's Wearhouse Request for Spring", cfg))
+        self.assertFalse(EA._is_muted("Re: Nautica deck", cfg))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
