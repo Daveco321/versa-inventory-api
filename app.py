@@ -1075,6 +1075,24 @@ def is_bottoms_style(sku):
     return len(base) >= 6 and base[4:6] in BOTTOMS_FABRIC_CODES
 
 
+def pants_image_keys(sku, brand_abbr):
+    """The PANTS-SPECIFIC photo keys the catalog tile already uses, so an
+    export shows the same photo (David, Sep 24 2026: TMDVBAP10SCP and
+    TMDVBAP32SCP showed on the catalog but not in the customer export).
+    Unlike the fabric-blind VD_010 key, these carry the P## serial and can
+    never pull a shirt photo:
+      dropbox  '<prefix>_P<n>'   serial number without its leading zero
+                                 (frontend resolveImage: VD_P10, VD_P7)
+      swatch   '<prefix>_P##'    the literal serial (styleColorFallbackKeys:
+                                 VD_P32, VD_P07)
+    Returns (dropbox_code or None, swatch_code or None)."""
+    base = str(sku or '').split('-')[0].upper()
+    if len(base) < 10 or base[6] != 'P' or not base[7:9].isdigit():
+        return None, None
+    prefix = extract_image_code(base, brand_abbr).split('_', 1)[0]
+    return f'{prefix}_P{int(base[7:9])}', f'{prefix}_{base[6:9]}'
+
+
 def find_sportswear_image_match(base_style, brand_abbr=None):
     """Find the best-matching sportswear image filename for a SKU.
 
@@ -2165,6 +2183,15 @@ def get_image_cached(item, s3_base_url):
     # Bottoms never use the brand+serial rungs below (fabric-blind keys —
     # VD pants were exporting the same-serial shirt photo). See is_bottoms_style.
     _no_serial_fallback = is_bottoms_style(sku)
+
+    # 2.7. Bottoms: the pants-specific keys the catalog tile uses (VD_P10 in
+    #      Dropbox, then the VD_P32 swatch), never the fabric-blind VD_010.
+    if not result and _no_serial_fallback:
+        _p_dbx, _p_swatch = pants_image_keys(sku, item.get('brand_abbr', item.get('brand', '')))
+        if _p_dbx:
+            result = get_dropbox_thumbnail(_p_dbx)
+        if not result and _p_swatch:
+            result = _process_image_from_url(f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{_p_swatch}.jpg")
 
     # 3. Try Dropbox photos
     if not result and not _no_serial_fallback:
@@ -7498,6 +7525,23 @@ def _fetch_raw_image(base_style, brand_abbr):
         sw_bytes, sw_ct = get_dropbox_image_bytes(sw_match)
         if sw_bytes:
             return sw_bytes, sw_ct
+
+    # 2.7. Bottoms: the pants-specific keys the catalog tile uses (see
+    #      pants_image_keys) - VD_P10 in Dropbox, then the VD_P32 swatch.
+    if _no_serial_fallback:
+        _p_dbx, _p_swatch = pants_image_keys(base_style, brand_abbr)
+        if _p_dbx and _p_dbx in _dropbox_photo_index:
+            dbx_bytes, dbx_ct = get_dropbox_image_bytes(_p_dbx)
+            if dbx_bytes:
+                return dbx_bytes, dbx_ct
+        if _p_swatch:
+            try:
+                resp = http_requests.get(f"{CLOUDFRONT_SWATCH_FALLBACK_URL}/{_p_swatch}.jpg",
+                                         headers=headers, timeout=10)
+                if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', '').lower():
+                    return resp.content, resp.headers.get('Content-Type')
+            except Exception:
+                pass
 
     # 3. Try Dropbox photos (disk cache → API download)
     if not _no_serial_fallback:
