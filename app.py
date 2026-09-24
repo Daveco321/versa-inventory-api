@@ -24,6 +24,8 @@ import threading
 import concurrent.futures
 from datetime import datetime, timedelta
 from io import BytesIO
+from collections import OrderedDict
+import hashlib
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -288,6 +290,7 @@ _inventory = {
     # that changes incrementally, not in 90% jumps).
     'committed_nonzero_count': 0,
     'committed_abs_sum': 0,
+    'gen': 0,   # bumped on every accepted load: exports record which one they were built from
 }
 
 def _sync_passes_sanity_check(new_items):
@@ -435,6 +438,7 @@ def load_overrides_from_s3():
         with _overrides_lock:
             _style_overrides = data
             _s3_overrides_etag = etag
+        _s3_etag_seen[S3_OVERRIDES_KEY] = (etag, time.time())
         _overrides_loaded = True
 
         if changed_styles:
@@ -447,6 +451,13 @@ def load_overrides_from_s3():
                     ]
                     for k in stale_override_keys:
                         _img_cache.pop(k, None)
+            # the /image proxy caches the embedded photo too (rung 0)
+            with _web_img_lock:
+                for s in changed_styles:
+                    _web_img_cache.pop(str(s).upper(), None)
+                    _web_img_cache.pop(get_base_style(s), None)
+            _thumb_drop(changed_styles)
+            _ovr_names_reset()   # photos may have moved into the STYLE OVERRIDES folder
             print(f"  ✓ Cross-worker sync: invalidated _img_cache for {len(changed_styles)} changed override styles")
 
         print(f"  ✓ Loaded {len(_style_overrides)} style overrides from S3 (ETag: {etag[:8]})")
@@ -460,13 +471,18 @@ def load_overrides_from_s3():
         print(f"  ⚠ Override load error: {e}")
         _overrides_loaded = True  # mark loaded on error
 
-def save_overrides_to_s3():
-    """Save style overrides to S3"""
-    global _s3_overrides_etag
+def save_overrides_to_s3(snap=None):
+    """Save style overrides to S3. snap = the exact map to write (default: the
+    current one). Afterwards this worker holds that map under the new ETag as one
+    pair, so a reload that finished mid-upload (it would carry the OLD map) can
+    never leave old data under the new ETag."""
+    global _s3_overrides_etag, _style_overrides
     try:
         s3 = get_s3()
         with _overrides_lock:
-            data = json.dumps(_style_overrides)
+            if snap is None:
+                snap = _style_overrides
+            data = json.dumps(snap)
         resp = s3.put_object(
             Bucket=S3_BUCKET,
             Key=S3_OVERRIDES_KEY,
@@ -475,8 +491,10 @@ def save_overrides_to_s3():
         )
         etag = resp.get('ETag', '').strip('"')
         with _overrides_lock:
+            _style_overrides = snap
             _s3_overrides_etag = etag
-        print(f"  ✓ Saved {len(_style_overrides)} style overrides to S3 (ETag: {etag[:8]})")
+        _s3_etag_seen[S3_OVERRIDES_KEY] = (etag, time.time())
+        print(f"  ✓ Saved {len(snap)} style overrides to S3 (ETag: {etag[:8]})")
         return True
     except Exception as e:
         print(f"  ✗ Failed to save overrides to S3: {e}")
@@ -796,6 +814,7 @@ def load_allocation_from_s3():
 # Production data cache — loaded from Dropbox, refreshed every 10 min
 # (overridable via PRODUCTION_RESYNC_MINUTES env var; see production_resync_loop below)
 _production_data = []
+_production_rev = None   # Dropbox rev of the ledger file loaded (export fingerprint)
 _production_last_sync = 0
 _production_lock = threading.Lock()
 _PRODUCTION_TTL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 60)  # default 10 min
@@ -804,7 +823,7 @@ _PRODUCTION_TTL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 6
 def load_production_from_dropbox():
     """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
     Caches result in memory; returns cached data if under 1 hour old."""
-    global _production_data, _production_last_sync
+    global _production_data, _production_last_sync, _production_rev
 
     # Return cache if fresh
     with _production_lock:
@@ -1010,6 +1029,7 @@ def load_production_from_dropbox():
         with _production_lock:
             _production_data = results
             _production_last_sync = time.time()
+            _production_rev = chosen.get('rev') or chosen.get('content_hash')
 
         print(f"  ✓ Loaded {len(results)} production rows from {row_count} Excel rows ({chosen['name']})")
         return results
@@ -1696,6 +1716,7 @@ def sync_dropbox_photos():
         # Clear image caches so they rebuild with Dropbox awareness
         _dropbox_img_cache.clear()
         _web_img_cache.clear()
+        _thumb_drop()
         _img_cache.clear()
 
         print(f"[Dropbox Photos] ✓ Indexed {len(new_index)} unique images ({total_files} total files), {len(new_sportswear_index)} sportswear", flush=True)
@@ -3787,6 +3808,69 @@ def _group_by_brand(items):
 # ============================================
 DROPBOX_INVENTORY_PATH = os.environ.get('DROPBOX_INVENTORY_PATH', '/Versa Share Files/Hourly ATS/Inventory_ATS.xlsx')
 
+# Dropbox revision of the inventory file this worker last accepted, so /sync can
+# skip the download + parse (~5-15s) while the file is unchanged (Sep 24 2026:
+# every phone open and every 5-minute phone refresh re-parsed it).
+_dbx_inv_rev = {'accepted': None, 'checked_at': 0.0}
+_sync_gate = threading.Lock()
+
+
+def _dropbox_inventory_rev():
+    """Current Dropbox rev of the inventory file (metadata only), or None."""
+    global _dropbox_token_expires
+    token = get_dropbox_token()
+    if not token:
+        return None
+    try:
+        for attempt in (0, 1):
+            r = http_requests.post('https://api.dropboxapi.com/2/files/get_metadata',
+                                   headers={'Authorization': f'Bearer {token}',
+                                            'Content-Type': 'application/json'},
+                                   data=json.dumps({'path': DROPBOX_INVENTORY_PATH}), timeout=10)
+            if r.status_code == 401 and attempt == 0:
+                _dropbox_token_expires = 0
+                token = get_dropbox_token()
+                if not token:
+                    return None
+                continue
+            if r.status_code != 200:
+                return None
+            return r.json().get('rev')
+    except Exception:
+        return None
+    return None
+
+
+def sync_inventory_if_changed(min_interval=20):
+    """sync_inventory() for request paths (/sync, the /inventory stale guard): when
+    this worker holds the Dropbox file's current revision, confirm it with a
+    metadata call (at most every min_interval seconds) instead of downloading and
+    parsing the file again. Concurrent callers share one real sync. Returns True
+    only when new data was loaded."""
+    with _inv_lock:
+        have = bool(_inventory.get('items'))
+        source = _inventory.get('source')
+    accepted = _dbx_inv_rev['accepted']
+    if have and source == 'dropbox' and accepted:
+        now = time.time()
+        if now - _dbx_inv_rev['checked_at'] < min_interval:
+            return False
+        rev = _dropbox_inventory_rev()
+        if rev and rev == accepted:
+            _dbx_inv_rev['checked_at'] = now
+            with _inv_lock:
+                _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
+            return False
+    if not _sync_gate.acquire(blocking=False):
+        _sync_gate.acquire()      # another request is syncing: use its result
+        _sync_gate.release()
+        return False
+    try:
+        return sync_inventory()
+    finally:
+        _sync_gate.release()
+
+
 def sync_from_dropbox():
     """Fetch inventory directly via Dropbox API — uses OAuth, never expires, no shared link needed."""
     token = get_dropbox_token()
@@ -3849,9 +3933,17 @@ def sync_from_dropbox():
 
         brands = _group_by_brand(items)
 
+        try:
+            rev = json.loads(resp.headers.get('Dropbox-API-Result') or '{}').get('rev')
+        except Exception:
+            rev = None
+        _dbx_inv_rev['accepted'] = rev
+        _dbx_inv_rev['checked_at'] = time.time()
+
         with _inv_lock:
             _inventory['items'] = items
             _inventory['brands'] = brands
+            _inventory['gen'] = _inventory.get('gen', 0) + 1
             _inventory['etag'] = 'dropbox'
             _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
             _inventory['item_count'] = len(items)
@@ -3959,6 +4051,7 @@ def sync_inventory():
     with _inv_lock:
         _inventory['items'] = items
         _inventory['brands'] = brands
+        _inventory['gen'] = _inventory.get('gen', 0) + 1
         _inventory['etag'] = etag
         _inventory['last_sync'] = datetime.utcnow().isoformat() + 'Z'
         _inventory['item_count'] = len(items)
@@ -3973,6 +4066,46 @@ def sync_inventory():
     return True
 
 
+_s3_etag_seen = {}   # S3 key -> (etag or None, checked at)
+
+
+def _s3_key_etag(key, max_age=60):
+    """ETag of an S3 object, asked at most every max_age seconds per worker."""
+    now = time.time()
+    hit = _s3_etag_seen.get(key)
+    if hit and now - hit[1] < max_age:
+        return hit[0]
+    try:
+        etag = str(get_s3().head_object(Bucket=S3_BUCKET, Key=key).get('ETag', '')).strip('"') or None
+    except Exception:
+        etag = hit[0] if hit else None
+    _s3_etag_seen[key] = (etag, now)
+    return etag
+
+
+def _export_inputs(max_age=60, reload=True):
+    """What a pre-built export is made from: this worker's inventory load, the
+    canonical overrides and the prepack rules. The S3 files are checked by ETag,
+    so a save that landed on ANOTHER worker changes this too. When the overrides
+    moved, they are reloaded first so the next export run bakes them in.
+    (/sync used to rebuild exports on every call; it now rebuilds when this
+    changes, Sep 24 2026.)"""
+    ovr = _s3_key_etag(S3_OVERRIDES_KEY, max_age)
+    with _overrides_lock:
+        local = _s3_overrides_etag
+    if ovr and ovr != local and reload:
+        load_overrides_from_s3()
+        with _overrides_lock:
+            local = _s3_overrides_etag
+    elif ovr and ovr != local:
+        local = ovr   # differs from what the exports hold: the run itself reloads them
+    with _inv_lock:
+        gen = _inventory.get('gen', 0)
+    with _production_lock:
+        prod = _production_rev
+    return (gen, local, _s3_key_etag(S3_PREPACK_DEFAULTS_KEY, max_age), prod)
+
+
 def generate_all_exports():
     global _regen_queued
     with _export_lock:
@@ -3983,6 +4116,7 @@ def generate_all_exports():
             _regen_queued = True
             return
         _exports['generating'] = True
+        _exports['inputs'] = None      # recording: /sync's `starting` guard leaves this run alone
         _exports['progress'] = 'starting...'
 
     # Everything this run reads (inventory, overrides, prepack rules) is
@@ -3993,6 +4127,9 @@ def generate_all_exports():
     run_started_iso = datetime.utcnow().isoformat() + 'Z'
 
     try:
+        inputs = _export_inputs(max_age=0)
+        with _export_lock:
+            _exports['inputs'] = inputs
         with _inv_lock:
             brands = dict(_inventory['brands'])
 
@@ -4099,6 +4236,7 @@ def generate_all_exports():
         print(f"  Export generation error: {e}")
         with _export_lock:
             _exports['progress'] = f'error: {e}'
+            _exports['inputs'] = None   # the next /sync tries again
     finally:
         # ALWAYS release the flag — the old code leaked generating=True on the
         # empty-inventory early return, permanently blocking every future regen
@@ -4169,7 +4307,7 @@ def sync():
     if request.method == 'OPTIONS':
         return '', 204
 
-    updated = sync_inventory()
+    updated = sync_inventory_if_changed()
 
     with _inv_lock:
         items = list(_inventory['items'])
@@ -4179,8 +4317,13 @@ def sync():
     with _export_lock:
         has_exports = bool(_exports['brands'])
         is_generating = _exports['generating']
+        built_from = _exports.get('inputs')
 
-    if (updated or not has_exports) and not is_generating:
+    # Rebuild when what the exports were made from changed (new inventory on
+    # this worker, or an overrides / prepack-rule save on any worker). A run in
+    # flight queues a follow-up, so a change mid-run is never lost.
+    starting = is_generating and built_from is None   # a run is recording its inputs
+    if (not has_exports and not is_generating) or (not starting and _export_inputs(reload=False) != built_from):
         print("  Triggering background export generation...")
         trigger_background_generation()
 
@@ -4224,7 +4367,7 @@ def inventory():
 
     if needs_sync:
         try:
-            sync_inventory()
+            sync_inventory_if_changed()
         except Exception as e:
             print(f"  [/inventory] Stale-worker sync failed: {e}")
 
@@ -5898,12 +6041,185 @@ def apo_dollar_summary_route():
 def get_overrides():
     if request.method == 'OPTIONS':
         return '', 204
+    if request.args.get('lite') == '1':
+        st = _ovr_lite_state(max_age=0)
+        resp = make_response(st['body'])
+        resp.headers['Content-Type'] = 'application/json'
+        return resp
     # ALWAYS reload from S3 to prevent stale-worker data loss.
     # This endpoint is only called on page load and when version polling detects a change,
     # so the extra S3 read is infrequent and worth the consistency guarantee.
     load_overrides_from_s3()
     with _overrides_lock:
         return jsonify({"overrides": _style_overrides})
+
+
+# ── Lite overrides for the phone app (Sep 24 2026) ───────────────────────
+# The full feed embeds every override photo as base64 (18.7MB on Sep 24, 160
+# photos); the rest of it is ~0.15MB. ?lite=1 swaps each embedded photo for
+# /image/ovr/<hash of the data URI>, served by override_image below with a
+# year-long cache (the URL changes whenever the photo does). Read-only
+# callers only: the desktop POSTs the whole map back, so it keeps the full feed.
+_ovr_lite = {'etag': None, 'body': None, 'by_hash': {}, 'checked': 0.0, 'retired': {}}
+_ovr_lite_lock = threading.Lock()
+# A phone keeps the lite map it loaded until its next version check (up to 5
+# minutes), so a replaced or removed photo keeps answering under its old hash
+# for a while. Content-addressed: an old hash only ever returns the photo it named.
+_OVR_RETIRED_SECONDS = 1800
+_OVR_RETIRED_MAX_CHARS = 40 * 1024 * 1024
+
+
+def _ovr_lite_rebuild():
+    """Rebuild the lite view from this worker's overrides if their version moved."""
+    with _overrides_lock:
+        etag = _s3_overrides_etag
+        snap = dict(_style_overrides)
+    with _ovr_lite_lock:
+        if _ovr_lite['body'] is not None and _ovr_lite['etag'] == etag:
+            return
+    by_hash, lite = {}, {}
+    for k, v in snap.items():
+        if _ovr_is_embedded(v):
+            h = hashlib.md5(v['image'].encode('utf-8', 'ignore')).hexdigest()[:24]
+            by_hash[h] = v['image']
+            nv = dict(v)
+            nv['image'] = '/image/ovr/' + h + '?k=' + _url_quote(str(k), safe='')
+            lite[k] = nv
+        else:
+            lite[k] = v
+    body = json.dumps({'overrides': lite, 'version': etag or '', 'lite': True})
+    now = time.time()
+    with _ovr_lite_lock:
+        retired = {h: v for h, v in (_ovr_lite.get('retired') or {}).items()
+                   if now - v[1] < _OVR_RETIRED_SECONDS and h not in by_hash}
+        for h, img in (_ovr_lite.get('by_hash') or {}).items():
+            if h not in by_hash:
+                retired[h] = (img, now)
+        total = 0
+        for h in sorted(retired, key=lambda k: retired[k][1], reverse=True):
+            total += len(retired[h][0])
+            if total > _OVR_RETIRED_MAX_CHARS:
+                retired.pop(h)
+        _ovr_lite.update(etag=etag, body=body, by_hash=by_hash, retired=retired)
+
+
+_ovr_lite_gate = threading.Lock()
+
+
+def _ovr_lite_state(max_age=15):
+    """The lite view of the canonical overrides, rebuilt when the S3 ETag moves.
+    The ETag is re-checked at most every max_age seconds (0 = always). One
+    caller at a time refreshes; callers that arrive meanwhile wait and reuse its
+    result instead of each downloading the 18MB file again."""
+    with _ovr_lite_lock:
+        due = _ovr_lite['body'] is None or time.time() - _ovr_lite['checked'] >= max_age
+        built_for = _ovr_lite['etag'] if _ovr_lite['body'] is not None else object()
+    with _overrides_lock:
+        current = built_for == _s3_overrides_etag
+    if not due and current:
+        with _ovr_lite_lock:
+            return dict(_ovr_lite)
+    if not _ovr_lite_gate.acquire(blocking=False):
+        _ovr_lite_gate.acquire()      # another request is refreshing: reuse its result
+        _ovr_lite_gate.release()
+        with _ovr_lite_lock:
+            if _ovr_lite['body'] is not None:
+                return dict(_ovr_lite)
+        _ovr_lite_gate.acquire()
+    try:
+        if due:
+            # a worker still loading at startup finishes that load first
+            for _ in range(40):
+                if _overrides_loaded:
+                    break
+                time.sleep(0.25)
+            try:
+                head = get_s3().head_object(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY)
+                s3_etag = str(head.get('ETag', '')).strip('"')
+            except Exception:
+                s3_etag = None
+            with _overrides_lock:
+                local = _s3_overrides_etag
+                empty = not _style_overrides
+            if (s3_etag and s3_etag != local) or empty:
+                load_overrides_from_s3()
+            with _ovr_lite_lock:
+                _ovr_lite['checked'] = time.time()
+        _ovr_lite_rebuild()
+        with _ovr_lite_lock:
+            return dict(_ovr_lite)
+    finally:
+        _ovr_lite_gate.release()
+
+
+def _url_quote(text, safe=''):
+    from urllib.parse import quote
+    return quote(text, safe=safe)
+
+
+def _sniff_image_type(raw):
+    """Content type from the bytes themselves (never trust a stored label)."""
+    if raw[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    if raw[:6] in (b'GIF87a', b'GIF89a'):
+        return 'image/gif'
+    if raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+        return 'image/webp'
+    return 'image/jpeg'
+
+
+@app.route('/image/ovr/<h>', methods=['GET', 'OPTIONS'])
+def override_image(h):
+    """An override photo embedded in the overrides JSON, by the hash in its lite URL."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    h = str(h or '').lower()
+    if not re.fullmatch(r'[0-9a-f]{24}', h):
+        return '', 404
+    def _known():
+        with _ovr_lite_lock:
+            img = _ovr_lite['by_hash'].get(h)
+            old = (_ovr_lite.get('retired') or {}).get(h)
+        if img is None and old and time.time() - old[1] < _OVR_RETIRED_SECONDS:
+            img = old[0]
+        return img
+    # the URL is content-addressed: a hash this worker knows is always the right photo
+    img = _known()
+    if img is None:
+        _ovr_lite_state(max_age=2)
+        img = _known()
+    if img is None:
+        # replaced long ago, or this worker never saw it: send the phone to the
+        # normal photo lookup for that style instead of a blank tile
+        key = str(request.args.get('k') or '').strip().upper()
+        if key and _SKU_PARAM_OK.match(key) and '..' not in key and '//' not in key:
+            base = get_base_style(key)
+            q = []
+            if request.args.get('w'):
+                q.append('w=' + _url_quote(str(request.args.get('w'))))
+            if key != base and not key.endswith('-') and key.split('-')[0] == base:
+                q.append('sku=' + _url_quote(key))
+            resp = make_response('', 302)
+            resp.headers['Location'] = f"/image/{_url_quote(base)}" + ('?' + '&'.join(q) if q else '')
+            resp.headers['Cache-Control'] = 'no-store'
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            return resp
+        return '', 404
+    w = _thumb_width(request.args.get('w'))
+    if w:
+        th = _thumb_get(('H:' + h, w))
+        if th:
+            return _img_resp(th[0], th[1], max_age=31536000, immutable=True)
+    try:
+        import base64 as _b64
+        raw = _b64.b64decode(img.split(',', 1)[1])
+    except Exception:
+        return '', 404
+    ct = _sniff_image_type(raw)
+    if w:
+        th = _sized(('H:' + h, w), raw, ct, w)
+        return _img_resp(th[0], th[1], max_age=31536000, immutable=True)
+    return _img_resp(raw, ct, max_age=31536000, immutable=True)
 
 @app.route('/overrides/version', methods=['GET', 'OPTIONS'])
 def get_overrides_version():
@@ -6020,11 +6336,14 @@ def save_overrides():
             if deleted_applied:
                 print(f"  🗑 Tombstones applied: {deleted_applied} of {len(deleted_keys)} keys removed")
 
-        # Find which styles have new/changed images (for CloudFront invalidation)
+        # Styles whose photo was added, replaced, cleared or deleted (cache and
+        # CloudFront invalidation). A removed photo must be evicted too, or this
+        # worker keeps serving it.
+        def _img_of(d):
+            return d.get('image') if isinstance(d, dict) else None
         changed_styles = [
-            style for style, data in overrides.items()
-            if isinstance(data, dict) and data.get('image') and
-               data.get('image') != (current.get(style) or {}).get('image')
+            style for style in set(current) | set(merged)
+            if _img_of(merged.get(style)) != _img_of(current.get(style))
         ]
 
         with _overrides_lock:
@@ -6035,7 +6354,7 @@ def save_overrides():
         # Async backup before saving canonical file
         threading.Thread(target=_backup_overrides_to_s3, args=(merged,), daemon=True).start()
 
-        success = save_overrides_to_s3()
+        success = save_overrides_to_s3(merged)
 
         if success:
             # Invalidate CloudFront cache for changed override images — instant update
@@ -6067,6 +6386,7 @@ def save_overrides():
                     for s in changed_styles:
                         _web_img_cache.pop(str(s).upper(), None)
                         _web_img_cache.pop(get_base_style(s), None)
+                _thumb_drop(changed_styles)
                 _ovr_names_reset()
                 print(f"  ✓ Cleared _img_cache for {len(changed_styles)} changed override styles")
 
@@ -6174,7 +6494,7 @@ def _run_override_image_extraction():
         with _overrides_lock:
             _style_overrides = snapshot
         _overrides_last_saved = time.time()
-        if not save_overrides_to_s3():
+        if not save_overrides_to_s3(snapshot):
             with _extract_lock:
                 _extract_state.update(running=False, done=True, stripped=0,
                                       error="Images uploaded but saving the stripped JSON failed — re-run. Backup: " + backup_key)
@@ -6192,6 +6512,7 @@ def _run_override_image_extraction():
         with _web_img_lock:
             for b in uploaded:
                 _web_img_cache.pop(str(b).upper(), None)
+        _thumb_drop(uploaded)
         trigger_background_generation()
 
         size_after = len(json.dumps(snapshot))
@@ -6379,6 +6700,7 @@ def _run_ovr_move_upload(ts):
             for n in names:
                 _web_img_cache.pop(n.upper(), None)
                 _web_img_cache.pop(get_base_style(n), None)
+        _thumb_drop(names)
         _ovr_names_reset()   # the phone's full-SKU lookup sees the new files at once
         paths = ['/' + (_OVR_IMG_PREFIX + w['file']).replace(' ', '+') for w in done]
         if paths:
@@ -6449,8 +6771,9 @@ def _ovr_move_strip():
     with _overrides_lock:
         _style_overrides = current
     _overrides_last_saved = time.time()
-    if not save_overrides_to_s3():
+    if not save_overrides_to_s3(current):
         return {'error': 'saving the new JSON failed - canonical file unchanged', 'backup': backup_key}, 500
+    _ovr_names_reset()
     trigger_background_generation()
     size_mb = round(len(json.dumps(current)) / 1e6, 3)
     print(f"  OK override photo move strip: {stripped} photos removed from JSON, {removed} empty entries "
@@ -7344,6 +7667,7 @@ def regenerate_exports():
         _img_cache.clear()
     with _web_img_lock:
         _web_img_cache.clear()
+    _thumb_drop()
     _dropbox_thumb_cache.clear()
     _dropbox_img_cache.clear()
 
@@ -7370,6 +7694,231 @@ def regenerate_exports():
 
 _web_img_cache = {}   # base_style → (content_bytes, content_type)
 _web_img_lock = threading.Lock()
+
+# ── Thumbnails for the phone app (Sep 24 2026) ──────────────────────────
+# Originals average ~1MB; the phone shows 40-220px tiles, so ?w=<px> sends a
+# JPEG no wider than the next bucket up (about 15x smaller). Thumbnails live in
+# their own byte-capped LRU so phone browsing never churns the full-size cache
+# that decks and exports read. Keys: (base style, w) for proxy lookups, dropped
+# wherever the full-size entry is dropped (_thumb_drop); ('H:<md5>', w) for
+# photos whose bytes are hashed at request time, which never go stale.
+_THUMB_WIDTHS = (160, 320, 480, 640, 960, 1280)
+_THUMB_CACHE_MAX_BYTES = 128 * 1024 * 1024
+_THUMB_MAX_ENTRY_BYTES = 512 * 1024
+_thumb_cache = OrderedDict()
+_thumb_bytes = 0
+_thumb_lock = threading.Lock()
+
+
+def _thumb_width(arg):
+    """Requested ?w= snapped UP to a bucket, or None for the original."""
+    try:
+        w = int(str(arg or '').strip())
+    except (TypeError, ValueError):
+        return None
+    if w <= 0:
+        return None
+    for b in _THUMB_WIDTHS:
+        if w <= b:
+            return b
+    return None
+
+
+def _make_thumb(raw, w):
+    """JPEG bytes no wider than w, or None when the original is already the
+    better thing to send (a JPEG that narrow, or a narrow PNG whose JPEG would not
+    be under half its size) or cannot be decoded."""
+    try:
+        with PilImage.open(BytesIO(raw)) as src:
+            is_jpeg = src.format == 'JPEG'
+            if is_jpeg:
+                src.draft('RGB', (w + 1, w + 1))   # reduced-scale decode, kept wider than w
+            im = ImageOps.exif_transpose(src)
+            narrow = im.width <= w
+            if narrow and is_jpeg:
+                return None
+            if im.mode in ('RGBA', 'LA', 'P'):
+                rgba = im.convert('RGBA')
+                bg = PilImage.new('RGB', rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[-1])
+                im = bg
+            elif im.mode != 'RGB':
+                im = im.convert('RGB')
+            if not narrow:
+                im.thumbnail((w, 1000000), PilImage.LANCZOS)
+            out = BytesIO()
+            im.save(out, format='JPEG', quality=80, optimize=True, progressive=True)
+            b = out.getvalue()
+            if narrow and len(b) * 2 > len(raw):
+                return None
+            return b
+    except Exception:
+        return None
+
+
+def _thumb_get(key):
+    with _thumb_lock:
+        hit = _thumb_cache.get(key)
+        if hit is not None:
+            _thumb_cache.move_to_end(key)
+        return hit
+
+
+def _thumb_put(key, val):
+    global _thumb_bytes
+    if len(val[0]) > _THUMB_MAX_ENTRY_BYTES:
+        return
+    with _thumb_lock:
+        old = _thumb_cache.pop(key, None)
+        if old is not None:
+            _thumb_bytes -= len(old[0])
+        _thumb_cache[key] = val
+        _thumb_bytes += len(val[0])
+        while _thumb_bytes > _THUMB_CACHE_MAX_BYTES and _thumb_cache:
+            _k, v = _thumb_cache.popitem(last=False)
+            _thumb_bytes -= len(v[0])
+
+
+def _thumb_drop(names=None):
+    """Drop thumbnails made from these styles' full-size photos (each name and its
+    base style), or every thumbnail when names is None. Call it wherever the
+    matching _web_img_cache entries are dropped."""
+    global _thumb_bytes
+    with _thumb_lock:
+        if names is None:
+            _thumb_cache.clear()
+            _thumb_bytes = 0
+            return
+        want = set()
+        for n in names:
+            s = str(n or '').upper().strip()
+            if s:
+                want.add(s)
+                want.add(get_base_style(s))
+        for k in [k for k in _thumb_cache if k[0] in want]:
+            _thumb_bytes -= len(_thumb_cache.pop(k)[0])
+
+
+def _off_loop(fn, *args):
+    """Run CPU-heavy Pillow work on gevent's native thread pool, so the worker keeps
+    answering other requests meanwhile (Pillow releases the GIL while it decodes,
+    resizes and encodes). A plain call when gevent is not patched in."""
+    try:
+        from gevent import monkey as _gm
+        if _gm.is_module_patched('threading'):
+            import gevent
+            return gevent.get_hub().threadpool.spawn(fn, *args).get()
+    except Exception as e:
+        print(f"  [image] thread pool unavailable, running inline: {e}")
+    return fn(*args)
+
+
+def _sized(key, raw, ct, w):
+    """(bytes, content type) to send for a ?w= request, cached under key."""
+    t = _off_loop(_make_thumb, raw, w)
+    val = (t, 'image/jpeg') if t else (raw, ct)
+    _thumb_put(key, val)
+    return val
+
+
+# Serve-then-refresh for proxy photos (Sep 24 2026). Photo files change outside
+# the override routes too (swatch uploads, Dropbox, the STYLE OVERRIDES folder),
+# and other workers never hear about it. A cached photo, thumbnail or cached miss
+# older than _PHOTO_TTL is served as-is while a background fetch checks the
+# source; if the bytes changed (or a missing photo appeared), the cached copies
+# are replaced for the next request. Nobody waits on the re-check.
+_PHOTO_TTL = 900
+_web_img_at = {}          # base style -> when its photo (or its absence) was last fetched
+_web_img_md5 = {}         # base style -> md5 of those bytes (None = no photo)
+_photo_refreshing = set()
+
+
+def _brand_for_base(base_style):
+    with _inv_lock:
+        for item in (_inventory.get('items') or []):
+            if item.get('sku', '').split('-')[0].upper() == base_style:
+                return item.get('brand_abbr', item.get('brand', ''))
+    return ''
+
+
+def _note_photo_fetch(base_style, raw):
+    _web_img_at[base_style] = time.time()
+    _web_img_md5[base_style] = hashlib.md5(raw).hexdigest() if raw else None
+
+
+def _photo_fetched(base_style, raw):
+    """Record a request-path fetch from the source. If the photo changed since the
+    last fetch, the thumbnails made from the old one are dropped (a failed or empty
+    fetch drops nothing)."""
+    if (raw and base_style in _web_img_at
+            and hashlib.md5(raw).hexdigest() != _web_img_md5.get(base_style)):
+        _thumb_drop([base_style])
+    _note_photo_fetch(base_style, raw)
+
+
+def _maybe_refresh_photo(base_style, brand_abbr=''):
+    at = _web_img_at.get(base_style)
+    if at is not None and time.time() - at < _PHOTO_TTL:
+        return
+    with _web_img_lock:
+        if base_style in _photo_refreshing:
+            return
+        _photo_refreshing.add(base_style)
+    threading.Thread(target=_refresh_photo, args=(base_style, brand_abbr), daemon=True).start()
+
+
+def _refresh_photo(base_style, brand_abbr=''):
+    try:
+        raw, ct = _fetch_raw_image(base_style, brand_abbr or _brand_for_base(base_style))
+        if not raw:
+            # no photo now, or a failed fetch: keep what is cached, look again later
+            _web_img_at[base_style] = time.time()
+            return
+        if base_style in _web_img_at and hashlib.md5(raw).hexdigest() == _web_img_md5.get(base_style):
+            _web_img_at[base_style] = time.time()
+            return
+        with _web_img_lock:
+            if _web_img_cache.get(base_style, 'MISS') != 'MISS':
+                _web_img_cache[base_style] = (raw, ct)   # replaces a stale photo or a cached miss
+        with _thumb_lock:
+            widths = [k[1] for k in _thumb_cache if k[0] == base_style]
+        _thumb_drop([base_style])
+        for tw in widths:
+            _sized((base_style, tw), raw, ct, tw)
+        _note_photo_fetch(base_style, raw)
+    except Exception as e:
+        print(f"  [image] background re-check of {base_style} failed: {e}")
+    finally:
+        with _web_img_lock:
+            _photo_refreshing.discard(base_style)
+
+
+def _photos_changed(names, target=None):
+    """Photo files were written outside the override routes (swatch uploads):
+    drop this worker's cached copies of those styles. Other workers pick the new
+    photos up through the serve-then-refresh re-check."""
+    names = [str(n or '').upper().strip() for n in (names or []) if n]
+    if target not in (None, '', 'style_overrides'):
+        return   # swatch-fallback / logo files are keyed by image code, not style
+    with _img_lock:
+        for n in names:
+            _img_cache.pop(n, None)
+            _img_cache.pop(get_base_style(n), None)
+    with _web_img_lock:
+        for n in names:
+            _web_img_cache.pop(n, None)
+            _web_img_cache.pop(get_base_style(n), None)
+    _thumb_drop(names)
+    _ovr_names_reset()
+
+
+def _img_resp(raw, ct, max_age=86400, immutable=False):
+    resp = make_response(raw)
+    resp.headers['Content-Type'] = ct
+    resp.headers['Cache-Control'] = f"public, max-age={max_age}" + (', immutable' if immutable else '')
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    return resp
 
 
 _SKU_PARAM_OK = re.compile(r'^[A-Z0-9][A-Z0-9 ._/-]*$')
@@ -7592,43 +8141,61 @@ def proxy_image(base_style):
     # file wins first, the same order the desktop and the exports already use.
     # Only real file names are fetched (see _full_sku_override_photo) and the sku must
     # look like a real SKU, so path tricks such as '..' cannot alias other objects.
+    w = _thumb_width(request.args.get('w'))
+    # The phone tags photo URLs with the first 8 characters of the overrides
+    # version it holds. A worker that has not seen that version yet reloads it
+    # first, so it never serves (and the phone never caches) a replaced photo.
+    tag = str(request.args.get('v') or '').split('-', 1)[0].lower()
+    if len(tag) == 8 and all(c in '0123456789abcdef' for c in tag):
+        with _overrides_lock:
+            local = (_s3_overrides_etag or '')[:8].lower()
+        if tag != local:
+            _ovr_lite_state(max_age=5)
     full_sku = str(request.args.get('sku') or '').strip().upper()
     if (full_sku and full_sku != base_style and full_sku.split('-')[0] == base_style
             and _SKU_PARAM_OK.match(full_sku) and '..' not in full_sku
             and '//' not in full_sku and '/./' not in full_sku):
         _hit = _full_sku_override_photo(full_sku)
         if _hit:
-            resp = make_response(_hit[0])
-            resp.headers['Content-Type'] = _hit[1]
-            resp.headers['Cache-Control'] = 'public, max-age=86400'
-            resp.headers['Access-Control-Allow-Origin'] = '*'
-            return resp
+            if w:
+                tk = ('H:' + hashlib.md5(_hit[0]).hexdigest(), w)
+                th = _thumb_get(tk) or _sized(tk, _hit[0], _hit[1], w)
+                return _img_resp(th[0], th[1])
+            return _img_resp(_hit[0], _hit[1])
+
+    brand_abbr = request.args.get('brand', '').upper()
+    if w:
+        th = _thumb_get((base_style, w))
+        if th:
+            _maybe_refresh_photo(base_style, brand_abbr)
+            return _img_resp(th[0], th[1])
 
     # Check web image cache first
     with _web_img_lock:
         cached = _web_img_cache.get(base_style, 'MISS')
     if cached is None:
+        _maybe_refresh_photo(base_style, brand_abbr)
         return '', 404  # Previously failed — skip
     if cached != 'MISS':
-        resp = make_response(cached[0])
-        resp.headers['Content-Type'] = cached[1]
-        resp.headers['Cache-Control'] = 'public, max-age=86400'
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        return resp
+        _maybe_refresh_photo(base_style, brand_abbr)
+        if w:
+            th = _sized((base_style, w), cached[0], cached[1], w)
+            return _img_resp(th[0], th[1])
+        return _img_resp(cached[0], cached[1])
 
     # Get brand from query param or look up from inventory
-    brand_abbr = request.args.get('brand', '').upper()
     if not brand_abbr:
-        with _inv_lock:
-            for item in (_inventory.get('items') or []):
-                if item.get('sku', '').split('-')[0].upper() == base_style:
-                    brand_abbr = item.get('brand_abbr', item.get('brand', ''))
-                    break
+        brand_abbr = _brand_for_base(base_style)
 
     # Fetch raw image from S3
     raw_bytes, content_type = _fetch_raw_image(base_style, brand_abbr)
+    _photo_fetched(base_style, raw_bytes)
 
     if raw_bytes:
+        if w:
+            # thumbnail callers leave the full-size cache to full-size callers
+            th = _sized((base_style, w), raw_bytes, content_type, w)
+            return _img_resp(th[0], th[1])
         # Cache for future requests (limit cache to ~500 images to control memory)
         with _web_img_lock:
             if len(_web_img_cache) > 200:
@@ -7638,11 +8205,7 @@ def proxy_image(base_style):
                     del _web_img_cache[k]
             _web_img_cache[base_style] = (raw_bytes, content_type)
 
-        resp = make_response(raw_bytes)
-        resp.headers['Content-Type'] = content_type
-        resp.headers['Cache-Control'] = 'public, max-age=86400'
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        return resp
+        return _img_resp(raw_bytes, content_type)
 
     # Cache the miss too (avoid re-fetching failures)
     with _web_img_lock:
@@ -9798,6 +10361,7 @@ def _do_full_regen(reason='scheduled'):
     with _web_img_lock:
         cleared_web = len(_web_img_cache)
         _web_img_cache.clear()
+    _thumb_drop()
     cleared_thumb = len(_dropbox_thumb_cache)
     _dropbox_thumb_cache.clear()
     cleared_dbx = len(_dropbox_img_cache)
@@ -17510,12 +18074,22 @@ def _pres_photo_fetch(sku, brand):
         if raw is None:
             with _web_img_lock:
                 cached = _web_img_cache.get(base, 'MISS')
-            if cached is None:
-                return None
-            if cached != 'MISS':
+            at = _web_img_at.get(base)
+            window = _PHOTO_TTL if cached else _PRES_PHOTO_MISS_TTL
+            if cached != 'MISS' and at is not None and time.time() - at < window:
+                if cached is None:
+                    return None
                 raw = cached[0]
             else:
-                raw, _ct = _fetch_raw_image(base, brand)
+                # not cached, or cached longer ago than the /image re-check window:
+                # decks always get the current photo
+                got, ct = _fetch_raw_image(base, brand)
+                if cached != 'MISS':
+                    _photo_fetched(base, got)
+                    if got:
+                        with _web_img_lock:
+                            _web_img_cache[base] = (got, ct)
+                raw = got or (cached[0] if cached not in (None, 'MISS') else None)
     except Exception:
         raw = None
     if not raw:
@@ -19344,7 +19918,7 @@ def mcp_endpoint(token=None):
 
 # Register swatch card extractor routes (/api/ai-proxy, /api/swatch/commit, /api/swatch/history)
 from swatch_extractor import register_swatch_routes
-register_swatch_routes(app, get_s3, S3_BUCKET)
+register_swatch_routes(app, get_s3, S3_BUCKET, on_images_changed=_photos_changed)
 
 # Factory scorecard (Versa-Docs admin page): /factory-scorecard[/lines|/status|/rebuild]
 # Inline auth (Versa-Docs admin session or the machine key); the prefix is in

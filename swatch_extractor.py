@@ -407,13 +407,15 @@ def _append_image_history(get_s3, s3_bucket, entry):
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTE REGISTRATION
 # ─────────────────────────────────────────────────────────────────────────────
-def register_swatch_routes(app, get_s3, s3_bucket):
+def register_swatch_routes(app, get_s3, s3_bucket, on_images_changed=None):
     """Register swatch routes on a Flask app.
 
     Args:
         app: Flask application instance
         get_s3: callable returning a boto3 S3 client (your existing helper)
         s3_bucket: bucket name (e.g. S3_BUCKET)
+        on_images_changed: optional callable(names, target) run after
+            commit-images writes photos, so the app can drop its cached copies
     """
 
     @app.route('/api/swatch/commit', methods=['POST'])
@@ -734,6 +736,12 @@ def register_swatch_routes(app, get_s3, s3_bucket):
                       flush=True)
             except Exception as e:
                 errors.append({'sku': sku, 'error': f'Upload failed: {e}'})
+
+        if uploaded and on_images_changed:
+            try:
+                on_images_changed([u['sku'] for u in uploaded], target)
+            except Exception as e:
+                print(f"  [swatch-img] ⚠ Cache refresh error (non-fatal): {e}", flush=True)
 
         # Audit log entry
         if uploaded:
