@@ -17927,9 +17927,10 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
         if cd.get('fit'):
             rows.append(('text', (fit_text(cd['fit'], 'Helvetica-Bold', f_txt, iw), 'Helvetica-Bold', f_txt, MUTED),
                          f_txt * 1.3))
-        if not orders_mode:
-            # A proposed-styles card carries a label instead of an availability
-            # number: nothing about it may read as units.
+        if not orders_mode and cd.get('bare'):
+            pass   # a proposed-styles card shows the details only: no number,
+                   # no badge, no chip (David, Sep 24 2026)
+        elif not orders_mode:
             num = str(cd.get('label') or f"{int(cd['number']):,}")
             nw = stringWidth(num, 'Helvetica-Bold', f_num)
             ch_h = f_chip + 4.2
@@ -18091,8 +18092,8 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
         c.drawString(xx, hy + lh / 2 - 5.2, fit_text(g['name'], 'Helvetica-Bold', 15, max(60.0, X1 - xx - 270)),
                      charSpace=0.4)
         n = len(g['cards'])
-        if any(cd.get('label') for cd in g['cards']):
-            meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · proposed, not in inventory"
+        if any(cd.get('bare') or cd.get('label') for cd in g['cards']):
+            meta = f"{date_label} · {n} style{'s' if n != 1 else ''}"
         else:
             units = sum(int(cd['number']) for cd in g['cards'])
             meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · {units:,} units"
@@ -18204,9 +18205,12 @@ def _pres_proposed_cards(raw):
             invalid.append({'style': sku, 'reason': f'over the {_PRES_PROPOSED_CAP}-style pitch cap'})
             continue
         color, fit, fab = _pres_details(base, base, brand)
+        # Details only: no PROPOSED badge, no chip, no number line anywhere on
+        # the card (David, Sep 24 2026). The tool RESULT still says proposed,
+        # so the model can never mistake these for availability.
         cards.append({'sku': base, 'base': base, 'brand': brand,
                       'color': color_override or color or '', 'fab': fab, 'fit': fit,
-                      'number': 0, 'label': 'PROPOSED', 'chip': ('Not in inventory', 'arr')})
+                      'number': 0, 'bare': True})
     return cards, invalid, sorted(set(already))
 
 
@@ -18240,10 +18244,13 @@ def _pres_proposed_build(params, density):
     now = _pres_now_et()
     date_label = _apo_fmt_date(now)
     title = _pres_title_core(params.get('title'), ['proposed', 'not in inventory'])
-    headline = ' · '.join(x for x in ('Versa Group', title, 'PROPOSED STYLES', 'Not in inventory') if x)
+    # No proposed/not-in-inventory wording anywhere on the document, header
+    # included (David, Sep 24 2026): the deck reads like any other deck, just
+    # without numbers. The tool RESULT carries the proposed flag instead.
+    headline = ' · '.join(x for x in ('Versa Group', title) if x)
     from html import unescape
     fname = unescape(unescape(str(params.get('filename') or ''))).strip() \
-        or f"{title + ' ' if title else ''}Proposed Styles Presentation"
+        or f"{title + ' ' if title else ''}Presentation"
     if fname.lower().endswith('.pdf'):
         fname = fname[:-4]
     fname = re.sub(r'\s{2,}', ' ', re.sub(r'[^A-Za-z0-9 &_.()-]+', '', fname)).strip() or 'Proposed Styles'
@@ -18257,9 +18264,10 @@ def _pres_proposed_build(params, density):
            'proposed': True, 'cards_per_page': density, 'pages': page_count, 'styles': len(cards),
            'brands': [{'brand': g['name'], 'styles': len(g['cards'])} for g in groups],
            'missing_photos': [cd['sku'] for cd in cards if not cd.get('photo')][:40],
-           'note': ('Give the user this link as a clickable download. Every card and the header say '
-                    'PROPOSED / Not in inventory: these style numbers do not exist yet, and no '
-                    'quantity is shown or implied. Say that plainly when presenting the link.')}
+           'note': ('Give the user this link as a clickable download. By design the deck itself '
+                    'carries NO proposed / not-in-inventory wording and no quantities - the cards '
+                    'show style details only. These style numbers still do not exist yet, so say '
+                    'that in your reply text and never imply availability.')}
     if invalid:
         out['invalid_styles'] = invalid
     if already:
@@ -18852,8 +18860,10 @@ _AI_AGENT_TOOLS = [
                      "or asks you to create style numbers. Never mix the two: a deck of EXISTING styles must use the "
                      "normal filters so real availability shows, and the tool bounces any proposed style that "
                      "already exists (already_exist in the result) - present those separately with a normal deck. "
-                     "Pitch cards show PROPOSED and 'Not in inventory' instead of any quantity; say that plainly "
-                     "when you hand over the link, and never invent or imply availability for them."),
+                     "By David's instruction the pitch deck itself carries NO proposed or not-in-inventory wording "
+                     "and no quantities - cards show the style details only. So YOUR REPLY TEXT must carry the "
+                     "caveat instead: say the styles are new and not in inventory yet, and never invent or imply "
+                     "availability for them."),
      'input_schema': {'type': 'object', 'properties': {
          'proposed_styles': {'type': 'array', 'items': {'type': 'string'},
                              'description': "Pitch-deck mode: full 12-char style numbers that do not exist yet, "

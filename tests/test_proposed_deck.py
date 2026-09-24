@@ -34,8 +34,9 @@ class ProposedCardsTests(unittest.TestCase):
         self.assertEqual(1, len(cards))
         cd = cards[0]
         self.assertEqual('MWDKPK998SLS', cd['sku'])
-        self.assertEqual('PROPOSED', cd['label'])
-        self.assertEqual(('Not in inventory', 'arr'), cd['chip'])
+        self.assertTrue(cd['bare'], 'details only: the renderer must skip the number row')
+        self.assertNotIn('label', cd)
+        self.assertNotIn('chip', cd)
         self.assertEqual(0, cd['number'], 'a pitch card must never carry units')
         self.assertIn('Knit', cd['fab'])
 
