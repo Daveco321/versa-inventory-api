@@ -1413,11 +1413,12 @@ def _py_is_button_down(sku, brand_abbr=''):
 
 def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     """Inclusive category matcher. One SKU can match multiple categories
-    (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men';
-    a VD shacket with fit SS matches 'young_men', 'sportswear', AND 'short_sleeve').
-    for_prepack keeps the old inclusive long-sleeve read for prepack RULES only:
-    a blazer/vest is not a long-sleeve shirt on any filter (David, Sep 23 2026),
-    but a 'long_sleeve' size-pack rule still reaches blazer SKUs via BR/DB."""
+    (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men').
+    Long / short sleeve FILTERS list dress shirts only (David, Sep 28 2026): a
+    polo, tee, henley or any Young Men/Sportswear fabric is Sportswear, and a
+    blazer/vest is not a long-sleeve shirt (Sep 23 2026). for_prepack keeps the
+    old inclusive sleeve read for prepack RULES only, so size packs on those
+    styles do not change."""
     if not category or category in ('all', 'any'):
         return True
     if category == 'sportswear':
@@ -1431,9 +1432,10 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     if category == 'young_men':
         return _py_is_young_men(sku)
     if category == 'short_sleeve':
-        return _py_is_short_sleeve(sku)
+        return _py_is_short_sleeve(sku) and (for_prepack or not _py_is_sportswear(sku, brand_abbr))
     if category == 'long_sleeve':
-        return _py_is_long_sleeve_shirt(sku) and (for_prepack or not _py_is_blazer(sku))
+        return _py_is_long_sleeve_shirt(sku) and (
+            for_prepack or (not _py_is_blazer(sku) and not _py_is_sportswear(sku, brand_abbr)))
     if category == 'button_down':
         return _py_is_button_down(sku, brand_abbr)
     # Non-overlapping categories fall through to the primary-category equality check
