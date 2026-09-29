@@ -5240,6 +5240,10 @@ def _apo_is_blue_lead(s):
     return True
 _APO_PRINT_RE = re.compile(r'\bprint\b|\bprnt\b|\bgrnd\b|\bstripe\b|\bstripes\b|\bgeo\b|\bcheck\b')
 
+# Colour names that are SOLIDS although the name has no "Solid" in it, and their bucket
+# (David, Sep 29 2026: "Tony Blue" is a blue solid). Mirrors the frontend NAMED_SOLID_COLORS.
+_APO_NAMED_SOLIDS = {'tony blue': 'navy'}
+
 def _apo_classify_color(color_display, brand_abbr):
     """Port of frontend classifyColor. Buckets: white/black/navy/other_solids/
     fancies; the report folds the first four into 'Solids'."""
@@ -5251,6 +5255,9 @@ def _apo_classify_color(color_display, brand_abbr):
     parts = re.split(r'\s+/\s+', c)
     if len(parts) > 1 and parts[0].strip():
         return _apo_classify_color(parts[0].strip(), brand_abbr)
+    named = _APO_NAMED_SOLIDS.get(re.sub(r'\s+', ' ', c))
+    if named:
+        return named
     has_print = bool(_APO_PRINT_RE.search(c))
     # Dobby is a woven texture, not a print — ANY name containing "dobby" is a
     # solid (David, Aug 24 2026), even when the name carries a stripe/check/
