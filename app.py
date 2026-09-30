@@ -8047,9 +8047,10 @@ def _fetch_raw_image(base_style, brand_abbr):
         except Exception:
             continue
 
-    # 2. Try CloudFront DROPBOX_SYNC (fastest — edge cached)
+    # 2. Try the S3 DROPBOX_SYNC mirror, S3 DIRECT like STYLE+OVERRIDES above: the
+    #    CloudFront edge held a replaced mirror photo for up to a day (Sep 30 2026).
     if not _no_serial_fallback and image_code.upper() in _dropbox_photo_index:
-        sync_base = f"{CLOUDFRONT_DROPBOX_SYNC_URL}/{image_code}"
+        sync_base = f"{S3_DROPBOX_SYNC_URL}/{image_code}"
         for ext in ['.jpg', '.png']:
             try:
                 url = sync_base + ext
@@ -8066,9 +8067,9 @@ def _fetch_raw_image(base_style, brand_abbr):
     #      SPORTSWEAR/ photos and any other brand with a SPORTSWEAR/ subfolder.
     sw_match = find_sportswear_image_match(base_style, brand_abbr)
     if sw_match:
-        # Try CloudFront DROPBOX_SYNC first (edge-cached) for the matched filename
+        # Try the S3 DROPBOX_SYNC mirror first (S3 direct, see step 2) for the matched filename
         if sw_match in _dropbox_photo_index:
-            sw_sync_base = f"{CLOUDFRONT_DROPBOX_SYNC_URL}/{sw_match}"
+            sw_sync_base = f"{S3_DROPBOX_SYNC_URL}/{sw_match}"
             for ext in ['.jpg', '.png']:
                 try:
                     url = sw_sync_base + ext
@@ -9061,6 +9062,156 @@ def admin_claude_uploads():
         except Exception as e:
             errors.append({'name': f.get('name'), 'error': str(e)[:120]})
     return jsonify({'written': written, 'errors': errors})
+
+
+# ── Photo refresh (David, Sep 30 2026) ───────────────────────────────────────
+# A photo REPLACED in the Dropbox PHOTOS INVENTORY folder never reached the
+# platform: the disk cache (/var/data) and the S3 DROPBOX_SYNC mirror are filled
+# only when a code is missing, never refreshed (BE_545 was swapped for a white
+# photo in Dropbox and every Ben Sherman 545 kept the old check shirt). This
+# maintenance route pushes named image codes through again: it re-lists the
+# Dropbox folder, downloads each code's current file, replaces the disk copy,
+# the export thumbnail and the S3 mirror copy (the other extension is removed),
+# and drops this worker's cached copies of every style that shows the code.
+# Other workers pick the new photo up through the /image serve-then-refresh
+# re-check (15 minutes). clear_override_images removes the photo from named
+# style overrides, because a photo uploaded on the style itself outranks the
+# shared brand photo. The machine key may call it (maintenance channel).
+_PHOTO_CODE_OK = re.compile(r'^[A-Z0-9_]{2,40}$')
+
+
+def _photo_bytes_type(data):
+    """(extension, content type) from the bytes, not the file name: a PNG saved
+    as .jpg is still a PNG."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return '.png', 'image/png'
+    return '.jpg', 'image/jpeg'
+
+
+def _refresh_photo_code(code):
+    code = str(code or '').strip().upper().replace('-', '_')
+    if not _PHOTO_CODE_OK.match(code):
+        return {'code': code, 'ok': False, 'error': 'bad code'}
+    with _dropbox_photo_lock:
+        path = _dropbox_photo_index.get(code)
+    if not path:
+        return {'code': code, 'ok': False, 'error': 'not in the Dropbox photo index'}
+    data, _ct = _download_dropbox_file(path)
+    if not data:
+        return {'code': code, 'ok': False, 'error': 'Dropbox download failed', 'path': path}
+    ext, ct = _photo_bytes_type(data)
+    disk = _get_disk_cache_path(code)
+    for old in (disk + '.jpg', disk + '.png', _get_thumb_disk_path(code)):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    try:
+        with open(disk + ext, 'wb') as f:
+            f.write(data)
+    except OSError:
+        pass
+    with _dropbox_img_cache_lock:
+        _dropbox_img_cache.pop(code, None)
+    _dropbox_thumb_cache.pop(code, None)
+    other = '.png' if ext == '.jpg' else '.jpg'
+    s3 = get_s3()
+    s3.delete_object(Bucket=S3_BUCKET, Key=f"{S3_DROPBOX_SYNC_PREFIX}/{code}{other}")
+    s3.put_object(Bucket=S3_BUCKET, Key=f"{S3_DROPBOX_SYNC_PREFIX}/{code}{ext}", Body=data,
+                  ContentType=ct, CacheControl='public, max-age=86400')
+    threading.Thread(target=_invalidate_cloudfront,
+                     args=([f"/ALL+INVENTORY+Photos/DROPBOX_SYNC/{code}.jpg",
+                            f"/ALL+INVENTORY+Photos/DROPBOX_SYNC/{code}.png"],), daemon=True).start()
+    # every style that shows this code: its cached photos, thumbnails and export images go
+    with _inv_lock:
+        items = list(_inventory.get('items') or [])
+    styles = set()
+    for it in items:
+        sku = str(it.get('sku') or '').upper()
+        try:
+            if sku and extract_image_code(sku, it.get('brand_abbr', it.get('brand', ''))).upper().replace('-', '_') == code:
+                styles.update((sku, get_base_style(sku)))
+        except Exception:
+            pass
+    if styles:
+        _photos_changed(sorted(styles))
+    return {'code': code, 'ok': True, 'path': path, 'bytes': len(data), 'type': ct, 'styles': sorted(styles)}
+
+
+def _clear_override_images(keys):
+    """Remove the photo from these exact style-override keys (the rest of each
+    override stays; a key left empty is removed). Same S3-first merge, backup and
+    cache eviction as POST /overrides."""
+    global _style_overrides, _overrides_last_saved
+    keys = [str(k or '').strip().upper() for k in keys]
+    keys = [k for k in keys if k and _OVR_NAME_OK.match(k)]
+    load_overrides_from_s3()
+    with _overrides_lock:
+        current = dict(_style_overrides)
+        loaded_etag = _s3_overrides_etag
+    if not current and not loaded_etag:
+        return {'ok': False, 'error': 'overrides not loaded from S3, nothing changed'}
+    merged = dict(current)
+    changed = []
+    for k in keys:
+        ov = merged.get(k)
+        if isinstance(ov, dict) and ov.get('image'):
+            rest = {kk: vv for kk, vv in ov.items() if kk != 'image'}
+            if rest:
+                merged[k] = rest
+            else:
+                merged.pop(k)
+            changed.append(k)
+    if not changed:
+        return {'ok': True, 'cleared': []}
+    threading.Thread(target=_backup_overrides_to_s3, args=(current,), daemon=True).start()   # the state before
+    with _overrides_lock:
+        _style_overrides = merged
+    _overrides_last_saved = time.time()
+    if not save_overrides_to_s3(merged):
+        return {'ok': False, 'error': 'save to S3 failed', 'cleared': []}
+    paths = [f"/ALL+INVENTORY+Photos/STYLE+OVERRIDES/{s}{e}" for s in changed for e in ('.jpg', '.png')]
+    threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
+    with _img_lock:
+        for s in changed:
+            _img_cache.pop(s, None)
+            for k in [k for k in list(_img_cache.keys()) if isinstance(k, str) and k.startswith(f"__override__:{s}:")]:
+                _img_cache.pop(k, None)
+    with _web_img_lock:
+        for s in changed:
+            _web_img_cache.pop(s, None)
+            _web_img_cache.pop(get_base_style(s), None)
+    _thumb_drop(changed)
+    _ovr_names_reset()
+    trigger_background_generation()
+    return {'ok': True, 'cleared': changed}
+
+
+@app.route('/admin/photos/refresh', methods=['POST', 'OPTIONS'])
+def admin_photos_refresh():
+    """JSON {"codes": ["BE_545"], "clear_override_images": ["TMBEPU545SLS"],
+    "resync": true}. resync (default true) re-lists the Dropbox photo folder
+    first, so a renamed or newly added file counts."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    body = request.get_json(silent=True) or {}
+    codes = body.get('codes') or []
+    ovr = body.get('clear_override_images') or []
+    if not isinstance(codes, list) or not isinstance(ovr, list) or len(codes) > 50 or len(ovr) > 50:
+        return jsonify({'error': 'codes and clear_override_images must be lists of at most 50'}), 400
+    out = {}
+    if codes and body.get('resync', True):
+        sync_dropbox_photos()
+    if codes:
+        out['codes'] = []
+        for c in codes:
+            try:
+                out['codes'].append(_refresh_photo_code(c))
+            except Exception as e:
+                out['codes'].append({'code': str(c), 'ok': False, 'error': str(e)[:200]})
+    if ovr:
+        out['overrides'] = _clear_override_images(ovr)
+    return jsonify(out)
 
 
 @app.route('/admin/refresh/colors', methods=['POST', 'OPTIONS'])
@@ -10213,8 +10364,10 @@ def authz_gate():
             # job (plan / upload / status / strip), Sep 10 2026.
             # POST /admin/banner-rules/upsert = add or replace ONE banner rule
             # with a server-side backup (Sep 10 2026).
+            # POST /admin/photos/refresh = push replaced Dropbox photos through the
+            # caches and clear named style-override photos (Sep 30 2026).
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
-                                             '/admin/banner-rules/upsert'):
+                                             '/admin/banner-rules/upsert', '/admin/photos/refresh'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
