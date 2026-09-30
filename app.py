@@ -9952,6 +9952,31 @@ def _one_time_nj_cover(row, removed_units):
     return max(0, min(removed, committed))
 
 
+def _one_time_nj_sized_nj(sku, merged):
+    """NJ units on the one-time style's SIZE rows ({SKU: merged row}): once the goods
+    land the feed puts them on 'TMVDSL032SSE-S'... rows, not on the row with the order."""
+    pre1, pre2 = sku + '-', sku + ' '
+    return sum(max(0, int((m or {}).get('nj') or 0)) for s, m in (merged or {}).items()
+               if s.startswith(pre1) or s.startswith(pre2))
+
+
+def _one_time_nj_style_nj(rows):
+    """Customer screens: the one-time style's NJ units across its base and size rows."""
+    if not _one_time_nj_first(_ONE_TIME_NJ_FIRST_SKU):
+        return 0
+    sku, total = _ONE_TIME_NJ_FIRST_SKU, 0
+    for it in rows or []:
+        if not isinstance(it, dict):
+            continue
+        s = str(it.get('sku') or '').upper()
+        if s == sku or s.startswith(sku + '-') or s.startswith(sku + ' '):
+            try:
+                total += max(0, int(it.get('nj') or 0))
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
 def _one_time_nj_uncommit(row, cover):
     try:
         c = int(row.get('committed') or 0)
@@ -9978,6 +10003,8 @@ def _strip_nj_rows(rows, lookup_nj=False, lookup_abfi=None):
         lookup_abfi = lookup_nj
     lookups = {'nj': bool(lookup_nj), 'abfi': bool(lookup_abfi)}
     by_sku = _nj_by_sku() if any(lookups.values()) else None
+    # one-time NJ exception: the style's NJ units (on its size rows once landed)
+    one_off_nj = _one_time_nj_style_nj(rows)
     out = []
     for it in rows:
         if not isinstance(it, dict):
@@ -9996,13 +10023,14 @@ def _strip_nj_rows(rows, lookup_nj=False, lookup_abfi=None):
                     pass
             elif by_sku is not None and lookups.get(k):
                 nj += int((by_sku.get(str(it.get('sku') or '').upper()) or {}).get(k, 0) or 0)
-        if nj or has_field:
+        # one-time NJ exception: the order those NJ units cover leaves with them, on the
+        # row that carries the order (the base row, whose own nj can be 0)
+        cover = _one_time_nj_cover(it, one_off_nj) if one_off_nj else 0
+        if nj or has_field or cover:
             it = dict(it)
-            if nj:
-                # one-time NJ exception: the order these units cover leaves with them
-                cover = _one_time_nj_cover(it, nj)
-                if cover:
-                    _one_time_nj_uncommit(it, cover)
+            if cover:
+                _one_time_nj_uncommit(it, cover)
+            if nj or cover:
                 it['total_warehouse'] = max(0, int(it.get('total_warehouse') or 0) - nj)
                 # Floored the same way total_warehouse is, one line up. When allocations
                 # have already consumed the restricted units this subtraction goes below
@@ -17466,7 +17494,8 @@ def _ai_tool_build_line_sheet(params):
                     _inc -= _cut
                     _ta -= _cut
                 # One-time NJ exception: the order the removed NJ units cover leaves with them.
-                _ta += _one_time_nj_cover(dict(r, sku=base), _nj + _cut)
+                if _one_time_nj_first(base):
+                    _ta += _one_time_nj_cover(dict(r, sku=base), _nj + _cut)
                 if _hid and _tw <= 0 and _inc <= 0:
                     continue   # only supply is a hidden-landing production
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
@@ -18524,10 +18553,13 @@ def _pres_stock_cards(source, customer_view, spec, params):
                 if hid > 0:
                     vis_inc = 0 if not any(not l['hidden'] for l in lots) else adj_inc - min(adj_inc, hid)
         a = assign.get(sku)
+        # one-time NJ exception: its landed NJ stock sits on the style's size rows
+        one_nj = _one_time_nj_sized_nj(sku, merged) if _one_time_nj_first(sku) else 0
         smart = None
         if source != 'all' and deductions > 0 and a not in ('warehouse', 'overseas') \
                 and (source == 'overseas' or inc > 0):
-            smart = _pres_route_sku(q, lots, orders_by_sku.get(sku, []), apo_by_sku.get(sku, []),
+            smart = _pres_route_sku(dict(q, nj=q['nj'] + one_nj) if one_nj else q, lots,
+                                    orders_by_sku.get(sku, []), apo_by_sku.get(sku, []),
                                     vw_by_sku.get(sku, []), today, sku=sku)
         if source == 'warehouse':
             if wh_view <= 0:
@@ -18560,7 +18592,7 @@ def _pres_stock_cards(source, customer_view, spec, params):
         else:
             # One-time NJ exception: on a customer deck the NJ units taken out above take
             # the order they cover with them (_one_time_nj_first).
-            cover = (min(deductions, (nj + abfi) + (adj_inc - vis_inc))
+            cover = (min(deductions, (nj + abfi + one_nj) + (adj_inc - vis_inc))
                      if customer_view and _one_time_nj_first(sku) else 0)
             number = (wh_view + vis_inc - (deductions - cover)) if customer_view else (wh_all + adj_inc - deductions)
         if deductions > 0 and source != 'all':

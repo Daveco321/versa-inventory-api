@@ -532,8 +532,13 @@ def _alloc_engine(slots, claims, nj_first=False):
             for i in nj_idx:
                 if rem <= 0:
                     break
-                if slots[i]['left'] > 0:
-                    rem = _take(slots[i], c, rem)
+                s = slots[i]
+                if s['left'] <= 0 or (s['type'] == 'warehouse' and c['fob']):
+                    continue   # FOB accounts never take US stock
+                # still late (forced) when the lot lands after the order's start date
+                late = bool(s['type'] == 'production' and c['startDt'] and s['arrival']
+                            and _dt(s['arrival']) > c['startDt'])
+                rem = _take(s, c, rem, forced=late)
             left[c['i']] = rem
 
     def fifo_walk(c, rem, forced):
@@ -871,7 +876,14 @@ def route_all(inventory_items, ledger_rows, orders, apo_rows, vw_rows, manual_ro
     for sku in feed_order:
         q = merged[sku]
         lots = build_lots(sku, q, led_by.get(sku, []), no_suppress, now)
-        res = route_sku(sku, q, lots, ord_by.get(sku, []), apo_by.get(sku, []), vw_by.get(sku, []),
+        q_route = q
+        if _one_time_nj_first(sku, today_d):
+            # one-time NJ exception: its landed NJ stock sits on the style's size rows
+            extra = sum(max(0, m['nj']) for s, m in merged.items()
+                        if s.startswith(sku + '-') or s.startswith(sku + ' '))
+            if extra:
+                q_route = dict(q, nj=q['nj'] + extra)
+        res = route_sku(sku, q_route, lots, ord_by.get(sku, []), apo_by.get(sku, []), vw_by.get(sku, []),
                         today_d, fob_set, picks_as_warehouse=picks,
                         assignment=assignments.get(sku) if honor else None,
                         gate_fallback=opts['gateFallback'])

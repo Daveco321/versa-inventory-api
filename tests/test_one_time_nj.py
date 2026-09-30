@@ -116,5 +116,43 @@ class OneTimeNjTests(unittest.TestCase):
         self.assertEqual(by_ref(res, f'1|{SKU}'), {'ZZ26049': 4032, 'ZZ26003': 2016})
 
 
+    def test_landed_nj_stock_on_size_rows_still_covers_the_order(self):
+        rows = [{'sku': SKU, 'nj': 0, 'abfi': 0, 'incoming': 4032, 'total_ats': -2016,
+                 'total_warehouse': 0, 'committed': -6048},
+                {'sku': SKU + '-S', 'nj': 3000, 'abfi': 0, 'incoming': 0, 'total_ats': 3000,
+                 'total_warehouse': 3000, 'committed': 0},
+                {'sku': SKU + '-M', 'nj': 3048, 'abfi': 0, 'incoming': 0, 'total_ats': 3048,
+                 'total_warehouse': 3048, 'committed': 0}]
+        out = {r['sku']: r for r in self.app._strip_nj_rows(rows)}
+        self.assertEqual((out[SKU]['total_ats'], out[SKU]['committed']), (4032, 0))
+        self.assertNotIn(SKU + '-S', out)   # NJ-only size rows never reach customers
+        self.assertEqual(self.app._one_time_nj_sized_nj(SKU, {r['sku']: r for r in rows}), 6048)
+
+    def test_pnl_after_landing_takes_the_nj_stock_on_size_rows(self):
+        items = [{'sku': SKU, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'abfi': 0, 'incoming': 4032,
+                  'committed': -6048, 'allocated': 0},
+                 {'sku': SKU + '-S', 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 3000, 'abfi': 0,
+                  'incoming': 0, 'committed': 0, 'allocated': 0},
+                 {'sku': SKU + '-M', 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 3048, 'abfi': 0,
+                  'incoming': 0, 'committed': 0, 'allocated': 0}]
+        ledger = [{'production': 'ZZ26049', 'poName': 'P', 'style': SKU, 'units': 4032, 'etd': '2026-12-30',
+                   'arrival': '2027-02-13', 'port_dated': True, 'fob_flag': False, 'warehouse': 'TR',
+                   'shipmentNo': ''}]
+        res = R.route_all(items, ledger, orders(SKU), [], [], [], {}, '2026-10-26', fob_codes=[], options={})
+        got = res['lineAlloc'][f'1|{SKU}']
+        self.assertEqual(sum(r['units'] for r in got if r.get('landing') == 'NJ'), 6048)
+        self.assertEqual(sum(r['units'] for r in got if r.get('ref') == 'ZZ26049'), 0)
+
+    def test_pnl_one_time_take_from_a_late_lot_stays_forced(self):
+        items = [{'sku': SKU, 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'abfi': 0, 'incoming': 10080,
+                  'committed': -6048, 'allocated': 0}]
+        ledger = [{'production': 'ZZ26003', 'poName': 'P', 'style': SKU, 'units': 6048, 'etd': '2026-09-15',
+                   'arrival': '2026-10-22', 'port_dated': True, 'fob_flag': False, 'warehouse': 'NJ',
+                   'shipmentNo': ''}]
+        res = R.route_all(items, ledger, orders(SKU), [], [], [], {}, '2026-09-30', fob_codes=[], options={})
+        got = res['lineAlloc'][f'1|{SKU}']
+        self.assertEqual([(r.get('ref'), r['units'], r['forced']) for r in got], [('ZZ26003', 6048, True)])
+
+
 if __name__ == '__main__':
     unittest.main()
