@@ -504,10 +504,37 @@ def _dated_sort_key(c):
     return c['startDt'] or c['cancelDt'] or FAR_DT
 
 
-def _alloc_engine(slots, claims):
-    """The engine's three tiers: pre-pick FIFO, dated latest-feasible, APO + VW FIFO."""
+# ONE-TIME NJ EXCEPTION (David, Sep 30 2026), the same one-off as the desktop
+# _oneTimeNjFirst and app.py _one_time_nj_first: TMVDSL032SSE's goods were rushed
+# to NJ for Burlington's PO, so this style's orders take its NJ units first (NJ
+# stock, then NJ-landing lots by arrival). This style only; do not add styles or
+# reuse it. It switches itself off after Dec 31 2026.
+ONE_TIME_NJ_FIRST_SKU = 'TMVDSL032SSE'
+ONE_TIME_NJ_FIRST_LAST_DAY = date(2026, 12, 31)
+
+
+def _one_time_nj_first(sku, today):
+    return _u(sku) == ONE_TIME_NJ_FIRST_SKU and today <= ONE_TIME_NJ_FIRST_LAST_DAY
+
+
+def _alloc_engine(slots, claims, nj_first=False):
+    """The engine's three tiers: pre-pick FIFO, dated latest-feasible, APO + VW FIFO.
+    nj_first: the one-time NJ exception above (orders take the NJ units first)."""
     fifo, lf, landed_set = _visit_orders(slots)
     has_non_nj = any(not s['nj'] and s['left'] > 0 for s in slots)
+    left = {}   # claim i -> units still to route after the one-time NJ pass
+    if nj_first:
+        nj_idx = sorted((i for i, s in enumerate(slots) if s['nj']),
+                        key=lambda i: (0 if slots[i]['type'] == 'warehouse' else 1,
+                                       slots[i]['arrival'] or FAR_DATE, i))
+        for c in sorted((c for c in claims if c['source'] == 'order'), key=_dated_sort_key):
+            rem = c['qty']
+            for i in nj_idx:
+                if rem <= 0:
+                    break
+                if slots[i]['left'] > 0:
+                    rem = _take(slots[i], c, rem)
+            left[c['i']] = rem
 
     def fifo_walk(c, rem, forced):
         for i in fifo:
@@ -519,7 +546,7 @@ def _alloc_engine(slots, claims):
         return rem
 
     def latest_feasible(c):
-        rem, fob, start = c['qty'], c['fob'], c['startDt']
+        rem, fob, start = left.get(c['i'], c['qty']), c['fob'], c['startDt']
         cancel = c['cancelDt'] or start or FAR_DT          # claim.cancelDate || claim.latestNeed
         if fob:   # pass 0: FOB accounts drain FOB-flagged batches first (slot array order)
             for s in slots:
@@ -575,7 +602,7 @@ def _alloc_engine(slots, claims):
     dated = sorted([c for c in claims if c['tier'] == 'dated'], key=_dated_sort_key)
     apovw = [c for c in claims if c['tier'] == 'apovw']
     for c in prepick:
-        c['short'] = fifo_walk(c, c['qty'], False)
+        c['short'] = fifo_walk(c, left.get(c['i'], c['qty']), False)
     for c in dated:
         c['short'] = latest_feasible(c)
     for c in apovw:
@@ -676,7 +703,7 @@ def route_sku(sku, q, lots, orders, apos, vws, today, fob_set=ENGINE_FOB_CODES, 
     else:
         mode = 'fifo'
     if mode in ('engine', 'engine_ungated'):
-        _alloc_engine(slots, claims)
+        _alloc_engine(slots, claims, nj_first=_one_time_nj_first(sku, today))
     elif mode == 'assignment':
         _alloc_fallback(slots, claims, assignment)
     elif mode == 'fifo':

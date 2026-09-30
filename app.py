@@ -9770,6 +9770,45 @@ def _nj_by_sku():
     return out
 
 
+# ── ONE-TIME NJ EXCEPTION (David, Sep 30 2026) ───────────────────────────────
+# TMVDSL032SSE ONLY. Its goods were rushed to NJ for Burlington's PO, so this
+# style's open orders take its NJ units first (the NJ-landing lot now, the NJ
+# warehouse stock once it lands) instead of NJ being the last resort, and the PO
+# lines up with the NJ units exactly. On customer screens those NJ units and the
+# order they cover drop out together, so the other delivery shows as free. David:
+# "a one time update for the smart routing and should never be used again". Do
+# not add styles or reuse this. It switches itself off after Dec 31 2026. The same
+# one-off is in the desktop page, pnl_routing.py, the phone app and orders2po.
+_ONE_TIME_NJ_FIRST_SKU = 'TMVDSL032SSE'
+_ONE_TIME_NJ_FIRST_LAST_DAY = datetime(2026, 12, 31).date()
+
+
+def _one_time_nj_first(sku):
+    return (str(sku or '').upper() == _ONE_TIME_NJ_FIRST_SKU
+            and _pres_now_et().date() <= _ONE_TIME_NJ_FIRST_LAST_DAY)
+
+
+def _one_time_nj_cover(row, removed_units):
+    """Customer screens: how much of this row's order deduction the NJ units just
+    removed from it covered (0 for every other style)."""
+    if not isinstance(row, dict) or not _one_time_nj_first(row.get('sku')):
+        return 0
+    try:
+        committed = abs(int(row.get('committed') or 0))
+        removed = int(removed_units or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(removed, committed))
+
+
+def _one_time_nj_uncommit(row, cover):
+    try:
+        c = int(row.get('committed') or 0)
+    except (TypeError, ValueError):
+        return
+    row['committed'] = c + cover if c < 0 else max(0, c - cover)
+
+
 def _strip_nj_rows(rows, lookup_nj=False, lookup_abfi=None):
     """The RESTRICTED warehouses (NJ and ABFI) are ADMIN-ONLY (per David):
     customer catalog views and exports must never see them. Removes their
@@ -9809,12 +9848,16 @@ def _strip_nj_rows(rows, lookup_nj=False, lookup_abfi=None):
         if nj or has_field:
             it = dict(it)
             if nj:
+                # one-time NJ exception: the order these units cover leaves with them
+                cover = _one_time_nj_cover(it, nj)
+                if cover:
+                    _one_time_nj_uncommit(it, cover)
                 it['total_warehouse'] = max(0, int(it.get('total_warehouse') or 0) - nj)
                 # Floored the same way total_warehouse is, one line up. When allocations
                 # have already consumed the restricted units this subtraction goes below
                 # zero and a customer sheet printed a negative Total ATS (Sep 16 2026).
                 # The honest customer answer is 0, and the drop rule below still fires.
-                it['total_ats'] = max(0, int(it.get('total_ats') or 0) - nj)
+                it['total_ats'] = max(0, int(it.get('total_ats') or 0) - nj + cover)
             for k in _RESTRICTED_KEYS:
                 it.pop(k, None)
             it.pop('nj_sizes', None)
@@ -9950,8 +9993,12 @@ def _strip_hidden_landing_rows(rows):
         # subtract the hidden productions' units, clamped
         cut = inc if sku not in visible else min(inc, h)
         if cut > 0:
+            # one-time NJ exception: the order these units cover leaves with them
+            cover = _one_time_nj_cover(it, cut)
+            if cover:
+                _one_time_nj_uncommit(it, cover)
             it['incoming'] = inc - cut
-            it['total_ats'] = int(it.get('total_ats') or 0) - cut
+            it['total_ats'] = int(it.get('total_ats') or 0) - cut + cover
             # Customer-view EXPORT rows carry warehouse NAMES, not total_warehouse —
             # treat a named warehouse as stock so a style with real warehouse units
             # is never dropped just because its only production lands in NJ.
@@ -17260,12 +17307,15 @@ def _ai_tool_build_line_sheet(params):
             _inc = int(r.get('incoming') or 0)
             if customer_view:
                 _hid = int(_hl_hidden.get(base, 0) or 0)
+                _cut = 0
                 if _hid:
                     _cut = min(_inc, _hid) if base in _hl_visible else _inc
                     _inc -= _cut
                     _ta -= _cut
-                    if _tw <= 0 and _inc <= 0:
-                        continue   # only supply is a hidden-landing production
+                # One-time NJ exception: the order the removed NJ units cover leaves with them.
+                _ta += _one_time_nj_cover(dict(r, sku=base), _nj + _cut)
+                if _hid and _tw <= 0 and _inc <= 0:
+                    continue   # only supply is a hidden-landing production
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
                     'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
                     'color': color, 'fit': fit, 'fabric_code': base[4:6] if len(base) >= 6 else '',
@@ -17436,8 +17486,9 @@ def _pres_int(v):
         return 0
 
 
-def _pres_route_sku(q, lots, orders, apos, vws, today):
+def _pres_route_sku(q, lots, orders, apos, vws, today, sku=None):
     """Port of the desktop smart routing engine (_routeSku) for ONE exact SKU.
+    sku is only read by the one-time NJ exception (_one_time_nj_first).
     q: merged quantities (jtw/tr/dcw/qa/nj/abfi, committed incl. manual + virtual
     allocations, allocated). lots: this SKU's ledger rows (units, arr, etd, fob_flag,
     hidden = lands NJ/AE/AW/ABFI, sup = arrival-suppressed). Returns the units the
@@ -17584,6 +17635,19 @@ def _pres_route_sku(q, lots, orders, apos, vws, today):
                 remaining = allocate_fifo(dict(claim, qty=remaining))
         return remaining
 
+    # One-time NJ exception (_one_time_nj_first): this style's orders take its NJ
+    # units first (NJ stock, then NJ-landing lots by arrival); the rest routes below.
+    if _one_time_nj_first(sku):
+        nj_first = sorted((i for i, sl in enumerate(slots) if sl['nj']),
+                          key=lambda i: (0 if slots[i]['type'] == 'warehouse' else 1,
+                                         slots[i]['arrival'] or far, i))
+        for c in sorted((c for c in claims if c['source'] == 'order'),
+                        key=lambda c: c['start'] or c['cancel'] or c['latest']):
+            for i in nj_first:
+                if c['qty'] <= 0:
+                    break
+                if slots[i]['units'] > 0:
+                    c['qty'] = take(slots[i], c['qty'])
     for c in prepick:
         allocate_fifo(c)
     for c in dated:
@@ -17811,7 +17875,7 @@ def _wh_applied_for_sku(sku, q, ctx, now, today):
                      'fob_flag': bool(pr.get('fob_flag')), 'hidden': hidden, 'sup': sup})
     if inc > 0:
         smart = _pres_route_sku(q, lots, ctx['orders_by_sku'].get(sku, []),
-                                ctx['apo_by_sku'].get(sku, []), ctx['vw_by_sku'].get(sku, []), today)
+                                ctx['apo_by_sku'].get(sku, []), ctx['vw_by_sku'].get(sku, []), today, sku=sku)
         if smart:
             return smart['wh'], 'smart routing'
         return min(deductions, wh_all), 'clamped against warehouse stock'
@@ -18311,7 +18375,7 @@ def _pres_stock_cards(source, customer_view, spec, params):
         if source != 'all' and deductions > 0 and a not in ('warehouse', 'overseas') \
                 and (source == 'overseas' or inc > 0):
             smart = _pres_route_sku(q, lots, orders_by_sku.get(sku, []), apo_by_sku.get(sku, []),
-                                    vw_by_sku.get(sku, []), today)
+                                    vw_by_sku.get(sku, []), today, sku=sku)
         if source == 'warehouse':
             if wh_view <= 0:
                 continue
@@ -18341,7 +18405,11 @@ def _pres_stock_cards(source, customer_view, spec, params):
                 od = od_vis = max(0, deductions - min(deductions, wh_all))
             number = (vis_inc - od_vis) if customer_view else (adj_inc - od)
         else:
-            number = (wh_view + vis_inc - deductions) if customer_view else (wh_all + adj_inc - deductions)
+            # One-time NJ exception: on a customer deck the NJ units taken out above take
+            # the order they cover with them (_one_time_nj_first).
+            cover = (min(deductions, (nj + abfi) + (adj_inc - vis_inc))
+                     if customer_view and _one_time_nj_first(sku) else 0)
+            number = (wh_view + vis_inc - (deductions - cover)) if customer_view else (wh_all + adj_inc - deductions)
         if deductions > 0 and source != 'all':
             stats['assigned' if a in ('warehouse', 'overseas') else
                   ('smart_routed' if smart is not None else 'fifo_fallback')] += 1
