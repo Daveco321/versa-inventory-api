@@ -14792,9 +14792,9 @@ def factory_view():
     factory_name = 'All factories' if all_mode else FACTORY_NAMES[code]
 
     # ── Production ledger (Dropbox-backed cache, self-TTL'd) ──
-    # A factory account sees its own schedule even while that factory is held
-    # (factory holds hide it from staff and customers, not from the factory).
-    ledger = _production_rows_all() if ident['role'] == 'factory' else load_production_from_dropbox()
+    # Versa-Docs is not a customer platform (David, Oct 1 2026): the factory view
+    # shows the FULL ledger to staff and factories alike, held factories included.
+    ledger = _production_rows_all()
 
     productions = []
     sku_set = set()

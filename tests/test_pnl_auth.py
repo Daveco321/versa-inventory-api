@@ -1198,6 +1198,38 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(f['opexBasis'], 'unit_share')
         self.assertEqual(f['confirmed'], {'deductions': True, 'royalty': False, 'revenueCosts': False, 'opex': False})
 
+    def test_lens_missing_is_reported_and_rebuilt(self):
+        """costLens (Oct 1 2026): a dataset built while the invoice history was
+        still loading leaves every history-only style uncosted. The route says
+        so and starts a rebuild once the memo is a minute old."""
+        eng = self.eng_with_history()
+        real_build = eng.build_dataset
+
+        def build_without_lens(src, costbook, settings, overrides, now_iso, routing_module):
+            ds = real_build(src, costbook, settings, overrides, now_iso, routing_module)
+            ds['shipped'] = {'state': 'building', 'byCustomer': {'fields': [], 'rows': []}}
+            ds['inputs'] = {'analytics_to': None}
+            return ds
+        eng.build_dataset = build_without_lens
+        h = self.harness(engine=eng)
+        h.upload()
+        h.svc.sales_matrix = self.cube
+        self.assertEqual(h.dataset().status_code, 200)
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        self.assertEqual(d['costLens']['state'], 'building')
+        self.assertEqual(d['costByCustomer'], {})                      # no history pairs costed
+        self.assertIsNone(h.svc._job)                                  # memo too young: no rebuild yet
+        with h.svc._lock:
+            h.svc._memo['started'] -= 120
+            h.svc._last_forced = 0
+        eng.build_dataset = real_build                                 # the lens is ready now
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        self.assertEqual(d['costLens']['state'], 'building')           # still the old memo
+        h.wait_idle()
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        self.assertIsNone(d['costLens']['state'])                      # rebuilt from the fake engine (no shipped block)
+        self.assertEqual(d['costByCustomer'], {'ROSS': {'ZZAAAA001': SENTINEL_COST}})
+
     def test_gzip_when_accepted(self):
         h = self.harness(engine=self.eng_with_history())
         h.upload()

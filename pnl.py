@@ -1787,15 +1787,21 @@ class _PnlService:
             return self._err(503, 'INPUTS_UNAVAILABLE', missing=['sales_matrix'], reason='sales_matrix')
         if matrix.get('building'):
             return _json({'building': True, 'part': 'matrix'}, 202)
+        # Always pass through _dataset_for: a usable memo answers at once and
+        # re-checks its inputs in the background when due (the analytics tool
+        # used to skip that, so a dataset built while the invoice history was
+        # still loading on the open-orders side stayed in service, Oct 1 2026).
+        r = self._dataset_for(key, False)
+        if r.status_code not in (200, 202):
+            return r
         cost = self._analytics_cost_maps(key)
         if cost is None:
-            r = self._dataset_for(key, False)
-            if r.status_code == 200:
-                cost = self._analytics_cost_maps(key)
-            elif r.status_code != 202:
-                return r
-            if cost is None:
-                return _json({'building': True, 'part': 'dataset'}, 202)
+            return _json({'building': True, 'part': 'dataset'}, 202)
+        lens = cost.get('lens') or {}
+        if lens.get('state') not in (None, 'ready'):
+            # Built without the invoice lens: every history-only style has no
+            # cost. The matrix is ready now, so rebuild (at most once a minute).
+            self._kick_lens_rebuild(key)
         out = {'ready': True,
                'matrix': {'customers': matrix.get('customers') or {},
                           'source': matrix.get('source') or {}},
@@ -1809,6 +1815,7 @@ class _PnlService:
                'costByStyle': cost['byStyle'],
                'costGrades': cost['grades'],
                'datasetBuiltAt': cost['builtAt'],
+               'costLens': lens,
                'fees': self._analytics_fees(matrix)}
         body = json.dumps(out, separators=(',', ':'), allow_nan=False, default=_json_default).encode('utf-8')
         gz = gzip.compress(body, compresslevel=6, mtime=0)
@@ -1888,6 +1895,25 @@ class _PnlService:
             print(f"[PnL] analytics fees unavailable: {type(e).__name__}", flush=True)
             return {'ready': False, 'reason': 'settings'}
 
+    def _kick_lens_rebuild(self, key):
+        """Start a forced rebuild for `key` when none is running and the served
+        memo is older than a minute. Used when the memo was built without the
+        invoice lens (shipped.state not ready) although the matrix is ready now."""
+        now = time.time()
+        with self._lock:
+            memo = self._memo
+            if self._job is not None or memo is None or memo['key'] != key:
+                return False
+            if now - memo['started'] < 60 or now - self._last_forced < 60:
+                return False
+            self._last_forced = now
+            try:
+                self._start_locked(key, 'build', forced=True)
+            except Exception:
+                return False
+        print('[PnL] analytics: dataset was built without the invoice lens; rebuilding', flush=True)
+        return True
+
     def _analytics_cost_maps(self, key):
         """Cost joins for h_analytics, derived at most once per dataset build:
         fobU per (account, base) from shipped.byCustomer (covers every
@@ -1900,12 +1926,19 @@ class _PnlService:
             hit = self._an_memo
             if memo is None or memo['key'] != key:
                 return hit if (hit is not None and hit['key'] == key) else None
-            if hit is not None and hit['key'] == key and hit['builtAt'] == memo['builtAt']:
+            # builtAt has second resolution: two builds in one second share it, so
+            # the memo's start time tells them apart (Oct 1 2026).
+            if (hit is not None and hit['key'] == key and hit['builtAt'] == memo['builtAt']
+                    and hit.get('started') == memo['started']):
                 return hit
-            body, built_at = memo['body'], memo['builtAt']
+            body, built_at, started = memo['body'], memo['builtAt'], memo['started']
         ds = json.loads(body)
         eng = self._module('engine')
         alias = dict(getattr(eng, 'HISTORY_CUSTOMER_ALIAS', None) or {})
+        shipped = ds.get('shipped') if isinstance(ds.get('shipped'), dict) else {}
+        inputs = ds.get('inputs') if isinstance(ds.get('inputs'), dict) else {}
+        lens = {'state': shipped.get('state'), 'analyticsTo': inputs.get('analytics_to'),
+                'analyticsIngested': inputs.get('analytics_ingested'), 'builtAt': built_at}
         by_cust = {}
         by_cust2 = {}
         bc = (ds.get('shipped') or {}).get('byCustomer') or {}
@@ -1938,8 +1971,8 @@ class _PnlService:
                     by_style[row[sf['base']]] = fob
                     if 'grade' in sf:
                         grades[row[sf['base']]] = row[sf['grade']]
-        hit = {'key': key, 'builtAt': built_at, 'alias': alias, 'byCust': by_cust,
-               'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades}
+        hit = {'key': key, 'builtAt': built_at, 'started': started, 'alias': alias, 'byCust': by_cust,
+               'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades, 'lens': lens}
         with self._lock:
             self._an_memo = hit
         return hit
