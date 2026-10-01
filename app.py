@@ -278,6 +278,9 @@ def get_s3():
 _inv_lock = threading.Lock()
 _inventory = {
     'items': [],
+    'items_raw': None,     # the last accepted sync before factory holds (Oct 1 2026)
+    'hold_stamp': None,    # which held factories 'items' was filtered with
+    'hold_report': None,
     'brands': {},
     'etag': None,
     'last_sync': None,
@@ -823,7 +826,7 @@ _PRODUCTION_TTL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 6
 def load_production_from_dropbox():
     """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
     Caches result in memory; returns cached data if under 1 hour old."""
-    global _production_data, _production_last_sync, _production_rev
+    global _production_data, _production_data_all, _production_last_sync, _production_rev
 
     # Return cache if fresh
     with _production_lock:
@@ -1026,13 +1029,19 @@ def load_production_from_dropbox():
             })
         wb.close()
 
+        # Factory holds (Oct 1 2026): the full ledger is kept for factory
+        # accounts and the admin hold panel; everyone else gets the filtered one.
+        held = _held_factories()
+        served = _hold_filter_production(results, held)
         with _production_lock:
-            _production_data = results
+            _production_data_all = results
+            _production_data = served
             _production_last_sync = time.time()
             _production_rev = chosen.get('rev') or chosen.get('content_hash')
 
-        print(f"  ✓ Loaded {len(results)} production rows from {row_count} Excel rows ({chosen['name']})")
-        return results
+        print(f"  ✓ Loaded {len(results)} production rows from {row_count} Excel rows ({chosen['name']})"
+              + (f"; {len(results) - len(served)} rows of held factory {','.join(sorted(held))} hidden" if held else ''))
+        return served
 
     except Exception as e:
         import traceback
@@ -2552,6 +2561,328 @@ def _factory_label(production_ref, full_name=False):
     return prefix
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# FACTORY HOLDS (Oct 1 2026, David: hide one factory's production everywhere
+# on the catalog, admin and customers alike, with an easy on/off switch per
+# factory; the styles still exist).
+#
+# A held factory's production rows disappear from every viewer path: the
+# served ledger (/production and every internal reader of _production_data or
+# _ledger_rows), the inventory items (their incoming and Total ATS lose the
+# held units; a style whose only supply is held production drops entirely),
+# exports, decks, routing, the AI tools and the phone app, which all read the
+# same in-memory data. Only two readers keep the full ledger on purpose:
+# /factory-view and /production for a FACTORY account (a factory sees its own
+# schedule) and the admin hold panel (so David can see what is hidden).
+#
+# The switch is S3 inventory/factory_holds.json {"held": ["XX"], ...}, read
+# with a 60 s cache. Flipping it re-filters this worker at once; the other
+# workers converge on their next hold tick (every /inventory, /production and
+# /sync request and the hourly resync check the stamp). Fail closed: while a
+# hold is active and the ledger cannot be read, the inventory sync keeps the
+# previous (already filtered) data instead of publishing unfiltered rows.
+# ═════════════════════════════════════════════════════════════════════════════
+S3_FACTORY_HOLDS_KEY = os.environ.get('S3_FACTORY_HOLDS_KEY', 'inventory/factory_holds.json')
+_FACTORY_HOLDS_TTL = 60
+_factory_holds = {'held': frozenset(), 'note': '', 'updated_at': None, 'updated_by': None,
+                  'loaded_at': 0.0, 'ok': False, 'error': ''}
+_factory_holds_lock = threading.Lock()
+_production_data_all = []          # the unfiltered ledger (held rows included)
+
+
+def _hold_codes(value):
+    """Normalize a held-factory list to a frozenset of 2-letter codes."""
+    out = set()
+    for c in (value or []):
+        c = str(c or '').strip().upper()
+        if len(c) == 2 and c.isalpha():
+            out.add(c)
+    return frozenset(out)
+
+
+def load_factory_holds_from_s3(force=False):
+    """Read the switch (cached 60 s). A missing file means no holds. A read
+    error keeps the last known state and is reported in /health."""
+    now = time.time()
+    with _factory_holds_lock:
+        if not force and now - _factory_holds['loaded_at'] < _FACTORY_HOLDS_TTL:
+            return _factory_holds['held']
+    held, note, upd_at, upd_by, ok, err = frozenset(), '', None, None, True, ''
+    try:
+        resp = get_s3().get_object(Bucket=S3_BUCKET, Key=S3_FACTORY_HOLDS_KEY)
+        data = json.loads(resp['Body'].read().decode('utf-8'))
+        if isinstance(data, dict):
+            held = _hold_codes(data.get('held'))
+            note = str(data.get('note') or '')[:300]
+            upd_at = data.get('updated_at')
+            upd_by = data.get('updated_by')
+    except ClientError as e:
+        if e.response['Error']['Code'] not in ('NoSuchKey', '404'):
+            ok, err = False, f"{type(e).__name__}: {e}"
+    except Exception as e:
+        ok, err = False, f"{type(e).__name__}: {e}"
+    with _factory_holds_lock:
+        if ok:
+            _factory_holds.update(held=held, note=note, updated_at=upd_at, updated_by=upd_by,
+                                  ok=True, error='')
+        else:
+            _factory_holds.update(ok=False, error=err[:300])
+            print(f"  ⚠ Factory holds: could not read {S3_FACTORY_HOLDS_KEY}, keeping the last known state: {err}", flush=True)
+        _factory_holds['loaded_at'] = now
+        return _factory_holds['held']
+
+
+def save_factory_holds_to_s3(held, note, by):
+    body = {'held': sorted(_hold_codes(held)), 'note': str(note or '')[:300],
+            'updated_at': datetime.utcnow().isoformat() + 'Z', 'updated_by': str(by or '')[:120]}
+    get_s3().put_object(Bucket=S3_BUCKET, Key=S3_FACTORY_HOLDS_KEY,
+                        Body=json.dumps(body).encode('utf-8'), ContentType='application/json')
+    with _factory_holds_lock:
+        _factory_holds.update(held=frozenset(body['held']), note=body['note'], updated_at=body['updated_at'],
+                              updated_by=body['updated_by'], loaded_at=time.time(), ok=True, error='')
+    return body
+
+
+def _held_factories():
+    return load_factory_holds_from_s3()
+
+
+def _factory_holds_stamp():
+    """What the inventory items were filtered with: the sorted held codes."""
+    return ','.join(sorted(_held_factories()))
+
+
+def _hold_filter_production(rows, held):
+    """The ledger rows a viewer may see: every row whose production number
+    does not start with a held factory code."""
+    if not held:
+        return list(rows or [])
+    return [p for p in (rows or []) if _factory_label(p.get('production')) not in held]
+
+
+def _hold_maps(rows_all, held):
+    """({style: held units}, {style: True when it has a visible production})
+    from the full ledger. Ledger styles match inventory SKUs 1:1."""
+    hidden, visible = {}, {}
+    if not held:
+        return hidden, visible
+    for p in rows_all or []:
+        st = str(p.get('style') or '').strip().upper()
+        if not st:
+            continue
+        if _factory_label(p.get('production')) in held:
+            try:
+                hidden[st] = hidden.get(st, 0) + int(p.get('units') or 0)
+            except Exception:
+                pass
+        else:
+            visible[st] = True
+    return hidden, visible
+
+
+def _apply_factory_hold_items(items, rows_all, held):
+    """Inventory items as every viewer sees them while factories are held.
+    A style with held production loses those units from incoming and Total
+    ATS (all of its incoming when no visible production remains, else the held
+    units, clamped). A style with no warehouse stock and nothing visible left
+    on order drops entirely. Returns (items, report). Pure."""
+    report = {'held': sorted(held or ()), 'styles_hidden': 0, 'styles_cut': 0,
+              'units_cut': 0, 'hidden_styles': []}
+    if not held:
+        return list(items or []), report
+    hidden, visible = _hold_maps(rows_all, held)
+    if not hidden:
+        return list(items or []), report
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        sku = str(it.get('sku') or '').strip().upper()
+        h = hidden.get(sku, 0)
+        if h <= 0:
+            out.append(it)
+            continue
+        it = dict(it)
+        inc = int(it.get('incoming') or 0)
+        cut = inc if sku not in visible else min(inc, h)
+        if cut > 0:
+            it['incoming'] = inc - cut
+            it['total_ats'] = int(it.get('total_ats') or 0) - cut
+            report['units_cut'] += cut
+        has_wh = int(it.get('total_warehouse') or 0) > 0
+        if not has_wh and int(it.get('incoming') or 0) <= 0:
+            report['styles_hidden'] += 1
+            if len(report['hidden_styles']) < 500:
+                report['hidden_styles'].append(sku)
+            continue
+        report['styles_cut'] += 1
+        out.append(it)
+    return out, report
+
+
+def _production_rows_all():
+    """The unfiltered ledger (held rows included): factory accounts and the
+    admin hold panel only. Loads the ledger on a cold worker."""
+    load_production_from_dropbox()
+    with _production_lock:
+        return list(_production_data_all)
+
+
+def _refilter_production(held=None):
+    """Re-derive the served ledger from the full one (after a switch flip)."""
+    global _production_data
+    held = _held_factories() if held is None else held
+    with _production_lock:
+        if _production_data_all:
+            _production_data = _hold_filter_production(_production_data_all, held)
+
+
+def _reapply_factory_hold(force=False):
+    """Re-filter this worker's inventory items from the raw sync result when
+    the switch changed (or force). Returns True when the items changed."""
+    stamp = _factory_holds_stamp()
+    with _inv_lock:
+        raw = _inventory.get('items_raw')
+        same = _inventory.get('hold_stamp') == stamp
+    if raw is None or (same and not force):
+        return False
+    held = _held_factories()
+    rows_all = _production_rows_all() if held else []
+    if held and not rows_all:
+        print("  ⚠ Factory holds: ledger unavailable, keeping the current filtered inventory", flush=True)
+        return False
+    items, report = _apply_factory_hold_items(raw, rows_all, held)
+    _refilter_production(held)
+    with _inv_lock:
+        _inventory['items'] = items
+        _inventory['brands'] = _group_by_brand(items)
+        _inventory['item_count'] = len(items)
+        _inventory['gen'] = _inventory.get('gen', 0) + 1
+        _inventory['hold_stamp'] = stamp
+        _inventory['hold_report'] = report
+    print(f"  ✓ Factory holds re-applied: held={report['held']} hidden styles={report['styles_hidden']} "
+          f"cut styles={report['styles_cut']} units cut={report['units_cut']:,}", flush=True)
+    return True
+
+
+def _hold_tick():
+    """Cheap per-request check: re-filter when the switch changed elsewhere."""
+    try:
+        _reapply_factory_hold()
+    except Exception as e:
+        print(f"  ⚠ Factory holds tick failed: {e}", flush=True)
+
+
+def _hold_filter_synced_items(items):
+    """Called by the inventory sync with the freshly parsed items. Returns the
+    items to publish, or None when a hold is active and the ledger cannot be
+    read (the caller then keeps its previous data: fail closed)."""
+    held = _held_factories()
+    if not held:
+        return items, {'held': [], 'styles_hidden': 0, 'styles_cut': 0, 'units_cut': 0, 'hidden_styles': []}
+    rows_all = _production_rows_all()
+    if not rows_all:
+        return None, None
+    return _apply_factory_hold_items(items, rows_all, held)
+
+
+def _factory_hold_overview():
+    """What the admin hold panel shows: every known factory with its ledger
+    footprint, which are held, and the allocations that sit on hidden styles."""
+    held = load_factory_holds_from_s3(force=True)
+    rows_all = _production_rows_all()
+    by_code = {}
+    for p in rows_all:
+        code = _factory_label(p.get('production'))
+        if not code:
+            continue
+        e = by_code.setdefault(code, {'rows': 0, 'units': 0, 'styles': set(), 'productions': set()})
+        e['rows'] += 1
+        try:
+            e['units'] += int(p.get('units') or 0)
+        except Exception:
+            pass
+        st = str(p.get('style') or '').strip().upper()
+        if st:
+            e['styles'].add(st)
+        e['productions'].add(str(p.get('production') or '').strip().upper())
+    factories = []
+    for code in sorted(set(FACTORY_NAMES) | set(by_code)):
+        e = by_code.get(code) or {'rows': 0, 'units': 0, 'styles': set(), 'productions': set()}
+        factories.append({'code': code, 'name': FACTORY_NAMES.get(code, code), 'held': code in held,
+                          'rows': e['rows'], 'units': e['units'], 'styles': len(e['styles']),
+                          'productions': sorted(e['productions'])})
+    with _inv_lock:
+        report = dict(_inventory.get('hold_report') or {})
+        stamp = _inventory.get('hold_stamp')
+    hidden_styles = set(report.get('hidden_styles') or [])
+    hidden_bases = {s.split('-')[0] for s in hidden_styles}
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    allocations = [a for a in apo_rows
+                   if str(a.get('style') or '').split('-')[0].strip().upper() in hidden_bases]
+    with _factory_holds_lock:
+        meta = {k: _factory_holds[k] for k in ('note', 'updated_at', 'updated_by', 'ok', 'error')}
+    return {'held': sorted(held), 'factories': factories, 'report': report,
+            'applied': stamp == ','.join(sorted(held)), 'allocations_on_hidden': allocations,
+            'config_key': S3_FACTORY_HOLDS_KEY, **meta}
+
+
+@app.route('/admin/factory-holds', methods=['GET', 'POST', 'OPTIONS'])
+def admin_factory_holds():
+    """GET: the hold overview (staff or machine key). POST {"held": ["XX"],
+    "note": "..."} replaces the held list (Versa-Docs ADMIN or machine key),
+    re-filters this worker at once and reports what is hidden now. Other
+    workers follow within about a minute."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    ident = _request_identity() or {}
+    if request.method == 'GET':
+        try:
+            return jsonify(_factory_hold_overview())
+        except Exception as e:
+            return jsonify({'error': f'{type(e).__name__}: {e}'}), 500
+    is_admin = ident.get('tier') == 'machine' or (ident.get('tier') == 'staff' and ident.get('is_admin') is True)
+    if not is_admin:
+        return jsonify({'error': 'Factory holds can only be changed by a Versa admin', 'code': 'ADMIN_ONLY'}), 403
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get('held'), list):
+        return jsonify({'error': '"held" must be a list of 2-letter factory codes'}), 400
+    held = _hold_codes(body.get('held'))
+    unknown = sorted(c for c in held if c not in FACTORY_NAMES)
+    if unknown:
+        return jsonify({'error': f"Unknown factory code(s): {', '.join(unknown)}. Known: {', '.join(sorted(FACTORY_NAMES))}"}), 400
+    by = ident.get('email') or ident.get('tier') or 'unknown'
+    try:
+        saved = save_factory_holds_to_s3(held, body.get('note'), by)
+        _refilter_production(held)
+        _reapply_factory_hold(force=True)
+        out = _factory_hold_overview()
+        out['saved'] = saved
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'error': f'{type(e).__name__}: {e}'}), 500
+
+
+def _factory_holds_health():
+    """The small holds block for /health and /admin/sync-status."""
+    try:
+        held = _held_factories()
+        with _inv_lock:
+            report = dict(_inventory.get('hold_report') or {})
+            stamp = _inventory.get('hold_stamp')
+        with _factory_holds_lock:
+            meta = {k: _factory_holds[k] for k in ('updated_at', 'updated_by', 'ok', 'error')}
+        with _production_lock:
+            held_rows = len(_production_data_all) - len(_production_data)
+        return {'held': sorted(held), 'applied': stamp == ','.join(sorted(held)),
+                'styles_hidden': report.get('styles_hidden', 0), 'styles_cut': report.get('styles_cut', 0),
+                'units_cut': report.get('units_cut', 0), 'production_rows_hidden': held_rows, **meta}
+    except Exception as e:
+        return {'error': f'{type(e).__name__}: {e}'}
+
+
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
                      flow_mode=False, headers_override=None, tjx_layout=False,
@@ -3933,6 +4264,14 @@ def sync_from_dropbox():
         if reason != 'passed' and reason != 'first-sync (no baseline to compare)':
             print(f"  ℹ Sanity check: {reason}", flush=True)
 
+        # Factory holds (Oct 1 2026): held factories' units come out before
+        # anyone reads these items. Fail closed: with a hold active and no
+        # ledger, keep the previous (filtered) data.
+        items_raw = items
+        items, hold_report = _hold_filter_synced_items(items_raw)
+        if items is None:
+            print("  ⚠ Dropbox sync held back: a factory hold is active and the ledger could not be read. Keeping previous data.", flush=True)
+            return False
         brands = _group_by_brand(items)
 
         try:
@@ -3944,6 +4283,9 @@ def sync_from_dropbox():
 
         with _inv_lock:
             _inventory['items'] = items
+            _inventory['items_raw'] = items_raw
+            _inventory['hold_stamp'] = ','.join(hold_report['held'])
+            _inventory['hold_report'] = hold_report
             _inventory['brands'] = brands
             _inventory['gen'] = _inventory.get('gen', 0) + 1
             _inventory['etag'] = 'dropbox'
@@ -4048,10 +4390,18 @@ def sync_inventory():
         print(f"  ⚠ S3 sync REJECTED — {reason}. Keeping previous good data.", flush=True)
         return False
 
+    items_raw = items
+    items, hold_report = _hold_filter_synced_items(items_raw)
+    if items is None:
+        print("  ⚠ S3 sync held back: a factory hold is active and the ledger could not be read. Keeping previous data.", flush=True)
+        return False
     brands = _group_by_brand(items)
 
     with _inv_lock:
         _inventory['items'] = items
+        _inventory['items_raw'] = items_raw
+        _inventory['hold_stamp'] = ','.join(hold_report['held'])
+        _inventory['hold_report'] = hold_report
         _inventory['brands'] = brands
         _inventory['gen'] = _inventory.get('gen', 0) + 1
         _inventory['etag'] = etag
@@ -4299,8 +4649,10 @@ def health():
         "dropbox_photos_cached": len([f for f in os.listdir(DROPBOX_DISK_CACHE) if f.endswith(('.jpg', '.png'))]) if os.path.exists(DROPBOX_DISK_CACHE) else 0,
         "dropbox_photos_last_sync": _dropbox_photos_last_sync,
         "production_rows": len(_production_data),
+        "production_rows_all": len(_production_data_all),
         "production_last_sync": _production_last_sync,
         "production_folder": DROPBOX_PRODUCTION_FOLDER,
+        "factory_holds": _factory_holds_health(),
     })
 
 
@@ -4310,6 +4662,7 @@ def sync():
         return '', 204
 
     updated = sync_inventory_if_changed()
+    _hold_tick()
 
     with _inv_lock:
         items = list(_inventory['items'])
@@ -4372,6 +4725,7 @@ def inventory():
             sync_inventory_if_changed()
         except Exception as e:
             print(f"  [/inventory] Stale-worker sync failed: {e}")
+    _hold_tick()
 
     with _inv_lock:
         return jsonify({
@@ -7432,6 +7786,10 @@ def delete_allocation_entries():
 def get_production():
     if request.method == 'OPTIONS':
         return '', 204
+    _hold_tick()
+    ident = _request_identity() or {}
+    if ident.get('tier') == 'factory':
+        return jsonify({"production": _production_rows_all()})   # a factory sees its own schedule
     data = load_production_from_dropbox()
     return jsonify({"production": data})
 
@@ -9394,6 +9752,7 @@ def admin_sync_status():
             'row_count': len(_apo_data),
             'auto_interval_minutes': 60,
         },
+        'factory_holds': _factory_holds_health(),
         'nj_warehouse': {
             # NJ is a column of the hourly ATS file now: same freshness as inventory.
             'last_sync_iso': inv_sync,
@@ -9667,7 +10026,8 @@ _AUTHZ_CATALOG_READS = {
     '/suppression-overrides', '/production', '/apo', '/saved-catalogs',
 }
 # Extra GET endpoints the machine key may use (report/export pulls).
-_AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports'}
+_AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports',
+                        '/admin/factory-holds'}   # the hold overview (Oct 1 2026)
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
@@ -9740,6 +10100,7 @@ def _request_identity():
                     role = (prof.get('role') or '').lower()
                     ident = {'tier': 'staff' if role == 'staff' else 'factory',
                              'prefix': prof.get('factory_prefix') or '',
+                             'email': prof.get('email') or '',
                              # Versa-Docs profiles.is_admin: the platform chat only
                              # gets the Past Orders tools for admins (Sep 9 2026)
                              'is_admin': prof.get('is_admin') is True}
@@ -10394,8 +10755,10 @@ def authz_gate():
             # with a server-side backup (Sep 10 2026).
             # POST /admin/photos/refresh = push replaced Dropbox photos through the
             # caches and clear named style-override photos (Sep 30 2026).
+            # POST /admin/factory-holds = the factory hold switch (Oct 1 2026).
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
-                                             '/admin/banner-rules/upsert', '/admin/photos/refresh'):
+                                             '/admin/banner-rules/upsert', '/admin/photos/refresh',
+                                             '/admin/factory-holds'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -10506,6 +10869,7 @@ def hourly_resync():
                 print("  ⏭ Skipping — export generation already in progress")
                 continue
 
+        _hold_tick()
         try:
             updated = sync_inventory()
             if updated:
@@ -14428,7 +14792,9 @@ def factory_view():
     factory_name = 'All factories' if all_mode else FACTORY_NAMES[code]
 
     # ── Production ledger (Dropbox-backed cache, self-TTL'd) ──
-    ledger = load_production_from_dropbox()
+    # A factory account sees its own schedule even while that factory is held
+    # (factory holds hide it from staff and customers, not from the factory).
+    ledger = _production_rows_all() if ident['role'] == 'factory' else load_production_from_dropbox()
 
     productions = []
     sku_set = set()
