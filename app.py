@@ -14598,7 +14598,7 @@ _UPSTREAM_FAIL_BACKOFF = 120  # after a failure, don't retry for 2 minutes
 # its built-in default and is served when that fetch fails, so the factory view
 # always has a workable list. Proxied here so factory browsers only ever need
 # one reachable host (onrender.com is blocked in China).
-_FOB_CUSTOMERS_SEED = ['CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1']
+_FOB_CUSTOMERS_SEED = ['GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1']   # CENT1 (Century 21) is NOT FOB (David, Oct 1 2026)
 _fob_customers_cache = {'data': None, 'fetched_at': 0}
 _fob_customers_lock = threading.Lock()
 
@@ -18001,10 +18001,10 @@ _PRES_SUPPRESS_SECONDS = 14 * 24 * 3600   # desktop _SUPPRESS_WINDOW_MS
 _PRES_SUPPRESS_TOL = 0.10                 # desktop _SUPPRESS_TOLERANCE
 _PRES_LANDED_WINDOW_DAYS = 30             # desktop _LANDED_WINDOW_DAYS
 # Desktop FOB_CUSTOMER_CODES (overseas pickup accounts; matched by open-orders code).
-_PRES_FOB_CUSTOMERS = {'CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1'}
+_PRES_FOB_CUSTOMERS = {'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1'}   # CENT1 (Century 21) is NOT FOB (David, Oct 1 2026)
 # Desktop OPEN_ORDERS_CUSTOMER_MAP (the engine's name fallback, used for the pre-pick test).
 _PRES_OO_CUSTOMER_MAP = {
-    'BEAL': 'Bealls', 'BEAL1': 'Bealls', 'BJS': "BJ's Wholesale", 'CENT': 'Centric Brands', 'CENT1': 'Centric Brands',
+    'BEAL': 'Bealls', 'BEAL1': 'Bealls', 'BJS': "BJ's Wholesale", 'CENT': 'Century 21', 'CENT1': 'Century 21',
     'COST': 'Costco', 'COST1': 'Costco', 'MULT': 'Multi Brands', 'MULT1': 'Multi Brands', 'VETE': 'Veterans Canteen',
     'WINN': 'Winners/TJX Canada', 'AAFE': 'AAFES/Military', 'AMAZ': 'Amazon', 'BELK': 'Belk', 'BFL': 'Brands for Less',
     'BLOO': "Bloomingdale's", 'BOSC': 'Boscovs', 'BURL': 'Burlington', 'CITI': 'Citi Trends', 'COPP': 'Coppel',

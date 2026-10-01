@@ -164,12 +164,12 @@ __all__ = [
 
 # ── Engine constants (index.html / app.py; public business rules, no cost data) ──
 # index.html FOB_CUSTOMER_CODES == app.py _PRES_FOB_CUSTOMERS
-ENGINE_FOB_CODES = frozenset({'CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1'})
+ENGINE_FOB_CODES = frozenset({'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1'})   # CENT1 (Century 21) is NOT FOB (David, Oct 1 2026)
 # index.html OPEN_ORDERS_CUSTOMER_MAP == app.py _PRES_OO_CUSTOMER_MAP (the engine's name
 # fallback, which the pre-pick test reads)
 ENGINE_CUSTOMER_NAMES = {
-    'BEAL': 'Bealls', 'BEAL1': 'Bealls', 'BJS': "BJ's Wholesale", 'CENT': 'Centric Brands',
-    'CENT1': 'Centric Brands', 'COST': 'Costco', 'COST1': 'Costco', 'MULT': 'Multi Brands',
+    'BEAL': 'Bealls', 'BEAL1': 'Bealls', 'BJS': "BJ's Wholesale", 'CENT': 'Century 21',
+    'CENT1': 'Century 21', 'COST': 'Costco', 'COST1': 'Costco', 'MULT': 'Multi Brands',
     'MULT1': 'Multi Brands', 'VETE': 'Veterans Canteen', 'WINN': 'Winners/TJX Canada',
     'AAFE': 'AAFES/Military', 'AMAZ': 'Amazon', 'BELK': 'Belk', 'BFL': 'Brands for Less',
     'BLOO': "Bloomingdale's", 'BOSC': 'Boscovs', 'BURL': 'Burlington', 'CITI': 'Citi Trends',

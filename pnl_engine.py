@@ -316,7 +316,7 @@ WAREHOUSE_NAMES = {'TR': 'Trans-Cal', 'J2': 'JTW', 'JTW': 'JTW', 'DW': 'DCW Torr
                    'FOB': 'FOB at the factory', 'CAN': 'Canada', 'WALM': 'Walmart direct import',
                    'WH': 'US warehouse pool'}
 _STOCK_KEYS = (('jtw', 'JTW'), ('tr', 'TR'), ('dcw', 'DCW'), ('qa', 'QA'), ('nj', 'NJ'), ('abfi', 'ABFI'))
-_ENGINE_FOB_FALLBACK = ('CENT1', 'GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1')
+_ENGINE_FOB_FALLBACK = ('GLOB', 'BFL', 'TJXAU', 'TJXUK', 'HALF', 'MULT', 'MULT1')   # CENT1 (Century 21) is NOT FOB (David, Oct 1 2026)
 _LIST_FACTORY_PSEUDO = ('MIX', 'WH', 'UNKNOWN', 'N/A', 'BLANK', 'OTHER')
 
 FLAG_LABELS = {
@@ -390,7 +390,8 @@ _CONF_RANK = {'high': 0, 'medium': 1, 'low': 2}
 FIT_COLUMN = {'SLIM': 'slim', 'REGULAR': 'regular', 'BIG_TALL': 'big_tall'}
 
 # ── Public defaults (DESIGN 5.2; r1_landed_cost.md). The UI marks unconfirmed blocks. ──
-_OFFPRICE = ('ROSS', 'DDS', 'BURL', 'MARS', 'TJMA', 'WINN', 'BEAL', 'BEAL1', 'HAMR', 'CITI', 'VARI', 'GABE', 'FORM')
+_OFFPRICE = ('ROSS', 'DDS', 'BURL', 'MARS', 'TJMA', 'WINN', 'BEAL', 'BEAL1', 'HAMR', 'CITI', 'VARI', 'GABE', 'FORM',
+             'CENT1')   # Century 21 (off-price; David, Oct 1 2026: not an FOB account)
 _DEPARTMENT = ('MACY', 'MACY1', 'JCP01', 'JCP02', 'KOHL', 'NORD', 'BELK', 'BLOO', 'BOSC', 'SEAR', 'SAKS')
 _CLUB = ('COST', 'COST1', 'COST2', 'BJS', 'PRIC')
 _WALMART = ('WALM1', 'PEER')
