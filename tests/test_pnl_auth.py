@@ -1157,6 +1157,47 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(d['pendingCube'], {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}})
         self.assertTrue(d['datasetBuiltAt'])
 
+    def test_fees_block_from_the_settings(self):
+        """fees (Oct 1 2026): the fee rates the analytics tool spreads per style.
+        With the fake engine (no helpers) the block says not ready and the rest
+        of the payload is unchanged; with the real engine's helpers it resolves
+        chargebacks per history customer, royalty per brand and the opex items."""
+        import pnl_engine as real
+        h = self.harness(engine=self.eng_with_history())
+        h.upload()
+        h.svc.sales_matrix = self.cube
+        self.assertEqual(h.dataset().status_code, 200)
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        self.assertEqual(d['fees'], {'ready': False, 'reason': 'engine'})
+        for name in ('merge_settings', '_cust_group', '_ded_pct', '_roy_pct', 'BRAND_NAMES', '_ENGINE_FOB_FALLBACK'):
+            setattr(h.engine, name, getattr(real, name))
+        r = h.admin('POST', '/api/pnl/settings', body={'settings': {
+            'deductions': {'byGroup': {'offprice': 1.0, 'other': 2.0}, 'byCustomer': {'NORD': 7.5}},
+            'customerGroups': {'ROSS': 'offprice'},
+            'royalty': {'defaultPct': 10.0, 'base': 'net', 'byBrand': {'NA': 8.0}},
+            'revenueCosts': {'items': [{'key': 'rent', 'name': 'Rent', 'pct': 1.0}]},
+            'opex': {'items': [{'name': 'Payroll', 'monthly': 4321}, {'name': 'Other', 'monthly': 0}]},
+            'confirmed': {'deductions': True}}})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        f = d['fees']
+        self.assertTrue(f['ready'])
+        # history customers of the cube and the pending cube, alias folded both ways
+        self.assertEqual(f['chargeback']['ROSS'], {'pct': 1.0, 'group': 'offprice'})
+        self.assertEqual(f['chargeback']['NORD'], {'pct': 7.5, 'group': 'department'})   # default group map
+        self.assertEqual(f['chargeback']['NORD_DROP']['pct'], 2.0)
+        self.assertEqual(f['royalty']['base'], 'net')
+        self.assertEqual(f['royalty']['defaultPct'], 10.0)
+        self.assertEqual(f['royalty']['byBrand']['NA'], 8.0)
+        self.assertEqual(f['royalty']['byBrand']['DK'], 10.0)
+        self.assertNotIn('BLK', f['royalty']['brands'])
+        self.assertEqual(f['royalty']['brandAlias'], {'NT': 'NA', 'DV': 'VD'})
+        self.assertEqual(f['revenueCosts'], [{'key': 'rent', 'name': 'Rent', 'pct': 1.0}])
+        self.assertEqual(f['opex'], [{'key': 'ox0', 'name': 'Payroll', 'monthly': 4321.0},
+                                     {'key': 'ox1', 'name': 'Other', 'monthly': 0.0}])
+        self.assertEqual(f['opexBasis'], 'unit_share')
+        self.assertEqual(f['confirmed'], {'deductions': True, 'royalty': False, 'revenueCosts': False, 'opex': False})
+
     def test_gzip_when_accepted(self):
         h = self.harness(engine=self.eng_with_history())
         h.upload()

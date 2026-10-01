@@ -272,6 +272,17 @@ class _BuildError(Exception):
         self.reason = reason
 
 
+
+def _num_or(v, default):
+    """A finite number, else default (settings values may be null or strings)."""
+    if isinstance(v, bool) or v is None:
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
 def _json_default(o):
     if isinstance(o, (datetime, date)):
         return o.isoformat()
@@ -1797,7 +1808,8 @@ class _PnlService:
                'cost2ByCustomer': cost.get('byCust2') or {},
                'costByStyle': cost['byStyle'],
                'costGrades': cost['grades'],
-               'datasetBuiltAt': cost['builtAt']}
+               'datasetBuiltAt': cost['builtAt'],
+               'fees': self._analytics_fees(matrix)}
         body = json.dumps(out, separators=(',', ':'), allow_nan=False, default=_json_default).encode('utf-8')
         gz = gzip.compress(body, compresslevel=6, mtime=0)
         try:
@@ -1809,6 +1821,72 @@ class _PnlService:
             resp.headers['Content-Encoding'] = 'gzip'
         resp.vary.add('Accept-Encoding')
         return resp
+
+    def _analytics_fees(self, matrix):
+        """The fee rates the Inventory Analytics tool spreads over every style
+        (Oct 1 2026, David: "a fee breakdown per style ... rent, payroll,
+        chargebacks"). Rates only, from the effective P&L settings; the page
+        does the per-style math so the numbers follow its filters. Chargebacks
+        are resolved per history customer exactly as the engine does (the
+        customer's own rate, else its group's, else 'other'). Royalty comes as
+        a resolved percent per known brand code plus the engine's brand rule
+        inputs. Revenue costs are percents of revenue. Opex items are monthly
+        dollars the page spreads by unit share. Never raises: {'ready': False}
+        when the settings or the engine helpers are unavailable."""
+        eng = self._module('engine')
+        rt = self._module('routing')
+        try:
+            merge = getattr(eng, 'merge_settings', None)
+            cust_group = getattr(eng, '_cust_group', None)
+            ded_pct = getattr(eng, '_ded_pct', None)
+            roy_pct = getattr(eng, '_roy_pct', None)
+            if not all(callable(f) for f in (merge, cust_group, ded_pct, roy_pct)):
+                return {'ready': False, 'reason': 'engine'}
+            stored, _etag = self.store.get_obj(SETTINGS)
+            S = merge(stored if isinstance(stored, dict) else {})
+            fob = frozenset(getattr(rt, 'ENGINE_FOB_CODES', None) or getattr(eng, '_ENGINE_FOB_FALLBACK', ()) or ())
+            alias = dict(getattr(eng, 'HISTORY_CUSTOMER_ALIAS', None) or {})
+            custs = set()
+            for blk in ((matrix.get('customers') or {}), (matrix.get('pendingCube') or {})):
+                for raw in blk:
+                    custs.add(str(raw))
+                    custs.add(str(alias.get(raw, raw)))
+            chargeback = {}
+            for c in sorted(custs):
+                g = cust_group(c, S, fob)
+                v = ded_pct(c, S, g)
+                chargeback[c] = {'pct': round(float(v or 0.0), 4), 'group': g}
+            brands = sorted(k for k in (getattr(eng, 'BRAND_NAMES', None) or {}) if k != 'BLK')
+            royalty = {'defaultPct': round(float(_num_or(S['royalty'].get('defaultPct'), 0.0)), 4),
+                       'base': 'revenue' if S['royalty'].get('base') == 'revenue' else 'net',
+                       'byBrand': {b: round(float(roy_pct(b, S) or 0.0), 4) for b in brands},
+                       'brands': brands, 'brandAlias': {'NT': 'NA', 'DV': 'VD'}}
+            rev_items = []
+            for it in (S.get('revenueCosts') or {}).get('items') or []:
+                if not isinstance(it, dict):
+                    continue
+                pct = _num_or(it.get('pct'), None)
+                if pct is None or not (0 <= pct <= 50):
+                    continue
+                rev_items.append({'key': str(it.get('key') or '')[:40], 'name': str(it.get('name') or it.get('key') or '')[:80],
+                                  'pct': round(float(pct), 4)})
+            opex_items = []
+            for i, it in enumerate((S.get('opex') or {}).get('items') or []):
+                if not isinstance(it, dict):
+                    continue
+                m = _num_or(it.get('monthly'), None)
+                if m is None or m < 0:
+                    continue
+                opex_items.append({'key': 'ox%d' % i, 'name': str(it.get('name') or 'Item %d' % (i + 1))[:80],
+                                   'monthly': round(float(m), 2)})
+            conf = S.get('confirmed') if isinstance(S.get('confirmed'), dict) else {}
+            return {'ready': True, 'chargeback': chargeback, 'royalty': royalty, 'revenueCosts': rev_items,
+                    'opex': opex_items, 'opexBasis': 'unit_share',
+                    'confirmed': {k: bool(conf.get(k)) for k in ('deductions', 'royalty', 'revenueCosts', 'opex')},
+                    'updatedAt': S.get('updatedAt')}
+        except Exception as e:
+            print(f"[PnL] analytics fees unavailable: {type(e).__name__}", flush=True)
+            return {'ready': False, 'reason': 'settings'}
 
     def _analytics_cost_maps(self, key):
         """Cost joins for h_analytics, derived at most once per dataset build:
