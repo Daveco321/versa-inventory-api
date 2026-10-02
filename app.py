@@ -15841,6 +15841,12 @@ def _ai_agent_filter(params):
     fabric_codes = {str(f).strip().upper() for f in (params.get('fabric_codes') or []) if str(f).strip()}
     color_q = (params.get('color') or '').strip().lower() or None
     search = (params.get('search') or '').strip().upper() or None
+    # Customer prefix = the first two letters of the style # (TJ, TM, AM ...).
+    # A list, so "TJ and TM styles" is one filter (David, Oct 2 2026).
+    _cp = params.get('customer_prefixes') or params.get('customer_prefix') or []
+    if isinstance(_cp, str):
+        _cp = re.split(r'[\s,;/]+', _cp)
+    prefixes = {str(p).strip().upper()[:2] for p in _cp if str(p or '').strip()}
     stock = (params.get('stock') or 'any').strip().lower()
     min_units = int(params.get('min_units') or 0)
     arrive_before = _apo_parse_date(params.get('arrive_before')) if params.get('arrive_before') else None
@@ -15879,6 +15885,8 @@ def _ai_agent_filter(params):
         if brand_keys and r['brand_abbr'] not in brand_keys:
             continue
         if search and search not in base:
+            continue
+        if prefixes and base[:2] not in prefixes:
             continue
         if fabric_codes and (len(base) < 6 or base[4:6] not in fabric_codes):
             continue
@@ -17739,6 +17747,78 @@ def _ai_tool_build_sales_sheet(params):
 
 
 _LINE_SHEET_TAB_CAP = 2000
+# Tabs per workbook. Was 4, which made "one tab per brand" impossible: a 12-brand
+# sheet silently lost 8 brands (David, Oct 2 2026). Tabs past this are named in
+# the result, never dropped silently.
+_LINE_SHEET_MAX_TABS = 30
+# Feed brand codes with no entry in the brand-name maps. KLP is how the feed
+# spells Karl Lagerfeld on TJX styles; without this the tab reads "KLP".
+_LINE_SHEET_BRAND_TITLES = {'KLP': 'Karl Lagerfeld Paris'}
+
+
+def _line_sheet_brand_title(abbr):
+    a = str(abbr or '').strip().upper()
+    return _LINE_SHEET_BRAND_TITLES.get(a) or _normalize_brand(a) or a
+
+
+def _line_sheet_split_by_brand(t, customer_view=False):
+    """Expand one tab spec with split_by_brand into one tab per brand that has
+    matching styles. Each new tab keeps every other filter and is pinned to its
+    brand; codes that name the same brand (NAUTICA and NT, KL and KLP) share a
+    tab. A curated skus tab is split by brand in the caller's order."""
+    def _title(name):
+        return f"{name} - {t['title']}" if t.get('title') else name
+
+    if t.get('skus'):
+        agg = _ai_agent_agg_inventory()
+        by_name, order = {}, []
+        for s in t.get('skus') or []:
+            r = agg.get(_ai_agent_base(str(s or '').strip().upper()))
+            name = _line_sheet_brand_title(r['brand_abbr']) if r is not None else 'Not found'
+            if name not in by_name:
+                by_name[name] = []
+                order.append(name)
+            by_name[name].append(s)
+        out = []
+        for name in order:
+            sub = {k: v for k, v in t.items() if k not in ('split_by_brand', 'title')}
+            sub['skus'] = by_name[name]
+            sub['title'] = _title(name)
+            out.append(sub)
+        return out
+
+    # Filtered tab: biggest brand first, by the units the tab will actually
+    # show (customer view takes out NJ/ABFI stock and hidden-landing lots).
+    rows, _ = _ai_agent_filter(t)
+    stock = (t.get('stock') or 'any').strip().lower()
+    hl_hidden, hl_visible = _hidden_landing_maps() if customer_view else ({}, {})
+    units, codes = {}, {}
+    for r in rows:
+        wh = r['total_warehouse']
+        inc = int(r.get('incoming') or 0)
+        if customer_view:
+            wh -= _restricted_units(r)
+            hid = int(hl_hidden.get(r['style'], 0) or 0)
+            if hid:
+                inc -= min(inc, hid) if r['style'] in hl_visible else inc
+        if stock == 'warehouse':
+            u = wh
+        elif stock == 'overseas':
+            u = inc
+        else:
+            u = max(wh, 0) + max(inc, 0)
+        name = _line_sheet_brand_title(r['brand_abbr'])
+        units[name] = units.get(name, 0) + max(int(u or 0), 0)
+        codes.setdefault(name, [])
+        if r['brand_abbr'] not in codes[name]:
+            codes[name].append(r['brand_abbr'])
+    out = []
+    for name in sorted(units, key=lambda n: (-units[n], n)):
+        sub = {k: v for k, v in t.items() if k not in ('split_by_brand', 'brand', 'brands', 'title')}
+        sub['brands'] = codes[name]
+        sub['title'] = _title(name)
+        out.append(sub)
+    return out
 
 
 def _ai_tool_build_line_sheet(params):
@@ -17763,7 +17843,21 @@ def _ai_tool_build_line_sheet(params):
     for p in prods_all:
         prod_by_base.setdefault(_ai_agent_base(p.get('style')), []).append(p)
     agg_cache = None
-    for ti, t in enumerate(tabs_in[:4]):
+    expanded = []
+    for t in tabs_in:
+        if not isinstance(t, dict):
+            continue
+        if t.get('split_by_brand'):
+            expanded.extend(_line_sheet_split_by_brand(t, customer_view))
+        else:
+            expanded.append(t)
+    tabs_in = expanded
+    if len(tabs_in) > _LINE_SHEET_MAX_TABS:
+        # Never drop a tab silently: name every one left off.
+        summary.append({'tabs_dropped_over_cap': [x.get('title') or f'Tab {i + 1}'
+                                                  for i, x in enumerate(tabs_in) if i >= _LINE_SHEET_MAX_TABS],
+                        'max_tabs': _LINE_SHEET_MAX_TABS})
+    for ti, t in enumerate(tabs_in[:_LINE_SHEET_MAX_TABS]):
         skus_req = []
         seen_req = set()
         for s in (t.get('skus') or []):
@@ -17930,6 +18024,15 @@ def _ai_tool_build_line_sheet(params):
                     or (t.get('view_mode') != 'ats' and int(it.get('incoming') or 0) > 0)]
             _dropped += len(t['items']) - len(keep)
             t['items'] = keep
+        # Per-tab counts must describe the file that is sent, not the styles
+        # before the drop; a tab that ends up empty is named as left out.
+        _kept = {t['tab_name']: len(t['items']) for t in tabs_out}
+        for e in summary:
+            if 'tab' in e and not e.get('skipped') and e['tab'] in _kept:
+                e['styles'] = _kept[e['tab']]
+                if not _kept[e['tab']]:
+                    e['skipped'] = True
+                    e['reason'] = 'no warehouse ATS left after committed stock'
         tabs_out = [t for t in tabs_out if t['items']]
         if not tabs_out:
             return {'error': 'nothing is available from a warehouse for these filters'}
@@ -20024,7 +20127,8 @@ _AI_AGENT_TOOLS = [
                      "the navy bucket is 'All Shades of Blue': navy, blue, indigo, serenity, periwinkle, turquoise, aqua, teal, "
                      "tanzine, cobalt, blueberry, seaspray, deep sea, denim, cerulean, sapphire, azure, cyan; and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
-                     "search (substring of style #), stock (any|warehouse|overseas), min_units, "
+                     "search (substring of style #), customer_prefixes (first 2 letters of the style #, e.g. ['TJ','TM']), "
+                     "stock (any|warehouse|overseas), min_units, "
                      "arrive_before/arrive_after (YYYY-MM-DD, filters styles with production arriving in that window and "
                      "reports qualifying_po_units). Totals cover ALL matches even when rows are truncated. "
                      "Use for ANY quantity/availability question."),
@@ -20032,6 +20136,7 @@ _AI_AGENT_TOOLS = [
          'brands': {'type': 'array', 'items': {'type': 'string'}},
          'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
          'color': {'type': 'string'}, 'search': {'type': 'string'},
+         'customer_prefixes': {'type': 'array', 'items': {'type': 'string'}},
          'stock': {'type': 'string', 'enum': ['any', 'warehouse', 'overseas']},
          'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
          'sort': {'type': 'string', 'enum': ['total_ats', 'warehouse', 'incoming']},
@@ -20151,7 +20256,10 @@ _AI_AGENT_TOOLS = [
                      'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
                      'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
-                     'Max 4 tabs; a tab holds every matching style (service guard at 2,000, which no single '
+                     'Up to 30 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
+                     'first), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
+                     'stock:"warehouse", split_by_brand:true}. customer_prefixes = first two letters of the '
+                     'style # (TJ, TM, AM...). A tab holds every matching style (service guard at 2,000, which no single '
                      'brand reaches, so never warn about a style cap unless the result says truncated). '
                      'Takes up to a minute, longer for very large tabs. Present the returned download_url '
                      'to the user as a clickable link. Excel only: when the user asks for a presentation, '
@@ -20164,6 +20272,9 @@ _AI_AGENT_TOOLS = [
              'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
              'color': {'type': 'string'}, 'stock': {'type': 'string', 'enum': ['any', 'warehouse', 'overseas']},
              'min_units': {'type': 'integer'}, 'arrive_before': {'type': 'string'}, 'arrive_after': {'type': 'string'},
+             'search': {'type': 'string'},
+             'customer_prefixes': {'type': 'array', 'items': {'type': 'string'}},
+             'split_by_brand': {'type': 'boolean'},
              'limit': {'type': 'integer'}}}},
          'customer_view': {'type': 'boolean'}, 'filename': {'type': 'string'}},
          'required': ['tabs']}},
