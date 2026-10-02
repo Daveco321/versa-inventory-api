@@ -34,6 +34,7 @@ Wire-up in app.py (after _caller_identity and load_production_from_dropbox exist
                               machine_key=INVENTORY_API_KEY,
                               load_master=load_production_from_dropbox)
 """
+import worker_leader
 import io
 import os
 import re
@@ -1262,6 +1263,13 @@ def _daily_loop():
             if target <= now:
                 target = target + dt.timedelta(days=1)
             time.sleep(max(60, (target - now).total_seconds()))
+            # One worker per instance does the daily job (Oct 2 2026). Every worker
+            # used to start it at the same minute: the status.json guard below is
+            # only written when a rebuild FINISHES, so all of them rebuilt at once,
+            # each holding every ledger copy in memory (a memory-limit restart).
+            # The others pick up the new build from S3 through _load_blob.
+            if not worker_leader.is_leader():
+                continue
             today = _et_today().isoformat()
             # the day's own ledger copy is always refreshed, even when a manual rebuild ran earlier
             try:

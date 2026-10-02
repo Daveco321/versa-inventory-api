@@ -29,6 +29,7 @@ import hashlib
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+import worker_leader
 from flask import Flask, request, jsonify, send_file, Response, make_response, g
 from flask_cors import CORS
 import xlsxwriter
@@ -4351,6 +4352,27 @@ def s3_upload_export(key, file_bytes):
         return False
 
 
+# s3 key -> export inputs fingerprint this worker last uploaded (Oct 2 2026)
+_export_uploaded_inputs = {}
+
+
+def _upload_export_once(key, file_bytes, inputs):
+    """The S3 copies of the cached exports are an archive nothing reads back
+    (downloads are served from memory), yet every gunicorn worker uploaded all
+    of them on every export run: about 75 MB a run, times 4 workers, billed as
+    outbound bandwidth (1,270 GB in September 2026). Only the leader worker
+    uploads now, and only when this run's inputs differ from its last upload
+    of the same key. A new day is a new key, so each day still gets its copy."""
+    if not worker_leader.is_leader():
+        return False
+    if inputs is not None and _export_uploaded_inputs.get(key) == inputs:
+        return False
+    ok = s3_upload_export(key, file_bytes)
+    if ok and inputs is not None:
+        _export_uploaded_inputs[key] = inputs
+    return ok
+
+
 def sync_inventory():
     """Sync inventory: try Dropbox first, then S3 fallback"""
     # Try Dropbox API first
@@ -4547,7 +4569,7 @@ def generate_all_exports():
                     }
 
                 s3_key = f"{S3_EXPORT_PREFIX}{name.replace(' ', '_')}_{date_str}.xlsx"
-                s3_upload_export(s3_key, xl_bytes)
+                _upload_export_once(s3_key, xl_bytes, inputs)
 
                 brands_list_for_multi.append({
                     'brand_name': name,
@@ -4570,7 +4592,7 @@ def generate_all_exports():
                         'items_count': sum(len(b['items']) for b in brands_list_for_multi),
                         'size_bytes': len(multi_bytes),
                     }
-                s3_upload_export(f"{S3_EXPORT_PREFIX}All_Brands_{date_str}.xlsx", multi_bytes)
+                _upload_export_once(f"{S3_EXPORT_PREFIX}All_Brands_{date_str}.xlsx", multi_bytes, inputs)
             except Exception as e:
                 print(f"    Failed: {e}")
 
