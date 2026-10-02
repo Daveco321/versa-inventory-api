@@ -89,6 +89,10 @@ class LineSheetTabs(unittest.TestCase):
         rows, _ = self.app._ai_agent_filter({'customer_prefix': 'TJ, TM', 'stock': 'overseas'})
         self.assertEqual({r['style'] for r in rows}, {'TMNAZZ902SLS', 'TJDKZZ903SLS', 'TMDKZZ904SLS'})
 
+    def test_a_list_sent_as_json_text_still_works(self):
+        rows, _ = self.app._ai_agent_filter({'customer_prefixes': '["TJ","TM"]', 'stock': 'overseas'})
+        self.assertEqual({r['style'] for r in rows}, {'TMNAZZ902SLS', 'TJDKZZ903SLS', 'TMDKZZ904SLS'})
+
     def test_no_prefix_means_no_prefix_filter(self):
         rows, _ = self.app._ai_agent_filter({})
         self.assertEqual(len(rows), len(AGG))

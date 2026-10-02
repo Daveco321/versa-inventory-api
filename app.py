@@ -15843,10 +15843,12 @@ def _ai_agent_filter(params):
     search = (params.get('search') or '').strip().upper() or None
     # Customer prefix = the first two letters of the style # (TJ, TM, AM ...).
     # A list, so "TJ and TM styles" is one filter (David, Oct 2 2026).
+    # A client holding an older copy of the tool schema sends the list as text
+    # ('["TJ","TM"]' or 'TJ, TM'), so read the letter groups out of any string.
     _cp = params.get('customer_prefixes') or params.get('customer_prefix') or []
     if isinstance(_cp, str):
-        _cp = re.split(r'[\s,;/]+', _cp)
-    prefixes = {str(p).strip().upper()[:2] for p in _cp if str(p or '').strip()}
+        _cp = [_cp]
+    prefixes = {tok.upper()[:2] for p in _cp for tok in re.findall(r'[A-Za-z0-9]+', str(p or ''))}
     stock = (params.get('stock') or 'any').strip().lower()
     min_units = int(params.get('min_units') or 0)
     arrive_before = _apo_parse_date(params.get('arrive_before')) if params.get('arrive_before') else None
