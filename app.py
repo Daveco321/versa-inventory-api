@@ -17763,13 +17763,16 @@ def _line_sheet_brand_title(abbr):
     return _LINE_SHEET_BRAND_TITLES.get(a) or _normalize_brand(a) or a
 
 
-def _line_sheet_split_by_brand(t, customer_view=False):
+def _line_sheet_split_by_brand(t, customer_view=False, keep_title=False):
     """Expand one tab spec with split_by_brand into one tab per brand that has
     matching styles. Each new tab keeps every other filter and is pinned to its
     brand; codes that name the same brand (NAUTICA and NT, KL and KLP) share a
-    tab. A curated skus tab is split by brand in the caller's order."""
+    tab. A curated skus tab is split by brand in the caller's order. Tabs are
+    named by brand alone; the parent title is added only when the caller asks
+    (two split tabs in one workbook), since a long suffix gets cut at Excel's
+    31 characters ("Karl Lagerfeld Paris - TJ TM Wa")."""
     def _title(name):
-        return f"{name} - {t['title']}" if t.get('title') else name
+        return f"{name} - {t['title']}" if (keep_title and t.get('title')) else name
 
     if t.get('skus'):
         agg = _ai_agent_agg_inventory()
@@ -17846,11 +17849,14 @@ def _ai_tool_build_line_sheet(params):
         prod_by_base.setdefault(_ai_agent_base(p.get('style')), []).append(p)
     agg_cache = None
     expanded = []
+    # Two split tabs in one workbook would both make a "Nautica" tab: only then
+    # does each keep its own title as a suffix to tell them apart.
+    n_split = sum(1 for t in tabs_in if isinstance(t, dict) and t.get('split_by_brand'))
     for t in tabs_in:
         if not isinstance(t, dict):
             continue
         if t.get('split_by_brand'):
-            expanded.extend(_line_sheet_split_by_brand(t, customer_view))
+            expanded.extend(_line_sheet_split_by_brand(t, customer_view, keep_title=n_split > 1))
         else:
             expanded.append(t)
     tabs_in = expanded
@@ -20259,7 +20265,7 @@ _AI_AGENT_TOOLS = [
                      'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
                      'Up to 30 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
-                     'first), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
+                     'first, each tab named by the brand), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
                      'stock:"warehouse", split_by_brand:true}. customer_prefixes = first two letters of the '
                      'style # (TJ, TM, AM...). A tab holds every matching style (service guard at 2,000, which no single '
                      'brand reaches, so never warn about a style cap unless the result says truncated). '

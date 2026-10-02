@@ -119,10 +119,19 @@ class LineSheetTabs(unittest.TestCase):
         ])
         self.assertTrue(all(t['view_mode'] == 'incoming' for t in self.built['tabs']))
 
-    def test_split_keeps_the_given_title_as_a_suffix(self):
+    def test_one_split_tab_is_named_by_brand_alone(self):
+        # The mailbox bot likes to add a title; the tab must still read "DKNY",
+        # not "DKNY - TJ TM Overseas" cut at 31 characters.
         self.app._ai_tool_build_line_sheet({'tabs': [
+            {'title': 'TJ TM Overseas', 'customer_prefixes': ['TJ'], 'stock': 'overseas', 'split_by_brand': True}]})
+        self.assertEqual([n for n, _ in self._tabs()], ['DKNY'])
+
+    def test_two_split_tabs_keep_their_titles_to_tell_them_apart(self):
+        self.app._ai_tool_build_line_sheet({'tabs': [
+            {'title': 'Warehouse', 'customer_prefixes': ['TJ'], 'stock': 'warehouse', 'split_by_brand': True},
             {'title': 'Overseas', 'customer_prefixes': ['TJ'], 'stock': 'overseas', 'split_by_brand': True}]})
-        self.assertEqual([n for n, _ in self._tabs()], ['DKNY - Overseas'])
+        self.assertEqual([n for n, _ in self._tabs()],
+                         ['Nautica - Warehouse', 'Chaps - Warehouse', 'DKNY - Overseas'])
 
     def test_a_brand_filter_on_the_parent_narrows_the_split(self):
         tabs = self.app._line_sheet_split_by_brand(
