@@ -691,6 +691,25 @@ class TestStoreRoutes(PnlTestCase):
         with self.assertRaises(StoreUnreadable):
             EncryptedStore(LocalDirStore(h1.store_dir), ka).get_obj(CB)
 
+    def test_rotate_route_runs_the_extra_rotations(self):
+        """Other stores on PNL_DATA_KEYS (Inventory Aging) rotate with the P&L; a failing one never
+        fails the P&L rotate and can never overwrite a P&L object's status."""
+        h = self.harness()
+        h.upload()
+        calls = []
+
+        def extra():
+            calls.append(1)
+            return {'aging/trend': 'rotated', CB: 'hijacked'}
+
+        def broken():
+            raise RuntimeError('synthetic')
+        h.svc.extra_rotations.extend([extra, broken])
+        r = h.admin('POST', '/api/pnl/rotate')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects'], {CB: 'rotated', ST: 'absent', OV: 'absent', 'aging/trend': 'rotated'})
+        self.assertEqual(calls, [1])
+
     def test_versions_and_restore_routes(self):
         h = self.harness()
         h.upload(3)

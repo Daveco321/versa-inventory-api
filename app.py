@@ -4205,6 +4205,37 @@ def sync_inventory_if_changed(min_interval=20):
         _sync_gate.release()
 
 
+def _dropbox_inventory_download(token):
+    """POST files/download for the inventory workbook, refreshing the token once
+    on a 401. Returns the response (any status), or None when the token could
+    not be refreshed. Shared by sync_from_dropbox and the Inventory Aging build
+    (a fresh worker's background thread, Oct 5 2026)."""
+    global _dropbox_token_expires
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Dropbox-API-Arg': json.dumps({'path': DROPBOX_INVENTORY_PATH})
+    }
+    resp = http_requests.post(
+        'https://content.dropboxapi.com/2/files/download',
+        headers=headers, timeout=60
+    )
+
+    # Auto-refresh token if expired
+    if resp.status_code == 401:
+        print("  ⚠ Dropbox auth failed (401) — forcing token refresh...")
+        _dropbox_token_expires = 0
+        token = get_dropbox_token()
+        if not token:
+            print("  ⚠ Could not refresh token, giving up")
+            return None
+        headers['Authorization'] = f'Bearer {token}'
+        resp = http_requests.post(
+            'https://content.dropboxapi.com/2/files/download',
+            headers=headers, timeout=60
+        )
+    return resp
+
+
 def sync_from_dropbox():
     """Fetch inventory directly via Dropbox API — uses OAuth, never expires, no shared link needed."""
     token = get_dropbox_token()
@@ -4214,29 +4245,9 @@ def sync_from_dropbox():
 
     print(f"  📂 Fetching inventory from Dropbox API: {DROPBOX_INVENTORY_PATH}")
     try:
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Dropbox-API-Arg': json.dumps({'path': DROPBOX_INVENTORY_PATH})
-        }
-        resp = http_requests.post(
-            'https://content.dropboxapi.com/2/files/download',
-            headers=headers, timeout=60
-        )
-
-        # Auto-refresh token if expired
-        if resp.status_code == 401:
-            print("  ⚠ Dropbox auth failed (401) — forcing token refresh...")
-            global _dropbox_token_expires
-            _dropbox_token_expires = 0
-            token = get_dropbox_token()
-            if not token:
-                print("  ⚠ Could not refresh token, giving up")
-                return False
-            headers['Authorization'] = f'Bearer {token}'
-            resp = http_requests.post(
-                'https://content.dropboxapi.com/2/files/download',
-                headers=headers, timeout=60
-            )
+        resp = _dropbox_inventory_download(token)
+        if resp is None:
+            return False
 
         if resp.status_code != 200:
             print(f"  ⚠ Dropbox API returned HTTP {resp.status_code}: {resp.text[:200]}")
@@ -4296,6 +4307,12 @@ def sync_from_dropbox():
             _inventory['committed_nonzero_count'] = fingerprint['committed_nonzero_count']
             _inventory['committed_abs_sum'] = fingerprint['committed_abs_sum']
         _nj_commit_report()
+        # Inventory Aging (Oct 5 2026): keep the accepted workbook for the lot sheets
+        # (only the ATS sheet is parsed above). Never allowed to fail the sync.
+        try:
+            _aging_note_source(rev, data, resp.headers.get('Dropbox-API-Result'), items_raw)
+        except Exception as _aging_exc:
+            print(f"  [Aging] workbook not kept: {type(_aging_exc).__name__}: {_aging_exc}", flush=True)
 
         print(f"  ✓ Dropbox sync: {len(items)} items across {len(brands)} brands "
               f"(non-zero committed: {fingerprint['committed_nonzero_count']}, "
@@ -10161,7 +10178,9 @@ _AUTHZ_CATALOG_READS = {
 # Extra GET endpoints the machine key may use (report/export pulls).
 _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports',
                         '/admin/factory-holds',   # the hold overview (Oct 1 2026)
-                        '/export-tjx-ats'}        # TJMAXX ATS Monday email (Oct 5 2026)
+                        '/export-tjx-ats',        # TJMAXX ATS Monday email (Oct 5 2026)
+                        # Inventory Aging (Oct 5 2026): the review copy proxies with the machine key
+                        '/api/inventory-aging', '/api/inventory-aging/trend'}
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
@@ -10563,7 +10582,8 @@ def _anon_inventory_row(it):
     """Catalog-link (anonymous) projection of one inventory row: lot/container strings
     carry internal PO names, and the committed/allocated split reveals per-customer
     allocation detail. Keep the NET effect (so client ATS math still holds) but hide
-    the breakdown (Sep 3 2026 audit)."""
+    the breakdown (Sep 3 2026 audit). receive_date (the style's oldest lot date) is
+    internal aging detail too (Oct 5 2026): catalog links got it until then."""
     if not isinstance(it, dict):
         return it
     it = dict(it)
@@ -10574,7 +10594,7 @@ def _anon_inventory_row(it):
         c, a = 0, 0
     it['committed'] = c + a
     it['allocated'] = 0
-    for k in ('lot_number', 'container'):
+    for k in ('lot_number', 'container', 'receive_date'):
         if k in it:
             it[k] = ''
     return it
@@ -10890,9 +10910,11 @@ def authz_gate():
             # POST /admin/photos/refresh = push replaced Dropbox photos through the
             # caches and clear named style-override photos (Sep 30 2026).
             # POST /admin/factory-holds = the factory hold switch (Oct 1 2026).
+            # POST /admin/aging/seed = the Inventory Aging restore map and trend
+            # backfill (Oct 5 2026; the route itself takes the machine key only).
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
                                              '/admin/banner-rules/upsert', '/admin/photos/refresh',
-                                             '/admin/factory-holds'):
+                                             '/admin/factory-holds', '/admin/aging/seed'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -18675,12 +18697,14 @@ def _wh_applied_for_sku(sku, q, ctx, now, today):
     return deductions, 'no production to absorb it'
 
 
-def _wh_split_by_base(bases, customer_view=True):
+def _wh_split_by_base(bases, customer_view=True, key_fn=None):
     """Per-warehouse AVAILABLE units for each base style.
 
     Returns {base: {'jtw':n,'tr':n,'dcw':n,'qa':n,'total':n,'exact':bool,'rules':[...]}}.
     'total' is what the four columns add up to, and the columns can never exceed
-    the stock actually standing in that warehouse."""
+    the stock actually standing in that warehouse. key_fn(SKU) -> base overrides
+    the default rollup (the part before the first '-'); Inventory Aging passes its
+    own base rule so legacy keys like BEN-22-38 stay separate (Oct 5 2026)."""
     wanted = {str(b or '').strip().upper() for b in (bases or [])}
     if not wanted:
         return {}
@@ -18694,7 +18718,7 @@ def _wh_split_by_base(bases, customer_view=True):
         # made a deck and a sheet disagree by up to 146 units on one style.
         if _is_sized_sku(sku):
             continue
-        base = sku.split('-')[0]
+        base = key_fn(sku) if key_fn is not None else sku.split('-')[0]
         if base not in wanted:
             continue
         stock = {k: max(0, m[k]) for k in _WH_KEYS}
@@ -21101,6 +21125,658 @@ try:
     _pnl_svc.sales_matrix = _pnl_sales_matrix   # request-thread-safe getter, not a build source
 except Exception as _pnl_exc:   # boot must never fail because of the P&L
     print(f"[PnL] disabled: {type(_pnl_exc).__name__}", flush=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INVENTORY AGING (Oct 5 2026)
+#
+# GET  /api/inventory-aging        staff (admins and the machine key also get NJ/ABFI)
+# GET  /api/inventory-aging/trend  staff + machine key: the daily trend series
+# POST /admin/aging/seed           machine key only: the JTW restore map or the trend backfill
+#
+# The lot sheets of the hourly Inventory_ATS.xlsx (parsed by inventory_aging.py)
+# age every JTW/TR/DCW lot. sync_from_dropbox keeps the accepted workbook bytes
+# per worker (_aging_note_source); the payload is built in a background thread,
+# memoised per (Dropbox rev, ET date) and answered 202 {"building": true} until
+# ready: a request never waits on a build (the Sep 22 2026 lesson). Nothing here
+# starts at import time. The restore map and the trend live encrypted
+# (pnl_store.EncryptedStore, PNL_DATA_KEYS) under inventory/aging/, because the
+# bucket is public-read. Only the leader worker writes the daily trend record.
+# The same key rotation as the P&L covers these objects (POST /api/pnl/rotate,
+# see _aging_rotate_store), and the trend route reads the store only from a
+# background thread (_aging_trend_load).
+# ═════════════════════════════════════════════════════════════════════════════
+import gzip as _aging_gzip
+try:
+    import inventory_aging as _aging
+except Exception as _aging_imp_exc:     # boot must never fail because of the aging tool
+    print(f"[Aging] disabled: inventory_aging.py did not import "
+          f"({type(_aging_imp_exc).__name__}: {_aging_imp_exc})", flush=True)
+    _aging = None
+
+AGING_STORE_PREFIX = 'inventory/aging/'
+AGING_RESTORE_OBJ = 'jtw-restore'
+AGING_TREND_OBJ = 'trend'
+_AGING_WHATS_TTL = 300          # whAts (routed warehouse availability) at most 5 minutes old
+_AGING_FAIL_RETRY = 60          # a failed build is retried after a minute
+_AGING_DEGRADED_TTL = 300       # a memo built without a readable restore map is redone after 5 min
+_AGING_FRESH_WAIT = 90          # a fresh worker waits this long for its startup sync's workbook
+_AGING_WHATS_RETRY = 30         # whAts that could not be computed (no inventory yet) is retried after 30 s
+_AGING_TREND_TTL = 60           # the trend route serves its in-memory copy, re-checked after a minute
+_AGING_TREND_RETRY = 15         # a trend load that failed is retried after 15 s
+_AGING_SEED_MAX = 5 * 1024 * 1024   # == inventory_aging.SEED_MAX_BYTES (kept here for a missing module)
+
+try:
+    from pnl_store import EncryptedStore as _AgingEncryptedStore, S3Store as _AgingS3Store
+    _aging_store = _AgingEncryptedStore(
+        _AgingS3Store(get_s3, os.environ.get('PNL_S3_BUCKET') or S3_BUCKET, prefix=AGING_STORE_PREFIX),
+        os.environ.get('PNL_DATA_KEYS', ''))
+except Exception as _aging_store_exc:
+    print(f"[Aging] store disabled: {type(_aging_store_exc).__name__}", flush=True)
+    _aging_store = None
+print(f"[Aging] routes registered | store "
+      f"{'configured' if getattr(_aging_store, 'ok', False) else 'NOT CONFIGURED (' + str(getattr(_aging_store, 'reason', 'none')) + ')'}"
+      f" at {AGING_STORE_PREFIX}", flush=True)
+
+_aging_lock = threading.Lock()
+_aging_parse_lock = threading.Lock()
+# Last accepted workbook on this worker: Dropbox rev, bytes, server_modified, items_raw.
+_aging_src = {'rev': None, 'bytes': None, 'asOf': None, 'items': None, 'at': 0.0}
+_aging_state = {
+    'memo': None,           # {'key','admin','staff','analysis','meta','restoreTag','degraded','at','whatsAt'}
+    'thread': None,         # the build thread
+    'fail': None,           # {'key','at'} of the last failed build
+    'parsed': None,         # {'rev','parsed'}: lot parse of the current workbook (before corrections)
+    'whats': None, 'whatsAt': 0.0, 'whatsRev': None, 'whatsThread': None,
+    'trendThread': None, 'trendAgain': False, 'trendDone': None,
+    # the trend document the trend route serves: {'etag','gz','at','error'} (error: None |
+    # 'unreadable' | 'failed'), loaded and re-checked by _aging_trend_load in the background
+    'trendDoc': None, 'trendLoadThread': None,
+}
+
+
+def _aging_store_ok():
+    return _aging_store is not None and bool(getattr(_aging_store, 'ok', False))
+
+
+def _aging_rotate_store():
+    """Re-encrypt the aging objects under the newest PNL_DATA_KEYS key. They share the P&L key,
+    so POST /api/pnl/rotate (step 1 of the pnl_store.py KEY RUNBOOK) runs this too; otherwise
+    dropping the old key after a rotate would leave them unreadable. Never raises."""
+    out = {}
+    if not _aging_store_ok():
+        return out
+    for name in (AGING_RESTORE_OBJ, AGING_TREND_OBJ):
+        label = 'aging/' + name
+        try:
+            out[label] = 'rotated' if _aging_store.rotate(name) else 'absent'
+        except Exception as e:
+            out[label] = 'unreadable' if type(e).__name__ == 'StoreUnreadable' else 'failed'
+            print(f"[Aging] rotate {name} failed: {type(e).__name__}", flush=True)
+    with _aging_lock:
+        doc = _aging_state.get('trendDoc')
+        if doc:
+            doc['at'] = 0.0             # re-read on the next trend request (new etag)
+    return out
+
+
+try:   # the P&L service exists only when its registration above succeeded
+    if globals().get('_pnl_svc') is not None and isinstance(getattr(_pnl_svc, 'extra_rotations', None), list):
+        _pnl_svc.extra_rotations.append(_aging_rotate_store)
+except Exception as _aging_rot_exc:
+    print(f"[Aging] rotate hook not registered: {type(_aging_rot_exc).__name__}", flush=True)
+
+
+def _aging_meta(api_result):
+    """(rev, server_modified) from a Dropbox-API-Result header value."""
+    try:
+        meta = json.loads(api_result or '{}')
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return meta.get('rev'), meta.get('server_modified')
+
+
+def _aging_rev_key(rev, data):
+    return rev or ('sha1:' + hashlib.sha1(data).hexdigest()[:16])
+
+
+def _aging_note_source(rev, data, api_result, items_raw):
+    """sync_from_dropbox hook: keep the accepted workbook, then (leader only) record the trend."""
+    if _aging is None:
+        return
+    _rev, as_of = _aging_meta(api_result)
+    with _aging_lock:
+        _aging_src.update(rev=_aging_rev_key(rev, data), bytes=data, asOf=as_of, items=items_raw,
+                          at=time.time())
+    _aging_after_sync()
+
+
+def _aging_today():
+    return _pres_now_et().date()
+
+
+def _aging_asof_date(as_of):
+    """ET calendar date of a Dropbox server_modified stamp (UTC), or None."""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(str(as_of).replace('Z', '+00:00'))
+        return dt.astimezone(ZoneInfo('America/New_York')).date()
+    except Exception:
+        return None
+
+
+def _aging_current_key():
+    with _aging_lock:
+        rev = _aging_src['rev'] if _aging_src['bytes'] is not None else None
+    if rev is None:
+        rev = _dbx_inv_rev.get('accepted')
+    return (rev, _aging_today().isoformat())
+
+
+def _aging_source():
+    """The workbook to age (dict copy of _aging_src). A fresh worker first waits for its startup
+    sync, then downloads the file once itself. Background threads only."""
+    with _aging_lock:
+        if _aging_src['bytes'] is not None:
+            return dict(_aging_src)
+    deadline = time.time() + _AGING_FRESH_WAIT
+    while time.time() < deadline:
+        with _inv_lock:
+            have_items = bool(_inventory.get('items'))
+        with _aging_lock:
+            if _aging_src['bytes'] is not None:
+                return dict(_aging_src)
+        if have_items:
+            break               # synced, but not from Dropbox bytes we kept: fetch them below
+        time.sleep(2)
+    token = get_dropbox_token()
+    if not token:
+        raise RuntimeError('no Dropbox token')
+    resp = _dropbox_inventory_download(token)
+    if resp is None or resp.status_code != 200 or len(resp.content or b'') < 1000:
+        raise RuntimeError(f'inventory download failed (HTTP {getattr(resp, "status_code", None)})')
+    data = resp.content
+    rev, as_of = _aging_meta(resp.headers.get('Dropbox-API-Result'))
+    items = None
+    with _inv_lock:
+        if rev and rev == _dbx_inv_rev.get('accepted'):
+            items = _inventory.get('items_raw')
+    with _aging_lock:
+        if _aging_src['bytes'] is None:     # a sync may have landed meanwhile: it wins
+            _aging_src.update(rev=_aging_rev_key(rev, data), bytes=data, asOf=as_of, items=items,
+                              at=time.time())
+        return dict(_aging_src)
+
+
+def _aging_restore_map():
+    """(restore map | None, tag, ok). ok is False when the store could not be read (the memo is
+    then redone later); a missing map or an unconfigured store is ok (restore unavailable)."""
+    if not _aging_store_ok():
+        return None, None, True
+    try:
+        obj, etag = _aging_store.get_obj(AGING_RESTORE_OBJ)
+    except Exception as e:
+        print(f"[Aging] restore map unreadable: {type(e).__name__}: {e}", flush=True)
+        return None, 'error', False
+    return (obj if isinstance(obj, dict) else None), etag, True
+
+
+def _aging_restore_tag():
+    if not _aging_store_ok():
+        return None
+    try:
+        return _aging_store.head(AGING_RESTORE_OBJ)
+    except Exception:
+        return 'error'
+
+
+def _aging_parsed(src):
+    """Lot parse of src's workbook, cached per rev (one parse at a time per worker)."""
+    with _aging_parse_lock:
+        with _aging_lock:
+            pc = _aging_state['parsed']
+        if pc and pc['rev'] == src['rev']:
+            return pc['parsed']
+        items = src.get('items')
+        rows = _aging.sku_rows_from_items(items, _is_sized_sku) if items else None
+        parsed = _aging.parse_workbook(src['bytes'], sku_rows=rows, is_sized=_is_sized_sku,
+                                       tick=lambda: time.sleep(0))
+        with _aging_lock:
+            _aging_state['parsed'] = {'rev': src['rev'], 'parsed': parsed}
+        if not parsed.get('lotsOk'):
+            print(f"[Aging] lot detail unusable for rev {src['rev']}: {parsed.get('lotsError')}", flush=True)
+        return parsed
+
+
+def _aging_compute_whats(analysis):
+    """{BASE: units free now in JTW+TR+DCW}: the smart-routed warehouse split (NJ/ABFI never in
+    it), rolled up with the aging base rule. Raises while this worker has no inventory loaded:
+    the split would then answer {} and every style would read 0 free instead of unknown."""
+    with _inv_lock:
+        have_items = bool(_inventory.get('items'))
+    if not have_items:
+        raise RuntimeError('this worker has no inventory loaded yet')
+    bases = {r['base'].upper() for r in analysis['parsed']['skus'].values() if r.get('base')}
+    split = _wh_split_by_base(sorted(bases), customer_view=True,
+                              key_fn=lambda s: _aging.base_style(s, _is_sized_sku).upper())
+    return {b: int(rec.get('jtw', 0)) + int(rec.get('tr', 0)) + int(rec.get('dcw', 0))
+            for b, rec in split.items()}
+
+
+def _aging_whats(analysis, rev, force=False):
+    """(whAts, at): the cached value for this rev when there is one (a stale one is refreshed in
+    the background by _aging_kick_whats), computed here otherwise. (None, at) when it cannot be
+    computed (whAts null = unknown), with at set so the next request retries it after
+    _AGING_WHATS_RETRY seconds instead of the full TTL."""
+    with _aging_lock:
+        wh, at, wrev = _aging_state['whats'], _aging_state['whatsAt'], _aging_state.get('whatsRev')
+    if wh is not None and wrev == rev and not force:
+        return wh, at
+    try:
+        wh = _aging_compute_whats(analysis)
+    except Exception as e:
+        print(f"[Aging] whAts unavailable: {type(e).__name__}: {e}", flush=True)
+        return None, time.time() - _AGING_WHATS_TTL + _AGING_WHATS_RETRY
+    at = time.time()
+    with _aging_lock:
+        _aging_state['whats'], _aging_state['whatsAt'], _aging_state['whatsRev'] = wh, at, rev
+    return wh, at
+
+
+def _aging_install_memo(key, analysis, wh, wh_at, meta, restore_tag, degraded, replace=None):
+    """Build both payload bodies (admin, staff) and install them. With replace, install only while
+    that memo is still the current one (a background refresh never undoes a newer build)."""
+    built_at = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    bodies = {}
+    for role, admin in (('admin', True), ('staff', False)):
+        payload = _aging.build_payload(analysis, admin, wh_ats=wh, rev=meta.get('rev'),
+                                       as_of=meta.get('asOf'), built_at=built_at)
+        raw = json.dumps(payload, separators=(',', ':'), allow_nan=False, default=str).encode('utf-8')
+        bodies[role] = _aging_gzip.compress(raw, compresslevel=6, mtime=0)
+        time.sleep(0)
+    memo = {'key': key, 'admin': bodies['admin'], 'staff': bodies['staff'], 'analysis': analysis,
+            'meta': meta, 'restoreTag': restore_tag, 'degraded': degraded, 'at': time.time(),
+            'whats': wh, 'whatsAt': wh_at}
+    with _aging_lock:
+        if replace is not None and _aging_state['memo'] is not replace:
+            return _aging_state['memo']
+        _aging_state['memo'] = memo
+        _aging_state['fail'] = None
+    return memo
+
+
+def _aging_build_once():
+    src = _aging_source()
+    today = _aging_today()
+    key = (src['rev'], today.isoformat())
+    parsed = _aging_parsed(src)
+    restore, tag, restore_ok = _aging_restore_map()
+    analysis = _aging.analyze(parsed, restore, today)
+    wh, wh_at = _aging_whats(analysis, src['rev'])
+    memo = _aging_install_memo(key, analysis, wh, wh_at, {'rev': src['rev'], 'asOf': src['asOf']},
+                               tag, not restore_ok)
+    if time.time() - wh_at > _AGING_WHATS_TTL:
+        _aging_kick_whats()
+    print(f"[Aging] built rev {src['rev']} for {today.isoformat()}: {len(analysis['lots']):,} lots, "
+          f"{len(parsed['skus']):,} SKUs, lotsOk={parsed.get('lotsOk')}", flush=True)
+    return memo
+
+
+def _aging_memo_fresh(memo, key):
+    if not memo or memo['key'] != key:
+        return False
+    return not (memo.get('degraded') and time.time() - memo['at'] > _AGING_DEGRADED_TTL)
+
+
+def _aging_build_loop():
+    for _ in range(3):
+        key = _aging_current_key()
+        with _aging_lock:
+            memo = _aging_state['memo']
+        if _aging_memo_fresh(memo, key):
+            return
+        try:
+            _aging_build_once()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[Aging] build failed: {type(e).__name__}: {e}", flush=True)
+            with _aging_lock:
+                _aging_state['fail'] = {'key': key, 'at': time.time()}
+            return
+
+
+def _aging_kick():
+    with _aging_lock:
+        t = _aging_state['thread']
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_aging_build_loop, daemon=True, name='aging-build')
+        _aging_state['thread'] = t
+    t.start()
+
+
+def _aging_whats_refresh():
+    """Background: fresh whAts (and a new restore map, when one was uploaded) for the memo."""
+    try:
+        with _aging_lock:
+            memo = _aging_state['memo']
+        if not memo:
+            return
+        analysis, tag = memo['analysis'], memo['restoreTag']
+        degraded = memo.get('degraded', False)
+        new_tag = _aging_restore_tag()
+        if new_tag != tag and new_tag != 'error':
+            restore, tag, ok = _aging_restore_map()
+            if ok:
+                analysis = _aging.analyze(analysis['parsed'], restore, analysis['today'])
+                degraded = False
+        wh, wh_at = _aging_whats(analysis, memo['meta'].get('rev'), force=True)
+        if wh is None:
+            wh = memo.get('whats')       # keep the last good value (or unknown); retried soon
+        if analysis is memo['analysis'] and tag == memo['restoreTag'] and wh == memo.get('whats'):
+            with _aging_lock:            # nothing in the payload changed: no rebuild, just the clock
+                if _aging_state['memo'] is memo:
+                    memo['whatsAt'] = wh_at
+            return
+        _aging_install_memo(memo['key'], analysis, wh, wh_at, memo['meta'], tag, degraded, replace=memo)
+    except Exception as e:
+        print(f"[Aging] whAts refresh failed: {type(e).__name__}: {e}", flush=True)
+
+
+def _aging_kick_whats():
+    with _aging_lock:
+        t = _aging_state['whatsThread']
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_aging_whats_refresh, daemon=True, name='aging-whats')
+        _aging_state['whatsThread'] = t
+    t.start()
+
+
+def _aging_trend_upsert(rec):
+    """Store rec for its date in the encrypted trend: get, modify, put on the etag, one retry on
+    a conflict. Returns True when something was written."""
+    from pnl_store import VersionConflict
+    for attempt in (0, 1):
+        doc, etag = _aging_store.get_obj(AGING_TREND_OBJ)
+        new, changed = _aging.upsert_trend(doc, rec, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+        if not changed:
+            return False
+        try:
+            new_etag = _aging_store.put_obj(AGING_TREND_OBJ, new, expected_etag=etag or '')
+        except VersionConflict:
+            if attempt:
+                raise
+            continue
+        _aging_trend_cache_put(new, new_etag)
+        return True
+    return False
+
+
+def _aging_trend_cache_put(doc, etag, error=None):
+    """Install the trend document the trend route serves on this worker. etag None (unknown)
+    makes the next request re-check the store at once."""
+    gz = None
+    if error is None:
+        if not isinstance(doc, dict):
+            doc = _aging.empty_trend()
+        out = {'series': doc.get('series') or [], 'dropped': doc.get('dropped') or [],
+               'updatedAt': doc.get('updatedAt')}
+        gz = _aging_gzip.compress(json.dumps(out, separators=(',', ':'), allow_nan=False).encode('utf-8'),
+                                  compresslevel=6, mtime=0)
+    now = time.time()
+    if error is not None:
+        at = now - _AGING_TREND_TTL + _AGING_TREND_RETRY      # retried soon
+    else:
+        at = now if etag else 0.0
+    with _aging_lock:
+        _aging_state['trendDoc'] = {'etag': etag, 'gz': gz, 'at': at, 'error': error}
+
+
+def _aging_trend_load():
+    """Background: (re)load the trend document for the trend route. A HEAD when a copy is held
+    (re-read only when the etag changed); a failed refresh keeps serving the last good copy."""
+    from pnl_store import StoreUnreadable
+    with _aging_lock:
+        cur = _aging_state['trendDoc']
+    try:
+        if cur and cur['error'] is None and cur['etag']:
+            etag = _aging_store.head(AGING_TREND_OBJ)
+            if etag == cur['etag']:
+                with _aging_lock:
+                    if _aging_state['trendDoc'] is cur:
+                        cur['at'] = time.time()
+                return
+        doc, etag = _aging_store.get_obj(AGING_TREND_OBJ)
+        _aging_trend_cache_put(doc, etag)
+    except StoreUnreadable:
+        print("[Aging] the saved trend cannot be opened with the configured key", flush=True)
+        _aging_trend_cache_put(None, None, error='unreadable')
+    except Exception as e:
+        print(f"[Aging] trend read failed: {type(e).__name__}: {e}", flush=True)
+        with _aging_lock:
+            if cur and cur['error'] is None and _aging_state['trendDoc'] is cur:
+                cur['at'] = time.time() - _AGING_TREND_TTL + _AGING_TREND_RETRY    # keep it, retry soon
+                return
+        _aging_trend_cache_put(None, None, error='failed')
+
+
+def _aging_kick_trend_load():
+    with _aging_lock:
+        t = _aging_state['trendLoadThread']
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_aging_trend_load, daemon=True, name='aging-trend-load')
+        _aging_state['trendLoadThread'] = t
+    t.start()
+
+
+def _aging_trend_job():
+    """Leader only, after an accepted sync: the trend record for the ET date of the file's
+    server_modified, aged as of that date."""
+    while True:
+        with _aging_lock:
+            _aging_state['trendAgain'] = False
+            src = dict(_aging_src)
+        try:
+            if src['bytes'] is not None:
+                day = _aging_asof_date(src['asOf']) or _aging_today()
+                mark = (src['rev'], day.isoformat())
+                with _aging_lock:
+                    done = _aging_state['trendDone'] == mark
+                if not done:
+                    parsed = _aging_parsed(src)
+                    restore, _tag, restore_ok = _aging_restore_map()
+                    rec = _aging.trend_record(_aging.analyze(parsed, restore, day), src='live')
+                    if rec is None:
+                        print(f"[Aging] no trend record for {day}: lot detail unusable", flush=True)
+                    elif restore_ok:
+                        wrote = _aging_trend_upsert(rec)
+                        print(f"[Aging] trend {day}: {'stored' if wrote else 'unchanged'}", flush=True)
+                        with _aging_lock:
+                            _aging_state['trendDone'] = mark
+        except Exception as e:
+            print(f"[Aging] trend upsert failed: {type(e).__name__}: {e}", flush=True)
+        with _aging_lock:
+            if not _aging_state['trendAgain']:
+                _aging_state['trendThread'] = None
+                return
+
+
+def _aging_after_sync():
+    """Start the trend job on the leader worker (never on a request thread's time)."""
+    if not _aging_store_ok() or not worker_leader.is_leader():
+        return
+    with _aging_lock:
+        t = _aging_state['trendThread']
+        if t is not None and t.is_alive():
+            _aging_state['trendAgain'] = True
+            return
+        t = threading.Thread(target=_aging_trend_job, daemon=True, name='aging-trend')
+        _aging_state['trendThread'] = t
+    t.start()
+
+
+def _aging_ident():
+    """(allowed, is_admin): staff sessions and the machine key only, whatever AUTH_MODE says."""
+    ident = _request_identity() or {}
+    tier = ident.get('tier')
+    if tier == 'machine':
+        return True, True
+    if tier == 'staff':
+        return True, ident.get('is_admin') is True
+    return False, False
+
+
+def _aging_gz_response(gz, status=200):
+    try:
+        use_gz = request.accept_encodings.quality('gzip') > 0
+    except Exception:
+        use_gz = False
+    resp = Response(gz if use_gz else _aging_gzip.decompress(gz), status=status, mimetype='application/json')
+    if use_gz:
+        resp.headers['Content-Encoding'] = 'gzip'
+    resp.vary.add('Accept-Encoding')
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route('/api/inventory-aging', methods=['GET', 'OPTIONS'])
+def api_inventory_aging():
+    if request.method == 'OPTIONS':
+        return '', 204
+    allowed, is_admin = _aging_ident()
+    if not allowed:
+        return jsonify({'error': 'Sign in on the platform to see inventory aging.'}), 401
+    if _aging is None:
+        return jsonify({'building': False, 'error': 'Inventory aging is not available on this server.'}), 503
+    key = _aging_current_key()
+    with _aging_lock:
+        memo = _aging_state['memo']
+        fail = _aging_state['fail']
+    if memo and memo['key'] == key:
+        if not _aging_memo_fresh(memo, key):
+            _aging_kick()           # built without a readable restore map: redo it, serve this meanwhile
+        elif time.time() - memo['whatsAt'] > _AGING_WHATS_TTL:
+            _aging_kick_whats()
+        return _aging_gz_response(memo['admin'] if is_admin else memo['staff'])
+    if fail and fail['key'] == key and time.time() - fail['at'] < _AGING_FAIL_RETRY:
+        return jsonify({'building': False,
+                        'error': 'The aging data could not be built from the inventory file. '
+                                 'It is retried automatically in a minute.'}), 503
+    _aging_kick()
+    return jsonify({'building': True}), 202
+
+
+@app.route('/api/inventory-aging/trend', methods=['GET', 'OPTIONS'])
+def api_inventory_aging_trend():
+    """Served from this worker's copy of the trend document; the store is read only by
+    _aging_trend_load in the background (202 {"building": true} until the first load)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    allowed, _is_admin = _aging_ident()
+    if not allowed:
+        return jsonify({'error': 'Sign in on the platform to see inventory aging.'}), 401
+    if _aging is None or not _aging_store_ok():
+        return jsonify({'configured': False}), 503
+    with _aging_lock:
+        cur = _aging_state['trendDoc']
+    if cur is None:
+        _aging_kick_trend_load()
+        return jsonify({'building': True}), 202
+    if time.time() - cur['at'] > _AGING_TREND_TTL:
+        _aging_kick_trend_load()            # serve this copy meanwhile
+    if cur['error'] == 'unreadable':
+        return jsonify({'configured': True,
+                        'error': 'The saved trend cannot be opened with the configured key.'}), 503
+    if cur['error']:
+        return jsonify({'configured': True, 'error': 'The trend could not be loaded. Try again shortly.'}), 503
+    return _aging_gz_response(cur['gz'])
+
+
+@app.route('/admin/aging/seed', methods=['POST', 'OPTIONS'])
+def admin_aging_seed():
+    """Machine key only. {"restore": {...}} stores the JTW restore map; {"trend": {"series",
+    "dropped"}, "mode": "replace"|"merge"} stores the trend backfill. Both encrypted.
+    "replace_unreadable": true (optional, logged) writes over an object the configured keys
+    cannot open: only for a truly lost key, like the P&L (pnl_store.py KEY RUNBOOK step 5).
+    A trend sent that way must use mode "replace"."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    ident = _request_identity() or {}
+    if ident.get('tier') != 'machine':
+        return jsonify({'error': 'Only the machine key can seed the aging store.'}), 403
+    if _aging is None or not _aging_store_ok():
+        return jsonify({'configured': False}), 503
+    if (request.content_length or 0) > _AGING_SEED_MAX:
+        return jsonify({'error': 'The body is over 5 MB.'}), 413
+    raw = request.get_data(cache=False)
+    if len(raw) > _AGING_SEED_MAX:
+        return jsonify({'error': 'The body is over 5 MB.'}), 413
+    try:
+        body = json.loads(raw.decode('utf-8'))
+    except Exception:
+        return jsonify({'error': 'The body is not valid JSON.'}), 400
+    replace = False
+    if isinstance(body, dict) and 'replace_unreadable' in body:
+        replace = body.pop('replace_unreadable')
+        if not isinstance(replace, bool):
+            return jsonify({'error': 'replace_unreadable must be true or false.'}), 400
+    kind, value, err = _aging.validate_seed(body)
+    if err:
+        return jsonify({'error': err}), 400
+    if replace and kind == 'trend' and value['mode'] != 'replace':
+        return jsonify({'error': 'replace_unreadable needs mode replace: a trend that cannot be opened '
+                                 'cannot be merged.'}), 400
+    from pnl_store import StoreUnreadable, VersionConflict
+    name = AGING_RESTORE_OBJ if kind == 'restore' else AGING_TREND_OBJ
+    other = AGING_TREND_OBJ if kind == 'restore' else AGING_RESTORE_OBJ
+    unreadable_msg = ('The saved {} cannot be opened with the configured key, so nothing was written. '
+                      'Put the old key back after the new one in PNL_DATA_KEYS and call POST /api/pnl/rotate. '
+                      'Only if the old key is truly lost, send this again with "replace_unreadable": true.')
+    now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        if not replace:
+            # never leave the aging store under two keys (the P&L store refuses that too)
+            _etag, ok, _code = _aging_store.readable(other)
+            if ok is False:
+                return jsonify({'error': unreadable_msg.format(other), 'code': 'StoreUnreadable',
+                                'object': other}), 409
+        else:
+            print(f"[Aging] seed {name} with replace_unreadable (lost key runbook)", flush=True)
+        if kind == 'restore':
+            _aging_store.put_obj(AGING_RESTORE_OBJ, value, replace_unreadable=replace)
+            with _aging_lock:
+                memo = _aging_state['memo']
+                if memo:
+                    memo['restoreTag'] = 'replaced'     # the next whAts refresh re-ages with it
+                    memo['whatsAt'] = 0.0
+            return jsonify({'ok': True, 'object': AGING_RESTORE_OBJ, 'pairs': len(value['pairs']),
+                            'containers': len(value['containers'])})
+        if replace:
+            new = _aging.merge_trend(None, value['series'], value['dropped'], 'replace', now)
+            new_etag = _aging_store.put_obj(AGING_TREND_OBJ, new, replace_unreadable=True)
+        else:
+            for attempt in (0, 1):
+                doc, etag = _aging_store.get_obj(AGING_TREND_OBJ)
+                new = _aging.merge_trend(doc, value['series'], value['dropped'], value['mode'], now)
+                try:
+                    new_etag = _aging_store.put_obj(AGING_TREND_OBJ, new, expected_etag=etag or '')
+                    break
+                except VersionConflict:
+                    if attempt:
+                        return jsonify({'error': 'The trend changed while it was being saved. Send it again.'}), 409
+        _aging_trend_cache_put(new, new_etag)
+        return jsonify({'ok': True, 'object': AGING_TREND_OBJ, 'mode': value['mode'],
+                        'records': len(new['series']), 'dropped': len(new['dropped'])})
+    except StoreUnreadable:
+        return jsonify({'error': unreadable_msg.format(name), 'code': 'StoreUnreadable', 'object': name}), 409
+    except Exception as e:
+        print(f"[Aging] seed failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({'error': 'The aging store could not be written.', 'code': type(e).__name__}), 503
 
 
 if __name__ == '__main__':

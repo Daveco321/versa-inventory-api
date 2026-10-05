@@ -1198,6 +1198,10 @@ class _PnlService:
         self._cb_summary = {}
         self._an_memo = None        # {'key', 'builtAt', 'alias', 'byCust', 'byStyle', 'grades'}
         self.sales_matrix = None    # set by the host app after registration (invoiced-history cube getter)
+        # Other stores on the same PNL_DATA_KEYS that POST /api/pnl/rotate must re-encrypt too:
+        # callables () -> {label: 'rotated' | 'absent' | ...}, appended by the host app (the
+        # Inventory Aging objects, Oct 5 2026). A failure there never fails the P&L rotate.
+        self.extra_rotations = []
         # tunables (instance attributes so tests can shorten them)
         self.wait_seconds = WAIT_SECONDS
         self.refresh_window = REFRESH_WINDOW
@@ -2083,6 +2087,13 @@ class _PnlService:
         result = {}
         for name in OBJECTS:
             result[name] = 'rotated' if self.store.rotate(name) else 'absent'
+        for fn in list(self.extra_rotations):
+            try:
+                extra = fn()
+                if isinstance(extra, dict):
+                    result.update({str(k): str(v) for k, v in extra.items() if k not in OBJECTS})
+            except Exception as e:
+                print('[PnL] extra rotation failed: %s' % type(e).__name__, flush=True)
         with self._lock:
             self._cb_summary = {}
         print('[PnL] store rotated user=%s' % ident['email'], flush=True)
