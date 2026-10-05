@@ -6421,6 +6421,112 @@ def apo_dollar_summary_route():
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
+# ── TJMAXX ATS (Monday email, David Oct 5 2026) ─────────────────────────────
+# The TJX catalog's two-tab line sheet built without a browser: the same anonymous
+# catalog feeds the page loads (read in-process, so scoping, NJ stripping and the
+# hidden-landing cuts are the server's own), routed and decorated by tjx_ats /
+# tjx_display exactly as index.html does. David's rules for the email:
+#   - TJ and TM style numbers only, every brand;
+#   - Warehouse leaves out U.S. Polo Assn., Nicole Miller and Von Dutch (Asley's edit);
+#   - Overseas is one row per delivery (smart-routed per lot);
+#   - any row of 35 units or less is dropped.
+# Used by open-orders-api's 'tjxAts' report.
+_TJX_ATS_SLUG = os.environ.get('TJX_ATS_CATALOG_SLUG', 'fffwr26a')
+_TJX_ATS_PREFIXES = ('TJ', 'TM')
+_TJX_ATS_WH_EXCLUDE = frozenset({'USPA', 'NICOLE', 'VD'})
+_TJX_ATS_MIN = 36
+
+
+def _tjx_catalog_feed(path, key, **params):
+    """GET one feed exactly as the catalog page receives it (anonymous + catalog_slug)."""
+    with app.test_client() as c:
+        r = c.get(path, query_string=dict(params, catalog_slug=_TJX_ATS_SLUG))
+    if r.status_code != 200:
+        raise RuntimeError(f'{path} returned HTTP {r.status_code}')
+    data = r.get_json(silent=True)
+    if not isinstance(data, dict) or key not in data:
+        raise RuntimeError(f'{path} returned no {key}')
+    return data[key]
+
+
+def build_tjx_ats(now=None):
+    """-> {'warehouse': rows, 'overseas': rows, 'summary': {...}} for the TJMAXX ATS email.
+    Raises when a feed the routing needs is unavailable (the email then retries)."""
+    from tjx_ats import TjxAtsBuilder, summarize
+    from tjx_display import TjxDisplay
+    if now is None:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('America/New_York')).replace(tzinfo=None)
+    inventory = _tjx_catalog_feed('/inventory', 'inventory')
+    production = _tjx_catalog_feed('/production', 'production')
+    if not inventory or not production:
+        raise RuntimeError('inventory or style ledger feed is empty')
+    orders, orders_ok = _fetch_all_open_orders()
+    if not orders:
+        raise RuntimeError('open orders unavailable, smart routing cannot run')
+    # lite=1: the same overrides with embedded photos swapped for URLs (~0.2MB, not ~19MB);
+    # the decorations read only color / fit / fabrication / fabricCode / brand / sizePack.
+    display = TjxDisplay(_tjx_catalog_feed('/overrides', 'overrides', lite='1'), _apo_color_map(),
+                         _tjx_catalog_feed('/banner-rules', 'rules'), catalog_customers=[])
+    b = TjxAtsBuilder(inventory, production,
+                      _tjx_catalog_feed('/apo', 'apo'),
+                      _tjx_catalog_feed('/allocations', 'allocations'),
+                      _tjx_catalog_feed('/manual-allocations', 'allocations'),
+                      _tjx_catalog_feed('/deduction-assignments', 'assignments'),
+                      _tjx_catalog_feed('/suppression-overrides', 'overrides'),
+                      orders, display, now)
+    # TJ/TM styles; by-size rows are hidden like every customer catalog (_hideSizedForCatalog)
+    tj_tm = lambda sku: sku[:2].upper() in _TJX_ATS_PREFIXES and not _is_sized_sku(sku)
+    wh = b.tab_rows('ats', sku_filter=tj_tm, brand_filter=lambda k: k not in _TJX_ATS_WH_EXCLUDE,
+                    min_ats=_TJX_ATS_MIN)
+    os_rows = b.tab_rows('incoming', sku_filter=tj_tm, min_ats=_TJX_ATS_MIN)
+    # The customer-export scrub /export-multi applies (a no-op on rows built from the
+    # scoped feeds; kept so this path can never print NJ stock or an NJ-landing lot).
+    wh = _customer_export_scrub(wh, 'ats', True, True, True)
+    os_rows = _customer_export_scrub(os_rows, 'incoming', True, True, True)
+    summary = {'asOf': now.isoformat(timespec='seconds'), 'ordersFresh': bool(orders_ok),
+               'warehouse': summarize(wh), 'overseas': summarize(os_rows, overseas=True)}
+    return {'warehouse': wh, 'overseas': os_rows, 'summary': summary}
+
+
+@app.route('/export-tjx-ats', methods=['GET', 'OPTIONS'])
+def export_tjx_ats():
+    """GET (machine key): the TJMAXX ATS workbook, with the summary JSON in the
+    X-Tjx-Ats-Summary header. ?format=summary -> the summary only (no images, fast);
+    ?format=json -> summary + both tabs' rows (parity checks)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    fmt = (request.args.get('format') or 'xlsx').strip().lower()
+    try:
+        res = build_tjx_ats()
+    except Exception as e:
+        import traceback
+        print(f'[TJX ATS] build failed: {e}', flush=True)
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 503
+    if fmt == 'summary':
+        return jsonify(res['summary'])
+    if fmt == 'json':
+        return jsonify(res)
+    try:
+        tabs = [{'brand_name': 'Warehouse', 'tab_name': 'Warehouse', 'view_mode': 'ats', 'flow_mode': False,
+                 'keep_order': True, 'items': res['warehouse']},
+                {'brand_name': 'Overseas', 'tab_name': 'Overseas', 'view_mode': 'incoming', 'flow_mode': True,
+                 'keep_order': True, 'items': res['overseas']}]
+        xl_bytes = build_multi_brand_excel(tabs, S3_PHOTOS_URL, catalog_mode=True, view_mode='ats',
+                                           flow_mode=False, prepack_defaults=_fresh_prepack_defaults(),
+                                           tjx_layout=True)
+        stamp = datetime.fromisoformat(res['summary']['asOf'])
+        resp = send_file(BytesIO(xl_bytes),
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         as_attachment=True, download_name=f'TJMAXX ATS {stamp:%m.%d.%y}.xlsx')
+        resp.headers['X-Tjx-Ats-Summary'] = json.dumps(res['summary'], separators=(',', ':'))
+        resp.headers['Access-Control-Expose-Headers'] = 'X-Tjx-Ats-Summary'
+        return resp
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
 # ── Style Overrides ────────────────────────────────
 @app.route('/overrides', methods=['GET', 'OPTIONS'])
 def get_overrides():
@@ -10049,7 +10155,8 @@ _AUTHZ_CATALOG_READS = {
 }
 # Extra GET endpoints the machine key may use (report/export pulls).
 _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports',
-                        '/admin/factory-holds'}   # the hold overview (Oct 1 2026)
+                        '/admin/factory-holds',   # the hold overview (Oct 1 2026)
+                        '/export-tjx-ats'}        # TJMAXX ATS Monday email (Oct 5 2026)
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
