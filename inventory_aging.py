@@ -19,10 +19,11 @@ sheets repeat names in a pivot block on the right). Row i of a raw sheet pairs
 with row i of its *_INVENTORY sheet (trailing rows with no style or SKU are not
 lots and are dropped first). When the counts differ the lot detail of
 that warehouse is unusable and reported, never guessed. One exception, verified
-row by row: the old JTW format listed every receipt including shipped-out
-lines, and its JTW_INVENTORY kept only the lines with a positive 'Ballance'.
-Those lines pair one to one (style, container and cartons must all agree, or
-JTW is unusable for that file).
+row by row: both JTW formats list every receipt including shipped-out lines,
+and JTW_INVENTORY keeps only the lines with a positive 'Ballance' (old format)
+or a positive 'OnHand' / 'Received' (new format; 'OnHand' when the listing has
+that column). Those lines pair one to one (style, container and cartons must
+all agree, or JTW is unusable for that file).
 
 Public API (the trend backfill depends on these signatures):
     parse_workbook(source, sku_rows=None, is_sized=None, tick=None) -> parsed
@@ -413,6 +414,39 @@ def _drop_trailing_keyless(rows, col):
     return rows[:n]
 
 
+def _new_jtw_on_hand(rx, raw, ix, inv):
+    """The NEW JTW listing (since 3/23/2026) keeps fully shipped lines, like the old one did;
+    JTW_INVENTORY holds, in order, the lines with a positive 'OnHand' (listings that carry that
+    column, 3/31 to 4/6/2026) or else 'Received', with QTY = that column. Returns (the raw lines
+    to pair, column used, None) when a candidate verifies on EVERY line (style, container,
+    cartons = QTY), else (None, None, reason). Never guessed."""
+    rstyle, rcont = rx.get('Style'), rx.get('Container #')
+    istyle, icont, icart = ix.get('Style'), ix.get('Container #'), ix.get('QTY')
+    if None in (rstyle, rcont, istyle, icont, icart):
+        return None, None, 'the JTW sheets have no Style, Container # or QTY column'
+    errors = []
+    for qname in ('OnHand', 'Received'):
+        qc = rx.get(qname)
+        if qc is None:
+            continue
+        keep = [r for r in raw if _num(_cell(r, qc)) > 0]
+        if len(keep) != len(inv):
+            errors.append(f'{len(keep):,} JTW lines with {qname} > 0 but {len(inv):,} JTW_INVENTORY rows')
+            continue
+        bad = None
+        for k, (a, b) in enumerate(zip(keep, inv)):
+            if (clean_key(_cell(a, rstyle)) != clean_key(_cell(b, istyle))
+                    or clean_key(_text(_cell(a, rcont))) != clean_key(_text(_cell(b, icont)))
+                    or _num(_cell(a, qc)) != _num(_cell(b, icart))):
+                bad = f'JTW_INVENTORY row {k + 2} does not match the JTW line with {qname} > 0'
+                break
+        if bad:
+            errors.append(bad)
+            continue
+        return keep, qname, None
+    return None, None, '; '.join(errors) or 'the JTW sheet has no OnHand or Received column'
+
+
 def _parse_wh_lots(wb, wh, tick=None):
     """(lots, error | None, format) for one warehouse. Lots are dicts with the raw date."""
     spec = _SHEETS[wh]
@@ -460,6 +494,12 @@ def _parse_wh_lots(wb, wh, tick=None):
                             or (icart is not None and _num(_cell(a, bcol)) != _num(_cell(b, icart)))):
                         return [], (f'JTW row {k + 2} of JTW_INVENTORY does not match the JTW listing '
                                     'line with a balance, so the two sheets cannot be paired'), fmt
+    if wh == 'JTW' and fmt == 'new' and len(raw) != len(inv):
+        # Same pattern in the new layout (fully shipped lines stay listed). When no candidate
+        # verifies, the counts still differ and the warehouse is reported below, never guessed.
+        kept = _new_jtw_on_hand(rx, raw, ix, inv)[0]
+        if kept is not None:
+            raw = kept
     if len(raw) != len(inv):
         return [], (f'{spec["raw"]} has {len(raw):,} rows but {spec["inv"]} has {len(inv):,}, '
                     'so the receive dates cannot be paired with the lots'), fmt

@@ -266,7 +266,8 @@ class Parse(unittest.TestCase):
 
     def test_trailing_rows_without_a_style_are_not_lots(self):
         """The raw JTW listing often ends in rows that hold only 'Available Inv' 0 and SourceFile.
-        They are dropped before pairing; a style-less row in the middle still makes JTW unusable."""
+        They are dropped before pairing; a style-less RECEIVED row in the middle still makes JTW
+        unusable (one with nothing received is a shipped-out line, see the new-format test)."""
         junk = [None, None, None, None, None, None, '0', 'JTW']
         s = std_sheets()
         s['JTW'] += [list(junk), list(junk)]
@@ -278,7 +279,7 @@ class Parse(unittest.TestCase):
         self.assertEqual(p['lotTotals'], p['whTotals'])
         self.assertIsNotNone(ia.trend_record(ia.analyze(p, RESTORE, TODAY)))
         s = std_sheets()
-        s['JTW'].insert(3, list(junk))
+        s['JTW'].insert(3, [None, None, None, 1, None, None, '0', 'JTW'])
         s['JTW'] += [list(junk)]
         p = ia.parse_workbook(make_wb(s))
         self.assertIn('JTW', p['whErrors'])
@@ -339,6 +340,47 @@ class Parse(unittest.TestCase):
         s['JTW_INVENTORY'][2][1] = C
         p = ia.parse_workbook(make_wb(s))
         self.assertIn('JTW', p['whErrors'])
+
+    def test_new_jtw_format_shipped_lines(self):
+        """Since Mar 23 2026 the JTW listing also keeps fully shipped lines, and JTW_INVENTORY holds
+        the lines with Received > 0 (OnHand > 0 when the listing has an OnHand column), in order,
+        with QTY = that column. They pair one to one, verified line by line, never guessed."""
+        def sheets(onhand=False):
+            s = std_sheets()
+            s['JTW'].pop()
+            s['JTW_INVENTORY'].pop()            # the zero-unit line: never in a real JTW_INVENTORY
+            for r, i in zip(s['JTW'][1:], s['JTW_INVENTORY'][1:]):
+                r[3] = i[2] + (2 if onhand else 0)      # Received (cartons); OnHand = QTY when present
+                if onhand:
+                    r.append(i[2])
+            if onhand:
+                s['JTW'][0] = JTW_HDR + ['OnHand']
+            s['JTW'][4][1] = None               # no container on the listing, 'N/A' on JTW_INVENTORY
+            return s
+
+        for onhand in (False, True):
+            base = ia.parse_workbook(make_wb(sheets(onhand)))
+            self.assertTrue(base['lotsOk'], base['lotsError'])
+            s = sheets(onhand)
+            gone = ['2025-01-02 00:00:00', 'ABCU9999999', B, 0, 'R9', None, '0', 'JTW']
+            if onhand:
+                gone = gone[:3] + [5] + gone[4:] + [0]  # received once, all shipped since
+            s['JTW'].insert(2, list(gone))
+            s['JTW'].insert(7, list(gone))
+            p = ia.parse_workbook(make_wb(s))
+            self.assertTrue(p['lotsOk'], p['lotsError'])
+            self.assertEqual(p['lots'], base['lots'])
+            self.assertEqual(p['lotTotals'], {'JTW': 1920, 'TR': 300, 'DCW': 48})
+            # a kept line that does not match its JTW_INVENTORY line: unusable, never guessed
+            s['JTW_INVENTORY'][3][1] = C
+            p = ia.parse_workbook(make_wb(s))
+            self.assertIn('JTW', p['whErrors'])
+            self.assertFalse(any(l['wh'] == 'JTW' for l in p['lots']))
+        # cartons that disagree with QTY: unusable
+        s = sheets()
+        s['JTW'].insert(2, ['2025-01-02 00:00:00', 'ABCU9999999', B, 0, 'R9', None, '0', 'JTW'])
+        s['JTW'][1][3] += 1
+        self.assertIn('JTW', ia.parse_workbook(make_wb(s))['whErrors'])
 
     def test_server_rows_from_items(self):
         items = [{'sku': A, 'brand': 'DKNY', 'jtw': 1080, 'tr': 0, 'dcw': 0, 'qa': 12, 'nj': 7, 'abfi': 5,
