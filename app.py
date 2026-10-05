@@ -60,6 +60,7 @@ CORS(app, resources={
     r"/api/pnl(/.*)?$": {
         "origins": [o.strip() for o in (os.environ.get('PNL_CORS_ORIGINS') or
                                         'https://versainventory.netlify.app,'
+                                        'https://versaopenorders.netlify.app,'   # phone app Analysis (Oct 5 2026)
                                         'https://rossversacatalog.com').split(',') if o.strip()],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
