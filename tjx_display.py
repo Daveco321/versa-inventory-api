@@ -28,8 +28,8 @@ from functools import reduce
 # ── JavaScript string semantics ─────────────────────────────────────────────
 
 # JS WhiteSpace + LineTerminator: what \s matches and what trim() strips.
-_JS_WS_CHARS = ('\t\n\x0b\x0c\r          '
-                '        　﻿')
+_JS_WS_CHARS = ('\t\n\x0b\x0c\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006'
+                '\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff')
 _S = '[\\t\\n\\x0b\\x0c\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]'
 _DOT = '[^\\n\\r\\u2028\\u2029]'   # JS '.' without the s flag
 _A = re.ASCII                       # JS \b and \w are ASCII only (no u flag)
@@ -114,12 +114,6 @@ def _js_some(v, fn):
     if isinstance(v, list):
         return any(fn(x) for x in v)
     raise TypeError('.some is not a function')
-
-
-def _js_filter(v, fn):
-    if isinstance(v, list):
-        return [x for x in v if fn(x)]
-    raise TypeError('.filter is not a function')
 
 
 # ── Brand tables (index.html BRAND_IMAGE_PREFIX / BRAND_MAPPING / BRAND_ORDER) ──
@@ -892,7 +886,7 @@ class TjxDisplay:
         ov = self.get_style_override(sku)
         if _truthy(ov) and _truthy(_js_get(ov, 'fabrication')):
             code, _name = parse_sku_fabric(sku)
-            return _js_or(_js_get(ov, 'fabricCode'), code, '✎'), ov['fabrication']
+            return _js_or(_js_get(ov, 'fabricCode'), code, '\u270e'), ov['fabrication']
         code, name = parse_sku_fabric(sku)
         if _truthy(code) and _truthy(name):
             return code, name

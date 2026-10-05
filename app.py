@@ -6438,11 +6438,16 @@ _TJX_ATS_MIN = 36
 
 
 def _tjx_catalog_feed(path, key, **params):
-    """GET one feed exactly as the catalog page receives it (anonymous + catalog_slug)."""
-    with app.test_client() as c:
+    """GET one feed exactly as the catalog page receives it (anonymous + catalog_slug).
+    A fresh app context is required: a test request inside a live request reuses the
+    caller's app context, and with it g._authz_ident, so the feed would come back
+    unscoped (the machine key's full view: NJ stock, hidden-landing lots)."""
+    with app.app_context(), app.test_client() as c:
         r = c.get(path, query_string=dict(params, catalog_slug=_TJX_ATS_SLUG))
     if r.status_code != 200:
         raise RuntimeError(f'{path} returned HTTP {r.status_code}')
+    if path in _SCOPE_FILTERS and r.headers.get('X-Catalog-Scope') != _TJX_ATS_SLUG:
+        raise RuntimeError(f'{path} was not scoped to catalog {_TJX_ATS_SLUG}')
     data = r.get_json(silent=True)
     if not isinstance(data, dict) or key not in data:
         raise RuntimeError(f'{path} returned no {key}')

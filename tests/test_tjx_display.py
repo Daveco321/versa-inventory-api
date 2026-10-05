@@ -88,7 +88,7 @@ class ColorTests(unittest.TestCase):
         self.assertEqual([], k('ZQNASUABCSLS', 'NAUTICA'))
 
     def test_two_part_and_abbreviations(self):
-        d = make(colors={'NA_301': 'BLK GRND||WHT  STRIPE', 'NA_302': '  srnty trq   blu '})
+        d = make(colors={'NA_301': 'BLK GRND||WHT\u00a0\u00a0STRIPE', 'NA_302': '  srnty trq   blu '})
         self.assertEqual('Black Grnd White Stripe', d.color_display('ZQNASU301SLS', 'NAUTICA'))
         self.assertEqual('Serenity Turquoise Blue', d.color_display('ZQNASU302SLS', 'NAUTICA'))
         self.assertEqual('', d.color_display('ZQNASU303SLS', 'NAUTICA'))
@@ -113,8 +113,8 @@ class ColorTests(unittest.TestCase):
         self.assertEqual('', d.color_family('ZQNASU201SLS', 'NAUTICA'))
 
     def test_js_whitespace_and_word_boundaries(self):
-        self.assertEqual('navy', T.classify_color('﻿Navy Solid'))
-        self.assertEqual('Café Solid', T.format_color_name('CAFé SOLID'))
+        self.assertEqual('navy', T.classify_color('\ufeffNavy\u00a0Solid'))
+        self.assertEqual('Caf\u00e9 Solid', T.format_color_name('CAF\u00e9 SOLID'))
         self.assertEqual('Blue2 Solid', T.format_color_name('Blue2 SOLID'))
 
 
@@ -166,7 +166,7 @@ class FitAndFabricTests(unittest.TestCase):
                             'ZQ': {'fabrication': 'Short Key'}})
         self.assertEqual(('ZZ', 'Custom Blend'), d.fabric('ZQNAZZ201SLS'))
         self.assertEqual(('QQ', 'Other Blend'), d.fabric('ZQNAZZ202SLS'))
-        self.assertEqual(('✎', 'Short Key'), d.fabric('ZQ'))
+        self.assertEqual(('\u270e', 'Short Key'), d.fabric('ZQ'))
         self.assertEqual(('ZZ', 'ZZ'), d.fabric('ZQNAZZ203SLS'))
         self.assertEqual(('N/A', 'Standard Fabric'), d.fabric('ZQNA'))
         self.assertEqual(('PP', '100% Polyester - 150D'), d.fabric('ZQNAPP201SLS'))
