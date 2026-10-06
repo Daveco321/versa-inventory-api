@@ -10918,7 +10918,7 @@ def authz_gate():
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
                                              '/admin/banner-rules/upsert', '/admin/photos/refresh',
                                              '/admin/factory-holds', '/admin/aging/seed',
-                                             '/admin/pnl-fees'):
+                                             '/admin/pnl-fees', '/admin/color-map/rows'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -21739,6 +21739,79 @@ def admin_pnl_missing_costs():
     resp = jsonify(payload)
     resp.headers['Cache-Control'] = 'no-store'
     return resp, status
+
+
+_COLOR_MAP_ROW_KEY_RE = re.compile(r'^[A-Z0-9][A-Z0-9._/ -]{1,59}$')
+
+
+@app.route('/admin/color-map/rows', methods=['POST', 'OPTIONS'])
+def admin_color_map_rows():
+    """Machine key only (Oct 6 2026, David: "USE THE S3 sheet"). Adds or updates rows of the S3
+    master color map ('Inventory Colors Data/style_color_map.xlsx', Key -> Color_Description), the
+    same file every page reads. Body {"rows": {"KEY": "Color description"}, "dry_run": false,
+    "check_sync": true}. Never deletes a row. The master is copied to the backups folder before
+    every write (like the Dropbox sync), and the write holds the sync lock. check_sync runs a dry
+    Dropbox sync afterwards and lists any written key an approved Dropbox source would set back."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    ident = _request_identity() or {}
+    if ident.get('tier') != 'machine':
+        return jsonify({'error': 'Only the machine key can use this route.'}), 403
+    body = request.get_json(silent=True)
+    rows = body.get('rows') if isinstance(body, dict) else None
+    if not isinstance(rows, dict) or not rows:
+        return jsonify({'error': 'Send {"rows": {"KEY": "Color description"}}.'}), 400
+    if len(rows) > 2000:
+        return jsonify({'error': 'At most 2,000 rows per call.'}), 400
+    dry = bool(body.get('dry_run'))
+    desired, bad = {}, []
+    for k, v in rows.items():
+        key = str(k or '').strip().upper()
+        name = ' '.join(v.split()) if isinstance(v, str) else ''
+        if not _COLOR_MAP_ROW_KEY_RE.match(key) or not name or len(name) > 150:
+            bad.append(str(k)[:60])
+            continue
+        desired[key] = name
+    if bad:
+        return jsonify({'error': 'Some keys or color names are not valid.', 'invalid': bad[:50]}), 400
+    if not _color_sync_lock.acquire(timeout=60):
+        return jsonify({'error': 'A color map sync is running. Try again in a minute.'}), 409
+    try:
+        from swatch_extractor import (_download_color_map, _resolve_color_map_sheet,
+                                      _append_rows, _upload_color_map, S3_COLOR_MAP_KEY)
+        wb, _etag, _size = _download_color_map(get_s3, S3_BUCKET)
+        ws = _resolve_color_map_sheet(wb)
+        updated, adds = _merge_color_rows(ws, desired, apply=not dry)
+        if updated is None:
+            return jsonify({'error': 'The color map layout was not recognized. Nothing was written.'}), 502
+        out = {'ok': True, 'dryRun': dry, 'wrote': False,
+               'updated': [{'key': k, 'old': old, 'new': new} for k, old, new in updated],
+               'added': [{'key': k, 'new': c} for k, c in adds]}
+        if not dry and (updated or adds):
+            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            get_s3().copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': S3_COLOR_MAP_KEY},
+                                 Key=f"{S3_COLOR_MAP_BACKUP_PREFIX}style_color_map_{ts}.xlsx")
+            if adds:
+                _append_rows(ws, adds)
+            _upload_color_map(get_s3, S3_BUCKET, wb)
+            out['wrote'] = True
+            out['backup'] = f"{S3_COLOR_MAP_BACKUP_PREFIX}style_color_map_{ts}.xlsx"
+            print('[Colors] color map rows written with the machine key: %d updated, %d added'
+                  % (len(updated), len(adds)), flush=True)
+    except Exception as e:
+        print(f"[Colors] color map row write failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({'error': 'The color map could not be updated.', 'code': type(e).__name__}), 502
+    finally:
+        _color_sync_lock.release()
+    if body.get('check_sync') and out.get('wrote'):
+        try:
+            res = sync_color_map_from_dropbox(dry_run=True, approved_only=True) or {}
+            back = [u for u in (res.get('all_updates') or []) if u.get('key') in desired]
+            out['syncWouldRevert'] = back
+            out['syncStatus'] = res.get('status')
+        except Exception as e:
+            out['syncCheckError'] = type(e).__name__
+    return jsonify(out)
 
 
 @app.route('/admin/aging/seed', methods=['POST', 'OPTIONS'])
