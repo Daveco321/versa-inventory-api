@@ -5933,7 +5933,7 @@ def _apo_prod_arrival(p, pants):
 
 # A2000 open orders come from the open-orders platform's public feed; cached
 # briefly so the three per-customer workbooks in one report share a fetch.
-_oo_orders_cache = {'data': None, 'time': 0.0}
+_oo_orders_cache = {'data': None, 'time': 0.0, 'ok': False}   # ok: the last call answered (fresh or cached-good)
 
 def _fetch_a2000_orders():
     now = time.time()
@@ -5945,11 +5945,159 @@ def _fetch_a2000_orders():
             orders = (r.json() or {}).get('orders') or []
             _oo_orders_cache['data'] = orders
             _oo_orders_cache['time'] = now
+            _oo_orders_cache['ok'] = True
             return orders
         print(f"[APO report] open-orders fetch HTTP {r.status_code}", flush=True)
     except Exception as e:
         print(f"[APO report] open-orders fetch failed: {e}", flush=True)
+    _oo_orders_cache['ok'] = False
     return _oo_orders_cache['data'] or []
+
+
+# ── Substitute allocations held back from the Big 3 reports (David, Oct 6 2026) ──
+# A "Select Sub" on the open-orders platform (Coverage Analytics) gets a matching
+# APO allocation for the replacement style. Those rows never reach the TJX / Ross /
+# Burlington allocation reports (workbooks and email summaries): the buyer could
+# order the substitute on top of the original, or learn the goods are substituted.
+# The rules live in apo_subs.py; this block only feeds it data.
+import apo_subs
+
+_sub_ann_cache = {'data': None, 'time': 0.0, 'ok': False, 'fail_until': 0.0}
+_SUB_ANN_TTL = 600
+
+def _fetch_sub_annotations():
+    """Open-orders Coverage Analytics annotations ({key: data}; data.sub is the
+    Select Sub). Returns (annotations, ok). 10-min cache; after a failed read the
+    last good copy (or {}) is served flagged not ok and the read is retried a
+    minute later, so a dead upstream is not hit on every call."""
+    now = time.time()
+    if _sub_ann_cache['data'] is not None and now - _sub_ann_cache['time'] < _SUB_ANN_TTL:
+        return _sub_ann_cache['data'], _sub_ann_cache['ok']
+    if now < _sub_ann_cache['fail_until']:
+        return (_sub_ann_cache['data'] or {}), False
+    seen = _sub_ann_cache['time']     # a concurrent call may store a fresher copy while we fetch
+    try:
+        r = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/coverage-annotations",
+                              headers=_oo_api_headers(), timeout=30)
+        if r.status_code == 200:
+            ann = (r.json() or {}).get('annotations')
+            if isinstance(ann, dict):
+                _sub_ann_cache.update(data=ann, time=now, ok=True, fail_until=0.0)
+                return ann, True
+            print('[APO subs] annotations answer had no map', flush=True)
+        else:
+            print(f'[APO subs] annotations fetch HTTP {r.status_code}', flush=True)
+    except Exception as e:
+        print(f'[APO subs] annotations fetch failed: {e}', flush=True)
+    if _sub_ann_cache['time'] != seen:
+        # Someone else refreshed the entry during our failed fetch: serve theirs, untouched.
+        return _sub_ann_cache['data'], _sub_ann_cache['ok']
+    _sub_ann_cache['ok'] = False
+    _sub_ann_cache['fail_until'] = time.time() + 60
+    return (_sub_ann_cache['data'] or {}), False
+
+_big3_po_cache = {'map': None, 'time': 0.0, 'ok': False, 'fail_until': 0.0}
+
+def _big3_po_customers():
+    """({po_digits: (customer_key, 'live' | 'archive')}, ok) for TJX / Ross /
+    Burlington POs: the live A2000 book first, then the received-PO archive for
+    POs that already shipped (a sub allocation can outlive its PO).
+    ok is False when the live book did not answer or any archive read was not
+    a fresh complete answer: Select Subs may then go unmatched (rule 2 off),
+    and the report says so. A complete map is cached 10 min; a partial one
+    (live book fine, archive rebuilding) only 60 s; when the live book failed
+    the last good map is served and nothing new is cached, retry in 60 s."""
+    now = time.time()
+    if _big3_po_cache['map'] is not None and now - _big3_po_cache['time'] < 600:
+        return _big3_po_cache['map'], _big3_po_cache['ok']
+    if now < _big3_po_cache['fail_until']:
+        return (_big3_po_cache['map'] or {}), False
+    seen = _big3_po_cache['time']
+    out = {}
+    orders = _fetch_a2000_orders()
+    live_ok = bool(_oo_orders_cache.get('ok')) and _oo_orders_cache.get('data') is not None
+    for o in orders:
+        ck = apo_subs.customer_key(o.get('customer'))
+        if ck not in apo_subs.BIG3:
+            continue
+        pod = apo_subs.po_digits(o.get('orderNo'))
+        if pod:
+            out[pod] = (ck, 'live')
+    arch_ok = True
+    for ck, codes in apo_subs.BIG3_A2000.items():
+        for code in codes:
+            try:
+                data, hok = _fetch_po_history(code)
+            except Exception as e:
+                print(f'[APO subs] po-history {code} failed: {e}', flush=True)
+                data, hok = None, False
+            pos = (data or {}).get('pos')
+            if not hok or not isinstance(pos, list):
+                arch_ok = False
+            for p in (pos or []):
+                pod = apo_subs.po_digits(p.get('orderNo'))
+                if pod and pod not in out:
+                    out[pod] = (ck, 'archive')
+    if _big3_po_cache['time'] != seen:
+        return _big3_po_cache['map'], _big3_po_cache['ok']      # a concurrent build won
+    if not live_ok:
+        print('[APO subs] live order book unavailable: PO map not rebuilt', flush=True)
+        _big3_po_cache['fail_until'] = time.time() + 60
+        return (_big3_po_cache['map'] or {}), False
+    ok = live_ok and arch_ok
+    # A partial map expires after 60 s (time back-dated) so the archive is retried soon.
+    _big3_po_cache.update(map=out, ok=ok, fail_until=0.0, time=(now if ok else now - 600 + 60))
+    return out, ok
+
+def _resolve_big3_po(pod, pomap):
+    """(customer_key, source) for a PO's digits: exact, then a 7+ digit prefix either way."""
+    hit = pomap.get(pod)
+    if hit:
+        return hit
+    if len(pod) >= 7:
+        for k, v in pomap.items():
+            if apo_subs.po_match(pod, k):
+                return v
+    return (None, None)
+
+def _apo_report_rows(customer, exclude_tokens=None):
+    """One customer's open APO allocations for the Big 3 reports: 'rows' the
+    report may show, 'hidden' the substitute allocations held back, 'review'
+    the kept rows whose style is a live sub style (team check). Also
+    'subs_ok' (the open-orders sub list was read) and 'annotations' (count)."""
+    with _apo_lock:
+        apo_rows = list(_apo_data)
+    if not apo_rows:
+        load_apo_from_dropbox()
+        with _apo_lock:
+            apo_rows = list(_apo_data)
+    cust_l = str(customer or '').strip().lower()
+    excl = [t.strip().upper() for t in (exclude_tokens or []) if t and t.strip()]
+    cand = []
+    for a in apo_rows:
+        if str(a.get('customer') or '').strip().lower() != cust_l:
+            continue
+        try:
+            qty = int(a.get('qty') or 0)
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        po = str(a.get('po') or '').upper()
+        if excl and any(t in po for t in excl):
+            continue
+        cand.append(a)
+    ann, ok = _fetch_sub_annotations()
+    state = {'map': None, 'ok': True}      # the PO map is built once, only if a Select Sub exists
+    def _resolve(pod):
+        if state['map'] is None:
+            m, mok = _big3_po_customers()
+            state['map'], state['ok'] = (m or {}), bool(mok)
+        return _resolve_big3_po(pod, state['map'])
+    refs = apo_subs.sub_refs(ann, _resolve)
+    kept, hidden, review = apo_subs.split_customer_rows(cand, customer, refs)
+    return {'customer': customer, 'rows': kept, 'hidden': hidden, 'review': review,
+            'subs_ok': ok, 'po_map_ok': state['ok'], 'annotations': len(ann or {})}
 
 
 # ── Allocation Dollar Value Estimated (David, Aug 10 2026) ───────────────────
@@ -6023,25 +6171,12 @@ def build_apo_dollar_summary(customer, exclude_tokens=None):
     the numbers behind the Allocation Dollar Value email summary. Price
     fallback order: this customer's avg for the brand → big-3 cross-customer
     avg for the brand → unpriced (value omitted, flagged)."""
-    with _apo_lock:
-        apo_rows = list(_apo_data)
-    if not apo_rows:
-        apo_rows = load_apo_from_dropbox() or []
+    # Substitute allocations are held back first (David, Oct 6 2026): see apo_subs.
+    rep = _apo_report_rows(customer, exclude_tokens)
     cust_l = str(customer or '').strip().lower()
-    excl = [t.strip().upper() for t in (exclude_tokens or []) if t and t.strip()]
     by_brand = {}
-    for a in apo_rows:
-        if str(a.get('customer') or '').strip().lower() != cust_l:
-            continue
-        try:
-            qty = int(a.get('qty') or 0)
-        except Exception:
-            qty = 0
-        if qty <= 0:
-            continue
-        po = str(a.get('po') or '').upper()
-        if excl and any(t in po for t in excl):
-            continue
+    for a in rep['rows']:
+        qty = int(a.get('qty') or 0)
         base = get_base_style(str(a.get('style') or ''))
         if not base:
             continue
@@ -6067,43 +6202,34 @@ def build_apo_dollar_summary(customer, exclude_tokens=None):
         'total_units': sum(r['units'] for r in rows),
         'total_value': sum(r['value'] for r in rows if r['value'] is not None),
         'unpriced_brands': [r['brand'] for r in rows if r['value'] is None],
+        'hidden_subs': apo_subs.summary(rep['hidden'], rep['review'], rep['subs_ok'], rep['annotations'], po_map_ok=rep['po_map_ok']),
     }
 
 
 def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
     """All open allocations for one customer → line-sheet xlsx bytes with
-    <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines).
+    <Brand> Solids / <Brand> Fancies tabs. Returns (xlsx_bytes, n_lines, meta);
+    meta = apo_subs.summary(...) of the substitute allocations held back
+    (xlsx_bytes is None when nothing is left to show).
     dollars=True (Allocation Dollar Value Estimated report): adds Est. Price /
     Est. Value columns from live A2000 average prices and SKIPS the
     'POs Ready to Ship' tab."""
-    with _apo_lock:
-        apo_rows = list(_apo_data)
-    if not apo_rows:
-        apo_rows = load_apo_from_dropbox() or []
+    # Substitute allocations are held back first (David, Oct 6 2026): see apo_subs.
+    rep = _apo_report_rows(customer, exclude_tokens)
     cust_l = str(customer or '').strip().lower()
-    excl = [t.strip().upper() for t in (exclude_tokens or []) if t and t.strip()]
+    meta = apo_subs.summary(rep['hidden'], rep['review'], rep['subs_ok'], rep['annotations'], po_map_ok=rep['po_map_ok'])
 
     # Aggregate this customer's open allocations to base style (mirrors the
     # CPP picker: qty <= 0 rows dropped; styles compared on base style).
     agg = {}
-    for a in apo_rows:
-        if str(a.get('customer') or '').strip().lower() != cust_l:
-            continue
-        try:
-            qty = int(a.get('qty') or 0)
-        except Exception:
-            qty = 0
-        if qty <= 0:
-            continue
-        po = str(a.get('po') or '').upper()
-        if excl and any(t in po for t in excl):
-            continue
+    for a in rep['rows']:
+        qty = int(a.get('qty') or 0)
         base = get_base_style(str(a.get('style') or ''))
         if not base:
             continue
         agg[base] = agg.get(base, 0) + qty
     if not agg:
-        return None, 0
+        return None, 0, meta
 
     # Per-base inventory aggregation (feed rows are per size-variant SKU).
     with _inv_lock:
@@ -6394,7 +6520,18 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
     apo_headers = [h for h in SHIP_PLAN_HEADERS if h != 'Shortfall']
     if dollars:
         apo_headers = apo_headers + ['Est. Price', 'Est. Value']
-    return build_ship_plan_excel(tabs, S3_PHOTOS_URL, headers=apo_headers), len(rows)
+    return build_ship_plan_excel(tabs, S3_PHOTOS_URL, headers=apo_headers), len(rows), meta
+
+
+def _hidden_subs_header(meta):
+    """X-Apo-Hidden-Subs: counts and the two health flags (subs_ok, po_map_ok);
+    the row detail stays on /apo-report-rows. The open-orders report withholds a
+    workbook whose header says a flag is False."""
+    m = meta if isinstance(meta, dict) else {}
+    return json.dumps({'lines': int(m.get('lines') or 0), 'units': int(m.get('units') or 0),
+                       'styles': list(m.get('styles') or []), 'subs_ok': bool(m.get('subs_ok')),
+                       'po_map_ok': bool(m.get('po_map_ok', True))},
+                      separators=(',', ':'))
 
 
 @app.route('/export-apo-brandcolor', methods=['GET', 'OPTIONS'])
@@ -6407,15 +6544,25 @@ def export_apo_brandcolor():
             return jsonify({'error': 'customer parameter required'}), 400
         excl = (request.args.get('exclude_po') or '').split(',')
         dollars = str(request.args.get('dollars') or '').strip() in ('1', 'true', 'yes')
-        xl_bytes, n = build_apo_brandcolor_excel(customer, excl, dollars=dollars)
+        xl_bytes, n, meta = build_apo_brandcolor_excel(customer, excl, dollars=dollars)
         if not xl_bytes:
-            return jsonify({'error': f'No open allocations for {customer}'}), 404
+            # Every allocation may have been a substitute: say so, so the caller can
+            # tell "nothing allocated" from "nothing left to show".
+            resp = jsonify({'error': f'No open allocations for {customer}',
+                            'hidden_subs': {k: meta.get(k) for k in ('lines', 'units', 'styles', 'subs_ok', 'po_map_ok')}})
+            resp.status_code = 404
+            resp.headers['X-Apo-Hidden-Subs'] = _hidden_subs_header(meta)
+            resp.headers['Access-Control-Expose-Headers'] = 'X-Apo-Hidden-Subs'
+            return resp
         ts = datetime.now().strftime('%Y-%m-%d')
         label = 'Dollar Value Estimated' if dollars else 'By Color-Brand'
         fname = re.sub(r'[\\/:*?"<>|]+', '', f'{customer} Allocations - {label}')
-        return send_file(BytesIO(xl_bytes),
+        resp = send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True, download_name=f'{fname}_{ts}.xlsx')
+        resp.headers['X-Apo-Hidden-Subs'] = _hidden_subs_header(meta)
+        resp.headers['Access-Control-Expose-Headers'] = 'X-Apo-Hidden-Subs'
+        return resp
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
@@ -6434,6 +6581,32 @@ def apo_dollar_summary_route():
             return jsonify({'error': 'customer parameter required'}), 400
         excl = (request.args.get('exclude_po') or '').split(',')
         return jsonify(build_apo_dollar_summary(customer, excl))
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/apo-report-rows', methods=['GET', 'OPTIONS'])
+def apo_report_rows_route():
+    """One customer's open allocations exactly as the Big 3 reports show them:
+    the substitute allocations are already held back and listed under
+    hidden_subs, so the open-orders email body and the workbooks always agree
+    (David, Oct 6 2026). Same parameters as /export-apo-brandcolor."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        customer = (request.args.get('customer') or '').strip()
+        if not customer:
+            return jsonify({'error': 'customer parameter required'}), 400
+        excl = (request.args.get('exclude_po') or '').split(',')
+        rep = _apo_report_rows(customer, excl)
+        rows = [{'customer': r.get('customer'), 'po': r.get('po'), 'style': r.get('style'),
+                 'qty': int(r.get('qty') or 0)} for r in rep['rows']]
+        return jsonify({'customer': customer, 'rows': rows, 'count': len(rows),
+                        'units': sum(r['qty'] for r in rows),
+                        'hidden_subs': apo_subs.summary(rep['hidden'], rep['review'],
+                                                        rep['subs_ok'], rep['annotations'],
+                                                        po_map_ok=rep['po_map_ok'])})
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
@@ -10178,6 +10351,7 @@ _AUTHZ_CATALOG_READS = {
 }
 # Extra GET endpoints the machine key may use (report/export pulls).
 _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/exports',
+                        '/apo-report-rows',       # Big 3 report rows with subs held back (Oct 6 2026)
                         '/admin/factory-holds',   # the hold overview (Oct 1 2026)
                         '/export-tjx-ats',        # TJMAXX ATS Monday email (Oct 5 2026)
                         # Inventory Aging (Oct 5 2026): the review copy proxies with the machine key
