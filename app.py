@@ -10181,7 +10181,9 @@ _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/expor
                         '/admin/factory-holds',   # the hold overview (Oct 1 2026)
                         '/export-tjx-ats',        # TJMAXX ATS Monday email (Oct 5 2026)
                         # Inventory Aging (Oct 5 2026): the review copy proxies with the machine key
-                        '/api/inventory-aging', '/api/inventory-aging/trend'}
+                        '/api/inventory-aging', '/api/inventory-aging/trend',
+                        # P&L fee rates and the no-cost style list (Oct 6 2026; never a cost value)
+                        '/admin/pnl-fees', '/admin/pnl-missing-costs'}
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
@@ -10915,7 +10917,8 @@ def authz_gate():
             # backfill (Oct 5 2026; the route itself takes the machine key only).
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
                                              '/admin/banner-rules/upsert', '/admin/photos/refresh',
-                                             '/admin/factory-holds', '/admin/aging/seed'):
+                                             '/admin/factory-holds', '/admin/aging/seed',
+                                             '/admin/pnl-fees'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -21696,6 +21699,46 @@ def api_inventory_aging_trend():
     if cur['error']:
         return jsonify({'configured': True, 'error': 'The trend could not be loaded. Try again shortly.'}), 503
     return _aging_gz_response(cur['gz'])
+
+
+@app.route('/admin/pnl-fees', methods=['GET', 'POST', 'OPTIONS'])
+def admin_pnl_fees():
+    """Machine key only (Oct 6 2026). GET the P&L fee rates (revenue costs, monthly opex, royalty,
+    chargebacks); POST {expected_etag, <any of those four>} to change them. Never the cost book or a
+    factory cost: see pnl.py machine_fees. Every change is logged."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    ident = _request_identity() or {}
+    if ident.get('tier') != 'machine':
+        return jsonify({'error': 'Only the machine key can use this route.'}), 403
+    svc = globals().get('_pnl_svc')
+    if svc is None:
+        return jsonify({'error': 'The P&L is not configured.'}), 503
+    body = None
+    if request.method == 'POST':
+        if (request.content_length or 0) > 256 * 1024:
+            return jsonify({'error': 'The body is too large.'}), 413
+        body = request.get_json(silent=True)
+    status, payload = svc.machine_fees(request.method, body)
+    resp = jsonify(payload)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp, status
+
+
+@app.route('/admin/pnl-missing-costs', methods=['GET'])
+def admin_pnl_missing_costs():
+    """Machine key only (Oct 6 2026): style numbers with no cost, sold ones (units, months,
+    customers) and ones active now (stock, production, orders). Never a cost value."""
+    ident = _request_identity() or {}
+    if ident.get('tier') != 'machine':
+        return jsonify({'error': 'Only the machine key can use this route.'}), 403
+    svc = globals().get('_pnl_svc')
+    if svc is None:
+        return jsonify({'error': 'The P&L is not configured.'}), 503
+    status, payload = svc.machine_missing_costs()
+    resp = jsonify(payload)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp, status
 
 
 @app.route('/admin/aging/seed', methods=['POST', 'OPTIONS'])

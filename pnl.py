@@ -2052,6 +2052,129 @@ class _PnlService:
             print('[PnL] settings saved replaced_unreadable=yes user=%s' % ident['email'], flush=True)
         return _json({'etag': etag, 'settings': clean, 'dropped': dropped[:50]})
 
+    # -- Machine-key fee maintenance (Oct 6 2026). David: "your the head admin ... make the
+    # updates yourself". The machine key may read and change ONLY the fee rates (revenue costs,
+    # monthly opex, royalty, chargebacks) and list the style numbers that have NO cost at all.
+    # It never reads the cost book, a factory cost or any other setting, and every change is
+    # logged. Everything else under /api/pnl still takes a signed-in admin only.
+    FEE_KEYS = ('revenueCosts', 'opex', 'royalty', 'deductions')
+
+    def machine_fees(self, method, body=None):
+        """(status, payload) for GET/POST /admin/pnl-fees (the host app checks the machine key)."""
+        try:
+            self._require_store()
+            stored, etag = self.store.get_obj(SETTINGS)
+            stored = stored if isinstance(stored, dict) else {}
+            if method != 'POST':
+                return 200, {'fees': {k: stored.get(k) for k in self.FEE_KEYS}, 'etag': etag,
+                             'updatedAt': stored.get('updatedAt'), 'updatedBy': stored.get('updatedBy')}
+            if not isinstance(body, dict) or 'expected_etag' not in body:
+                return 400, {'error': 'Send the fee changes with the expected_etag from a GET.'}
+            extra = sorted(k for k in body if k not in self.FEE_KEYS and k != 'expected_etag')
+            if extra:
+                return 400, {'error': 'Only the fee rates can change here.', 'refused': extra[:20]}
+            changes = {k: body[k] for k in self.FEE_KEYS if k in body}
+            if not changes:
+                return 400, {'error': 'No fee changes were sent.'}
+            if body['expected_etag'] != etag:
+                return 409, {'error': 'The settings changed since your read. Read them again.', 'etag': etag}
+            merged = dict(stored)
+            merged.update(changes)
+            clean, problems, dropped = validate_settings(merged, self._defaults())
+            if problems:
+                return 422, {'error': 'INVALID_SETTINGS', 'problems': problems[:50], 'problemCount': len(problems)}
+            clean['updatedAt'] = _utc_iso()
+            clean['updatedBy'] = 'machine key (fee rates)'
+            new_etag = self.store.put_obj(SETTINGS, clean, expected_etag=etag)
+            print('[PnL] fee rates changed with the machine key: %s' % ','.join(sorted(changes)), flush=True)
+            return 200, {'etag': new_etag, 'fees': {k: clean.get(k) for k in self.FEE_KEYS},
+                         'dropped': dropped[:50]}
+        except VersionConflict:
+            return 409, {'error': 'The settings changed since your read. Read them again.'}
+        except StoreError as e:
+            return 503, {'error': 'The P&L store is not available.', 'code': type(e).__name__}
+
+    def machine_missing_costs(self):
+        """(status, payload) for GET /admin/pnl-missing-costs: style numbers with no cost anywhere.
+        sold = invoiced bases (alias-folded customers) with no cost for any account and none at the
+        style level; active = styles the dataset tracks now (stock, production, open orders,
+        allocations) whose cost is unknown. Units and dates only, never a cost value."""
+        try:
+            self._require_store()
+            for kind in ('engine', 'routing'):
+                if self._module(kind) is None:
+                    return 503, {'error': 'PNL_NOT_CONFIGURED', 'reason': kind}
+            key = tuple(self.store.head(n) for n in OBJECTS)
+            if key[0] is None:
+                return 409, {'error': 'NO_COSTBOOK'}
+            r = self._dataset_for(key, False)
+            if r.status_code == 202:
+                return 202, {'building': True, 'part': 'dataset'}
+            if r.status_code != 200:
+                return r.status_code, {'error': 'dataset'}
+            get_matrix = self.sales_matrix
+            matrix = get_matrix() if callable(get_matrix) else None
+            if matrix is None:
+                return 503, {'error': 'INPUTS_UNAVAILABLE', 'missing': ['sales_matrix']}
+            if matrix.get('building'):
+                return 202, {'building': True, 'part': 'matrix'}
+            cost = self._analytics_cost_maps(key)
+            if cost is None:
+                return 202, {'building': True, 'part': 'dataset'}
+            with self._lock:
+                memo = self._memo
+                body = memo['body'] if (memo is not None and memo['key'] == key) else None
+            costed = set(cost['byStyle'])
+            for mp in (cost['byCust'], cost['byCust2']):
+                for c in mp:
+                    costed.update(mp[c].keys())
+            alias = cost['alias']
+            sold = {}
+            for raw, styles in (matrix.get('customers') or {}).items():
+                acct = alias.get(raw, raw)
+                for base, months in (styles or {}).items():
+                    if base in costed:
+                        continue
+                    row = sold.setdefault(base, {'base': base, 'units': 0, 'first': '', 'last': '', 'custs': {}})
+                    for m, v in (months or {}).items():
+                        u = (v[0] if isinstance(v, (list, tuple)) and v else 0) or 0
+                        if u <= 0:
+                            continue
+                        row['units'] += u
+                        row['custs'][acct] = row['custs'].get(acct, 0) + u
+                        if not row['first'] or m < row['first']:
+                            row['first'] = m
+                        if not row['last'] or m > row['last']:
+                            row['last'] = m
+            sold_rows = []
+            for row in sold.values():
+                if row['units'] <= 0:
+                    continue
+                top = sorted(row['custs'].items(), key=lambda kv: -kv[1])[:3]
+                sold_rows.append({'base': row['base'], 'units': row['units'], 'first': row['first'],
+                                  'last': row['last'], 'customers': [c for c, _u in top]})
+            sold_rows.sort(key=lambda r: -r['units'])
+            active = []
+            if body is not None:
+                ds = json.loads(body)
+                st = ds.get('styles') or {}
+                sf = {n: i for i, n in enumerate(st.get('fields') or [])}
+                want = [k for k in ('brand', 'onHand', 'incoming', 'openUnits', 'apoUnits', 'lifeUnits') if k in sf]
+                if 'base' in sf and 'fobU' in sf:
+                    for row in st.get('rows') or []:
+                        if row[sf['fobU']] is not None:
+                            continue
+                        rec = {'base': row[sf['base']]}
+                        for k in want:
+                            rec[k] = row[sf[k]]
+                        active.append(rec)
+            active.sort(key=lambda r: -((r.get('onHand') or 0) + (r.get('incoming') or 0) + (r.get('openUnits') or 0)))
+            return 200, {'sold': sold_rows, 'active': active,
+                         'invoicesThrough': (matrix.get('source') or {}).get('to'),
+                         'datasetBuiltAt': cost.get('builtAt')}
+        except StoreError as e:
+            return 503, {'error': 'The P&L store is not available.', 'code': type(e).__name__}
+
     def h_overrides(self, ident):
         self._require_store()
         if request.method != 'POST':
