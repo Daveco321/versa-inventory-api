@@ -131,7 +131,7 @@ class MachineRoutesWiringTest(unittest.TestCase):
         extra = re.search(r"_AUTHZ_MACHINE_EXTRA = \{(.*?)\}", self.src, re.S).group(1)
         self.assertIn("'/admin/pnl-fees'", extra)
         self.assertIn("'/admin/pnl-missing-costs'", extra)
-        self.assertRegex(self.src, r"'/admin/aging/seed',\s*'/admin/pnl-fees'\):")
+        self.assertRegex(self.src, r"'/admin/aging/seed',\s*'/admin/pnl-fees'[,)]")
 
     def test_routes_check_the_machine_tier(self):
         for fn in ('def admin_pnl_fees', 'def admin_pnl_missing_costs'):
