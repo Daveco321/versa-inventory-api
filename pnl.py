@@ -480,6 +480,11 @@ def _stamps(src):
         s = sa.get('source') if isinstance(sa.get('source'), dict) else {}
         sa_key = 'building' if sa.get('building') else (str(s.get('ingestedAt')), str(s.get('rows')),
                                                          str(sa.get('styleCount')), str(sa.get('v')))
+        # The invoice brand map (brandMap) changes only with an open-orders deploy, which leaves
+        # the invoice stamps above as they were: its own digest makes the next check rebuild.
+        bm = sa.get('brandMap')
+        if isinstance(bm, dict) and not sa.get('building'):
+            sa_key = sa_key + (str(bm.get('v')), _digest(bm.get('bases')))
     else:
         sa_key = None
     ri = {k: v for k, v in (src.get('routing_inputs') or {}).items() if k not in ('now_et', 'now')}
@@ -1899,7 +1904,8 @@ class _PnlService:
                 g = cust_group(c, S, fob)
                 v = ded_pct(c, S, g)
                 chargeback[c] = {'pct': round(float(v or 0.0), 4), 'group': g}
-            brands = sorted(k for k in (getattr(eng, 'BRAND_NAMES', None) or {}) if k != 'BLK')
+            # BLK (Black Label) carries its own royalty row, so the page needs its rate too (Oct 7 2026).
+            brands = sorted(getattr(eng, 'BRAND_NAMES', None) or {})
             royalty = {'defaultPct': round(float(_num_or(S['royalty'].get('defaultPct'), 0.0)), 4),
                        'base': 'revenue' if S['royalty'].get('base') == 'revenue' else 'net',
                        'byBrand': {b: round(float(roy_pct(b, S) or 0.0), 4) for b in brands},

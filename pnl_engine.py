@@ -16,8 +16,10 @@ build_dataset(src, costbook, settings, overrides, now_iso, routing_module) -> di
     src             the normalized sources of pnl.py (DESIGN 3.4): inventory{items,last_sync},
                     ledger{rows,last_sync}, apo{rows,last_sync}, manual_allocations[],
                     vw_allocations[], open_orders{orders,ok,fetched_at}, fob_customers[],
-                    routing_inputs{}, sales_analytics (payload | {'building': True} | None),
-                    today 'YYYY-MM-DD'. Optional: ledger_history{rows} (or a list) with past
+                    routing_inputs{}, sales_analytics (payload | {'building': True} | None; an
+                    optional payload brandMap{v, labels, bases{BASE: brand key}} brands past
+                    invoices' styles, see brand_of), today 'YYYY-MM-DD'. Optional:
+                    ledger_history{rows} (or a list) with past
                     ledger lines (production, poName, style, units) that restore received refs.
     costbook        DESIGN 5.1 (records + params). Records without 'pool' get one derived from
                     source_code, so the study table (prices_ALL.json) also works.
@@ -269,9 +271,17 @@ BRAND_NAMES = {
     'KN': 'Jones New York', 'GB': 'Geoffrey Beene', 'VD': 'Von Dutch', 'VC': 'Vince Camuto', 'EB': 'Eddie Bauer',
     'BE': 'Ben Sherman', 'LB': 'Lucky Brand', 'KL': 'Karl Lagerfeld', 'NM': 'Nicole Miller', 'RB': 'Reebok',
     'TA': 'Tayion', 'SH': "Shaquille O'Neal", 'MS': 'Michael Strahan', 'NW': 'Nine West', 'RG': 'Robert Graham',
-    'BL': "Bloomingdale's private label", 'NE': 'Neiman Marcus private label', 'VS': 'Versa', 'AC': 'America',
-    'DH': 'DH', 'DN': 'DN', 'BLK': 'Black Label',
+    'BL': "Bloomingdale's private label", 'NE': 'Neiman Marcus private label', 'VS': 'Versa', 'AC': 'American Crew',
+    'DH': 'DH', 'DN': 'Divine 9', 'BLK': 'Black Label',
 }
+# The codes a program or legacy code's own letters may name (program_brand). Frozen before the
+# brands below are added: those come only from the invoice brand map, never from a code's letters.
+_PROGRAM_BRAND_CODES = frozenset(BRAND_NAMES) - {'BLK'}
+# Brands that only the invoice brand map names (A2000 GRP codes; Oct 7 2026). A modern code whose
+# letters give HC or CL now also shows the brand's name.
+BRAND_NAMES.update({'HC': 'Henri Christian', 'CL': 'Christian Lacroix', 'AR': 'Architect',
+                    'PM': 'Preswick & Moore', 'BJ': "Berkley Jensen (BJ's)", 'BD': 'Buffalo David Bitton',
+                    'AV': 'Adrienne Vittadini'})
 # SKU brand code BL is shared by Bloomingdale's private label (feed label BLO) and Black Label
 # (feed label BLACK). Rows whose feed label says Black Label report the pseudo code BLK.
 _BLACK_LABELS = frozenset({'BLACK', 'BLACK LABEL'})
@@ -280,6 +290,12 @@ BRAND_LABEL_CODE = {'NAUTICA': 'NA', 'VD': 'VD', 'CHAPS': 'CH', 'USPA': 'US', 'T
                     'BEN': 'BE', 'LUCKY': 'LB', 'JNY': 'JN', 'BEENE': 'GB', 'SHAQ': 'SH', 'STRAHAN': 'MS',
                     'DKNY': 'DK', 'VINCE': 'VC', 'NM': 'NM', 'KLP': 'KL', 'RB': 'RB', 'AMERICA': 'AC',
                     'BLACK': 'BL', 'BLO': 'BL', 'NW': 'NW'}
+# Invoice brand map key -> SKU brand code. The map (open-orders brandMap, frozen Oct 7 2026) keys a
+# past invoice's base style by the platform's brand keys (BRAND_MAPPING) plus five label-only keys.
+# The feed-label table above stays as it was, so a feed label and the legacy cost default (L6) read
+# exactly what they read before; the keys added here are used for map lookups only.
+MAP_KEY_CODE = dict(BRAND_LABEL_CODE, NICOLE='NM', KL='KL', REEBOK='RB', VERSA='VS', HC='HC', CL='CL', DN='DN',
+                    NE='NE', RG='RG', ARCHITECT='AR', PRESWICK='PM', BJ='BJ', BUFFALO='BD', ADRIENNE='AV')
 # APO free-text customer -> A2000 codes whose open prices estimate APO revenue (study extra.py). The
 # first code is the account the row is booked to; any other code is the same customer's second
 # account and adds its price evidence. Names were tied to codes by style prefix, open orders and
@@ -1388,7 +1404,18 @@ def program_brand(base):
     else:
         return None
     cand = {'NT': 'NA', 'DV': 'VD'}.get(cand, cand)
-    return cand if cand in BRAND_NAMES and cand != 'BLK' else None
+    return cand if cand in _PROGRAM_BRAND_CODES else None
+
+
+def brand_map_bases(sa):
+    """The invoice brand map carried by the analytics payload (sa['brandMap']['bases']) as
+    {BASE: brand key}, upper case, or {} when the payload has none (then nothing changes)."""
+    bm = sa.get('brandMap') if isinstance(sa, dict) else None
+    bases = bm.get('bases') if isinstance(bm, dict) else None
+    if not isinstance(bases, dict):
+        return {}
+    return {k.strip().upper(): v.strip().upper() for k, v in bases.items()
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()}
 
 
 def _pool_of(r):
@@ -2909,12 +2936,33 @@ class _Build:
         """The feed's brand label for a base style (any of its SKUs), else the invoice history's."""
         return self.feed_label(b) or ((getattr(self, 'an', None) or {}).get(b) or {}).get('label')
 
-    def brand_of(self, dec, sku=None, label=None, base=None):
-        """Brand code of a row (contract C7): the decoded SKU brand (program map included); else the
-        feed label; else the code's own brand letters (program and legacy codes); else ''. SKU brand
-        BL with the feed label BLACK is Black Label (BLK), which carries its own royalty row. A style row
-        (sku None: styles, shipped history) reads the style's feed label before the label passed in, so a
-        Black Label style whose invoices say BLO stays Black Label (review finding R5-1)."""
+    def map_brand(self, b, sku=None, hist=None):
+        """SKU brand code the invoice brand map gives a base style, or None. The most specific key
+        first: a history key passed in, then the SKU's base as the invoice history keys it (a legacy
+        dash code keeps its dash parts), then the base. A map key with no SKU brand code
+        (MAP_KEY_CODE) gives None."""
+        bm = getattr(self, 'bmap', None)
+        if not bm:
+            return None
+        key = None
+        for k in (_u(hist) if hist else None, hist_base_of(sku) if sku else None, b):
+            if k and k in bm:
+                key = bm[k]
+                break
+        if not key:
+            return None
+        return 'BLK' if key in _BLACK_LABELS else MAP_KEY_CODE.get(key)
+
+    def brand_of(self, dec, sku=None, label=None, base=None, hist=None):
+        """Brand code of a row (contract C7): the decoded SKU brand (program map included) when it is a
+        known brand code; else the invoice brand map (styles on past invoices take the brand A2000 gave
+        them; David, Oct 7 2026); else the decoded letters as they are; else the feed label; else the
+        code's own brand letters (program and legacy codes); else ''. A modern code with a known brand
+        keeps it, so a new style follows its style number. SKU brand BL with the feed label BLACK (or
+        the map key BLACK) is Black Label (BLK), which carries its own royalty row. A style row (sku
+        None: styles, shipped history) reads the style's feed label before the label passed in, so a
+        Black Label style whose invoices say BLO stays Black Label (review finding R5-1). hist: an
+        invoice-history key to try in the map when the base is shorter (map_brand)."""
         b = base or (dec['base'] if dec else (base_of(sku) if sku else ''))
         lab = _u(self.feed_label(b)) if (sku is None and b) else ''
         if not lab and label:
@@ -2923,9 +2971,17 @@ class _Build:
             lab = _u((getattr(self, 'inv', {}).get(_u(sku)) or {}).get('label'))
         if not lab and b:
             lab = _u(self.base_label(b))
-        if dec and dec.get('brand'):
-            br = dec['brand']
-            return 'BLK' if br == 'BL' and lab in _BLACK_LABELS else br
+        br = dec.get('brand') if dec else None
+        if br and br in BRAND_NAMES:
+            # BL is both Bloomingdale's and Black Label: a BLACK feed label or map key says which.
+            if br == 'BL' and (lab in _BLACK_LABELS or self.map_brand(b, sku, hist) == 'BLK'):
+                return 'BLK'
+            return br
+        mb = self.map_brand(b, sku, hist)
+        if mb:
+            return 'BLK' if mb == 'BL' and lab in _BLACK_LABELS else mb
+        if br:
+            return br
         if lab in _BLACK_LABELS:
             return 'BLK'
         if lab and BRAND_LABEL_CODE.get(lab):
@@ -2999,6 +3055,7 @@ class _Build:
         self.history = _rows(hist.get('rows') if isinstance(hist, dict) else hist)
         sa = s.get('sales_analytics')
         self.sa = sa if isinstance(sa, dict) else None
+        self.bmap = brand_map_bases(self.sa)     # {} without a map: every brand as before
 
     def route(self):
         ri = self.src.get('routing_inputs') if isinstance(self.src.get('routing_inputs'), dict) else {}
@@ -3305,8 +3362,10 @@ class _Build:
             if hb in self.ci.kit_pcs:
                 continue
             d = self.ci.decode(hb)
-            # The lines' resolver first; a size-suffixed history key falls back to its own label.
-            br = self.brand_of(d, hb, base=hb) or self.brand_of(d, hb, label=e.get('label'), base=hb) or None
+            # The lines' resolver first; a size-suffixed history key falls back to its own label. The
+            # history key itself is tried in the brand map (a legacy dash code's base drops its dash parts).
+            br = (self.brand_of(d, hb, base=hb, hist=st)
+                  or self.brand_of(d, hb, label=e.get('label'), base=hb, hist=st) or None)
             for c, v in e['customers'].items():
                 if v[0] > 0 and v[1] > 0 and self.pieces_per(c, st) == 1:
                     k = self.hist_code(c)
@@ -4388,7 +4447,9 @@ class _Build:
             g = _cust_group(c, self.S, self.fob_set)
             customers[c] = {'name': names.get(c) or c, 'group': g, 'fob': c in self.fob_set}
         brands = set()
-        for rows in (self.lines, self.apo, self.inventory, self.production, self.styles):
+        # Shipped history too, so a brand sold only in past invoices (Preswick & Moore...) shows its name
+        # and can take a royalty rate (Oct 7 2026).
+        for rows in (self.lines, self.apo, self.inventory, self.production, self.styles, self.hist_rows):
             brands.update(r['brand'] for r in rows if r.get('brand'))
         list_facs = self.ci.pc_facs | self.ci.dp_facs | self.ci.ky_facs
         facs = set(k for k in (self.S.get('factories') or {}) if k != '_default')
@@ -4540,6 +4601,12 @@ class _Build:
             'lotTiers': dict(self.whc.tiers), 'overridesActive': self.ci.overrides_active,
             'fx': fxin,
         }
+        if self.bmap:       # only when the payload carries a map, so a build without one is unchanged
+            bm = self.sa.get('brandMap') or {}
+            ver = bm.get('v')
+            inputs['brandMap'] = {'v': (ver if isinstance(ver, int) and not isinstance(ver, bool)
+                                        else ver[:20] if isinstance(ver, str) else None),
+                                  'bases': len(self.bmap)}
         return {
             'v': 1, 'builtAt': self.now_iso, 'asOf': self.today, 'inputs': inputs, 'settings': S,
             'dict': self.dictionary(),

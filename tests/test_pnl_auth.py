@@ -1239,7 +1239,7 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(f['royalty']['defaultPct'], 10.0)
         self.assertEqual(f['royalty']['byBrand']['NA'], 8.0)
         self.assertEqual(f['royalty']['byBrand']['DK'], 10.0)
-        self.assertNotIn('BLK', f['royalty']['brands'])
+        self.assertIn('BLK', f['royalty']['byBrand'])          # Black Label's own royalty row (Oct 7 2026)
         self.assertEqual(f['royalty']['brandAlias'], {'NT': 'NA', 'DV': 'VD'})
         self.assertEqual(f['revenueCosts'], [{'key': 'rent', 'name': 'Rent', 'pct': 1.0}])
         self.assertEqual(f['opex'], [{'key': 'ox0', 'name': 'Payroll', 'monthly': 4321.0},
