@@ -263,6 +263,38 @@ class Cascade(unittest.TestCase):
         self.assertEqual(c.resolve('ROQAQH777SLS', 'NN')['fobU'], 9.5555)              # fabric and category
         self.assertEqual(c.resolve('ROQAQF401SLS', 'NN')['level'], 'L4a')             # not yet effective
 
+    def test_style_override_on_a_dash_code_matches_the_whole_code(self):
+        # Oct 7 2026: a history code keeps its dash (ROQAQF522-904 style legacy codes). Its style-scope cost
+        # files under the history's own base, so the history key finds it and the bare prefix does not take it.
+        # A size typed on the end still folds to the base, as before.
+        base = {'reason': 'synthetic', 'effective': '', 'by': 'x@example.com', 'at': '2026-01-01'}
+        ov = [dict(base, id='d1', scope='style', key={'style': ' zzqqf522-904 '}, fobU=9.1212),
+              dict(base, id='d2', scope='style', key={'style': 'ROQAQF201SLS-M'}, fobU=9.2323),
+              dict(base, id='d3', scope='style', key={'style': 'ZZQQF611-16'}, fobU=9.3434)]
+        c = ci(overrides=ov)
+        r = c.public(c.raw('ZZQQF522-904', 'UNKNOWN'))
+        self.assertEqual((r['level'], r['fobU']), ('L0', 9.1212))
+        self.assertNotEqual(c.raw('ZZQQF522', 'UNKNOWN')['level'], 'L0')
+        self.assertNotEqual(c.raw('ZZQQF522-905', 'UNKNOWN')['level'], 'L0')
+        self.assertEqual(c.resolve('ROQAQF201SLS', 'NN')['fobU'], 9.2323)              # size suffix folds
+        self.assertEqual(c.public(c.raw('ZZQQF611', 'UNKNOWN'))['fobU'], 9.3434)        # legacy size suffix folds
+        for code in ('ZZQQF522-904', 'ZZQQF611-16', 'ROQAQF201SLS-M', 'CU-QZZZ26-M', 'ROQAQF201SLS', 'ZZQQF7-'):
+            self.assertEqual(E.hist_base_of(code), {'ZZQQF611-16': 'ZZQQF611', 'ROQAQF201SLS-M': 'ROQAQF201SLS',
+                                                    'ZZQQF7-': 'ZZQQF7'}.get(code, code))
+
+    def test_dash_code_cost_reaches_its_invoice_history_rows(self):
+        s = src()
+        s['sales_analytics']['styles'].append(['ZZQQF522-904', 'SYN', 9, 90.0, '2025-01-05', '2026-02-10',
+                                               {'2026-01': [9, 90.0, 0, 0.0]}, {'ROSS1': [9, 90.0]}, 'RED'])
+        s['sales_analytics']['styles'].append(['ZZQQF522', 'SYN', 5, 50.0, '2025-01-05', '2026-02-10',
+                                               {'2026-01': [5, 50.0, 0, 0.0]}, {'ROSS1': [5, 50.0]}, 'RED'])
+        ov = [{'id': 'd1', 'scope': 'style', 'key': {'style': 'ZZQQF522-904'}, 'fobU': 9.1212, 'reason': 'synthetic',
+               'effective': '', 'by': 'x@example.com', 'at': '2026-01-01'}]
+        ds = build(s, overrides=ov)
+        H = {r['base']: r for r in rows({'b': ds['shipped']['byCustomer']}, 'b') if r['cust'] == 'ROSS'}
+        self.assertEqual((H['ZZQQF522-904']['level'], H['ZZQQF522-904']['fobU']), ('L0', 9.1212))
+        self.assertNotEqual(H['ZZQQF522']['level'], 'L0')                             # the prefix stays its own
+
     def test_fx_rate_and_after_cut(self):
         c = ci(settings={'fx': {'rate': 7.7}})
         self.assertEqual(c.resolve('ROQAQF201SLS', 'NN')['fobU'], round(4.4444 * FXB / 7.7, 4))

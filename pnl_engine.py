@@ -622,6 +622,26 @@ def base_of(s):
     return s.split('-')[0]
 
 
+# The invoice history's base rule (open-orders _sales_style_base): a modern code keeps its first dash
+# segment; any other code sheds trailing size segments and keeps the rest of its dash parts.
+_HIST_MODERN_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$')
+_HIST_SIZE_SEG_RE = re.compile(r'^(\d{1,2}(\.\d)?|\d{2}/\d{2}|XS|S|M|L|XL|XXL|XXXL|[2-4]XL|LT|XLT|[2-3]XLT)$')
+
+
+def hist_base_of(s):
+    """Base style as the invoice history keys it. Costco program codes keep their whole code, as in base_of."""
+    tok = str(s or '').strip().upper().split(' ')[0]
+    if tok.startswith('CU-') or tok.startswith('CC-'):
+        return tok
+    first = tok.split('-')[0]
+    if _HIST_MODERN_RE.match(first):
+        return first
+    parts = tok.split('-')
+    while len(parts) > 1 and (not parts[-1] or _HIST_SIZE_SEG_RE.match(parts[-1])):
+        parts.pop()
+    return '-'.join(parts)
+
+
 def norm_vd(b):
     return b[:2] + 'VD' + b[4:] if len(b) > 4 and b[2:4] == 'DV' else b
 
@@ -1713,8 +1733,13 @@ class CostIndex:
             if eff and self.today and eff > self.today:
                 continue
             ref, style, design = _u(k.get('ref')), base_of(k.get('style')), _u(k.get('design'))
+            # A style-scope cost files under the invoice history's own base (Oct 7 2026). History codes such
+            # as XXNAU522-304 keep their dash and look themselves up whole; base_of would file the cost under
+            # XXNAU522, where it never matched and could reach another code with that prefix. A code without
+            # a dash, a modern code and a code ending in a size read the same either way.
+            code = hist_base_of(k.get('style'))
             fab, cat = _u(k.get('fabric')), str(k.get('category') or '').strip().lower()
-            key = {'ref_style': (ref, style) if ref and style else None, 'style': (style,) if style else None,
+            key = {'ref_style': (ref, style) if ref and style else None, 'style': (code,) if code else None,
                    'design': (design,) if design else None, 'ref': (ref,) if ref else None,
                    'fabric_category': (fab, cat) if fab and cat else None}[sc]
             if key:
