@@ -2094,9 +2094,11 @@ C15_RECS = [
     c15rec('GN!K117', 4.6161, ['VN'], pat=None, fit='REGULAR', names_styles=['301PSS'], label='SAMPLE ROW STYLE#301PSS'),
     c15rec('GN!F118', 3.9797, ['VN'], label='SAMPLE PLAIN SOLID'),
     c15rec('GN!K118', 4.1919, ['VN'], fit='REGULAR', label='SAMPLE PLAIN SOLID'),
-    # Grid GY club block: an all-brand row for fabric VG, and a QA row of another fabric (QA has a section there).
-    c15rec('GY!F119', 4.1414, ['VG'], brand=None, brand_scope='all', label='SAMPLE ALL BRANDS', pool='GY:CLUB'),
-    c15rec('GY!F120', 4.2929, ['VH'], label='SAMPLE QA ROW', pool='GY:CLUB'),
+    # Grid GY base sheet: an all-brand row for fabric VG, and a QA row of another fabric (QA has a section there).
+    # (A customer block prices only its own customer's styles since Oct 7 2026, so the all-brand row sits on the
+    # base sheet here; CustomerBlocks tests the block rule.)
+    c15rec('GY!F119', 4.1414, ['VG'], brand=None, brand_scope='all', label='SAMPLE ALL BRANDS', pool='GY:BASE'),
+    c15rec('GY!F120', 4.2929, ['VH'], label='SAMPLE QA ROW', pool='GY:BASE'),
     # VK: a section that serves two brand codes. PO: a zip polo next to the plain polo GK!F1.
     c15rec('GN!F121', 3.7979, ['VK'], brand_codes=['QA', 'QE'], label='SAMPLE TWO CODE SECTION'),
     c15rec('GK!F122', 2.8989, ['PO'], category='polo', tags=['zipper'], label='SAMPLE ZIP POLO', pool='GK:ANY'),
@@ -2150,7 +2152,7 @@ class OneRightRowC15(unittest.TestCase):
     def test_generic_section_when_the_brand_has_none(self):
         # R1: with no section for the brand on a sheet, that sheet's all-brand rows serve.
         g = pick15('ROQCVG201SLS', 'TT')
-        self.assertEqual((g['level'], g['price'], g['ids']), ('L4b', 4.1414, ('GY!F119',)))
+        self.assertEqual((g['level'], g['price'], g['ids']), ('L4a', 4.1414, ('GY!F119',)))
         self.assertNotIn('cross_brand', g['flags'])
 
     def test_another_brand_only_as_the_last_resort(self):
@@ -2210,12 +2212,14 @@ class OneRightRowC15(unittest.TestCase):
         self.assertEqual((o['price'], dict(o['skip'])['GN!F117']), (3.9797, 'other_pattern'))
 
     def test_white_and_colour_rows(self):
-        # R5: a plain row beats white and colour rows. With no plain row, the lowest of them, flagged.
+        # R5: a plain row beats white and colour rows. With no plain row and no colour map entry, the colour row
+        # (most styles are colours), flagged colour_assumed (Oct 7 2026).
         v = pick15('ROQAVC201SLS')
         self.assertEqual((v['price'], dict(v['skip'])['GN!F113']), (3.5555, 'variant_not_this_style'))
         d = pick15('ROQAVD201SLS')
-        self.assertEqual((d['price'], d['skip']), (3.2626, (('GN!F116', 'tie_not_lowest'),)))
-        self.assertIn('ambiguous_rows', d['flags'])
+        self.assertEqual((d['price'], d['skip']), (3.3737, (('GN!F115', 'variant_not_this_style'),)))
+        self.assertIn('colour_assumed', d['flags'])
+        self.assertNotIn('ambiguous_rows', d['flags'])
 
     def test_zip_polo(self):
         # R5: the zip collar letter shows the variant, so a zip polo takes the zipper row and a plain polo does not.
@@ -2596,6 +2600,597 @@ class ShippedDivDates(unittest.TestCase):
         self.assertIn('Dropship invoice history ends on Jan 10, 2026.', al['al_stale_analytics']['detail'])
         self.assertNotIn('The invoice history ends', al['al_stale_analytics']['detail'])
         self.assertNotIn('al_stale_analytics', {a['id'] for a in build()['alerts']})   # fresh dates: no alert
+
+
+# ── Oct 7 2026: the colour map, fabric families, customer blocks, delivered (DDP) prices, manual cost keys,
+# shipped garment counts, the awaiting-invoice estimate and the A2000 export alert. Synthetic codes (brands QA, QB,
+# QC; fabrics QD, QF, QG, QW; customer prefixes CL and ZB; account ZZPC) and sentinel prices only. ──
+NEW_FLAGS = ('colour_row', 'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'fabric_family',
+             'group_block_missing', 'ddp', 'ddp_mixed')
+
+
+def ci_cm(cmap, costbook=None, overrides=None):
+    """A CostIndex with a platform colour map ({style or BRAND_SERIAL key: description})."""
+    return E.CostIndex(costbook or C15_BOOK, {}, overrides or [], [], today=TODAY, colour_map=cmap)
+
+
+def ovr(oid, scope, key, fobU, **kw):
+    o = {'id': oid, 'scope': scope, 'key': key, 'fobU': fobU, 'reason': 'synthetic', 'effective': '',
+         'by': 'x@example.com', 'at': '2026-01-01'}
+    o.update(kw)
+    return o
+
+
+class ColourClassesOct7(unittest.TestCase):
+    def test_classify_and_colour_info(self):
+        cases = {'WHITE SOLID': ('white', 'white', False), 'BLACK SOLID': ('black', 'colour', False),
+                 'NAVY SOLID': ('navy', 'colour', False), 'IVORY SLD': ('white', 'white', False),
+                 'RED SOLID': ('other_solids', 'colour', False), 'BLUE DOBBY': ('navy', 'colour', False),
+                 # a print named with its ground first, a print without a ground, a stripe
+                 'WHITE FLORAL': ('fancies', 'white', True), 'NAVY FLORAL': ('fancies', 'colour', True),
+                 'NAVY STRIPE': ('fancies', 'colour', True),
+                 # ground||print: the ground decides white or colour, and it is always a print
+                 'WHITE||NAVY FLORAL': ('fancies', 'white', True), 'NAVY||WHITE FLORAL': ('fancies', 'colour', True),
+                 # two colours with a slash: the first part classifies
+                 'WHITE / NAVY': ('fancies', 'white', True)}
+        for text, (cls, ground, printed) in cases.items():
+            self.assertEqual(E.classify_colour(text), cls, text)
+            self.assertEqual(E.colour_info(text), {'cls': cls, 'ground': ground, 'print': printed}, text)
+            self.assertEqual(E.classify_colour(text.lower()), cls, text)
+        self.assertEqual(E.classify_colour(''), 'fancies')
+        self.assertEqual(E.classify_colour(None), 'fancies')
+        self.assertIsNone(E.colour_info(''))
+        self.assertIsNone(E.colour_info('   '))
+        self.assertIsNone(E.colour_info(None))
+        self.assertEqual(set(E.COLOUR_CLASSES), {'white', 'black', 'navy', 'other_solids', 'fancies'})
+
+    def test_colour_map_keys(self):
+        self.assertEqual(E.colour_map_keys('ROQAQF201SLS'), ['ROQAQF201SLS', 'QA_201'])
+        self.assertEqual(E.colour_map_keys(' roqaqf201sls '), ['ROQAQF201SLS', 'QA_201'])
+        self.assertEqual(E.colour_map_keys('ZZQA123-RED'), ['ZZQA123-RED'])         # not a modern code: itself only
+        self.assertEqual(E.colour_map_keys(''), [''])
+
+
+class ColourRowsOct7(unittest.TestCase):
+    """Contract C15 R5 with the colour map: fabric VD has a white row (GN!F115, 3.2626) and a colour row (GN!F116,
+    3.3737) only; VC has a plain row (GN!F112, 3.5555) as well; VQ has a plain solid row (GN!F101) and a regular
+    print row (GN!F104)."""
+    CMAP = {'ROQAVD301SLS': 'WHITE SOLID', 'ROQAVD302SLS': 'BLACK SOLID', 'QA_304': 'WHITE SOLID',
+            'ROQAVC305SLS': 'WHITE SOLID', 'ROQAVC306SLS': 'NAVY SOLID',
+            'ROQAVQ240SL': 'BLACK SOLID', 'ROQAVQ241SL': 'NAVY FLORAL', 'ROQAVQ242SLS': 'NAVY FLORAL',
+            'ROQAVQ243SLP': 'BLACK SOLID'}
+
+    def setUp(self):
+        self.c = ci_cm(self.CMAP)
+
+    def test_white_and_colour_rows_follow_the_map(self):
+        c = self.c
+        w = c.raw('ROQAVD301SLS', 'NN')
+        self.assertEqual((w['level'], w['price'], w['ids'], w['flags']), ('L4a', 3.2626, ('GN!F115',), ('colour_row',)))
+        self.assertEqual(dict(w['skip']), {'GN!F116': 'variant_not_this_style'})
+        self.assertIn('the colour map says this style is white', w['basis'])
+        k = c.raw('ROQAVD302SLS', 'NN')
+        self.assertEqual((k['price'], k['ids'], k['flags']), (3.3737, ('GN!F116',), ('colour_row',)))
+        self.assertIn('the colour map says this style is a colour', k['basis'])
+        u = c.raw('ROQAVD303SLS', 'NN')                                   # not in the map: the colour row, flagged
+        self.assertEqual((u['price'], u['ids'], u['flags']), (3.3737, ('GN!F116',), ('colour_assumed',)))
+        self.assertIn('The colour map does not know this style', u['basis'])
+        self.assertIsNone(c.colour('ROQAVD303SLS'))
+        d = c.decode('ROQAVD301SLS')
+        self.assertEqual((d['colour'], d['ground'], d['pat'], d['patSrc'], d['patConflict']),
+                         ('white', 'white', 'SOLID', None, False))
+        self.assertEqual((c.decode('ROQAVD303SLS')['colour'], c.decode('ROQAVD303SLS')['ground']), (None, None))
+
+    def test_a_plain_row_beats_both_for_a_style_the_map_does_not_know(self):
+        p = self.c.raw('ROQAVC307SLS', 'NN')
+        self.assertEqual((p['price'], p['ids'], p['flags']), (3.5555, ('GN!F112',), ()))
+        self.assertEqual(dict(p['skip']), {'GN!F113': 'variant_not_this_style', 'GN!F114': 'variant_not_this_style'})
+        # A mapped style on the same sheet takes its own white or colour row, the plain row set aside. (The row
+        # that names the style's ground is the more specific one; pinned here so a change is deliberate.)
+        w = self.c.raw('ROQAVC305SLS', 'NN')
+        self.assertEqual((w['price'], w['ids'], w['flags']), (3.2323, ('GN!F113',), ('colour_row',)))
+        self.assertEqual(dict(w['skip'])['GN!F112'], 'variant_not_this_style')
+        self.assertEqual(self.c.raw('ROQAVC306SLS', 'NN')['ids'], ('GN!F114',))
+
+    def test_the_brand_serial_key_is_found(self):
+        c = self.c
+        self.assertEqual(c.colour('ROQAVD304SLS'), {'cls': 'white', 'ground': 'white', 'print': False})
+        r = c.raw('ROQAVD304SLS', 'NN')
+        self.assertEqual((r['price'], r['ids'], r['flags']), (3.2626, ('GN!F115',), ('colour_row',)))
+        self.assertEqual(c.raw('TMQAVD304SLS', 'NN')['ids'], ('GN!F115',))      # the key names the brand and serial
+        self.assertIsNone(c.colour('ROQBVD304SLS'))                            # QB_304 is not QA_304
+        o = c.raw('ROQBVD304SLS', 'NN')                                        # QA's rows as the last resort, colour assumed
+        self.assertEqual(o['level'], 'L4c')
+        self.assertTrue({'cross_brand', 'colour_assumed'} <= set(o['flags']))
+
+    def test_a_map_with_bad_entries_or_none_changes_nothing(self):
+        for cmap in (None, {}, 'x', {5: 'WHITE SOLID', 'ROQAVD301SLS': 7, 'ROQAVD302SLS': '  '}):
+            c = ci_cm(cmap)
+            self.assertEqual(c.cmap, {})
+            self.assertEqual(c.raw('ROQAVD301SLS', 'NN')['flags'], ('colour_assumed',))
+        c = ci_cm({' roqavd301sls ': 'WHITE SOLID'})
+        self.assertEqual(c.cmap, {'ROQAVD301SLS': 'WHITE SOLID'})
+        self.assertEqual(c.raw('ROQAVD301SLS', 'NN')['ids'], ('GN!F115',))
+
+    def test_a_style_number_without_a_pattern_letter_reads_the_map(self):
+        c = self.c
+        self.assertIsNone(E.decode_sku('ROQAVQ240SL')['pat'])
+        s = c.raw('ROQAVQ240SL', 'NN')
+        self.assertEqual((s['level'], s['price'], s['ids'], s['flags']), ('L4a', 3.3131, ('GN!F101',), ('pattern_from_colour',)))
+        self.assertEqual(dict(s['skip'])['GN!F104'], 'other_pattern')
+        self.assertIn('The style number has no pattern letter, so the pattern comes from the colour map', s['basis'])
+        d = c.decode('ROQAVQ240SL')
+        self.assertEqual((d['pat'], d['patSrc'], d['colour']), ('SOLID', 'colour', 'black'))
+        p = c.raw('ROQAVQ241SL', 'NN')                                     # a fancy is a print
+        self.assertEqual((p['price'], p['ids'], p['flags']), (3.5353, ('GN!F104',), ('pattern_from_colour', 'pattern_guess')))
+        self.assertEqual((c.decode('ROQAVQ241SL')['pat'], c.decode('ROQAVQ241SL')['patSrc']), ('PRINT', 'colour'))
+        n = c.raw('ROQAVQ244SL', 'NN')                                     # not in the map: every pattern fits (R7)
+        self.assertEqual((n['price'], n['ids']), (3.3131, ('GN!F101',)))
+        self.assertIn('ambiguous_rows', n['flags'])
+        self.assertNotIn('pattern_from_colour', n['flags'])
+        self.assertIsNone(c.decode('ROQAVQ244SL')['pat'])
+
+    def test_a_letter_that_disagrees_with_the_map_keeps_the_letter(self):
+        c = self.c
+        s = c.raw('ROQAVQ242SLS', 'NN')                                    # S says solid, the map says a print
+        self.assertEqual((s['price'], s['ids'], s['flags']), (3.3131, ('GN!F101',), ('pattern_conflict',)))
+        self.assertEqual(dict(s['skip'])['GN!F104'], 'other_pattern')
+        d = c.decode('ROQAVQ242SLS')
+        self.assertEqual((d['pat'], d['patSrc'], d['patConflict'], d['colour']), ('SOLID', None, True, 'fancies'))
+        p = c.raw('ROQAVQ243SLP', 'NN')                                    # P says print, the map says a solid
+        self.assertEqual((p['price'], p['ids']), (3.5353, ('GN!F104',)))
+        self.assertTrue({'pattern_conflict', 'pattern_guess'} <= set(p['flags']))
+        self.assertTrue(c.decode('ROQAVQ243SLP')['patConflict'])
+        self.assertEqual(c.raw('ROQAVQ201SLS', 'NN')['flags'], ())       # not in the map: no conflict
+
+    def test_dataset_passes_the_map_and_counts_its_keys(self):
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('41', 'ROQAVD301SLS', 10, 9.0)]
+        s['colour_map'] = {'ROQAVD301SLS': 'WHITE SOLID', 'QA_777': 'NAVY SOLID', 'bad': 5}
+        ds = build(s, cb=C15_BOOK)
+        self.assertEqual(ds['inputs']['colourMapKeys'], 2)
+        line = by(ds, 'lines', 'id')['41|ROQAVD301SLS']
+        self.assertEqual((line['fobU'], line['level']), (3.2626, 'L4a'))
+        self.assertIn('colour_row', line['flags'])
+        st = by(ds, 'styles', 'base')['ROQAVD301SLS']
+        self.assertEqual((st['costRow'][1], st['costFlags']), ('F115', ['colour_row']))
+        self.assertEqual(build(src(), cb=C15_BOOK)['inputs']['colourMapKeys'], 0)
+
+
+# Fabric families: params say QG is a sibling of QF. Brand QB has a QG row only; brand QC has no row at all.
+FAM_RECS = [calc('GN!G1', 'GN:BASE', 4.7171, 'QB', ['QG'], 'SLIM', 'SOLID'),
+            # a Pinnacle-type list (source code PC, as the AA fixtures above) naming a QB style on one ref
+            rec('AA!J21', 'PC', 'ref_price_list', 6.2121, factory_code='AA', production_ref='AA26021',
+                style='ROQBQF311SLS', fabric_codes=['QF'], scope='ref_style')]
+FAM_BOOK = dict(basis_book(FAM_RECS), params=dict(PARAMS, fabricFamilies={'QF': ['QG']}))
+
+
+class FabricFamilyOct7(unittest.TestCase):
+    def test_the_brands_own_family_row_before_another_brands_row(self):
+        c = ci(costbook=FAM_BOOK)
+        r = c.raw('ROQBQF301SLS', 'NN')
+        self.assertEqual((r['level'], r['price'], r['ids'], r['flags']), ('L4d', 4.7171, ('GN!G1',), ('derived', 'fabric_family')))
+        self.assertNotIn('cross_brand', r['flags'])
+        self.assertIn("No sheet row for fabric QF under this brand, so the brand's row for QG, a fabric of the same "
+                      'family, is used', r['basis'])
+        pub = c.resolve('ROQBQF301SLS', 'NN')
+        self.assertEqual((pub['level'], pub['fobU'], pub['evidence']), ('L4d', 4.7171, ['GN!G1']))
+        self.assertEqual(E.grade_of('L4d'), 'B')
+        # Without a family for QF, the same style takes another brand's QF row, as before (L4c, grade D).
+        plain = ci(costbook=basis_book(FAM_RECS)).raw('ROQBQF301SLS', 'NN')
+        self.assertEqual(plain['level'], 'L4c')
+        self.assertIn('cross_brand', plain['flags'])
+        self.assertIs(ci().families, E.FABRIC_FAMILY_SIBLINGS)          # no param: the public table
+        self.assertEqual(ci(costbook=FAM_BOOK).families, {'QF': ['QG']})
+
+    def test_family_skus(self):
+        c = ci(costbook=FAM_BOOK)
+        fam = c.family_skus(c.decode('ROQBQF301SLS'))
+        self.assertEqual([(s['fab'], s['famOf'], s['base']) for s in fam], [('QG', 'QF', 'ROQBQF301SLS')])
+        self.assertEqual(c.family_skus(c.decode('ROQBQH302SLS')), [])          # QH has no family
+        self.assertEqual(c.family_skus(c.decode('ROQBQFP02SRS')), [])          # pants: no calculator price
+        self.assertEqual(c.family_skus(None), [])
+
+    def test_a_list_proxy_still_wins_and_another_brand_only_without_a_family_row(self):
+        c = ci(costbook=FAM_BOOK)
+        l5 = c.raw('ROQBQF311SLS', 'NN')                                   # the style on a factory list: L5 first
+        self.assertEqual((l5['level'], l5['price'], l5['ids']), ('L5', 6.2121, ('AA!J21',)))
+        x = c.raw('ROQCQF303SLS', 'NN')                                    # QC: no QG row, so another brand's QF row
+        self.assertEqual((x['level'], x['gcap']), ('L4c', 'D'))
+        self.assertIn('cross_brand', x['flags'])
+        self.assertNotIn('fabric_family', x['flags'])
+        h = c.raw('ROQBQH302SLS', 'NN')                                    # QH: no family at all
+        self.assertEqual((h['level'], h['price'], h['ids']), ('L4c', 5.0505, ('GN!F2',)))
+
+    def test_grid_exact_quotes_and_the_combined_cost_carry_the_family_match(self):
+        c = ci(costbook=FAM_BOOK)
+        m = c.grid_exact(c.decode('ROQBQF301SLS'), 'NN')
+        self.assertEqual(len(m), 5)
+        self.assertEqual((m[0], m[1]['c']['id'], m[2], m[3]), ('L4d', 'GN!G1', 0.0, 'exact'))
+        self.assertEqual((m[4]['fab'], m[4]['famOf']), ('QG', 'QF'))
+        self.assertEqual(len(c.grid_exact(c.decode('ROQAQF201SLS'), 'NN')), 4)    # an own-fabric match: four items
+        q = c.quotes('ROQBQF301SLS')
+        self.assertEqual([(x['fac'], x['level'], x['price'], x['src']) for x in q], [('UNKNOWN', 'L4d', 4.7171, 'GN')])
+        self.assertIn('fabric_family', q[0]['flags'])
+        cb = c.combined('ROQBQF301SLS')
+        self.assertEqual((cb['rule'], cb['res']['price'], cb['res']['level'], cb['res']['gcap']), ('single', 4.7171, 'L4d', 'B'))
+        self.assertIn('fabric_family', cb['res']['flags'])
+        sq = c.style_quote('ROQBQF301SLS')
+        self.assertEqual((sq['fobU'], sq['grade'], sq['costByFactory']), (4.7171, 'B', [['UNKNOWN', 'GN', 'S', 4.7171, 'L4d']]))
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('42', 'ROQBQF301SLS', 10, 9.0)]
+        ds = build(s, cb=FAM_BOOK)
+        line = by(ds, 'lines', 'id')['42|ROQBQF301SLS']
+        self.assertEqual((line['fobU'], line['level'], line['routing']), (4.7171, 'L4d', 'R6'))   # grade D is the routing
+        self.assertIn('fabric_family', line['flags'])
+        st = by(ds, 'styles', 'base')['ROQBQF301SLS']
+        self.assertEqual((st['fobU'], st['level'], st['grade']), (4.7171, 'L4d', 'B'))
+        self.assertEqual((st['costRow'][:2], st['costFlags'], st['costRule']), (['SYN-GN', 'G1'], ['fabric_family'], 'single'))
+
+    def test_clean_params_fabric_families(self):
+        out, missing, invalid = E.clean_params(dict(PARAMS, fabricFamilies='x'))
+        self.assertNotIn('fabricFamilies', out)
+        self.assertEqual(invalid, ['fabricFamilies'])
+        self.assertEqual(missing, [])                                      # an optional param
+        out, _, invalid = E.clean_params(dict(PARAMS, fabricFamilies={'qf': ['qg', ' qh ']}))
+        self.assertEqual((out['fabricFamilies'], invalid), ({'QF': ['QG', 'QH']}, []))
+        out, _, invalid = E.clean_params(dict(PARAMS, fabricFamilies={'QF': ['QG'], 'QH': 'QG'}))
+        self.assertEqual((out['fabricFamilies'], invalid), ({'QF': ['QG']}, ['fabricFamilies']))
+        out, _, invalid = E.clean_params(dict(PARAMS, fabricFamilies=None))
+        self.assertEqual((out['fabricFamilies'], invalid), (None, []))
+        bad = dict(basis_book(), params=dict(PARAMS, fabricFamilies='x'))
+        self.assertIs(E.CostIndex(bad, {}, [], []).families, E.FABRIC_FAMILY_SIBLINGS)
+        ds = build(src(), cb=bad)
+        a = {a['id']: a for a in ds['alerts']}['al_costbook_params']
+        self.assertIn('fabric families', a['detail'])
+        self.assertEqual((a['invalid'], ds['inputs']['costbookInvalid']), (['fabricFamilies'], ['fabricFamilies']))
+
+
+# Customer blocks: the CLUB group's own block on the GN family (GN:CLUB, not a base sheet) and a group (ZBASE,
+# prefix ZB) whose own block is the GN base sheet.
+POOL_PARAMS = copy.deepcopy(PARAMS)
+POOL_PARAMS['customerGroupPrefix']['ZB'] = 'ZBASE'
+POOL_PARAMS['poolOrder']['GN']['byGroup']['ZBASE'] = ['GN:BASE']
+POOL_RECS = [calc('GN!C1', 'GN:CLUB', 3.0303, 'QA', ['QF'], 'SLIM', 'SOLID'),
+             calc('GN!C2', 'GN:CLUB', 3.1313, 'QA', ['QW'], 'SLIM', 'SOLID')]
+POOL_BOOK = dict(basis_book(POOL_RECS), params=POOL_PARAMS)
+
+
+class CustomerBlocksOct7(unittest.TestCase):
+    def test_base_and_group_pools(self):
+        c = ci(costbook=POOL_BOOK)
+        self.assertEqual(c.base_pools(), {'GN:BASE', 'GY:BASE', 'GK:ANY'})
+        self.assertEqual(c.group_pools('CLUB'), ['GY:CLUB', 'GN:CLUB'])
+        self.assertEqual(c.group_pools('ZBASE'), ['GN:BASE'])
+        self.assertEqual(c.group_pools('OTHER'), [])
+        self.assertEqual(c.pool_order('TT', 'CLUB', 'dress_shirt'), (['GY:CLUB', 'GN:CLUB', 'GY:BASE'], ['GN:BASE', 'GK:ANY']))
+        self.assertEqual(c.pool_order('NN', 'CLUB', 'dress_shirt'), (['GY:CLUB', 'GN:CLUB', 'GN:BASE'], ['GY:BASE', 'GK:ANY']))
+        self.assertEqual(c.pool_order('TT', 'OTHER', 'dress_shirt'), (['GY:BASE'], ['GN:BASE', 'GK:ANY']))
+        self.assertEqual(c.pool_order('TT', 'ZBASE', 'dress_shirt'), (['GY:BASE'], ['GN:BASE', 'GK:ANY']))
+        self.assertEqual(c.pool_order('NN', 'ZBASE', 'dress_shirt'), (['GN:BASE'], ['GY:BASE', 'GK:ANY']))
+        self.assertEqual(c.pool_order('TT', 'CLUB', 'polo'), (['GK:ANY'], ['GY:BASE']))
+
+    def test_the_customers_block_comes_first_on_every_factory(self):
+        c = ci(costbook=POOL_BOOK)
+        for fac in ('TT', 'NN', 'UNKNOWN'):
+            r = c.raw('CLQAQF201SLS', fac)
+            self.assertEqual((r['level'], r['price'], r['ids'], r['flags']), ('L4a', 3.0303, ('GN!C1',), ()), fac)
+        self.assertEqual(c.raw('CLQAQW202SLS', 'TT')['price'], 3.1313)
+
+    def test_another_group_never_prices_from_the_block(self):
+        c = ci(costbook=POOL_BOOK)
+        self.assertEqual(c.raw('ROQAQF201SLS', 'TT')['ids'], ('GY!F1',))        # the factory grid, as before
+        self.assertEqual(c.raw('ROQAQF201SLS', 'NN')['ids'], ('GN!F1',))
+        self.assertEqual(c.raw('ROQAQW202SLS', 'TT')['level'], 'L7')          # QW is only in the club block
+        self.assertEqual(c.raw('ZBQAQW202SLS', 'TT')['level'], 'L7')
+        l6 = ci([led('NN26001', 'ROQAQF801SLS', 100)], costbook=POOL_BOOK).resolve('ROQAQW202SLS', 'TT')
+        self.assertEqual(l6['level'], 'L6')                                  # a default, never the block
+
+    def test_a_group_whose_own_sheet_is_a_base_sheet_keeps_the_factory_order(self):
+        c = ci(costbook=POOL_BOOK)
+        t = c.raw('ZBQAQF201SLS', 'TT')
+        self.assertEqual((t['level'], t['price'], t['ids']), ('L4a', 4.1717, ('GY!F1',)))        # TT prefers GY
+        n = c.raw('ZBQAQF201SLS', 'NN')
+        self.assertEqual((n['level'], n['price'], n['ids']), ('L4a', 4.4444, ('GN!F1',)))
+        z = c.raw('ZBQAQH203SLS', 'TT')
+        self.assertEqual((z['level'], z['ids'], z['flags']), ('L4b', ('GN!F2',), ()))
+
+    def test_group_block_missing(self):
+        c = ci(costbook=POOL_BOOK)
+        r = c.raw('CLQAQH203SLS', 'TT')                                      # QH is only on the GN base sheet
+        self.assertEqual((r['level'], r['price'], r['ids'], r['flags']), ('L4b', 5.0505, ('GN!F2',), ('group_block_missing',)))
+        self.assertIn("This customer's own price block has no row for the style, so a regular sheet is used", r['basis'])
+        self.assertEqual(c.raw('CLQAQF201SLS', 'TT')['flags'], ())           # its block has the row
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('43', 'CLQAQH203SLS', 10, 9.0, cust='CLZZ')]
+        ds = build(s, cb=POOL_BOOK)
+        line = by(ds, 'lines', 'id')['43|CLQAQH203SLS']
+        self.assertIn('group_block_missing', line['flags'])
+        self.assertEqual(by(ds, 'styles', 'base')['CLQAQH203SLS']['costFlags'], ['group_block_missing'])
+
+
+# Delivered prices: a calculator row and a list row with terms DDP.
+DDP_RECS = [calc('GN!D1', 'GN:BASE', 5.1515, 'QA', ['QD'], 'SLIM', 'SOLID', terms='DDP'),
+            rec('AA!J31', 'PC', 'ref_price_list', 7.3131, factory_code='AA', production_ref='AA26031',
+                style='ROQAQF131SLS', fabric_codes=['QF'], scope='ref_style', terms='DDP')]
+DDP_BOOK = basis_book(DDP_RECS)
+
+
+class DeliveredPricesOct7(unittest.TestCase):
+    def test_is_ddp(self):
+        self.assertTrue(E._is_ddp({'terms': 'DDP'}))
+        self.assertTrue(E._is_ddp({'terms': ' ddp '}))
+        for v in ({'terms': 'FOB'}, {'terms': ''}, {'terms': None}, {}, None, {'terms': 'DDP '[:2]}):
+            self.assertFalse(E._is_ddp(v), v)
+
+    def test_a_delivered_record_flags_its_resolution(self):
+        c = ci(costbook=DDP_BOOK)
+        r = c.resolve('ROQAQD201SLS', 'NN')
+        self.assertEqual((r['level'], r['fobU'], r['flags']), ('L4a', 5.1515, ['ddp']))
+        self.assertIn('A delivered (DDP) price: duty and freight are in it, so no import costs are added', r['basis'])
+        lst = c.resolve('ROQAQF131SLS', 'AA', 'AA26031')                       # a list row: the terms step adds it
+        self.assertEqual((lst['level'], lst['fobU'], lst['flags']), ('L1', 7.3131, ['ddp']))
+        self.assertEqual(c.resolve('ROQAQF101SLS', 'AA', 'AA26001')['flags'], [])   # an FOB list row
+        self.assertEqual(c.resolve('ROQAQF201SLS', 'NN')['flags'], [])
+        self.assertEqual([q['flags'] for q in c.quotes('ROQAQF131SLS')], [('ddp',)])
+
+    def test_an_open_line_costed_from_it_adds_no_import_costs(self):
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('31', 'ROQAQD201SLS', 10, 9.0)]
+        ds = build(s, cb=DDP_BOOK)
+        L = by(ds, 'lines', 'id')['31|ROQAQD201SLS']
+        self.assertEqual((L['dutyRegime'], L['duty'], L['freight'], L['fees'], L['fobU'], L['fob'], L['cogs']),
+                         ('none', 0.0, 0.0, 0.0, 5.1515, 51.52, 51.52))
+        self.assertIn('ddp', L['flags'])
+        for f in ('non_us_dest', 'fob_line', 'ddp_mixed'):
+            self.assertNotIn(f, L['flags'])
+        self.assertEqual(L['fobLine'], 0)
+        for k, v in client_recalc(L, ds['settings'], ds['dict'], 'lines').items():
+            self.assertEqual(L[k], v, k)
+        self.assertEqual(by(ds, 'styles', 'base')['ROQAQD201SLS']['costFlags'], ['ddp'])
+        self.assertNotIn('non_us_dest', kinds_of(ds))
+
+    def test_a_manual_cost_with_ddp_terms_on_every_table(self):
+        ov = [ovr('v1', 'style', {'style': 'ROQAQF201SLS'}, 9.2222, terms='DDP')]
+        c = ci(overrides=ov)
+        r = c.resolve('ROQAQF201SLS', 'TT', 'TT26001')
+        self.assertEqual((r['level'], r['fobU'], r['flags']), ('L0', 9.2222, ['ddp']))
+        self.assertIn('Delivered (DDP) price, no import costs added', r['basis'])
+        self.assertEqual(ci(overrides=[ovr('v2', 'style', {'style': 'ROQAQF201SLS'}, 9.2222, terms='FOB')])
+                         .resolve('ROQAQF201SLS', 'TT')['flags'], [])
+        ds = build(src(), overrides=ov)
+        for key in ('1|ROQAQF201SLS', '2|ROQAQF201SLS'):
+            L = by(ds, 'lines', 'id')[key]
+            self.assertEqual((L['level'], L['dutyRegime'], L['duty'], L['freight'], L['fees']), ('L0', 'none', 0.0, 0.0, 0.0))
+            self.assertIn('ddp', L['flags'])
+            self.assertNotIn('non_us_dest', L['flags'])
+        for r in rows(ds, 'inventory'):
+            if r['base'] == 'ROQAQF201SLS':
+                self.assertEqual((r['level'], r['dutyRegime'], r['landed'], r['landedU']), ('L0', 'none', r['fob'], r['fobU']))
+                self.assertIn('ddp', r['flags'])
+                self.assertNotIn('non_us_dest', r['flags'])
+        p = by(ds, 'production', 'ref')['TT26001']
+        self.assertEqual((p['level'], p['dutyRegime'], p['landed'], p['flags']), ('L0', 'none', p['fob'], ['ddp']))
+        a = [r for r in rows(ds, 'apo') if r['base'] == 'ROQAQF201SLS'][0]
+        self.assertEqual((a['dutyRegime'], a['duty'], a['freight'], a['fees']), ('none', 0.0, 0.0, 0.0))
+        self.assertIn('ddp', a['flags'])
+        st = by(ds, 'styles', 'base')['ROQAQF201SLS']
+        self.assertEqual((st['fobU'], st['landedU'], st['costRule']), (9.2222, 9.2222, 'manual'))
+
+    def test_a_mix_of_delivered_and_fob_parts_keeps_the_import_costs(self):
+        # Line 4 (ROQAQH204SLS, 600 units) is placed 300 on TT26002 and 300 on NN26002. A delivered manual cost on
+        # TT26002 only: the line stays a US import, flagged ddp_mixed, never ddp. The same in both cost rule modes.
+        mix = [ovr('m1', 'ref_style', {'ref': 'TT26002', 'style': 'ROQAQH204SLS'}, 9.3333, terms='DDP')]
+        for settings in ({}, CASCADE):
+            ds = build(src(), overrides=mix, settings=settings)
+            L = by(ds, 'lines', 'id')['4|ROQAQH204SLS']
+            al = {a['ref']: a for a in rows(ds, 'alloc') if a['line'] == L['id']}
+            self.assertEqual({k: (v['units'], v['level']) for k, v in al.items()}, {'TT26002': (300, 'L0'), 'NN26002': (300, 'L4a')})
+            self.assertEqual((L['dutyRegime'], L['factory'], L['fobU']), ('us', 'MIX', E.r4((300 * 9.3333 + 300 * 5.0505) / 600)))
+            self.assertIn('ddp_mixed', L['flags'])
+            self.assertNotIn('ddp', L['flags'])
+            self.assertGreater(L['duty'], 0)
+            d, f, e = E.adders(L['fob'], L['units'], L['cat'], L['fiber'], L['origin'], ds['settings'], 'us')
+            self.assertEqual((L['duty'], L['freight'], L['fees']), (d, f, e))
+            P = {r['ref']: r for r in rows(ds, 'production') if r['base'] == 'ROQAQH204SLS'}   # each ref makes two styles
+            self.assertEqual((P['TT26002']['dutyRegime'], P['TT26002']['fobU'], P['TT26002']['landed']),
+                             ('none', 9.3333, P['TT26002']['fob']))
+            self.assertIn('ddp', P['TT26002']['flags'])
+            self.assertEqual(P['NN26002']['dutyRegime'], 'us')
+            self.assertNotIn('ddp', P['NN26002']['flags'])
+            self.assertGreater(P['NN26002']['landed'], P['NN26002']['fob'])
+        # Stock blended from both refs (lot tier T4) in cascade mode: a weighted cost flagged ddp_mixed, still an import.
+        s = src()
+        s['inventory']['items'] = s['inventory']['items'] + [inv('ROQAQH204SLS-M', tr=100)]
+        row = [r for r in rows(build(s, overrides=mix, settings=CASCADE), 'inventory') if r['sku'] == 'ROQAQH204SLS-M'][0]
+        self.assertEqual((row['lotTier'], row['dutyRegime'], row['fobU']), ('T4', 'us', E.r4((9.3333 + 5.0505) / 2)))
+        self.assertIn('ddp_mixed', row['flags'])
+        self.assertNotIn('ddp', row['flags'])
+        self.assertGreater(row['landed'], row['fob'])
+
+    def test_dict_labels_every_new_flag(self):
+        for f in NEW_FLAGS:
+            self.assertIn(f, E.FLAG_LABELS, f)
+            self.assertNotRegex(E.FLAG_LABELS[f], '[\u2013\u2014]')
+        self.assertTrue(set(E.C15_FLAGS) <= set(E.FLAG_LABELS))
+        self.assertTrue({'colour_row', 'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'fabric_family',
+                         'group_block_missing', 'ddp'} <= set(E.C15_FLAGS))
+        mix = [ovr('m1', 'ref_style', {'ref': 'TT26002', 'style': 'ROQAQH204SLS'}, 9.3333, terms='DDP')]
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [order('31', 'ROQAQD201SLS', 10, 9.0)]
+        seen = set()
+        for ds in (build(s, cb=DDP_BOOK, overrides=mix), build(src(), cb=FAM_BOOK)):
+            for t in ('lines', 'apo', 'inventory', 'production'):
+                for r in rows(ds, t):
+                    for f in r['flags']:
+                        self.assertIn(f, ds['dict']['flags'], (t, f))
+                        seen.add(f)
+            for f in NEW_FLAGS:
+                self.assertIn(f, ds['dict']['flags'])
+        self.assertTrue({'ddp', 'ddp_mixed'} <= seen)
+
+
+class ManualCostKeysOct7(unittest.TestCase):
+    def test_style_keys(self):
+        self.assertEqual(E.CostIndex.style_keys('ZZQA123-RED-M', 'ZZQA123'), ('ZZQA123-RED', 'ZZQA123'))
+        self.assertEqual(E.CostIndex.style_keys('ZZQA123-RED-M', E.base_of('ZZQA123-RED-M')), ('ZZQA123-RED', 'ZZQA123'))
+        self.assertEqual(E.CostIndex.style_keys('ROQAQF201SLS-M', 'ROQAQF201SLS'), ('ROQAQF201SLS',))
+        self.assertEqual(E.CostIndex.style_keys('ZZQQF522-904', 'ZZQQF522'), ('ZZQQF522-904', 'ZZQQF522'))
+        self.assertEqual(E.CostIndex.style_keys(' zzqa123-red-m 15', 'ZZQA123'), ('ZZQA123-RED', 'ZZQA123'))
+        self.assertEqual(E.CostIndex.style_keys(None, 'ZZQA123'), ('ZZQA123',))
+        self.assertEqual(E.CostIndex.style_keys('', 'ZZQA123'), ('ZZQA123',))
+        self.assertEqual((E.hist_base_of('ZZQA123-RED-M'), E.base_of('ZZQA123-RED-M')), ('ZZQA123-RED', 'ZZQA123'))
+
+    def test_a_cost_keyed_by_the_history_base_reaches_the_stock_row(self):
+        ov = [ovr('k1', 'style', {'style': 'ZZQA123-RED'}, 8.1111)]
+        c = ci(overrides=ov)
+        self.assertEqual(c.raw('ZZQA123', 'UNKNOWN')['level'], 'L7')                                 # the base alone: no
+        self.assertEqual(c.raw('ZZQA123', 'UNKNOWN', full='ZZQA123-BLU-M')['level'], 'L7')          # another colour: no
+        full = c.raw('ZZQA123', 'UNKNOWN', full='ZZQA123-RED-M')
+        self.assertEqual((full['level'], full['price'], full['ids']), ('L0', 8.1111, ('OVR:k1',)))
+        s = src()
+        s['inventory']['items'] = s['inventory']['items'] + [inv('ZZQA123-RED-M', tr=50), inv('ZZQA123-BLU-M', tr=20)]
+        I = {r['sku']: r for r in rows(build(s, overrides=ov), 'inventory')}
+        self.assertEqual((I['ZZQA123-RED-M']['base'], I['ZZQA123-RED-M']['level'], I['ZZQA123-RED-M']['fobU']),
+                         ('ZZQA123', 'L0', 8.1111))
+        self.assertEqual((I['ZZQA123-BLU-M']['level'], I['ZZQA123-BLU-M']['fobU']), ('L7', None))
+        self.assertEqual(by(build(s), 'inventory', 'sku')['ZZQA123-RED-M']['level'], 'L7')          # no cost: L7
+
+
+class ShippedUnitsOct7(unittest.TestCase):
+    def test_company_units_count_garments_and_inv_units_the_invoice_units(self):
+        ds = build(src_kit_hist())
+        comp = {r['month']: r for r in rows({'c': ds['shipped']['company']}, 'c')}
+        self.assertIn('invUnits', ds['shipped']['company']['fields'])
+        # January: 30 shirts plus 10 cartons of 12; February: 20 shirts.
+        self.assertEqual((comp['2026-01']['units'], comp['2026-01']['invUnits'], comp['2026-01']['rev']), (150, 40, 1500.0))
+        self.assertEqual((comp['2026-02']['units'], comp['2026-02']['invUnits']), (20, 20))
+        self.assertEqual(sum(r['units'] for r in comp.values()), 170)
+        self.assertEqual(sum(r['invUnits'] for r in comp.values()), 60)
+        Y = by({'b': ds['shipped']['byStyle']}, 'b', 'base')
+        self.assertEqual((Y['ZZKIT01']['pcs'], Y['ROQAQF201SLS']['pcs']), (12, 1))
+        self.assertEqual(Y['ZZKIT01']['months'], {'2026-01': [10, 1200.0]})          # invoice units stay cartons
+        self.assertIn('pcs', ds['shipped']['byStyle']['fields'])
+        plain = build(src())                                                       # no kit: both counts agree
+        for r in rows({'c': plain['shipped']['company']}, 'c'):
+            self.assertEqual(r['units'], r['invUnits'], r['month'])
+        self.assertTrue(all(r['pcs'] == 1 for r in rows({'b': plain['shipped']['byStyle']}, 'b')))
+
+
+def src_pending(to=None):
+    """src() plus the open-orders archive's awaiting-invoice estimate: one account (ZZPC), one style, one month."""
+    s = src()
+    if to:
+        s['sales_analytics']['source']['to'] = to
+    s['sales_pending'] = {'ready': True,
+                          'cube': {'ZZPC': {'ROQAQF201SLS': {'2026-03': [100, 1000.0]}}},
+                          'summary': {'totals': {'pos': 3, 'units': 100, 'value': 1000.0}, 'customers': {'ZZPC': {'pos': 3}}},
+                          'invoicesThrough': '2026-02-20'}
+    return s
+
+
+class PendingOct7(unittest.TestCase):
+    def test_the_block_is_costed_like_an_invoice_and_kept_apart(self):
+        ds = build(src_pending())
+        P = ds['shipped']['pending']
+        self.assertEqual((P['ready'], P['basis'], P['months'], P['invoicesThrough']), (True, 'estimate', ['2026-03'], '2026-02-20'))
+        self.assertEqual(P['totals'], {'pos': 3, 'units': 100, 'value': 1000.0})
+        self.assertEqual(P['company']['fields'], list(E.PENDING_FIELDS))
+        self.assertNotRegex(P['note'], '[\u2013\u2014]')
+        self.assertIn('Not part of the invoiced months', P['note'])
+        # One row, to the cent: the style's cost today, this account's chargeback rate, a US import.
+        S = ds['settings']
+        unit = by(ds, 'styles', 'base')['ROQAQF201SLS']['fobU']
+        origin = by(ds, 'lines', 'id')['1|ROQAQF201SLS']['origin']
+        ded = E._ded_pct('ZZPC', S, E._cust_group('ZZPC', S, frozenset()))
+        fob = E.r2(100 * unit)
+        m = E.line_money(1000.0, fob, 100, 'dress_shirt', 'mmf', origin, 'us', ded, E._roy_pct('QA', S), S)
+        want = dict(m, month='2026-03', units=100, invUnits=100, rev=1000.0, fob=fob, costedShare=1.0, costedRev=1000.0)
+        row = rows({'c': P['company']}, 'c')[0]
+        self.assertEqual(row, want)
+        self.assertEqual(row['duty'], E.r2(fob * (25.9 + 20.0) / 100 + 100 * 0.07))       # public US rates
+        self.assertEqual(P['byCustomer'], [dict({k: v for k, v in want.items() if k != 'month'}, cust='ZZPC', pos=3)])
+        # Nothing of it reaches the invoiced months.
+        plain = build(src())
+        for k in ('months', 'company', 'byStyle', 'byCustomer', 'note', 'range'):
+            self.assertEqual(ds['shipped'][k], plain['shipped'][k], k)
+        self.assertEqual(ds['totals'], plain['totals'])
+        self.assertEqual(ds['inputs']['pending'], {'ready': True, 'totals': {'pos': 3, 'units': 100, 'value': 1000.0}})
+        self.assertEqual(plain['inputs']['pending'], {'ready': False, 'totals': {'pos': 0, 'units': 0, 'value': 0.0}})
+        json.dumps(ds, allow_nan=False)
+
+    def test_pieces_regime_and_months_follow_the_account(self):
+        s = src_pending()
+        s['sales_pending']['cube'] = {'FOBX': {'ROQAQF201SLS': {'2026-03-15': [10, 100.0], '2026-04': [5, 50.0], '2025-12': [0, 0.0]}},
+                                      'ZZPC': {'ZZKIT01': {'2026-03': [2, 240.0]}, 'ZZNOCOST9': {'2026-03': [4, 40.0]}}}
+        s['sales_pending']['summary']['customers'] = {'FOBX': {'pos': 1}, 'ZZPC': {'pos': 2}}
+        P = build(s)['shipped']['pending']
+        self.assertEqual(P['months'], ['2026-03', '2026-04'])                     # a day in the key folds; zero rows skip
+        C = {r['cust']: r for r in P['byCustomer']}
+        self.assertEqual((C['FOBX']['pos'], C['FOBX']['units'], C['FOBX']['rev']), (1, 15, 150.0))
+        self.assertEqual((C['FOBX']['duty'], C['FOBX']['freight'], C['FOBX']['fees']), (0.0, 0.0, 0.0))    # an FOB account
+        self.assertEqual((C['ZZPC']['units'], C['ZZPC']['invUnits'], C['ZZPC']['pos']), (2 * 12 + 4, 6, 2))   # kit pieces
+        self.assertEqual((C['ZZPC']['costedRev'], C['ZZPC']['costedShare']), (240.0, round(240.0 / 280.0, 3)))
+
+    def test_not_available_without_the_source(self):
+        for s in (src(), dict(src(), sales_pending={'ready': False}), dict(src(), sales_pending={'ready': True}),
+                  dict(src(), sales_pending='x'), dict(src(), sales_pending={'ready': True, 'cube': 'x'})):
+            P = build(s)['shipped']['pending']
+            self.assertEqual((P['ready'], P['months'], P['byCustomer'], P['company']['rows']), (False, [], [], []))
+            self.assertEqual(P['totals'], {'pos': 0, 'units': 0, 'value': 0.0})
+            self.assertEqual(P['invoicesThrough'], '2026-02-20')                  # the invoice history's own date
+            self.assertEqual(P['note'], 'Awaiting-invoice estimates are not available from the open-orders service right now.')
+        b = build(src(analytics=False))                                           # history still loading: the block exists
+        self.assertEqual((b['shipped']['state'], b['shipped']['pending']['ready']), ('building', False))
+
+    def test_the_stale_history_alert_names_the_estimate(self):
+        self.assertEqual(E.STALE_ANALYTICS_DAYS, 10)
+        est = 'About 3 purchase orders (100 units, $1,000) have shipped since then with no invoice loaded; the Statement shows them as an estimate.'
+        a = {a['id']: a for a in build(src_pending('2026-02-15'))['alerts']}['al_stale_analytics']   # 15 days: info
+        self.assertEqual((a['severity'], a['title']), ('info', 'Shipped history is old'))
+        self.assertIn('The invoice history ends on Feb 15, 2026, 15 days ago.', a['detail'])
+        self.assertIn(est, a['detail'])
+        self.assertNotRegex(a['detail'], '[\u2013\u2014]')
+        m = {a['id']: a for a in build(src_pending('2026-02-01'))['alerts']}['al_stale_analytics']   # 29 days: medium
+        self.assertEqual(m['severity'], 'medium')
+        self.assertIn(est, m['detail'])
+        s = src()
+        s['sales_analytics']['source']['to'] = '2026-02-15'
+        n = {a['id']: a for a in build(s)['alerts']}['al_stale_analytics']           # no estimate loaded: not mentioned
+        self.assertNotIn('estimate', n['detail'])
+        self.assertNotIn('al_stale_analytics', {a['id'] for a in build(src_pending())['alerts']})   # fresh: no alert
+
+
+class OrdersExportAlertOct7(unittest.TestCase):
+    def test_an_old_export_is_an_alert_and_the_inputs_say_so(self):
+        self.assertEqual(E.STALE_ORDERS_HOURS, 6)
+
+        def run(source, ok=True):
+            s = src(orders_ok=ok)
+            if source is not None:
+                s['open_orders']['source'] = source
+            ds = build(s)
+            return {a['id']: a for a in ds['alerts']}.get('al_orders_export'), ds['inputs']['orders_source']
+        a, inp = run({'ageHours': 9, 'stale': False})
+        self.assertEqual((a['kind'], a['severity'], a['title'], a['count'], a['unit']),
+                         ('stale_input', 'medium', 'A2000 order export is old', 1, None))
+        self.assertIn('written 9 hours ago.', a['detail'])
+        self.assertNotRegex(a['detail'], '[\u2013\u2014]')
+        self.assertEqual(inp, {'modified': None, 'ageHours': 9, 'stale': False, 'checkedAt': None})
+        a, inp = run({'ageHours': 2, 'stale': False})                                   # fresh: nothing
+        self.assertIsNone(a)
+        self.assertEqual(inp['ageHours'], 2)
+        a, inp = run({'ageHours': 30, 'stale': True, 'modified': '2026-03-01T04:00:00Z', 'checkedAt': '2026-03-02T11:00:00Z'})
+        self.assertIn('written 30 hours ago (Mar 1, 2026).', a['detail'])
+        self.assertEqual(inp, {'modified': '2026-03-01T04:00:00Z', 'ageHours': 30, 'stale': True, 'checkedAt': '2026-03-02T11:00:00Z'})
+        a, _ = run({'stale': True})                                                     # the feed's own verdict
+        self.assertIn('written some time ago.', a['detail'])
+        a, inp = run(None)
+        self.assertIsNone(a)
+        self.assertIsNone(inp)
+        a, _ = run({'ageHours': 9, 'stale': False}, ok=False)                           # a failed feed: that alert only
+        self.assertIsNone(a)
+        self.assertIn('al_stale_orders', {x['id'] for x in build(src(orders_ok=False))['alerts']})
 
 
 if __name__ == '__main__':

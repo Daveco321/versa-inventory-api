@@ -14994,7 +14994,8 @@ def _fetch_all_open_orders():
         resp = http_requests.get(f"{OPEN_ORDERS_API_URL}/api/orders", headers=_oo_api_headers(), timeout=15)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
-        orders = resp.json().get('orders', []) or []
+        payload = resp.json()
+        orders = payload.get('orders', []) or []
         # An empty list is a bad payload, not a real 'no open orders' state —
         # don't cache it as fresh for the next 10 minutes.
         if not orders:
@@ -15003,6 +15004,11 @@ def _fetch_all_open_orders():
             _all_open_orders_cache['data'] = orders
             _all_open_orders_cache['fetched_at'] = time.time()
             _all_open_orders_cache['fail_until'] = 0
+            # What the feed says about its A2000 export (Oct 7 2026): the P&L warns when it is old.
+            _all_open_orders_cache['source'] = {'modified': payload.get('sourceModified'),
+                                                'ageHours': payload.get('sourceAgeHours'),
+                                                'stale': payload.get('sourceStale'),
+                                                'checkedAt': payload.get('sourceCheckedAt')}
         return list(orders), True
     except Exception as e:
         print(f"[FactoryView] open-orders fetch failed: {e}", flush=True)
@@ -21215,10 +21221,34 @@ def _pnl_sources():
         orders, ok = _fetch_all_open_orders()
         with _all_open_orders_lock:
             fetched = _all_open_orders_cache.get('fetched_at') or 0
-        return {'orders': orders, 'ok': bool(ok), 'fetched_at': _iso(fetched)}
+            source = dict(_all_open_orders_cache.get('source') or {})
+        return {'orders': orders, 'ok': bool(ok), 'fetched_at': _iso(fetched), 'source': source}
 
     def fob_customers():
         return list(_fetch_fob_customers() or [])
+
+    def colour_map():
+        # The platform colour map (S3 style_color_map.xlsx, cached hourly): white or colour sheet rows and
+        # patterns for style numbers without a pattern letter (Oct 7 2026). Looked up by name so a wiring
+        # without the loader (tests) gives an empty map, which changes nothing.
+        loader = globals().get('_apo_color_map')
+        try:
+            return dict((loader() if callable(loader) else None) or {})
+        except Exception:
+            return {}
+
+    def sales_pending():
+        # The open-orders awaiting-invoice estimates (its /api/sales-history/matrix pendingCube), from the
+        # same cached fetch the Analytics endpoint uses. Not ready: the P&L shows a note, nothing else.
+        getter = globals().get('_pnl_sales_matrix')
+        try:
+            m = getter() if callable(getter) else None
+        except Exception:
+            m = None
+        if not isinstance(m, dict) or m.get('building') or not m.get('pendingReady'):
+            return {'ready': False}
+        return {'ready': True, 'cube': m.get('pendingCube') or {}, 'summary': m.get('pending') or {},
+                'invoicesThrough': (m.get('source') or {}).get('to')}
 
     def routing_inputs():
         # Reloaded per call exactly like _pres_stock_cards: other workers may hold newer copies.
@@ -21243,7 +21273,7 @@ def _pnl_sources():
             'manual_allocations': manual_allocations, 'vw_allocations': vw_allocations,
             'open_orders': open_orders, 'fob_customers': fob_customers,
             'routing_inputs': routing_inputs, 'sales_analytics': _pnl_sales_analytics,
-            'today': today}
+            'today': today, 'colour_map': colour_map, 'sales_pending': sales_pending}
 
 
 # Identity for the P&L only. The shared _caller_identity cache keeps a profile for 300 s; for

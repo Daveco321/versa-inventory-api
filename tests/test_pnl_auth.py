@@ -155,6 +155,8 @@ ROUTE_CALLS = [
     ('/api/pnl/audit', 'POST', {'action': 'export', 'detail': 'tab=orders'}),
     ('/api/pnl/rotate', 'POST', {}),
     ('/api/pnl/analytics', 'GET', None),
+    ('/api/pnl/quote', 'GET', None),                        # Cost Glossary (Oct 8 2026)
+    ('/api/pnl/quote/batch', 'POST', {'rows': []}),
     ('/api/pnl', 'GET', None),
     ('/api/pnl', 'POST', {}),
     ('/api/pnl/some/unknown/path', 'GET', None),
@@ -164,7 +166,7 @@ STORE_ROUTES = {('/api/pnl/dataset', 'GET'), ('/api/pnl/costbook', 'GET'), ('/ap
                 ('/api/pnl/costbook/versions', 'GET'), ('/api/pnl/costbook/restore', 'POST'),
                 ('/api/pnl/settings', 'GET'), ('/api/pnl/settings', 'POST'),
                 ('/api/pnl/overrides', 'GET'), ('/api/pnl/overrides', 'POST'), ('/api/pnl/rotate', 'POST'),
-                ('/api/pnl/analytics', 'GET')}
+                ('/api/pnl/analytics', 'GET'), ('/api/pnl/quote', 'GET'), ('/api/pnl/quote/batch', 'POST')}
 
 
 def new_key():
@@ -216,6 +218,17 @@ def make_engine(mode='ok', gate=None):
                 'notes': [SENTINEL_LABEL, len(src['open_orders']['orders'])]}
 
     eng.build_dataset = build_dataset
+
+    class CostIndex:
+        """The Cost Glossary routes build a cost index from the store (Oct 8 2026). The fake records the call and
+        knows no params, so a quote with no inputs is refused (400) and an empty batch answers (200): enough for
+        the auth matrix; the real index is tested in test_pnl_quote.py."""
+        def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None, colour_map=None):
+            eng.calls.append({'costIndex': True, 'costbook': costbook, 'settings': settings, 'overrides': overrides,
+                              'today': today, 'colour_map': colour_map})
+            self.params = {}
+
+    eng.CostIndex = CostIndex
     return eng
 
 
@@ -1523,7 +1536,7 @@ class TestAppWiring(unittest.TestCase):
         self.assertIsNot(man[0], ns['_manual_allocations'][0])
         self.assertEqual(src['vw_allocations'](), [{'sku': 'ZZAAAA001SLS', 'qty': 2}])
         self.assertEqual(src['open_orders'](), {'orders': [{'ctrlNo': 1}], 'ok': True,
-                                                'fetched_at': '2026-01-01T00:00:00Z'})
+                                                'fetched_at': '2026-01-01T00:00:00Z', 'source': {}})
         self.assertEqual(src['fob_customers'](), ['ZZFOB'])
         ri = src['routing_inputs']()
         self.assertEqual((counters['assign'], counters['suppress']), (1, 1))
@@ -2090,6 +2103,112 @@ class TestSettingsC11ToC14(PnlTestCase):
         self.assertEqual(h.admin('GET', '/api/pnl/settings').get_json()['etag'], etag)    # nothing saved
         text = h.admin('GET', '/api/pnl/settings').get_data(as_text=True)
         self.assertNotIn('50.01', text)
+
+
+class TestOct7TermsAndSources(unittest.TestCase):
+    """Oct 7 2026: delivered (DDP) terms on a manual cost, and the optional sources behind the engine (the colour
+    map, the awaiting-invoice estimate and the A2000 export stamp on the open orders). Synthetic codes only."""
+    OVR = {'id': 'ovr_t1', 'scope': 'style', 'key': {'style': 'zzaaaa001sls'}, 'fobU': SENTINEL_COST,
+           'reason': 'synthetic', 'effective': ''}
+    RAW = {'inventory': {'items': [{'sku': 'ZZAAAA001SLS'}], 'last_sync': '2026-01-01T00:00:00Z'},
+           'ledger': {'rows': [{'style': 'ZZAAAA001SLS', 'units': 1}], 'last_sync': '2026-01-01T00:00:00Z'},
+           'apo': {'rows': [], 'last_sync': None}, 'manual_allocations': [], 'vw_allocations': [],
+           'open_orders': {'orders': [{'ctrlNo': 1}], 'ok': True, 'fetched_at': '2026-01-01T00:00:00Z'},
+           'fob_customers': [], 'routing_inputs': {'now': '2026-01-02T09:30:00'}, 'sales_analytics': None,
+           'today': '2026-01-02'}
+    PEND = {'ready': True, 'cube': {'ZZPC': {'ZZAAAA001SLS': {'2026-03': [1, 10.0]}}},
+            'summary': {'totals': {'pos': 1, 'units': 1, 'value': 10.0}, 'customers': {'ZZPC': {'pos': 1}}},
+            'invoicesThrough': '2026-02-20'}
+
+    def test_terms_ddp_is_kept_fob_is_the_default_and_anything_else_is_refused(self):
+        clean, problems, dropped = pnl.validate_overrides([dict(self.OVR, terms='DDP')], email=ADMIN,
+                                                          now_iso='2026-03-02T12:00:00Z')
+        self.assertEqual((problems, dropped), ([], []))
+        self.assertEqual((clean[0]['terms'], clean[0]['key']['style'], clean[0]['by'], clean[0]['at']),
+                         ('DDP', 'ZZAAAA001SLS', ADMIN, '2026-03-02T12:00:00Z'))
+        self.assertEqual(pnl.validate_overrides([dict(self.OVR, terms=' ddp ')], email=ADMIN)[0][0]['terms'], 'DDP')
+        for fob in ('FOB', ' fob ', '', None):
+            clean, problems, _d = pnl.validate_overrides([dict(self.OVR, terms=fob)], email=ADMIN)
+            self.assertEqual(problems, [], fob)
+            self.assertNotIn('terms', clean[0], fob)                      # FOB is the default and is not stored
+        clean, problems, _d = pnl.validate_overrides([dict(self.OVR)], email=ADMIN)
+        self.assertNotIn('terms', clean[0])
+        for bad in ('XYZ', 'CIF', 'D D P', 5, True, ['DDP'], {'terms': 'DDP'}):
+            clean, problems, _d = pnl.validate_overrides([dict(self.OVR, terms=bad)], email=ADMIN)
+            self.assertIsNone(clean, bad)
+            self.assertIn({'path': 'overrides[0].terms', 'issue': 'invalid'}, problems, bad)
+        # by and at: unchanged terms keep the old stamp; a change of terms is a change.
+        prev, _p, _d = pnl.validate_overrides([dict(self.OVR, terms='DDP')], email='old@example.test',
+                                              now_iso='2026-01-01T00:00:00Z')
+        same, _p, _d = pnl.validate_overrides([dict(self.OVR, terms='DDP')], previous=prev, email=ADMIN,
+                                              now_iso='2026-03-02T00:00:00Z')
+        self.assertEqual((same[0]['by'], same[0]['at']), ('old@example.test', '2026-01-01T00:00:00Z'))
+        changed, _p, _d = pnl.validate_overrides([dict(self.OVR, terms='FOB')], previous=prev, email=ADMIN,
+                                                 now_iso='2026-03-02T00:00:00Z')
+        self.assertEqual((changed[0]['by'], changed[0]['at']), (ADMIN, '2026-03-02T00:00:00Z'))
+        self.assertNotIn('terms', changed[0])
+        self.assertEqual(pnl.SOURCE_KEYS[-2:], ('colour_map', 'sales_pending'))
+
+    def test_normalize_sources_shapes_the_new_inputs(self):
+        norm = pnl._normalize_sources(dict(self.RAW))
+        self.assertEqual((norm['colour_map'], norm['sales_pending'], norm['open_orders']['source']), ({}, {}, {}))
+        self.assertEqual(norm['today'], '2026-01-02')
+        src = dict(self.RAW,
+                   colour_map={' zza1 ': 'WHITE SOLID', 'ZZA2': 5, 3: 'NAVY SOLID', 'ZZA3': '  ', 'zza4': 'NAVY||FLORAL',
+                               'ZZA5': None},
+                   sales_pending=json.loads(json.dumps(self.PEND)),
+                   open_orders=dict(self.RAW['open_orders'],
+                                    source={'modified': '2026-03-01T04:00:00Z', 'ageHours': '9', 'stale': 1,
+                                            'checkedAt': '2026-03-01T13:00:00Z', 'junk': 'x'}))
+        norm = pnl._normalize_sources(src)
+        self.assertEqual(norm['colour_map'], {'ZZA1': 'WHITE SOLID', 'ZZA4': 'NAVY||FLORAL'})
+        self.assertEqual(norm['sales_pending'], self.PEND)
+        self.assertIsNot(norm['sales_pending'], src['sales_pending'])                 # the engine gets a copy
+        self.assertIsNot(norm['sales_pending']['cube'], src['sales_pending']['cube'])
+        self.assertEqual(norm['open_orders']['source'],
+                         {'modified': '2026-03-01T04:00:00Z', 'ageHours': 9.0, 'stale': False,
+                          'checkedAt': '2026-03-01T13:00:00Z'})
+        self.assertEqual(norm['open_orders']['orders'], [{'ctrlNo': 1}])
+        for bad in ('x', 5, ['a'], None, True):
+            n = pnl._normalize_sources(dict(self.RAW, colour_map=bad, sales_pending=bad))
+            self.assertEqual((n['colour_map'], n['sales_pending']), ({}, {}), bad)
+        nan = pnl._normalize_sources(dict(self.RAW, sales_pending={'ready': True, 'x': float('nan')}))
+        self.assertEqual(nan['sales_pending'], {})
+        st = pnl._normalize_sources(dict(self.RAW, open_orders=dict(self.RAW['open_orders'], source={'stale': True})))
+        self.assertEqual(st['open_orders']['source'], {'modified': None, 'ageHours': None, 'stale': True, 'checkedAt': None})
+        for bad in ('x', [], {}, None, 5, {'ageHours': 'soon', 'stale': 'yes'}, {'junk': 1}):
+            n = pnl._normalize_sources(dict(self.RAW, open_orders=dict(self.RAW['open_orders'], source=bad)))
+            # only a non-empty object is read; anything else is no stamp at all
+            want = ({'modified': None, 'ageHours': None, 'stale': False, 'checkedAt': None}
+                    if isinstance(bad, dict) and bad else {})
+            self.assertEqual(n['open_orders']['source'], want, bad)
+        self.assertEqual(pnl._missing_inputs(norm), [])
+
+    def test_stamps_follow_the_colour_map_the_pending_summary_and_the_export(self):
+        def stamp(**over):
+            return pnl._stamps(pnl._normalize_sources(dict(self.RAW, **over)))
+        base = stamp()
+        self.assertEqual(base, stamp())
+        cm = stamp(colour_map={'ZZA1': 'WHITE SOLID'})
+        self.assertNotEqual(base, cm)
+        self.assertEqual(cm, stamp(colour_map={' zza1 ': 'WHITE SOLID'}))
+        self.assertNotEqual(cm, stamp(colour_map={'ZZA1': 'NAVY SOLID'}))
+        self.assertNotEqual(cm, stamp(colour_map={'ZZA1': 'WHITE SOLID', 'ZZA2': 'NAVY SOLID'}))
+        pend = stamp(sales_pending=self.PEND)
+        self.assertNotEqual(base, pend)
+        self.assertEqual(pend, stamp(sales_pending=json.loads(json.dumps(self.PEND))))
+        self.assertNotEqual(pend, stamp(sales_pending=dict(self.PEND, ready=False)))
+        self.assertNotEqual(pend, stamp(sales_pending=dict(self.PEND, invoicesThrough='2026-02-21')))
+        other = dict(self.PEND, summary={'totals': {'pos': 2, 'units': 1, 'value': 10.0}, 'customers': {'ZZPC': {'pos': 2}}})
+        self.assertNotEqual(pend, stamp(sales_pending=other))
+        oo = self.RAW['open_orders']
+        exp = stamp(open_orders=dict(oo, source={'modified': '2026-03-01T04:00:00Z', 'ageHours': 9, 'stale': False}))
+        self.assertNotEqual(base, exp)
+        # the export's own date is the stamp; its age and the check time move every poll and change nothing
+        self.assertEqual(exp, stamp(open_orders=dict(oo, source={'modified': '2026-03-01T04:00:00Z', 'ageHours': 10,
+                                                                 'stale': True, 'checkedAt': '2026-03-02T00:00:00Z'})))
+        self.assertNotEqual(exp, stamp(open_orders=dict(oo, source={'modified': '2026-03-02T04:00:00Z', 'ageHours': 9})))
+        self.assertEqual(base, stamp(open_orders=dict(oo, source={'ageHours': 9, 'stale': False})))
 
 
 if __name__ == '__main__':

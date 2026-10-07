@@ -372,13 +372,23 @@ FLAG_LABELS = {
     'price_unconfirmed': 'The sheet says this price is still needed. Treat it as unconfirmed.',
     'named_row_conflict': 'A sheet row names this style, but its pattern or sleeve differs from the style number. '
                           'Confirm which is right.',
+    # Oct 7 2026: colour, fabric family, customer blocks and delivered prices
+    'colour_row': "The sheet prices white and colour apart. This style's colour row is used.",
+    'colour_assumed': 'The colour map does not know this style. The colour row is used, not the white row.',
+    'pattern_from_colour': 'The style number has no pattern letter. Solid or print comes from the colour map.',
+    'pattern_conflict': 'The colour map and the style number disagree on solid or print. The style number is used.',
+    'fabric_family': 'No sheet row for this fabric. The same brand\'s row for a fabric of the same family is used.',
+    'group_block_missing': "This customer's own price block has no row for the style. A regular sheet is used.",
+    'ddp': 'Delivered price (DDP). Duty and freight are in the price, so no import costs are added.',
+    'ddp_mixed': 'Part of the cost is a delivered (DDP) price. Import costs are still added on the whole row. Check.',
 }
 
 # ── Contract C15 (David, Sep 15 2026): one right row per factory sheet ──
 # A style's cost on a sheet comes from exactly one row, picked from the style number: the brand's section (R1), the
 # fabric code (R2), the sleeve (R3), the pattern (R4), no special finish the style does not show (R5), the column for
 # its fit (R6). Rows still tied: the lowest, flagged ambiguous_rows (R7). Never a median of rows.
-C15_FLAGS = ('ambiguous_rows', 'cross_brand', 'fit_unknown', 'pattern_guess')
+C15_FLAGS = ('ambiguous_rows', 'cross_brand', 'fit_unknown', 'pattern_guess', 'fabric_family', 'colour_row',
+             'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'group_block_missing', 'ddp')
 C15_REASONS = ('other_brand', 'other_pattern', 'other_sleeve', 'variant_not_this_style', 'lower_confidence',
                'tie_not_lowest')
 # costRowsSkipped order: the rows closest to the one used first.
@@ -391,6 +401,106 @@ REL_VARIANTS = frozenset({'white', 'colour', 'usa_cotton', 'xinjiang_cotton', 'c
 # Fabric codes whose public FABRIC_RULES text says Yarn Dye (YD, SP and CY). A style of these fabrics reads yarn dyed
 # whatever its pattern letter (contract C15 R4 and R5).
 YARN_DYE_FABRICS = frozenset({'YD', 'SP', 'CY'})
+# Fabric family siblings (Oct 7 2026, David: some sheets only say the brand and the fabric). When no sheet quotes a
+# brand for a fabric code, the brand's own row for a sibling fabric of the same public family serves before another
+# brand's row. The public fabric reference groups these as 4-WAY STRETCH (AW, DS, WS, TW, CS); the 95/5 poly spandex
+# supershirt (SU) is the same cloth under its trade name. Plain cloths come first, then weaves, dobby last.
+# costbook.params.fabricFamilies ({code: [sibling codes in order]}) replaces this table.
+FABRIC_FAMILY_SIBLINGS = {
+    'AW': ['CS', 'SU', 'WS', 'TW', 'DS'], 'SU': ['AW', 'CS', 'WS', 'TW', 'DS'], 'CS': ['AW', 'SU', 'WS', 'TW', 'DS'],
+    'WS': ['TW', 'AW', 'CS', 'SU', 'DS'], 'TW': ['WS', 'AW', 'CS', 'SU', 'DS'], 'DS': ['AW', 'CS', 'SU', 'WS', 'TW'],
+}
+# Colour classes of the platform colour map (index.html classifyColor, public). A style's colour decides between a
+# sheet's WHITE row and its COLOR row (contract C15 R5, Oct 7 2026); a style with no pattern letter reads its
+# pattern from it (fancies are prints).
+COLOUR_CLASSES = ('white', 'black', 'navy', 'other_solids', 'fancies')
+_COLOUR_BLUE_RE = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b|'
+                             r'\bteal\b|\btanzine\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|'
+                             r'\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b')
+_COLOUR_NONBLUE_RE = re.compile(r'\b(?:grey|gray|black|white|red|pink|green|brown|tan|khaki|olive|burgundy|wine|purple|'
+                                r'plum|orange|yellow|gold|silver|charcoal|ivory|cream|beige|camel|rust|coral|lilac|'
+                                r'lavender|mint|sage)\b')
+_COLOUR_PRINT_RE = re.compile(r'\bprint\b|\bprnt\b|\bgrnd\b|\bstripe\b|\bstripes\b|\bgeo\b|\bcheck\b')
+_COLOUR_WHITE_RE = re.compile(r'\bwhite\b|\bivory\b|\bcream\b')
+_COLOUR_SOLID_RE = re.compile(r'^(.*?)\s*\bs(?:olid|ld)\b')
+_COLOUR_NAMED = {'tony blue': 'navy'}
+
+
+def _colour_blue_lead(s):
+    if not _COLOUR_BLUE_RE.search(s):
+        return False
+    if re.search(r'\bdenim\b', s) and not re.search(r'\bnavy\b|\bblue\b|\bindigo\b', s) and _COLOUR_NONBLUE_RE.search(s):
+        return False
+    return True
+
+
+def classify_colour(text):
+    """The platform's colour class of a colour map description (port of index.html classifyColor): 'white',
+    'black', 'navy', 'other_solids' or 'fancies'. A description with a ground and a print ('WHITE||NAVY FLORAL')
+    classifies as its first part before the separator is read by colour_ground. Empty text is 'fancies'."""
+    c = str(text or '').strip().lower()
+    if not c:
+        return 'fancies'
+    parts = re.split(r'\s+/\s+', c)
+    if len(parts) > 1 and parts[0].strip():
+        return classify_colour(parts[0].strip())
+    n = _COLOUR_NAMED.get(re.sub(r'\s+', ' ', c))
+    if n:
+        return n
+    has_print = _COLOUR_PRINT_RE.search(c) is not None
+    if re.search(r'\bdobby\b', c):
+        if _COLOUR_WHITE_RE.search(c):
+            return 'white'
+        if re.search(r'\bblack\b', c):
+            return 'black'
+        if _colour_blue_lead(c):
+            return 'navy'
+        return 'other_solids'
+    m = _COLOUR_SOLID_RE.match(c)
+    if not has_print and m and _colour_blue_lead(m.group(1)):
+        return 'navy'
+    if not has_print and m:
+        lead = m.group(1)
+        if _COLOUR_WHITE_RE.search(lead):
+            return 'white'
+        if re.search(r'\bblack\b', lead):
+            return 'black'
+        return 'other_solids'
+    if not has_print and re.search(r'\bs(?:olid|ld)\b', c):
+        return 'other_solids'
+    return 'fancies'
+
+
+def colour_info(text):
+    """What a colour map description says for pricing: {'cls': colour class, 'ground': 'white' | 'colour',
+    'print': bool}. A 'ground||print' description is a print on that ground; a plain description is a print when
+    it classifies as fancies. White, ivory and cream grounds are 'white'; every other ground is 'colour'."""
+    raw = str(text or '').strip()
+    if not raw:
+        return None
+    if '||' in raw:
+        ground, _, _printed = raw.partition('||')
+        g = ground.strip().lower()
+        return {'cls': 'fancies', 'ground': 'white' if _COLOUR_WHITE_RE.search(g) else 'colour', 'print': True}
+    cls = classify_colour(raw)
+    if cls == 'fancies':
+        # A print named without its ground: a white ground only when the description starts with it.
+        white = re.match(r'^\s*(white|wht|ivory|cream)\b', raw.lower()) is not None
+        return {'cls': cls, 'ground': 'white' if white else 'colour', 'print': True}
+    return {'cls': cls, 'ground': 'white' if cls == 'white' else 'colour', 'print': False}
+
+
+def colour_map_keys(base):
+    """The colour map keys a base style may be filed under: the style number itself, then the platform's
+    BRAND_SERIAL key (its brand letters and serial), with NT also tried as NA (Nautica serials past 999)."""
+    b = _u(base)
+    keys = [b]
+    if MOD_SKU_RE.match(b):
+        brand, serial = b[2:4], b[6:9]
+        keys.append('%s_%s' % (brand, serial))
+        if brand == 'NT':
+            keys.append('NA_%s' % serial)
+    return keys
 # Cost book record flags read by contract C15: a row whose text says its price is still needed (it loses to any
 # confirmed row), and a row whose pattern the cost book only inferred (R4 reads it as a row with no pattern).
 PROVISIONAL_FLAGS = frozenset({'PROVISIONAL_TEXT_NEED_PRICE'})
@@ -477,7 +587,8 @@ DEFAULT_SETTINGS = {
 # Alert thresholds (not cost data).
 THIN_CM = 0.05            # PO contribution margin under 5 percent
 STALE_FEED_HOURS = 6      # ATS / APO older than this at build time
-STALE_ANALYTICS_DAYS = 45
+STALE_ANALYTICS_DAYS = 10         # invoice history older than this: 'Shipped history is old' (medium past twice that)
+STALE_ORDERS_HOURS = 6            # A2000 order export older than this at build time
 _EV_CAP = 30
 _REF_CAP = 200
 
@@ -555,7 +666,7 @@ _PARAM_NAMES = {'params': 'all parameters', 'fxBase': 'cost book RMB rate', 'ssD
                 'fitPremium': 'fit premiums', 'gridPrecedence': 'calculator grid order',
                 'poolOrder': 'calculator sheet order', 'programMap': 'program code map', 'kitPcs': 'kit sizes',
                 'customerGroupPrefix': 'customer prefixes', 'fiberByFabric': 'fiber by fabric',
-                'fiberByStyle': 'fiber by style'}
+                'fiberByStyle': 'fiber by style', 'fabricFamilies': 'fabric families'}
 
 
 # ── Small helpers ──
@@ -1363,6 +1474,17 @@ def clean_params(params):
                 if len(clean) != len(v):
                     bad(key)
                 out[key] = clean
+    if 'fabricFamilies' in p and p['fabricFamilies'] is not None:
+        v = p['fabricFamilies']
+        if not isinstance(v, dict):
+            out.pop('fabricFamilies', None)
+            bad('fabricFamilies')
+        else:
+            clean = {k.strip().upper(): [_u(x) for x in sibs] for k, sibs in v.items()
+                     if isinstance(k, str) and _str_list(sibs)}
+            if len(clean) != len(v):
+                bad('fabricFamilies')
+            out['fabricFamilies'] = clean
     return out, missing, invalid
 
 
@@ -1452,6 +1574,12 @@ def _pool_label(pool):
     return lab + (' (%s block)' % grp.title() if head in ('NF-OC', 'YW-SM') and grp else '')
 
 
+def _is_ddp(r):
+    """True when a cost book record or a manual cost is a delivered price (terms DDP, Oct 7 2026): duty and
+    freight are in the price, so the P&L adds no import costs on goods costed from it."""
+    return str((r or {}).get('terms') or '').strip().upper() == 'DDP'
+
+
 def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=(), row=None, skip=()):
     """A resolution. fx: the share of price that is RMB based (value share; a negative dollar step
     can put it a little above 1). fxr: the rate that RMB-based part stands at, or None. row: (record id, fit
@@ -1494,7 +1622,8 @@ class CostIndex:
     ledger row (same index) with its resolution in 'res' (the row's own factory, the ladder). history_rows:
     optional past ledger lines; with the ledger they say which refs carry each style (contract C13)."""
 
-    def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None, history_rows=None):
+    def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None, history_rows=None,
+                 colour_map=None):
         cb = costbook if isinstance(costbook, dict) else {}
         # Params are type checked here, so a stored or restored cost book with a bad param switches
         # that rule off (and the dataset says so) instead of failing the build.
@@ -1502,6 +1631,12 @@ class CostIndex:
         self.params = p
         self.S = S = merge_settings(settings, p)
         self.today = _d10(today)
+        # The platform colour map ({key: description}, Oct 7 2026): a style's colour picks the sheet's white or
+        # colour row and gives a pattern to a style number without a pattern letter. Empty: nothing changes.
+        self.cmap = ({_u(k): str(v) for k, v in colour_map.items() if isinstance(k, str) and isinstance(v, str) and v.strip()}
+                     if isinstance(colour_map, dict) else {})
+        self._col = {}
+        self.families = p.get('fabricFamilies') if isinstance(p.get('fabricFamilies'), dict) else FABRIC_FAMILY_SIBLINGS
         roles = price_field_roles(cb)
         self._f_usd, self._f_base, self._f_cut = roles['usd'], roles['base'], roles['cut']
         self._f_rmb, self._f_e1 = roles.get('rmb'), roles.get('e1')
@@ -1561,9 +1696,37 @@ class CostIndex:
         self._quotes, self._comb = {}, {}
 
     # ── decode / helpers ──
+    def colour(self, b):
+        """colour_info of base style b from the colour map, or None when the map does not know it."""
+        if b in self._col:
+            return self._col[b]
+        info = None
+        if self.cmap:
+            for k in colour_map_keys(b):
+                raw = self.cmap.get(k)
+                if raw:
+                    info = colour_info(raw)
+                    break
+        self._col[b] = info
+        return info
+
     def decode(self, b):
+        """decode_sku plus what the colour map says (Oct 7 2026): 'colour' (its class), 'ground' ('white' or
+        'colour', the row a sheet with white and colour rows should give), and for a shirt with no pattern letter
+        the pattern the colour map implies (patSrc 'colour'). A letter that disagrees with the map keeps the letter,
+        flagged patConflict."""
         if b not in self._dec:
-            self._dec[b] = decode_sku(b, self.params)
+            d = decode_sku(b, self.params)
+            if d is not None:
+                d['colour'], d['ground'], d['patSrc'], d['patConflict'] = None, None, None, False
+                info = self.colour(b)
+                if info and d['cat'] not in ('pants', 'blazer', 'vest'):
+                    d['colour'], d['ground'] = info['cls'], info['ground']
+                    if d['pat'] is None:
+                        d['pat'], d['patSrc'] = ('PRINT' if info['print'] else 'SOLID'), 'colour'
+                    elif d['pat'] in ('SOLID', 'PRINT') and info['print'] != (d['pat'] == 'PRINT'):
+                        d['patConflict'] = True
+            self._dec[b] = d
         return self._dec[b]
 
     def rec_usd(self, r):
@@ -1768,7 +1931,7 @@ class CostIndex:
             c = {'id': r['id'], 'brand': r.get('brand_code'), 'brands': brands, 'generic': r.get('brand_scope') == 'all',
                  'codes': codes, 'primary': prim if prim in codes else (codes[0] if codes else None),
                  'conf': r.get('fabric_code_confidence'), 'cat': r.get('category'), 'fit': r.get('fit_class'),
-                 'sleeve': r.get('sleeve'),
+                 'sleeve': r.get('sleeve'), 'ddp': _is_ddp(r),
                  'pat': r.get('pattern') if rfl & INFERRED_PATTERN_FLAGS else r.get('pattern_effective'), 'price': pr,
                  'alt': pr if alt is None else alt, 'rmb': ref is not None, 'ref': ref,
                  'quote': r.get('record_kind') == 'factory_quotation',
@@ -1808,18 +1971,43 @@ class CostIndex:
                 self._ovr[sc][key] = o
         self.overrides_active = sum(len(v) for v in self._ovr.values())
 
-    def _override(self, b, sku, ref, fac):
+    @staticmethod
+    def style_keys(full, b):
+        """The style-scope manual cost keys a SKU may be filed under (Oct 7 2026): the invoice history's own base
+        of the full SKU (a legacy dash code keeps its dash parts), then each shorter dash prefix of the SKU, then
+        the base. So a cost keyed the way the feed or the history spells a legacy code reaches the stock row."""
+        keys = []
+        if full:
+            f = _u(full).split(' ')[0]
+            keys.append(hist_base_of(f))
+            parts = f.split('-')
+            while len(parts) > 1:
+                parts.pop()
+                keys.append('-'.join(parts))
+            # A legacy code with a one-letter colour suffix after its digits (a jewelry code's C or R) also
+            # tries the code without it: the manual cost is often keyed by the plain code.
+            head = f.split('-')[0]
+            if not MOD_SKU_RE.match(head) and len(head) > 2 and head[-1].isalpha() and head[-2].isdigit():
+                keys.append(head[:-1])
+        keys.append(b)
+        return tuple(dict.fromkeys(k for k in keys if k))
+
+    def _override(self, b, sku, ref, fac, full=None):
         refu = ref or ''
-        for sc, key in (('ref_style', (refu, b)), ('style', (b,)),
-                        ('design', (b[2:],) if sku and sku.get('modern') else None), ('ref', (refu,)),
-                        ('fabric_category', (sku['fab'], sku['cat']) if sku else None)):
+        checks = [('ref_style', (refu, b))] + [('style', (k,)) for k in self.style_keys(full, b)] + [
+            ('design', (b[2:],) if sku and sku.get('modern') else None), ('ref', (refu,)),
+            ('fabric_category', (sku['fab'], sku['cat']) if sku else None)]
+        for sc, key in checks:
             if key is None:
                 continue
             o = self._ovr[sc].get(key)
             if o:
                 reason = str(o.get('reason') or '').strip()
-                return _R('L0', float(o['fobU']), 'Manual cost.' + (' Reason: %s' % reason[:120] if reason else ''),
-                          ('OVR:%s' % o.get('id'),), fac, fx=0.0)
+                ddp = _is_ddp(o)
+                return _R('L0', float(o['fobU']), 'Manual cost.' + (' Delivered (DDP) price, no import costs added.'
+                                                                    if ddp else '')
+                          + (' Reason: %s' % reason[:120] if reason else ''),
+                          ('OVR:%s' % o.get('id'),), fac, fx=0.0, flags=('ddp',) if ddp else ())
         return None
 
     def _prepare_ledger(self, rows):
@@ -1877,19 +2065,50 @@ class CostIndex:
                 L['res'] = self.raw(L['b'], L['fac'], L['ref'] or None, L['poName'])
 
     # ── calculator matching ──
+    def base_pools(self):
+        """The sheets that price every customer (each family's base pools, and any pool for ANY customer)."""
+        cfg = self.pool_cfg
+        out = set()
+        for k, v in cfg.items():
+            if isinstance(v, dict) and k != 'polo':
+                out.update(v.get('base') or [])
+        out.update(p for p in (cfg.get('all') or []) if str(p).partition(':')[2] == 'ANY')
+        return out
+
+    def group_pools(self, grp):
+        """The customer group's own price blocks on every family, in family order (poolOrder.<family>.byGroup)."""
+        cfg = self.pool_cfg
+        out = []
+        for k, v in cfg.items():
+            if isinstance(v, dict) and k != 'polo':
+                out += list((v.get('byGroup') or {}).get(grp) or [])
+        return list(dict.fromkeys(out))
+
     def pool_order(self, fac, grp, cat):
+        """(primary pools, fallback pools) for a style of customer group grp made by factory fac (Oct 7 2026):
+        the group's own price blocks first, whichever family they sit on (a Costco or Walmart block prices its
+        own customer's styles before any factory grid), then the factory's own family base sheets; the fallback is
+        the other family's base sheets. Another customer's block never prices this group's styles: the 'all'
+        list only contributes base pools and this group's own pools."""
         cfg = self.pool_cfg
         if cat == 'polo':
             polo = cfg.get('polo') or {}
             return list(polo.get('primary') or []), list(polo.get('fallback') or [])
         fams = list(self.grid.get(fac) or self.grid.get('_default') or [])
+        base = self.base_pools()
+        own_all = self.group_pools(grp)
+        # The group's own blocks that are not base sheets (Costco, Walmart, BJ's, Half Price, Kohl's...) come first
+        # on every factory. A group whose own sheet is a base sheet (the TJX sheet of the NEW FACTORIES family)
+        # keeps the factory's family order: Topfind's TJX styles stay on the YIWU grid first.
+        own = [p for p in own_all if p not in base]
 
         def fam_pools(fam):
             f = cfg.get(fam) or {}
-            return list((f.get('byGroup') or {}).get(grp) or []) + list(f.get('base') or [])
-        prim = list(dict.fromkeys(fam_pools(fams[0]))) if fams else []
+            return [p for p in (f.get('byGroup') or {}).get(grp) or [] if p in base] + list(f.get('base') or [])
+        prim = list(dict.fromkeys(own + (fam_pools(fams[0]) if fams else [])))
         seen, fb = set(prim), []
-        for pool in [x for fam in fams[1:] for x in fam_pools(fam)] + list(cfg.get('all') or []):
+        allowed = base | set(own_all)
+        for pool in [x for fam in fams[1:] for x in fam_pools(fam)] + [p for p in (cfg.get('all') or []) if p in allowed]:
             if pool not in seen:
                 seen.add(pool)
                 fb.append(pool)
@@ -2053,10 +2272,21 @@ class CostIndex:
                 E = narrow(firm, 'lower_confidence')
             elif not firm:
                 flags.append('price_unconfirmed')
-            rel = [c for c in E if c['tags'] & hints & REL_VARIANTS]
+            # R5 (Oct 7 2026): the style's colour, from the colour map, shows the white or the colour row of a sheet
+            # that prices them apart. A style the map does not know takes the colour row, flagged colour_assumed.
+            ground = sku.get('ground')
+            hints2 = hints | frozenset([ground]) if ground else hints
+            rel = [c for c in E if c['tags'] & hints2 & REL_VARIANTS]
             plain = [c for c in E if not (c['tags'] & REL_VARIANTS) and not c['names']]
             if rel or plain:
                 E = narrow(rel or plain, 'variant_not_this_style')
+                if rel and ground and any(ground in c['tags'] for c in rel):
+                    flags.append('colour_row')
+            elif not ground:
+                colour_rows = [c for c in E if 'colour' in c['tags']]
+                if colour_rows and any('white' in c['tags'] for c in E):
+                    E = narrow(colour_rows, 'variant_not_this_style')
+                    flags.append('colour_assumed')
             E = sorted(E, key=tie_key)
             if len(E) > 1:
                 flags.append('ambiguous_rows')
@@ -2140,6 +2370,27 @@ class CostIndex:
                     return lvl_d, s, add + (ssd if s_ != sl else 0.0), 'fit_from_slim', cross
         return None
 
+    def family_skus(self, sku):
+        """The style read as each sibling fabric of its family (Oct 7 2026), in family order: the same style number
+        with the sibling's code in place of its own ('famOf' keeps the real code). Empty for a fabric with no family
+        or a garment the calculators do not price."""
+        fab = (sku or {}).get('fab')
+        if not fab or sku['cat'] in ('pants', 'blazer', 'vest', 'overshirt'):
+            return []
+        return [dict(sku, fab=sib, famOf=fab) for sib in (self.families.get(fab) or []) if sib != fab]
+
+    def calc_family(self, sku, fac, grp):
+        """The brand's own row for a sibling fabric of the same family, when no sheet quotes the brand for the
+        style's own fabric: -> (level 'L4d', pick, adjustment, how, False, sibling sku) or None. Each sibling tries
+        the exact rungs of calc_match (own brand only, never another brand's row); the first family member with a
+        row wins. The result is a derived price (flag fabric_family, grade B) that _resolve tries after the
+        factory lists and before another brand's row (contract C15 R1)."""
+        for sku2 in self.family_skus(sku):
+            m = self.calc_match(sku2, fac, grp)
+            if m:
+                return 'L4d', m[1], m[2], m[3], False, sku2
+        return None
+
     def _calc_res(self, sku, fac, lvl, sel, adj, how, cross=False):
         """A calculator resolution (levels L4a to L4d; L4c for another brand's row) from the one row picked by
         contract C15 (sel, from _pick). The ladder and the direct calculator quotes of contract C13 both build it
@@ -2162,7 +2413,24 @@ class CostIndex:
         if neutral and how == 'exact':
             text = "this customer's own quotation for the fabric, fit, sleeve and pattern"
         said = ["Another brand's row, because no sheet quotes this brand for the style"] if cross else []
+        fam = sku.get('famOf')
+        if fam:
+            said.append("No sheet row for fabric %s under this brand, so the brand's row for %s, a fabric of the same "
+                        'family, is used' % (fam, sku['fab']))
         said.append(text)
+        if 'colour_row' in sel['flags']:
+            said.append("The sheet prices white and colour apart, and the colour map says this style is %s"
+                        % ('white' if sku.get('ground') == 'white' else 'a colour'))
+        if 'colour_assumed' in sel['flags']:
+            said.append('The colour map does not know this style, so the colour row is used, not the white row')
+        if sku.get('patSrc') == 'colour':
+            said.append('The style number has no pattern letter, so the pattern comes from the colour map')
+        if c.get('ddp'):
+            said.append('A delivered (DDP) price: duty and freight are in it, so no import costs are added')
+        grp = sku.get('group')
+        own_block = grp and self.group_pools(grp)
+        if own_block and sel['pool'] not in own_block and not (set(own_block) & self.base_pools()):
+            said.append("This customer's own price block has no row for the style, so a regular sheet is used")
         if sel.get('named'):
             said.append('The row text names this style, so it is the style\'s row')
         if 'named_row_conflict' in sel['flags']:
@@ -2178,10 +2446,20 @@ class CostIndex:
             flags.append('derived')
         if cross:
             flags.append('cross_brand')
+        if fam:
+            flags.append('fabric_family')
         if fit in ('MODERN', 'TAILORED'):
             flags.append('fit_as_regular')
         if not known:
             flags.append('fit_unknown')
+        if sku.get('patSrc') == 'colour':
+            flags.append('pattern_from_colour')
+        if sku.get('patConflict'):
+            flags.append('pattern_conflict')
+        if own_block and sel['pool'] not in own_block and not (set(own_block) & self.base_pools()):
+            flags.append('group_block_missing')
+        if c.get('ddp'):
+            flags.append('ddp')
         flags.extend(sel['flags'])
         if sku['program']:
             flags.append('program_map')
@@ -2220,6 +2498,13 @@ class CostIndex:
             s = self._pick(pools, sku, fc, sku['sleeve'])
             if s:
                 return lvl, s, 0.0, ('exact' if fc == sku['fit'] else 'fit_regular')
+        # No row for the fabric under this brand: the brand's row for a sibling fabric of the same family, as a
+        # derived quote (Oct 7 2026). The fifth item is the sibling reading of the style.
+        for sku2 in self.family_skus(sku):
+            for pools in (prim, fb):
+                s = self._pick(pools, sku2, fc, sku2['sleeve'])
+                if s:
+                    return 'L4d', s, 0.0, ('exact' if fc == sku['fit'] else 'fit_regular'), sku2
         return None
 
     def _qv(self, q):
@@ -2261,8 +2546,8 @@ class CostIndex:
         out = []
         for ref, pr, rid in self.pc_by_style.get(norm_vd(b), ()):
             r = self.records[rid]
-            q = _R('L1', pr, 'Factory list, same ref and style.', (rid,), _u(r.get('factory_code')) or fac_of(ref),
-                   row=self._lrow(rid, sku))
+            q = self._terms(_R('L1', pr, 'Factory list, same ref and style.', (rid,),
+                               _u(r.get('factory_code')) or fac_of(ref), row=self._lrow(rid, sku)))
             out.append(dict(q, src=str(r.get('source_code') or ''), where=ref or None))
         im = self.img_style.get(norm_vd(b))
         if im:                                  # a customer quotation that names the style (its factory's one row)
@@ -2286,6 +2571,7 @@ class CostIndex:
                             (rid,), fac, flags=('fit_as_regular',) if mapped else (), row=self._lrow(rid, sku))
                     else:
                         continue
+                    q = self._terms(q)
                     out.append(dict(q, src=str(self.records[q['ids'][0]].get('source_code') or ''), where=ref))
         lists = self.pc_facs | self.dp_facs | self.ky_facs
         grid = [fac for fac in sorted(carry)
@@ -2297,7 +2583,8 @@ class CostIndex:
         for fac in grid:
             m = self.grid_exact(sku, fac)
             if m:
-                out.append(dict(self._calc_res(sku, fac, *m), src=str(m[1]['pool']).partition(':')[0],
+                sk = m[4] if len(m) > 4 else sku          # a family match quotes the sibling reading
+                out.append(dict(self._calc_res(sk, fac, *m[:4]), src=str(m[1]['pool']).partition(':')[0],
                                 where=self._pool_sheet([m[1]['c']])))
         out.sort(key=lambda q: (self._qv(q), q['fac'], q['src'], q['where'] or ''))
         self._quotes[b] = out
@@ -2364,6 +2651,8 @@ class CostIndex:
             level = min((v['level'] for v in use), key=LEVEL_RANK.get)
             grade = max(v['grade'] for v in use)
             flags = [f for v in use for f in v['flags'] if f != 'range'] + ['cost_average']
+            if 'ddp' in flags and not all('ddp' in v['flags'] for v in use):
+                flags = [f for f in flags if f != 'ddp'] + ['ddp_mixed']     # delivered and FOB quotes averaged
             rng = (min(v['price'] for v in use), max(v['price'] for v in use))
             basis = 'Average of %d factory quotes (%s). They are within %s percent of each other.' % (n, names, pct)
         else:
@@ -2436,20 +2725,35 @@ class CostIndex:
 
     # ── the cascade ──
     def raw(self, b, fac, ref=None, poName=None, allow_default=True, brand_label=None, customer_group=None,
-            use_ovr=True):
-        key = (b, fac, ref, (poName or '')[:2].upper(), allow_default, brand_label, customer_group, use_ovr)
+            use_ovr=True, full=None):
+        """full: the SKU as the feed or the order spells it, when known (a manual cost may be keyed by it)."""
+        fk = self.style_keys(full, b) if (full and use_ovr and self.overrides_active) else None
+        if fk == (b,):
+            fk = None
+        key = (b, fac, ref, (poName or '')[:2].upper(), allow_default, brand_label, customer_group, use_ovr, fk)
         out = self._cache.get(key)
         if out is None:
-            out = self._resolve(b, fac, ref, poName, allow_default, brand_label, customer_group, use_ovr)
+            out = self._resolve(b, fac, ref, poName, allow_default, brand_label, customer_group, use_ovr, full)
+            out = self._terms(out)
             self._cache[key] = out
         return out
 
-    def _resolve(self, b, fac, ref, poName, allow_default, brand_label, group, use_ovr):
+    def _terms(self, res):
+        """A resolution priced from delivered (DDP) records only carries the ddp flag (Oct 7 2026), so no import
+        costs are added on it. Manual costs set their own flag; a mix of delivered and FOB rows stays FOB."""
+        if not res or res.get('level') in ('L0', 'L6', 'L7') or 'ddp' in res['flags'] or not res.get('ids'):
+            return res
+        recs = [self.records.get(i) for i in res['ids']]
+        if recs and all(r and _is_ddp(r) for r in recs):
+            res = dict(res, flags=tuple(res['flags']) + ('ddp',))
+        return res
+
+    def _resolve(self, b, fac, ref, poName, allow_default, brand_label, group, use_ovr, full=None):
         sku = self.decode(b)
         if sku is not None and group:
             sku = dict(sku, group=group)
         if use_ovr and self.overrides_active:
-            o = self._override(b, sku, ref, fac)
+            o = self._override(b, sku, ref, fac, full)
             if o:
                 return o
         # Contract C15: every rung takes one row of the style's own brand (R1), pattern (R4) and fit column (R6).
@@ -2539,6 +2843,10 @@ class CostIndex:
                         p, rid, fl, rng, sk = _lowest(ps)
                         return _R('L5', p, text + (many if fl else ''), (rid,), fac, rng=rng, flags=fl,
                                   row=self._lrow(rid, sku), skip=sk)
+            # Oct 7 2026: the brand's own row for a sibling fabric of the same family, before another brand's row.
+            m = self.calc_family(sku, fac, sku['group'])
+            if m:
+                return self._calc_res(m[5], fac, *m[:5])
             # Contract C15 R1: another brand's row only when nothing else prices the style (level L4c, grade D).
             m = self.calc_match(sku, fac, sku['group'], cross=True)
             if m:
@@ -2646,7 +2954,7 @@ class _WarehouseCoster:
         b = base_of(sku)
         refs = self.by.get(b)
         if not refs:
-            res = self.ci.raw(b, 'UNKNOWN', brand_label=brand_label)
+            res = self.ci.raw(b, 'UNKNOWN', brand_label=brand_label, full=sku)
             self.tiers['T5'] += 1
             return dict(res, tier='T5', ref=None, fac='UNKNOWN')
         chosen, tier = None, None
@@ -2682,13 +2990,13 @@ class _WarehouseCoster:
             if etds and len(etds) == len(chosen) and rd < min(etds):
                 extra.append('ref_after_stock')
         self.tiers[tier] += 1
-        return self._combine(b, chosen, refs, tier, blended, brand_label, extra)
+        return self._combine(b, chosen, refs, tier, blended, brand_label, extra, full=sku)
 
-    def _combine(self, b, chosen, refs, tier, blended, brand_label, extra=()):
+    def _combine(self, b, chosen, refs, tier, blended, brand_label, extra=(), full=None):
         parts = []
         for ref in chosen:
             e = refs[ref]
-            res = self.ci.raw(b, fac_of(ref), ref, e['pn'], brand_label=brand_label)
+            res = self.ci.raw(b, fac_of(ref), ref, e['pn'], brand_label=brand_label, full=full)
             parts.append((ref, max(e['cur'], e['hist']), res))
         priced = [x for x in parts if x[2]['price'] is not None]
         add = (('blended_lot',) if blended else ()) + tuple(extra)
@@ -2712,6 +3020,10 @@ class _WarehouseCoster:
         flags.update(add)
         if len(priced) < len(parts):
             flags.add('partial_cost')
+        # Delivered (DDP) and FOB refs blended: the row stays an import, flagged ddp_mixed (Oct 7 2026).
+        if 'ddp' in flags and not all('ddp' in res['flags'] for _, _, res in priced):
+            flags.discard('ddp')
+            flags.add('ddp_mixed')
         fw = Counter()
         for ref, w, _ in priced:
             fw[fac_of(ref)] += w
@@ -2772,9 +3084,13 @@ STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 
                 'openRevCost', 'costByFactory', 'costRule', 'costSpread', 'costRow', 'costRowsSkipped', 'costFlags',
                 'kitPcs')
 SHIPPED_COMPANY_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
-                          'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost')
+                          'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost', 'invUnits')
 SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', 'months', 'fobU', 'level', 'grade',
-                        'origin', 'fxShare', 'fxRef', 'caShare')
+                        'origin', 'fxShare', 'fxRef', 'caShare', 'pcs')
+# shipped.pending (Oct 7 2026): awaiting-invoice estimates by estimated ship month, the company fields plus the
+# invoice units (cartons for a kit program) behind the garment count.
+PENDING_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
+                  'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost', 'invUnits')
 # Contract C14: lifetime invoices per account and style, costed like order lines (pieces appended: kit
 # programs are invoiced by the carton, like their order lines).
 SHIPPED_CUSTOMER_FIELDS = ('cust', 'base', 'brand', 'cat', 'fiber', 'origin', 'units', 'rev', 'fobU', 'fob', 'duty',
@@ -2851,7 +3167,7 @@ class _Build:
                     out = [(self.inv[s]['onhand'] / tot, self.wh[s], self.wh_fac(self.wh[s]['fac']), self.wh[s].get('ref'),
                             'warehouse') for s in rows if self.inv[s]['onhand'] > 0]
             else:
-                res = self.ci.final(b, self.ci.raw(b, 'UNKNOWN'))
+                res = self.ci.final(b, self.ci.raw(b, 'UNKNOWN', full=sku))
                 out = [(1.0, res, 'UNKNOWN', None, 'calculator')]
         self._gen[key] = out
         return out
@@ -2915,9 +3231,18 @@ class _Build:
         ofac = ow.most_common(1)[0][0] if ow else None
         worst = next((c for c in comps if c['lv'] == lv), None)
         tiers = {c.get('tier') for c in comps if c.get('kind') == 'warehouse'}
+        # Delivered (DDP) prices (Oct 7 2026): every priced component delivered means the row adds no import
+        # costs; a mix keeps the import costs and says so (ddp_mixed), so nothing is silently half landed.
+        ddp = None
+        if priced and comps:
+            n = sum(1 for c in comps if 'ddp' in c['fl'])
+            ddp = 'all' if n == len(comps) else 'mixed' if n else None
+        if ddp == 'mixed':
+            flags.discard('ddp')
+            flags.add('ddp_mixed')
         return {'unit': unit, 'fx': fx, 'fxr': fxr, 'level': lv, 'factory': fac, 'ref': ref, 'costRef': cost_ref,
                 'origin': _factory_origin(self.S, ofac) if ofac else _factory_origin(self.S, '_default'),
-                'flags': flags, 'ids': [i for c in comps for i in c['ids']], 'priced': priced,
+                'flags': flags, 'ids': [i for c in comps for i in c['ids']], 'priced': priced, 'ddp': ddp,
                 'cap': max([c.get('cap') or 'A' for c in comps] or ['A']),
                 'lotTier': next(iter(tiers)) if len(tiers) == 1 else None,
                 'basis': worst['basis'] if worst else 'No price found. Needs a manual cost.'}
@@ -3069,6 +3394,14 @@ class _Build:
         self.sa = sa if isinstance(sa, dict) else None
         self.bmap = brand_map_bases(self.sa)     # {} without a map: every brand as before
         self.bfix = brand_map_bases(self.sa, 'fixes')
+        # Oct 7 2026: the platform colour map (white or colour rows, patterns for letterless codes), the
+        # open-orders awaiting-invoice estimates, and what the orders feed says about its A2000 export.
+        cm = s.get('colour_map')
+        self.cmap = cm if isinstance(cm, dict) else {}
+        sp = s.get('sales_pending')
+        self.pending_src = sp if isinstance(sp, dict) else {}
+        osrc = self.oo_src.get('source')
+        self.oo_source = osrc if isinstance(osrc, dict) else {}
 
     def route(self):
         ri = self.src.get('routing_inputs') if isinstance(self.src.get('routing_inputs'), dict) else {}
@@ -3117,7 +3450,7 @@ class _Build:
 
     def cost_supply(self):
         self.ci = CostIndex(self.cb, self.S, self.overrides, self.ledger_rows, today=self.today,
-                            history_rows=self.history)
+                            history_rows=self.history, colour_map=self.cmap)
         self.whc = _WarehouseCoster(self.ci, self.history)
         # Contract C13: every table takes a style's cost through CostIndex.final, the one choke point. The
         # warehouse cost of a SKU and each ledger line's cost ('use') pass it here; generic() and style_cost()
@@ -3178,6 +3511,8 @@ class _Build:
                 comps = [self.comp(q * sh, res, fac, ref, 'unsourced') for sh, res, fac, ref, _ in self.generic(sku, b)]
             shown = comps if q > 0 else [self.comp(0, res, fac, ref, 'unsourced') for sh, res, fac, ref, _ in self.generic(sku, b)]
             ag = self.agg(shown)
+            if ag.get('ddp') == 'all':
+                regime = 'none'                        # a delivered price: duty and freight are already in it
             fobU = r4(ag['unit']) if ag['priced'] else None
             # Contract C2 rounding: the unit cost is rounded to 4 decimals first, then fob = r2(pieces x fobU).
             fob = None if fobU is None else (0.0 if q <= 0 else r2(q * pcs * fobU))
@@ -3200,7 +3535,7 @@ class _Build:
                 flags.add('late')
             if fob_line and regime == 'none':
                 flags.add('fob_line')
-            if regime != 'us' and not fob_line:
+            if regime != 'us' and not fob_line and ag.get('ddp') != 'all':
                 flags.add('non_us_dest')
             if cust in self.S['regimeByCustomer']:
                 flags.add('customer_regime')
@@ -3480,6 +3815,8 @@ class _Build:
                 regs = set().union(*[self.cust_regimes.get(c, set()) for c in codes]) if codes else set()
                 regime = next(iter(regs)) if len(regs) == 1 else 'us'
                 derived = regime != 'us'
+            if ag.get('ddp') == 'all':
+                regime, derived = 'none', False        # a delivered price: duty and freight are already in it
             group, ded = self.cust_info(cust)
             money = line_money(rev, fob, qty, cat, fiber, ag['origin'], regime, ded, _roy_pct(brand, self.S), self.S)
             routing = _worst_routing(al.get('routing') for al in arows) or ('R6' if qty > 0 else None)
@@ -3489,7 +3826,7 @@ class _Build:
                 flags.add('fob_line')
             if derived:
                 flags.update(('non_us_dest', 'regime_from_orders'))
-            elif regime != 'us' and not fob_line:
+            elif regime != 'us' and not fob_line and ag.get('ddp') != 'all':
                 flags.add('non_us_dest')
             if set_by is not None:
                 flags.add('customer_regime')
@@ -3547,15 +3884,16 @@ class _Build:
             # else is a style estimate, so it cannot be graded better than B. A combined cost (C13) also
             # caps the grade at its own grade.
             grade = max(grade_of(level), 'A' if w.get('tier') in ('T1', 'T2') else 'B', w.get('gcap') or 'A')
+            ddp = unit is not None and 'ddp' in (w.get('flags') or ())
             for k, code in _STOCK_KEYS:
                 units = m[k]
                 if units <= 0:
                     continue
-                regime = self.dest_regime(code)
+                regime = 'none' if ddp else self.dest_regime(code)
                 fob = r2(units * fobU) if fobU is not None else None
                 lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S)
                 flags = set(w.get('flags') or ())
-                if regime != 'us':
+                if regime != 'us' and not ddp:
                     flags.add('non_us_dest')
                 row = {'sku': sku, 'base': m['b'], 'brand': brand, 'cat': cat, 'fiber': fiber, 'wh': code, 'units': units,
                        'fobU': fobU, 'landedU': lndU, 'fob': fob, 'landed': lnd, 'level': level,
@@ -3622,7 +3960,8 @@ class _Build:
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
             origin = _factory_origin(self.S, L['fac'])
             fob_landing = L['landing'] == 'FOB'
-            regime = self.dest_regime(L['landing'])
+            ddp = unit is not None and 'ddp' in res['flags']
+            regime = 'none' if ddp else self.dest_regime(L['landing'])
             fobU = r4(unit)
             fob = r2(units * fobU) if fobU is not None else None
             lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S)
@@ -3634,7 +3973,7 @@ class _Build:
             claimed = _int(lu.get('claimed'))
             level = res['level'] if unit is not None else 'L7'
             flags = set(res['flags'])
-            if regime != 'us' and not fob_landing:
+            if regime != 'us' and not fob_landing and not ddp:
                 flags.add('non_us_dest')
             if lu.get('suppressed'):
                 flags.add('suppressed')
@@ -3870,13 +4209,16 @@ class _Build:
         cas = sum(v[1] for c, v in cust.items() if v[1] > 0 and regs[c] == 'ca') / tv
         return ded, fobs, cas
 
-    def shipped_style_money(self, b, an, unit, cat, fiber, origin, brand):
-        out = {'cogs': 0.0 if unit is not None else None, 'gp': None, 'net': 0.0, 'rows': {}}
+    def shipped_style_money(self, b, an, unit, cat, fiber, origin, brand, ddp=False):
+        """ddp: the style's cost is a delivered price (no import adders on any share, Oct 7 2026)."""
+        out = {'cogs': 0.0 if unit is not None else None, 'gp': None, 'net': 0.0, 'rows': {}, 'pcs': 1}
         if not an or not self.months:
             if unit is None:
                 out['cogs'] = None
             return out
         ded, fobs, cas = self.mix_of(an)
+        if ddp:
+            fobs, cas = 1.0, 0.0
         roy = _roy_pct(brand, self.S)
         on_rev = royalty_base(self.S) == 'revenue'
         rcp = revenue_cost_pct(self.S)
@@ -3884,6 +4226,7 @@ class _Build:
         # Kit programs are invoiced per carton while the style cost is per piece, so the factory
         # cost and every adder count pieces, the same convention as shipped_by_customer.
         pcs = self.style_pieces(b, an)
+        out['pcs'] = pcs
         rev = cogs = dsum = rsum = 0.0
         for ym in self.months:
             e = an['months'].get(ym)
@@ -3894,7 +4237,7 @@ class _Build:
             rev += v
             dd = v * ded / 100
             dsum += dd
-            rec = {'u': u, 'v': v, 'ded': dd, 'rc': v * rcp / 100}
+            rec = {'u': u, 'pcs': qty, 'v': v, 'ded': dd, 'rc': v * rcp / 100}
             if unit is not None:
                 fob = r2(qty * unit4)
                 d, f, x = adders(fob, qty, cat, fiber, origin, self.S, 'us')
@@ -3926,6 +4269,7 @@ class _Build:
             self.shipped = {'months': [], 'company': _table(SHIPPED_COMPANY_FIELDS, []),
                             'byStyle': _table(SHIPPED_STYLE_FIELDS, []), 'note': note, 'state': self.an_state,
                             'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, []), 'range': self.shipped_range()}
+            self.shipped['pending'] = self.build_pending()
             return
         comp = {ym: defaultdict(float) for ym in self.months}
         by_style = []
@@ -3939,18 +4283,22 @@ class _Build:
             sc = self.style_cost(st, label)
             unit = sc['unit'] if sc['priced'] else None
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
-            sm = self.shipped_style_money(st, an, unit, cat, fiber, sc['origin'], brand)
+            ddp = unit is not None and sc.get('ddp') == 'all'
+            sm = self.shipped_style_money(st, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp)
             level = sc['level'] if unit is not None else 'L7'
+            # months: invoice units and value; pcs: pieces per invoice unit (a kit or carton program), so the
+            # page's unit totals count garments like the booked months do (Oct 7 2026).
             by_style.append({'base': st, 'brand': brand, 'cat': cat, 'fiber': fiber, 'dedPct': r4(sm.get('ded', 0.0)),
                              'fobShare': r4(sm.get('fobShare', 0.0)),
                              'months': {ym: [int(round(r['u'])), r2(r['v'])] for ym, r in sm['rows'].items()},
                              'fobU': r4(unit), 'level': level, 'grade': max(grade_of(level), sc['cap']),
                              'origin': sc['origin'], 'fxShare': r4(sc['fx']) if unit is not None else 0.0,
                              'fxRef': _fxref_out(r4(sc['fx']) if unit is not None else 0.0, sc.get('fxr')),
-                             'caShare': r4(sm.get('caShare', 0.0))})
+                             'caShare': r4(sm.get('caShare', 0.0)), 'pcs': sm.get('pcs') or 1})
             for ym, r in sm['rows'].items():
                 c = comp[ym]
-                c['units'] += r['u']
+                c['units'] += r['pcs']            # garments (F11), like the booked months
+                c['invUnits'] += r['u']
                 c['rev'] += r['v']
                 c['deduct'] += r['ded']
                 if unit is not None:
@@ -3972,7 +4320,7 @@ class _Build:
                          'freight': freight, 'fees': fees, 'cogs': cogs, 'deduct': r2(c['deduct']), 'net': net, 'gp': gp,
                          'royalty': roy, 'contrib': r2(gp - roy - rc),
                          'costedShare': round(c['costedRev'] / c['rev'], 3) if c['rev'] else 0.0,
-                         'costedRev': r2(c['costedRev']), 'revCost': rc})
+                         'costedRev': r2(c['costedRev']), 'revCost': rc, 'invUnits': int(round(c['invUnits']))})
         ob_to = self._div_to('OB') or _d10(self.sa_src.get('to'))
         ds_to = self._div_to('DS')
         head = ('Invoices run through %s. ' % friendly_date(ob_to)) if ob_to else ''
@@ -3986,6 +4334,89 @@ class _Build:
         self.shipped = {'months': list(self.months), 'company': _table(SHIPPED_COMPANY_FIELDS, rows),
                         'byStyle': _table(SHIPPED_STYLE_FIELDS, by_style), 'note': note, 'state': 'ready',
                         'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, self.hist_rows), 'range': self.shipped_range()}
+        self.shipped['pending'] = self.build_pending()
+
+    def build_pending(self):
+        """shipped.pending (Oct 7 2026): purchase orders that left the open book but have no invoice yet, as the
+        open-orders archive estimates them (basis 'estimate': the units and value each PO carried when it left,
+        by estimated ship month). Costed like invoices at today's costs, with each account's chargeback rate and
+        duty regime. Never merged into the invoiced months: the page shows it as its own block."""
+        p = self.pending_src
+        cube = p.get('cube') if isinstance(p.get('cube'), dict) else None
+        summ = p.get('summary') if isinstance(p.get('summary'), dict) else {}
+        tot = summ.get('totals') if isinstance(summ.get('totals'), dict) else {}
+        sa_to = self.sa_src.get('to') if isinstance(getattr(self, 'sa_src', None), dict) else None
+        out = {'ready': False, 'basis': 'estimate', 'months': [], 'byCustomer': [], 'company': _table(PENDING_FIELDS, []),
+               'totals': {'pos': _int(tot.get('pos')), 'units': _int(tot.get('units')), 'value': r2(_num(tot.get('value')))},
+               'invoicesThrough': _d10(p.get('invoicesThrough')) or _d10(sa_to),
+               'note': 'Shipped but not yet invoiced. An estimate from the order book: the units and value each PO '
+                       'carried when it left the open book, by its estimated ship month, costed at today\'s costs. '
+                       'Not part of the invoiced months.'}
+        if not p.get('ready') or cube is None:
+            out['note'] = 'Awaiting-invoice estimates are not available from the open-orders service right now.'
+            return out
+        comp = defaultdict(lambda: defaultdict(float))
+        byc = defaultdict(lambda: defaultdict(float))
+        pos_by = {}
+        for c, e in (summ.get('customers') or {}).items():
+            if isinstance(e, dict):
+                k = self.hist_code(c)
+                pos_by[k] = pos_by.get(k, 0) + _int(e.get('pos'))
+        for cust_raw, styles in cube.items():
+            if not isinstance(styles, dict):
+                continue
+            cust = self.hist_code(cust_raw)
+            regime = self.cust_regime(cust)
+            ded = self.cust_info(cust)[1]
+            for st, months in styles.items():
+                if not isinstance(months, dict):
+                    continue
+                st = _u(st)
+                if not st:
+                    continue
+                dec = self.ci.decode(st)
+                label = (self.an.get(st) or {}).get('label')
+                sc = self.style_cost(st, label)
+                unit = sc['unit'] if sc['priced'] else None
+                brand = self.brand_of(dec, None, label, base=st)
+                cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
+                pcs = self.pieces_per(cust, st)
+                reg = 'none' if (unit is not None and sc.get('ddp') == 'all') else regime
+                roy = _roy_pct(brand, self.S)
+                for ym, v in months.items():
+                    if not (isinstance(v, (list, tuple)) and len(v) >= 2):
+                        continue
+                    u, val = _num(v[0]), _num(v[1])
+                    if u <= 0 and val <= 0:
+                        continue
+                    qty = u * pcs
+                    rev = r2(val)
+                    fob = r2(qty * r4(unit)) if unit is not None else None
+                    money = line_money(rev, fob, qty, cat, fiber, sc['origin'], reg, ded, roy, self.S)
+                    for tgt in (comp[str(ym)[:7]], byc[cust]):
+                        tgt['units'] += qty
+                        tgt['invUnits'] += u
+                        tgt['rev'] += rev
+                        tgt['deduct'] += money['deduct'] or 0.0
+                        tgt['net'] += money['net'] or 0.0
+                        tgt['revCost'] += money['revCost'] or 0.0
+                        if unit is not None:
+                            tgt['costedRev'] += rev
+                            tgt['fob'] += fob
+                            for k in ('duty', 'freight', 'fees', 'cogs', 'gp', 'royalty', 'contrib'):
+                                tgt[k] += money[k] or 0.0
+
+        def row(key, c):
+            r = {key[0]: key[1], 'units': int(round(c['units'])), 'invUnits': int(round(c['invUnits'])),
+                 'costedShare': round(c['costedRev'] / c['rev'], 3) if c['rev'] else 0.0}
+            for k in ('rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'contrib',
+                      'costedRev', 'revCost'):
+                r[k] = r2(c[k])
+            return r
+        rows = [row(('month', ym), comp[ym]) for ym in sorted(comp)]
+        custs = [dict(row(('cust', c), byc[c]), pos=pos_by.get(c, 0)) for c in sorted(byc)]
+        out.update(ready=True, months=sorted(comp), company=_table(PENDING_FIELDS, rows), byCustomer=custs)
+        return out
 
     def shipped_range(self):
         """shipped.range (contract C14): the invoice history's own dates, from sales_analytics.source.
@@ -4030,7 +4461,7 @@ class _Build:
             qty = units * self.pieces_per(cust, st)
             rev = r2(val)
             fob = r2(qty * fobU) if fobU is not None else None
-            regime = self.cust_regime(cust)
+            regime = 'none' if (unit is not None and sc.get('ddp') == 'all') else self.cust_regime(cust)
             level = sc['level'] if unit is not None else 'L7'
             share = r4(sc['fx']) if unit is not None else 0.0
             row = {'cust': cust, 'base': st, 'brand': brand, 'cat': cat, 'fiber': fiber, 'origin': sc['origin'],
@@ -4253,6 +4684,18 @@ class _Build:
             add('stale_input', 'high', 'Open orders may be stale',
                 'The open orders feed reported a problem. Numbers may miss the latest changes.',
                 count=1, refs={}, aid='al_stale_orders')
+        else:
+            # The A2000 order export behind the open orders (Oct 7 2026): a frozen export looks like a fresh book.
+            osrc = self.oo_source
+            age = _fnum(osrc.get('ageHours'))
+            if osrc.get('stale') is True or (age is not None and age > STALE_ORDERS_HOURS):
+                when = friendly_date(str(osrc.get('modified') or '')[:10]) if osrc.get('modified') else None
+                add('stale_input', 'medium', 'A2000 order export is old',
+                    'The open orders come from an A2000 export written %s%s. The order book may be frozen while '
+                    'orders keep shipping. Check the Qlik export.'
+                    % (('%d hours ago' % int(age)) if age is not None else 'some time ago',
+                       (' (%s)' % when) if when else ''),
+                    count=1, refs={}, aid='al_orders_export')
         if self.an_state == 'invalid':
             add('stale_input', 'medium', 'Shipped history could not be read',
                 'The invoice history arrived in a shape the P&L cannot read. The Statement shows booked months only. '
@@ -4265,16 +4708,28 @@ class _Build:
             to = self._div_to('OB') or _d10(self.sa_src.get('to'))
             ds_to = self._div_to('DS')
 
+            def _age(d):
+                return (self.today_d - date.fromisoformat(d)).days if d else 0
+
             def _hist_old(d):
-                return bool(d) and (self.today_d - date.fromisoformat(d)).days > STALE_ANALYTICS_DAYS
+                return bool(d) and _age(d) > STALE_ANALYTICS_DAYS
             hist_parts = []
             if _hist_old(to):
-                hist_parts.append('The invoice history ends on %s.' % friendly_date(to))
+                hist_parts.append('The invoice history ends on %s, %d days ago.' % (friendly_date(to), _age(to)))
             if _hist_old(ds_to) and ds_to != to:
                 hist_parts.append('Dropship invoice history ends on %s.' % friendly_date(ds_to))
             if hist_parts:
-                add('stale_input', 'info', 'Shipped history is old', ' '.join(hist_parts),
-                    count=1, refs={}, aid='al_stale_analytics')
+                # What the gap holds (Oct 7 2026): the archive's awaiting-invoice estimate, when it is loaded.
+                pend = (getattr(self, 'shipped', None) or {}).get('pending') or {}
+                pt = pend.get('totals') or {}
+                if pend.get('ready') and pt.get('pos'):
+                    hist_parts.append('About %d purchase orders (%s units, %s) have shipped since then with no '
+                                      'invoice loaded; the Statement shows them as an estimate.'
+                                      % (pt['pos'], '{:,}'.format(pt['units']), '${:,.0f}'.format(pt['value'])))
+                hist_parts.append('Upload the A2000 invoice report (Past Orders, Invoice data) to bring shipped '
+                                  'revenue up to date.')
+                add('stale_input', 'medium' if _age(to) > 2 * STALE_ANALYTICS_DAYS else 'info',
+                    'Shipped history is old', ' '.join(hist_parts), count=1, refs={}, aid='al_stale_analytics')
             if self.an_skipped:
                 add('stale_input', 'info', 'Shipped history partly unreadable',
                     '%d invoice history rows could not be read in full. Their readable parts are used.' % self.an_skipped,
@@ -4454,7 +4909,8 @@ class _Build:
                 names[c] = str(o['customerFull']).strip()
         names.update({k: v for k, v in self.apo_names.items() if k not in names})
         codes = ({r['cust'] for r in self.lines} | {r['cust'] for r in self.apo} | set(self.fob_set)
-                 | {r['cust'] for r in self.hist_rows})
+                 | {r['cust'] for r in self.hist_rows}
+                 | {r['cust'] for r in ((self.shipped or {}).get('pending') or {}).get('byCustomer') or []})
         customers = {}
         for c in sorted(x for x in codes if x):
             g = _cust_group(c, self.S, self.fob_set)
@@ -4613,6 +5069,12 @@ class _Build:
                         'forcedUnits': ls.get('forcedUnits'), 'options': st.get('options')},
             'lotTiers': dict(self.whc.tiers), 'overridesActive': self.ci.overrides_active,
             'fx': fxin,
+            # Oct 7 2026: the A2000 export behind the orders, the colour map, the awaiting-invoice estimate.
+            'orders_source': {k: self.oo_source.get(k) for k in ('modified', 'ageHours', 'stale', 'checkedAt')}
+            if self.oo_source else None,
+            'colourMapKeys': len(self.ci.cmap),
+            'pending': {'ready': bool((self.shipped.get('pending') or {}).get('ready')),
+                        'totals': (self.shipped.get('pending') or {}).get('totals')},
         }
         if self.bmap:       # only when the payload carries a map, so a build without one is unchanged
             bm = self.sa.get('brandMap') or {}

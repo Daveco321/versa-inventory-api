@@ -152,7 +152,8 @@ OBJECTS = (COSTBOOK, SETTINGS, OVERRIDES)
 _LABELS = ((COSTBOOK, 'costbook'), (SETTINGS, 'settings'), (OVERRIDES, 'overrides'))
 
 SOURCE_KEYS = ('inventory', 'ledger', 'apo', 'manual_allocations', 'vw_allocations',
-               'open_orders', 'fob_customers', 'routing_inputs', 'sales_analytics', 'today')
+               'open_orders', 'fob_customers', 'routing_inputs', 'sales_analytics', 'today',
+               'colour_map', 'sales_pending')     # Oct 7 2026: optional; a missing getter changes nothing
 
 MAX_COSTBOOK_BYTES = 12 * 1024 * 1024
 MAX_SETTINGS_BYTES = 1 * 1024 * 1024
@@ -223,6 +224,8 @@ ROUTE_TABLE = (
     ('/api/pnl/audit', ('POST',)),
     ('/api/pnl/rotate', ('POST',)),
     ('/api/pnl/analytics', ('GET',)),
+    ('/api/pnl/quote', ('GET',)),               # Cost Glossary (Oct 8 2026): one quote, showing its sheet rows
+    ('/api/pnl/quote/batch', ('POST',)),        # Cost Glossary: a style list -> cost sheet reference
     ('/api/pnl', ('GET', 'POST')),
     ('/api/pnl/<path:rest>', ('GET', 'POST')),
 )
@@ -447,6 +450,19 @@ def _normalize_sources(raw):
         sa = json.loads(json.dumps(sa, allow_nan=False)) if isinstance(sa, dict) else None
     except (TypeError, ValueError):
         sa = None
+    # Oct 7 2026: the colour map ({key: description}), the awaiting-invoice estimates and what the orders
+    # feed says about its A2000 export. Each is optional: a getter that is missing or fails leaves {}.
+    cm = raw.get('colour_map')
+    cm = ({str(k).strip().upper(): str(v) for k, v in cm.items() if isinstance(k, str) and isinstance(v, str) and v.strip()}
+          if isinstance(cm, dict) else {})
+    sp = raw.get('sales_pending')
+    try:
+        sp = json.loads(json.dumps(sp, allow_nan=False)) if isinstance(sp, dict) else {}
+    except (TypeError, ValueError):
+        sp = {}
+    osrc = oo.get('source') if isinstance(oo.get('source'), dict) else {}
+    osrc = {'modified': _str_or_none(osrc.get('modified')), 'ageHours': _num_or_none(osrc.get('ageHours')),
+            'stale': osrc.get('stale') is True, 'checkedAt': _str_or_none(osrc.get('checkedAt'))} if osrc else {}
     return {
         'inventory': {'items': _rows(inv.get('items')), 'last_sync': _str_or_none(inv.get('last_sync'))},
         'ledger': {'rows': _rows(led.get('rows')), 'last_sync': _str_or_none(led.get('last_sync'))},
@@ -454,13 +470,23 @@ def _normalize_sources(raw):
         'manual_allocations': _rows(raw.get('manual_allocations')),
         'vw_allocations': _rows(raw.get('vw_allocations')),
         'open_orders': {'orders': _rows(oo.get('orders')), 'ok': oo.get('ok') is True,
-                        'fetched_at': _str_or_none(oo.get('fetched_at'))},
+                        'fetched_at': _str_or_none(oo.get('fetched_at')), 'source': osrc},
         'fob_customers': ([str(c).strip().upper() for c in fob if str(c).strip()]
                           if isinstance(fob, (list, tuple)) else []),
         'routing_inputs': copy.deepcopy(ri) if isinstance(ri, dict) else {},
         'sales_analytics': sa,
         'today': today,
+        'colour_map': cm,
+        'sales_pending': sp,
     }
+
+
+def _num_or_none(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float('inf'), float('-inf')) else None
 
 
 def _missing_inputs(src):
@@ -488,11 +514,15 @@ def _stamps(src):
     else:
         sa_key = None
     ri = {k: v for k, v in (src.get('routing_inputs') or {}).items() if k not in ('now_et', 'now')}
+    sp = src.get('sales_pending') or {}
+    pend_key = (sp.get('ready') is True, _digest(sp.get('summary') or {}), _digest(sp.get('cube') or {}),
+                str(sp.get('invoicesThrough')))
     return (_digest(src['inventory']['items']), _digest(src['ledger']['rows']),
             _digest(src['apo']['rows']), _digest(src['open_orders']['orders']),
             src['open_orders']['ok'], _digest(src['manual_allocations']),
             _digest(src['vw_allocations']), _digest(src['fob_customers']), _digest(ri),
-            sa_key, src['today'])
+            sa_key, src['today'], _digest(src.get('colour_map') or {}), pend_key,
+            _digest((src['open_orders'].get('source') or {}).get('modified')))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1085,7 +1115,8 @@ def validate_settings(settings, defaults=None):
 _OVR_SCOPES = {'ref_style': ('ref', 'style'), 'style': ('style',), 'design': ('design',),
                'ref': ('ref',), 'fabric_category': ('fabric', 'category')}
 _OVR_KEY_FIELDS = ('ref', 'style', 'design', 'fabric', 'category')
-_OVR_FIELDS = ('id', 'scope', 'key', 'fobU', 'reason', 'effective', 'by', 'at')
+_OVR_FIELDS = ('id', 'scope', 'key', 'fobU', 'reason', 'effective', 'by', 'at', 'terms')
+_OVR_TERMS = ('FOB', 'DDP')       # price terms of a manual cost (Oct 7 2026): DDP adds no import costs
 MAX_OVERRIDES = 5000
 _OVR_FOB_BAND = (0.0, 1000.0)
 
@@ -1167,10 +1198,19 @@ def validate_overrides(items, previous=None, email='', now_iso=None):
         if not isinstance(eff, str) or (eff and not _DATE_RE.match(eff)):
             problems.append(_problem(path + '.effective', 'invalid_date'))
             eff = ''
+        terms = o.get('terms')
+        terms = '' if terms is None else terms
+        if not isinstance(terms, str) or (terms.strip().upper() not in ('',) + _OVR_TERMS):
+            problems.append(_problem(path + '.terms', 'invalid'))
+            terms = ''
+        terms = terms.strip().upper()
         rec = {'id': oid, 'scope': scope, 'key': key, 'fobU': fob,
                'reason': _CTRL_RE.sub('', reason).strip(), 'effective': eff}
+        if terms == 'DDP':
+            rec['terms'] = 'DDP'          # FOB is the default and is not stored
         old = prev.get(oid)
-        if old is not None and all(old.get(f) == rec[f] for f in ('scope', 'key', 'fobU', 'reason', 'effective')):
+        if old is not None and all(old.get(f) == rec.get(f) for f in ('scope', 'key', 'fobU', 'reason', 'effective',
+                                                                        'terms')):
             rec['by'], rec['at'] = old.get('by'), old.get('at')
         else:
             rec['by'], rec['at'] = email, now_iso
@@ -1202,6 +1242,7 @@ class _PnlService:
         self._last_forced = 0.0
         self._cb_summary = {}
         self._an_memo = None        # {'key', 'builtAt', 'alias', 'byCust', 'byStyle', 'grades'}
+        self._quote_memo = None     # {'key', 'ci'}: the Cost Glossary's cost index (Oct 8 2026)
         self.sales_matrix = None    # set by the host app after registration (invoiced-history cube getter)
         # Other stores on the same PNL_DATA_KEYS that POST /api/pnl/rotate must re-encrypt too:
         # callables () -> {label: 'rotated' | 'absent' | ...}, appended by the host app (the
@@ -2201,7 +2242,7 @@ class _PnlService:
                 sold_rows.append({'base': row['base'], 'units': row['units'], 'first': row['first'],
                                   'last': row['last'], 'customers': [c for c, _u in top]})
             sold_rows.sort(key=lambda r: -r['units'])
-            active = []
+            active, defaulted = [], []
             if body is not None:
                 ds = json.loads(body)
                 st = ds.get('styles') or {}
@@ -2209,18 +2250,244 @@ class _PnlService:
                 want = [k for k in ('brand', 'onHand', 'incoming', 'openUnits', 'apoUnits', 'lifeUnits') if k in sf]
                 if 'base' in sf and 'fobU' in sf:
                     for row in st.get('rows') or []:
-                        if row[sf['fobU']] is not None:
-                            continue
                         rec = {'base': row[sf['base']]}
                         for k in want:
                             rec[k] = row[sf[k]]
-                        active.append(rec)
-            active.sort(key=lambda r: -((r.get('onHand') or 0) + (r.get('incoming') or 0) + (r.get('openUnits') or 0)))
-            return 200, {'sold': sold_rows, 'active': active,
+                        if row[sf['fobU']] is None:
+                            active.append(rec)
+                        elif 'level' in sf and row[sf['level']] == 'L6':
+                            # Oct 7 2026: a category default is a cost, but not the style's own; list it so a
+                            # manual cost can replace it. Units and the level only, never the default's value.
+                            rec['level'] = 'L6'
+                            defaulted.append(rec)
+
+            def _units(r):
+                return -((r.get('onHand') or 0) + (r.get('incoming') or 0) + (r.get('openUnits') or 0))
+            active.sort(key=_units)
+            defaulted.sort(key=_units)
+            return 200, {'sold': sold_rows, 'active': active, 'defaulted': defaulted,
                          'invoicesThrough': (matrix.get('source') or {}).get('to'),
                          'datasetBuiltAt': cost.get('builtAt')}
         except StoreError as e:
             return 503, {'error': 'The P&L store is not available.', 'code': type(e).__name__}
+
+    # ── Cost Glossary (Oct 8 2026): quote a brand, fabric and fit, or a style number, and show the sheet rows ──
+    _QUOTE_MAX_ROWS = 2000
+    _QUOTE_FITS = {'SLIM': ('SL', 'SS'), 'REGULAR': ('RF', 'SR'), 'BIG_TALL': ('BT', 'SB')}
+    _QUOTE_PATS = {'SOLID': 'S', 'PRINT': 'P', 'YARN_DYED': 'Y'}
+    _QUOTE_CODE_RE = re.compile(r'^[A-Z]{2}$')
+    _QUOTE_STYLE_RE = re.compile(r'^[A-Z0-9][A-Z0-9-]{3,39}$')
+
+    def _quote_index(self, key):
+        """The cost index the glossary quotes from: the stored cost book, settings and manual costs, with the
+        colour map and no ledger (so no category defaults), memoized per store key. None without the engine."""
+        with self._lock:
+            hit = self._quote_memo
+            if hit is not None and hit['key'] == key:
+                return hit['ci']
+        eng = self._module('engine')
+        if eng is None or not hasattr(eng, 'CostIndex'):
+            return None
+        cb, _e1 = self.store.get_obj(COSTBOOK)
+        settings, _e2 = self.store.get_obj(SETTINGS)
+        ov, _e3 = self.store.get_obj(OVERRIDES)
+        cm = {}
+        fn = self.sources.get('colour_map')
+        if callable(fn):
+            try:
+                cm = fn() or {}
+            except Exception:
+                cm = {}
+        today = None
+        tf = self.sources.get('today')
+        if callable(tf):
+            try:
+                today = tf()
+            except Exception:
+                today = None
+        if not (isinstance(today, str) and _DATE_RE.match(today)):
+            today = _et_today_fallback()
+        ci = eng.CostIndex(cb if isinstance(cb, dict) else {}, settings if isinstance(settings, dict) else {},
+                           ov if isinstance(ov, list) else [], [], today=today, colour_map=cm)
+        ci.generated_at = cb.get('generatedAt') if isinstance(cb, dict) else None
+        with self._lock:
+            self._quote_memo = {'key': key, 'ci': ci}
+        return ci
+
+    def _quote_key(self):
+        key = tuple(self.store.head(n) for n in OBJECTS)
+        if key[0] is None:
+            return None
+        return key
+
+    def _quote_style_of(self, ci, q):
+        """A synthetic style number for the glossary's calculator inputs: customer prefix from the group,
+        brand and fabric letters, serial 001, the fit code and the pattern letter. (style, problem)."""
+        def up(k):
+            v = q.get(k)
+            return str(v).strip().upper() if isinstance(v, str) else ''
+        brand, fab = up('brand'), up('fabric')
+        fit, sleeve, pat, group = up('fit') or 'SLIM', up('sleeve') or 'LS', up('pattern') or 'SOLID', up('group') or 'OTHER'
+        if not self._QUOTE_CODE_RE.match(brand):
+            return None, 'brand'
+        if not self._QUOTE_CODE_RE.match(fab):
+            return None, 'fabric'
+        if fit not in self._QUOTE_FITS:
+            return None, 'fit'
+        if sleeve not in ('LS', 'SS'):
+            return None, 'sleeve'
+        if pat not in self._QUOTE_PATS:
+            return None, 'pattern'
+        if not _CODE_RE.match(group):
+            return None, 'group'
+        gp = ci.params.get('customerGroupPrefix') if isinstance(ci.params.get('customerGroupPrefix'), dict) else {}
+        prefix = next((p for p, g in sorted(gp.items()) if g == group and p != '_default' and len(p) == 2), 'ZZ')
+        fitc = self._QUOTE_FITS[fit][1 if sleeve == 'SS' else 0]
+        return prefix + brand + fab + '001' + fitc + self._QUOTE_PATS[pat], None
+
+    def _quote_res(self, eng, ci, res, fac, sku):
+        """One resolution as the glossary shows it: the public cost fields, the factory, the sheet row behind the
+        price (workbook, sheet, cell, row text, fit column, the price the sheet prints), the rows set aside with
+        the reason, the rule in plain words, and the landed cost per unit under the current settings."""
+        pub = ci.public(res)
+        row = res.get('row')
+        r = ci.records.get(row[0]) if row else None
+        out = dict(pub, factory=fac, factoryName=eng._factory_name(ci.S, fac), basis=res.get('basis'),
+                   grade=max(eng.grade_of(res['level']), res.get('gcap') or 'A'), rule=res.get('rule'),
+                   manual=res.get('level') == 'L0')
+        out['row'] = ({'id': r['id'], 'source': r.get('origin_file') or r.get('source_code'),
+                       'sourceCode': r.get('source_code'), 'sheet': r.get('sheet'), 'cell': r.get('cell'),
+                       'text': ' '.join(str(r.get('fabrication') or r.get('style') or '').split()),
+                       'fit': row[1], 'priceSheet': eng.r4(ci.sheet_price(r)), 'brand': r.get('brand'),
+                       'customerGroup': r.get('customer_group'), 'ref': r.get('production_ref_resolved') or r.get('production_ref'),
+                       'terms': r.get('terms') or 'FOB'} if r else None)
+        skipped = []
+        for rid, why in (res.get('skip') or ())[:12]:
+            x = ci.records.get(rid)
+            if x:
+                skipped.append({'id': rid, 'text': ' '.join(str(x.get('fabrication') or x.get('style') or '').split()),
+                                'priceSheet': eng.r4(ci.sheet_price(x)), 'reason': why})
+        out['skipped'] = skipped
+        attrs = {'cat': sku['cat'], 'fiber': sku['fiber']} if sku else {'cat': 'dress_shirt', 'fiber': 'mmf'}
+        regime = 'none' if 'ddp' in (res.get('flags') or ()) else 'us'
+        out['landed'] = eng.landed(pub['fobU'], attrs, ci.S, regime, eng._factory_origin(ci.S, fac))
+        out['landed']['regime'] = regime
+        return out
+
+    def _quote_one(self, eng, ci, style, group=None, factory=None):
+        b = eng.base_of(style)
+        sku = ci.decode(b)
+        dec = ({k: sku.get(k) for k in ('base', 'brand', 'fab', 'cat', 'fit', 'sleeve', 'pat', 'group', 'colour',
+                                        'ground', 'patSrc', 'program', 'fiber')} if sku else None)
+        if group and dec:
+            dec['group'] = group
+        facs = ([str(factory).strip().upper()] if factory else
+                sorted({k for k in (ci.S.get('factories') or {}) if k != '_default'} | ci.pc_facs | ci.dp_facs | ci.ky_facs))
+        per = []
+        for fac in facs:
+            res = ci.raw(b, fac, None, None, allow_default=False, customer_group=group)
+            if res.get('price') is None:
+                continue
+            per.append(self._quote_res(eng, ci, res, fac, sku))
+        ladder = ci.raw(b, 'UNKNOWN', None, None, allow_default=False, customer_group=group)
+        lad = self._quote_res(eng, ci, ladder, 'UNKNOWN', sku) if ladder.get('price') is not None else None
+        comb = ci.combined(b)
+        combined = None
+        if comb is not None:
+            combined = self._quote_res(eng, ci, comb['res'], comb['res'].get('fac') or 'UNKNOWN', sku)
+            combined.update(rule=comb['rule'], spread=comb['spread'],
+                            values=[{'factory': v['fac'], 'factoryName': eng._factory_name(ci.S, v['fac']),
+                                     'fobU': eng.r4(v['price']), 'level': v['level'], 'grade': v['grade']} for v in comb['values']])
+        reason = None
+        if sku is None:
+            reason = 'The style number cannot be decoded.'
+        elif not per and lad is None:
+            reason = 'No sheet row and no manual cost prices this brand, fabric, fit, sleeve and pattern.'
+        return {'style': b, 'decoded': dec, 'combined': combined, 'ladder': lad, 'perFactory': per, 'reason': reason}
+
+    def h_quote(self, ident):
+        self._require_store()
+        key = self._quote_key()
+        if key is None:
+            return self._err(409, 'NO_COSTBOOK')
+        ci = self._quote_index(key)
+        eng = self._module('engine')
+        if ci is None or eng is None:
+            return self._err(503, 'PNL_NOT_CONFIGURED', reason='engine')
+        q = {k: request.args.get(k) for k in ('style', 'brand', 'fabric', 'fit', 'sleeve', 'pattern', 'group', 'factory')}
+        group = str(q.get('group') or '').strip().upper() or None
+        if group and not _CODE_RE.match(group):
+            raise _BadRequest()
+        factory = str(q.get('factory') or '').strip().upper() or None
+        if factory and not _CODE_RE.match(factory):
+            raise _BadRequest()
+        style = str(q.get('style') or '').strip().upper()
+        if style:
+            if not self._QUOTE_STYLE_RE.match(style):
+                raise _BadRequest()
+            out = self._quote_one(eng, ci, style, group, factory)
+            out['query'] = {'style': style, 'group': group, 'factory': factory}
+        else:
+            synth, problem = self._quote_style_of(ci, q)
+            if problem:
+                return self._err(400, 'BAD_REQUEST', field=problem)
+            out = self._quote_one(eng, ci, synth, group, factory)
+            out['query'] = {k: (str(q.get(k)).strip().upper() if q.get(k) else None)
+                            for k in ('brand', 'fabric', 'fit', 'sleeve', 'pattern', 'group', 'factory')}
+            out['synthetic'] = True
+        out['costbookGeneratedAt'] = getattr(ci, 'generated_at', None)
+        return _json(out)
+
+    def h_quote_batch(self, ident):
+        self._require_store()
+        body = self._read_json(self.max_overrides_bytes)
+        rows = body.get('rows') if isinstance(body, dict) else None
+        if not isinstance(rows, list) or len(rows) > self._QUOTE_MAX_ROWS:
+            raise _BadRequest()
+        key = self._quote_key()
+        if key is None:
+            return self._err(409, 'NO_COSTBOOK')
+        ci = self._quote_index(key)
+        eng = self._module('engine')
+        if ci is None or eng is None:
+            return self._err(503, 'PNL_NOT_CONFIGURED', reason='engine')
+        dgroup = str(body.get('group') or '').strip().upper() or None
+        if dgroup and not _CODE_RE.match(dgroup):
+            raise _BadRequest()
+        out = []
+        for i, q in enumerate(rows):
+            if not isinstance(q, dict):
+                out.append({'i': i, 'problem': 'not_an_object'})
+                continue
+            style = str(q.get('style') or '').strip().upper()
+            group = str(q.get('group') or '').strip().upper() or dgroup
+            if group and not _CODE_RE.match(group):
+                out.append({'i': i, 'problem': 'group'})
+                continue
+            synthetic = False
+            if style:
+                if not self._QUOTE_STYLE_RE.match(style):
+                    out.append({'i': i, 'problem': 'style'})
+                    continue
+            else:
+                style, problem = self._quote_style_of(ci, q)
+                if problem:
+                    out.append({'i': i, 'problem': problem})
+                    continue
+                synthetic = True
+            one = self._quote_one(eng, ci, style, group, None)
+            best = one['combined'] or one['ladder']
+            rec = {'i': i, 'style': one['style'], 'synthetic': synthetic, 'decoded': one['decoded'],
+                   'reason': one['reason']}
+            if best:
+                rec.update({'fobU': best['fobU'], 'level': best['level'], 'grade': best['grade'], 'rule': best.get('rule'),
+                            'factory': best['factory'], 'factoryName': best['factoryName'], 'flags': best['flags'],
+                            'basis': best['basis'], 'landedU': best['landed']['landedU'], 'manual': best['manual'],
+                            'row': best['row']})
+                rec['perFactory'] = [{'factory': p['factory'], 'fobU': p['fobU'], 'level': p['level'],
+                                      'row': p['row']} for p in one['perFactory']]
+            out.append(rec)
+        return _json({'rows': out, 'count': len(out)})
 
     def h_overrides(self, ident):
         self._require_store()
@@ -2284,6 +2551,8 @@ class _PnlService:
             '/api/pnl/audit': ('pnl_audit', self.h_audit),
             '/api/pnl/rotate': ('pnl_rotate', self.h_rotate),
             '/api/pnl/analytics': ('pnl_analytics', self.h_analytics),
+            '/api/pnl/quote': ('pnl_quote', self.h_quote),
+            '/api/pnl/quote/batch': ('pnl_quote_batch', self.h_quote_batch),
             '/api/pnl': ('pnl_root', self.h_not_found),
             '/api/pnl/<path:rest>': ('pnl_unknown', self.h_not_found),
         }
