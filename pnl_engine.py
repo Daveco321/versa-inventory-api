@@ -1407,11 +1407,13 @@ def program_brand(base):
     return cand if cand in _PROGRAM_BRAND_CODES else None
 
 
-def brand_map_bases(sa):
-    """The invoice brand map carried by the analytics payload (sa['brandMap']['bases']) as
-    {BASE: brand key}, upper case, or {} when the payload has none (then nothing changes)."""
+def brand_map_bases(sa, part='bases'):
+    """The invoice brand map carried by the analytics payload (sa['brandMap'][part]) as
+    {BASE: brand key}, upper case, or {} when the payload has none (then nothing changes). part
+    'fixes' reads the corrections: style numbers made with the wrong brand letters, whose map
+    brand wins even over the decoded brand (David, Oct 7 2026)."""
     bm = sa.get('brandMap') if isinstance(sa, dict) else None
-    bases = bm.get('bases') if isinstance(bm, dict) else None
+    bases = bm.get(part) if isinstance(bm, dict) else None
     if not isinstance(bases, dict):
         return {}
     return {k.strip().upper(): v.strip().upper() for k, v in bases.items()
@@ -2972,6 +2974,16 @@ class _Build:
         if not lab and b:
             lab = _u(self.base_label(b))
         br = dec.get('brand') if dec else None
+        fixes = getattr(self, 'bfix', None)
+        if fixes:
+            for k in (_u(hist) if hist else None, hist_base_of(sku) if sku else None, b):
+                if k and k in fixes:
+                    # a correction: the style number names the wrong brand
+                    fk = fixes[k]
+                    fc = 'BLK' if fk in _BLACK_LABELS else MAP_KEY_CODE.get(fk)
+                    if fc:
+                        return fc
+                    break
         if br and br in BRAND_NAMES:
             # BL is both Bloomingdale's and Black Label: a BLACK feed label or map key says which.
             if br == 'BL' and (lab in _BLACK_LABELS or self.map_brand(b, sku, hist) == 'BLK'):
@@ -3056,6 +3068,7 @@ class _Build:
         sa = s.get('sales_analytics')
         self.sa = sa if isinstance(sa, dict) else None
         self.bmap = brand_map_bases(self.sa)     # {} without a map: every brand as before
+        self.bfix = brand_map_bases(self.sa, 'fixes')
 
     def route(self):
         ri = self.src.get('routing_inputs') if isinstance(self.src.get('routing_inputs'), dict) else {}

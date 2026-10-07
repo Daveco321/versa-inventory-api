@@ -164,6 +164,24 @@ class BrandMapRule(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class Corrections(unittest.TestCase):
+    """brandMap.fixes (Oct 7 2026): a style number made with the wrong brand letters. The map's brand
+    wins even over the decoded brand, for that style only."""
+
+    def test_a_fix_beats_the_decoded_brand(self):
+        s = src_map(MAP)
+        s['sales_analytics']['brandMap']['fixes'] = {MOD_KNOWN: 'CHAPS'}
+        ds = T.build(s)
+        for brands in (shipped_brands(ds), customer_brands(ds), style_brands(ds)):
+            self.assertEqual(brands[MOD_KNOWN], 'CH')     # its letters say NA; the correction says CHAPS
+        self.assertEqual(customer_brands(ds)[WORD_GUESS], 'DK')   # other styles keep the plain map rule
+
+    def test_reader(self):
+        self.assertEqual(E.brand_map_bases({'brandMap': {'fixes': {' zzq ': ' nicole '}}}, 'fixes'),
+                         {'ZZQ': 'NICOLE'})
+        self.assertEqual(E.brand_map_bases({'brandMap': {'bases': {}}}, 'fixes'), {})
+
+
 class NoMapIsUnchanged(unittest.TestCase):
     def dump(self, s):
         return json.dumps(T.build(s), sort_keys=True, allow_nan=False)

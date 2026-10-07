@@ -484,7 +484,7 @@ def _stamps(src):
         # the invoice stamps above as they were: its own digest makes the next check rebuild.
         bm = sa.get('brandMap')
         if isinstance(bm, dict) and not sa.get('building'):
-            sa_key = sa_key + (str(bm.get('v')), _digest(bm.get('bases')))
+            sa_key = sa_key + (str(bm.get('v')), _digest(bm.get('bases')), _digest(bm.get('fixes') or {}))
     else:
         sa_key = None
     ri = {k: v for k, v in (src.get('routing_inputs') or {}).items() if k not in ('now_et', 'now')}
