@@ -2428,6 +2428,62 @@ def src_kit_hist():
     return s
 
 
+class CartonAccountBJS(unittest.TestCase):
+    """Oct 7 2026: BJ's books its own program codes in cartons (the open-orders app reads BJ's order qty x 36 with
+    the dollars unchanged). The pack is the size the code names, else 36; a BJ's code without the BJ prefix counts
+    pieces. Synthetic codes and sentinel costs only."""
+    OV = [{'id': 'c%d' % i, 'scope': 'style', 'key': {'style': st}, 'fobU': 7.0013, 'reason': 'synthetic',
+           'effective': '', 'by': 'x@example.com', 'at': '2026-01-01'}
+          for i, st in enumerate(('BJQQ-KIT36A', 'BJQQ-KIT48', 'BJQQ880011', 'ZZLOOSE-SS'))]
+
+    def test_pack_named_in_the_code(self):
+        self.assertEqual([E.carton_pieces(c, 36) for c in ('BJQQ-KIT48', 'BJQQ731KIT36', 'BJQQ-36KITS2', 'BJQQ-36KIT',
+                                                           'BJQQ880011', 'BJQQSP25KT1')], [48, 36, 36, 36, 36, 36])
+        # A season or serial run into the word is never a pack; three digits after KIT are not a pack either.
+        self.assertEqual([E.carton_pieces(c, 36) for c in ('BJQQSP27KIT', 'BJQQFA26KITA', 'BJQQ731KIT', 'BJQQ-KIT100',
+                                                           'BJQQ-24KIT')], [36, 36, 36, 36, 24])
+        self.assertEqual(E.unit_pieces('ROSS', 'BJQQ-KIT48', {}), 1)                  # not the carton account
+        self.assertEqual(E.unit_pieces('BJS', 'ZZKIT02-1', {'ZZKIT02': 12}), 12)     # kitPcs by base wins
+
+    def src_hist(self):
+        s = src()
+        for st, u, v in (('BJQQ-KIT36A', 10, 3600.0), ('BJQQ-KIT48', 5, 2400.0), ('BJQQ880011', 4, 1440.0),
+                         ('ZZLOOSE-SS', 90, 900.0)):
+            s['sales_analytics']['styles'].append([st, 'SYN', u, v, '2026-01-05', '2026-01-20',
+                                                   {'2026-01': [u, v, 0, 0.0]}, {'BJS': [u, v]}, 'RED'])
+        return s
+
+    def test_invoice_history_counts_pieces(self):
+        ds = build(self.src_hist(), overrides=self.OV)
+        bc = {r['base']: r for r in rows({'b': ds['shipped']['byCustomer']}, 'b') if r['cust'] == 'BJS'}
+        self.assertEqual({k: (bc[k]['units'], bc[k]['pieces'], bc[k]['fob']) for k in bc},
+                         {'BJQQ-KIT36A': (10, 360, E.r2(360 * 7.0013)), 'BJQQ-KIT48': (5, 240, E.r2(240 * 7.0013)),
+                          'BJQQ880011': (4, 144, E.r2(144 * 7.0013)), 'ZZLOOSE-SS': (90, 90, E.r2(90 * 7.0013))})
+        st = by(ds, 'styles', 'base')
+        self.assertEqual((st['BJQQ-KIT36A']['kitPcs'], st['BJQQ-KIT36A']['expPrice']), (36, E.r4(3600.0 / 360)))
+        self.assertEqual(st['BJQQ-KIT36A']['t12Cogs'], bc['BJQQ-KIT36A']['cogs'])     # style lens counts pieces too
+        self.assertIsNone(st['ZZLOOSE-SS']['kitPcs'])
+
+    def test_open_lines_count_pieces_like_the_order_app(self):
+        s = src()
+        s['open_orders']['orders'] = s['open_orders']['orders'] + [
+            order('21', 'BJQQ-KIT36A', 5, 360.0, cust='BJS', bulk=True), order('22', 'ZZLOOSE-SS', 7, 10.0, cust='BJS'),
+            order('23', 'BJQQ-KIT36A', 3, 10.0, cust='KOHL')]
+        L = by(build(s, overrides=self.OV), 'lines', 'id')
+        self.assertEqual((L['21|BJQQ-KIT36A']['units'], L['21|BJQQ-KIT36A']['pieces']), (5, 180))
+        self.assertIn('kit', L['21|BJQQ-KIT36A']['flags'])
+        self.assertEqual(L['22|ZZLOOSE-SS']['pieces'], 7)
+        self.assertEqual(L['23|BJQQ-KIT36A']['pieces'], 3)                            # another account: pieces
+        st = by(build(s, overrides=self.OV), 'styles', 'base')['BJQQ']
+        self.assertEqual(st['expPrice'], E.r4(3 * 10.0 / 3))                           # each line's own pieces
+
+    def test_carton_invoices_never_price_an_allocation_per_piece(self):
+        s = self.src_hist()
+        s['apo']['rows'] = s['apo']['rows'] + [{'style': 'BJQQ880011', 'qty': 72, 'customer': 'BJS', 'po': 'SYNTH BJ'}]
+        a = [r for r in rows(build(s, overrides=self.OV), 'apo') if r['po'] == 'SYNTH BJ'][0]
+        self.assertNotIn(a['priceBasis'], ('customer_invoice', 'style_t12', 'customer_brand_invoice'))
+
+
 class KitShippedMoney(unittest.TestCase):
     """Invoice-history units of a kit program are cartons; its cost is per piece. The shipped lens
     costs the pieces, exactly as shipped.byCustomer does."""

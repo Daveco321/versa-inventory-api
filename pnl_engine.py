@@ -642,6 +642,39 @@ def hist_base_of(s):
     return '-'.join(parts)
 
 
+# BJ's books its own program codes in cartons (Oct 7 2026; the open-orders app reads BJ's order quantities as
+# cartons with the dollars already right). Account -> (code prefix, pieces per carton). The pack is the size the
+# code names (KIT48, -36KIT), else the default. A code without the prefix is a loose-piece program and counts
+# pieces (the invoices show one). Checked against every BJ's invoice to Sep 2026.
+CARTON_ACCOUNTS = {'BJS': ('BJ', 36)}
+# KIT36 / KITS36 after the word, or 36KIT / 36KITS as its own dash segment. Digits run into the word without a
+# dash (SP27KIT, 522KIT) are a season or a serial, never a pack.
+_PACK_IN_CODE = (re.compile(r'KITS?(\d{2})(?!\d)'), re.compile(r'(?:^|-)(\d{2})KITS?(?=\d|-|$|[A-Z])'))
+
+
+def carton_pieces(code, default):
+    """Pieces in one carton of code: the pack the code names, else default."""
+    for rx in _PACK_IN_CODE:
+        m = rx.search(code)
+        if m and int(m.group(1)) >= 2:
+            return int(m.group(1))
+    return default
+
+
+def unit_pieces(acct, code, kit_pcs):
+    """Pieces in one order or invoice unit of code for account acct (an account code, history aliases already
+    folded). The cost book's kitPcs wins (the history's whole code, then the base); a carton account's own program
+    codes count its cartons (CARTON_ACCOUNTS); anything else counts pieces."""
+    hb = hist_base_of(code)
+    for key in (hb, base_of(code)):
+        if key in kit_pcs:
+            return kit_pcs[key]
+    rule = CARTON_ACCOUNTS.get(_u(acct))
+    if rule and hb.startswith(rule[0]):
+        return carton_pieces(hb, rule[1])
+    return 1
+
+
 def norm_vd(b):
     return b[:2] + 'VD' + b[4:] if len(b) > 4 and b[2:4] == 'DV' else b
 
@@ -2923,6 +2956,23 @@ class _Build:
         g = _cust_group(code, self.S, self.fob_set)
         return g, _ded_pct(code, self.S, g)
 
+    def pieces_per(self, cust, code):
+        """Pieces in one order or invoice unit of code for customer cust (unit_pieces)."""
+        return unit_pieces(self.hist_code(cust), code, self.ci.kit_pcs)
+
+    def style_pieces(self, b, an=None):
+        """Pieces per unit on a style row (its open lines and invoices): kitPcs, else a carton account's
+        program code that the account buys."""
+        k = self.ci.kit_pcs
+        for key in (b, base_of(b)):
+            if key in k:
+                return k[key]
+        custs = {self.hist_code(c) for c in ((an or {}).get('customers') or {})}
+        for acct, (prefix, default) in CARTON_ACCOUNTS.items():
+            if b.startswith(prefix) and (acct in custs or (acct, b) in self.cust_line):
+                return carton_pieces(b, default)
+        return 1
+
     # ── inputs ──
     def load_inputs(self):
         s = self.src
@@ -3034,7 +3084,7 @@ class _Build:
             b = base_of(sku)
             dec = self.ci.decode(b)
             q = max(0, _int(o.get('openQty')) + _int(o.get('pickQty')))
-            pcs = self.ci.kit_pcs.get(b, 1)
+            pcs = self.pieces_per(o.get('customer'), sku)
             price = _num(o.get('salesPrice'))
             ov, pv = o.get('openValue'), o.get('pickValue')
             rev = r2(_num(ov) + _num(pv)) if (ov is not None or pv is not None) else r2(q * price)
@@ -3258,7 +3308,7 @@ class _Build:
             # The lines' resolver first; a size-suffixed history key falls back to its own label.
             br = self.brand_of(d, hb, base=hb) or self.brand_of(d, hb, label=e.get('label'), base=hb) or None
             for c, v in e['customers'].items():
-                if v[0] > 0 and v[1] > 0:
+                if v[0] > 0 and v[1] > 0 and self.pieces_per(c, st) == 1:
                     k = self.hist_code(c)
                     hist_style[(k, hb)][0] += v[0]
                     hist_style[(k, hb)][1] += v[1]
@@ -3312,7 +3362,7 @@ class _Build:
                 pflags.add('price_proxy')
             # 6. The style's invoices in the last 12 months. Kit programs are invoiced per carton,
             # so they skip this rung, as the lifetime maps above do.
-            if price is None and b not in self.ci.kit_pcs:
+            if price is None and self.style_pieces(b, self.an.get(b)) == 1:
                 e = self.an.get(b)
                 if e and e.get('t12') and e['t12'][0] > 0 and e['t12'][1] > 0:
                     price, basis = e['t12'][1] / e['t12'][0], 'style_t12'
@@ -3631,13 +3681,14 @@ class _Build:
             e[1] += abs(m['committed'])
             e[2] += abs(m['allocated'])
             e[3] = e[3] or m['label']
-        open_b = defaultdict(lambda: {'u': 0, 'rev': 0.0, 'ded': 0.0, 'gp': 0.0, 'contrib': 0.0, 'rc': 0.0,
+        open_b = defaultdict(lambda: {'u': 0, 'pcs': 0, 'rev': 0.0, 'ded': 0.0, 'gp': 0.0, 'contrib': 0.0, 'rc': 0.0,
                                       'lad': defaultdict(lambda: [0, 0.0])})
         for r in self.lines:
             if r['type'] != 'a2000' or r['units'] <= 0:
                 continue
             e = open_b[r['base']]
             e['u'] += r['units']
+            e['pcs'] += r['pieces'] if r.get('pieces') is not None else r['units']
             e['rev'] += r['rev']
             e['ded'] += r['deduct'] or 0.0
             e['gp'] += r['gp'] or 0.0
@@ -3675,10 +3726,10 @@ class _Build:
             # Expected price and the deduction percent of the same customer mix (contract C8).
             # Open lines and invoice history count kit cartons, so a kit base divides by its pieces
             # per carton (build_lines' convention); the landed cost it meets below is per piece.
-            pcs = self.ci.kit_pcs.get(b, 1)
+            pcs = self.style_pieces(b, an)
             exp = ded = None
             if ob and ob['u'] > 0:
-                exp = ob['rev'] / (ob['u'] * pcs)
+                exp = ob['rev'] / ob['pcs']           # each line's own pieces (kit and carton lines included)
                 ded = 100 * ob['ded'] / ob['rev'] if ob['rev'] else None
             elif t12[0] > 0 and t12[1] > 0:
                 exp = t12[1] / (t12[0] * pcs)
@@ -3760,7 +3811,7 @@ class _Build:
         unit4 = r4(unit)
         # Kit programs are invoiced per carton while the style cost is per piece, so the factory
         # cost and every adder count pieces, the same convention as shipped_by_customer.
-        pcs = self.ci.kit_pcs.get(b, 1)
+        pcs = self.style_pieces(b, an)
         rev = cogs = dsum = rsum = 0.0
         for ym in self.months:
             e = an['months'].get(ym)
@@ -3904,7 +3955,7 @@ class _Build:
             fobU = r4(unit)
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
             brand = self.brand_of(dec, None, label, base=st)
-            qty = units * self.ci.kit_pcs.get(st, 1)
+            qty = units * self.pieces_per(cust, st)
             rev = r2(val)
             fob = r2(qty * fobU) if fobU is not None else None
             regime = self.cust_regime(cust)

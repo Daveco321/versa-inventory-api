@@ -1157,6 +1157,39 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertEqual(d['pendingCube'], {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}})
         self.assertTrue(d['datasetBuiltAt'])
 
+    def test_pieces_per_unit_for_carton_and_kit_pairs(self):
+        """piecesPer (Oct 7 2026): BJ's invoices and orders count cartons. An invoiced pair takes the engine's own
+        pieces / units from shipped.byCustomer; a pair never invoiced takes the engine's rule; anything else is left
+        out (one piece per unit)."""
+        import pnl_engine as real
+        eng = make_engine()
+        eng.HISTORY_CUSTOMER_ALIAS = {}
+        eng.unit_pieces = real.unit_pieces
+
+        def build_dataset(src, costbook, settings, overrides, now_iso, routing_module):
+            return {'v': 1, 'builtAt': now_iso, 'asOf': src['today'],
+                    'shipped': {'byCustomer': {'fields': ['cust', 'base', 'fobU', 'grade', 'units', 'pieces'],
+                                               'rows': [['BJS', 'BJQQ-KIT36A', SENTINEL_COST, 'A', 10, 360],
+                                                        ['BJS', 'ZZLOOSE-SS', SENTINEL_COST, 'A', 9, 9],
+                                                        ['ROSS', 'ZZAAAA001', SENTINEL_COST, 'A', 10, 10]]}},
+                    'styles': {'fields': ['base', 'fobU', 'grade', 'kitPcs'],
+                               'rows': [['ZZKIT02', SENTINEL_COST, 'A', 12]]}}
+        eng.build_dataset = build_dataset
+        h = self.harness(engine=eng)
+        h.upload()
+        cube = self.cube()
+        cube['customers']['BJS'] = {'BJQQ-KIT36A': {'2026-01': [10, 3600.0]}, 'ZZLOOSE-SS': {'2026-01': [9, 90.0]}}
+        cube['pendingCube']['BJS'] = {'BJQQ-KIT48': {'2026-10': [2, 960.0]}, 'ZZKIT02': {'2026-10': [1, 99.0]}}
+        h.svc.sales_matrix = lambda: cube
+        deadline = time.time() + 10
+        r = h.admin('GET', '/api/pnl/analytics')
+        while r.status_code == 202 and time.time() < deadline:
+            h.wait_idle()
+            r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+        self.assertEqual(d['piecesPer'], {'BJS': {'BJQQ-KIT36A': 36.0, 'BJQQ-KIT48': 48, 'ZZKIT02': 12}})
+
     def test_fees_block_from_the_settings(self):
         """fees (Oct 1 2026): the fee rates the analytics tool spreads per style.
         With the fake engine (no helpers) the block says not ready and the rest

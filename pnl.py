@@ -1818,6 +1818,7 @@ class _PnlService:
                'cost2ByCustomer': cost.get('byCust2') or {},
                'costByStyle': cost['byStyle'],
                'costGrades': cost['grades'],
+               'piecesPer': self._analytics_pieces(matrix, cost),
                'datasetBuiltAt': cost['builtAt'],
                'costLens': lens,
                'fees': self._analytics_fees(matrix)}
@@ -1832,6 +1833,33 @@ class _PnlService:
             resp.headers['Content-Encoding'] = 'gzip'
         resp.vary.add('Accept-Encoding')
         return resp
+
+    def _analytics_pieces(self, matrix, cost):
+        """{raw history customer: {base: pieces per unit}} for every cube and awaiting-invoice pair whose unit holds
+        several pieces (Oct 7 2026: BJ's invoices and orders count cartons, kits count kits). The invoiced pairs take
+        the engine's own ratio from shipped.byCustomer; a pair never invoiced takes the engine's rule. Costs stay per
+        piece, so the page multiplies the cube's units by this before any per-unit math."""
+        eng = self._module('engine')
+        rule = getattr(eng, 'unit_pieces', None)
+        alias = cost.get('alias') or {}
+        seen = cost.get('pieces') or {}
+        kits = cost.get('kitStyles') or {}
+        out = {}
+        for cube in ((matrix.get('customers') or {}), (matrix.get('pendingCube') or {})):
+            for raw, styles in cube.items():
+                if not isinstance(styles, dict):
+                    continue
+                acct = alias.get(raw, raw)
+                for base in styles:
+                    n = (seen.get(acct) or {}).get(base)
+                    if n is None and callable(rule):
+                        try:
+                            n = rule(acct, base, kits)
+                        except Exception:
+                            n = None
+                    if n and n != 1:
+                        out.setdefault(raw, {})[base] = n
+        return out
 
     def _analytics_fees(self, matrix):
         """The fee rates the Inventory Analytics tool spreads over every style
@@ -1945,11 +1973,15 @@ class _PnlService:
                 'analyticsIngested': inputs.get('analytics_ingested'), 'builtAt': built_at}
         by_cust = {}
         by_cust2 = {}
+        pieces = {}         # account -> {base: pieces per invoiced unit} where a unit holds several (kits, cartons)
         bc = (ds.get('shipped') or {}).get('byCustomer') or {}
         f = {n: i for i, n in enumerate(bc.get('fields') or [])}
         if 'cust' in f and 'base' in f and 'fobU' in f:
             have2 = all(k in f for k in ('units', 'fob', 'duty', 'freight', 'fees'))
+            havep = 'units' in f and 'pieces' in f
             for row in bc.get('rows') or []:
+                if havep and row[f['units']] and row[f['pieces']] and row[f['pieces']] != row[f['units']]:
+                    pieces.setdefault(row[f['cust']], {})[row[f['base']]] = round(row[f['pieces']] / row[f['units']], 4)
                 fob = row[f['fobU']]
                 if fob is not None:
                     by_cust.setdefault(row[f['cust']], {})[row[f['base']]] = fob
@@ -1965,9 +1997,13 @@ class _PnlService:
                         imp = (row[f['duty']] or 0) + (row[f['freight']] or 0) + (row[f['fees']] or 0)
                         by_cust2.setdefault(row[f['cust']], {})[row[f['base']]] = [
                             round(tot / u, 4), round(imp / u, 4)]
-        by_style, grades = {}, {}
+        by_style, grades, kit_styles = {}, {}, {}
         st = ds.get('styles') or {}
         sf = {n: i for i, n in enumerate(st.get('fields') or [])}
+        if 'base' in sf and 'kitPcs' in sf:
+            for row in st.get('rows') or []:
+                if row[sf['kitPcs']]:
+                    kit_styles[row[sf['base']]] = row[sf['kitPcs']]
         if 'base' in sf and 'fobU' in sf:
             for row in st.get('rows') or []:
                 fob = row[sf['fobU']]
@@ -1976,7 +2012,8 @@ class _PnlService:
                     if 'grade' in sf:
                         grades[row[sf['base']]] = row[sf['grade']]
         hit = {'key': key, 'builtAt': built_at, 'started': started, 'alias': alias, 'byCust': by_cust,
-               'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades, 'lens': lens}
+               'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades, 'lens': lens, 'pieces': pieces,
+               'kitStyles': kit_styles}
         with self._lock:
             self._an_memo = hit
         return hit
