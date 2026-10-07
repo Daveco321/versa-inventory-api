@@ -1156,6 +1156,22 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertTrue(d['pendingReady'])
         self.assertEqual(d['pendingCube'], {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}})
         self.assertTrue(d['datasetBuiltAt'])
+        self.assertIsNone(d['brandMap'])                            # upstream sent none
+        # brandMap (Oct 7 2026): the upstream base -> brand key map passes through unchanged.
+        bm = {'v': 1, 'labels': {'ZZLABEL': 'Zz Label'}, 'bases': {'ZZAAAA001': 'NAUTICA', 'ZZBBBB002': 'ZZLABEL'}}
+        cube = self.cube()
+        cube['brandMap'] = bm
+        h.svc.sales_matrix = lambda: cube
+        r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+        self.assertEqual(d['brandMap'], bm)
+        self.assertEqual(d['matrix']['customers']['ROSS']['ZZAAAA001']['2026-08'], [10, 95.0])
+        cube['brandMap'] = ['not', 'a', 'map']                      # a bad shape is dropped, never passed on
+        r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+        self.assertIsNone(d['brandMap'])
 
     def test_pieces_per_unit_for_carton_and_kit_pairs(self):
         """piecesPer (Oct 7 2026): BJ's invoices and orders count cartons. An invoiced pair takes the engine's own

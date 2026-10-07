@@ -1806,6 +1806,9 @@ class _PnlService:
             # Built without the invoice lens: every history-only style has no
             # cost. The matrix is ready now, so rebuild (at most once a minute).
             self._kick_lens_rebuild(key)
+        # brandMap (Oct 7 2026): the open-orders side's frozen base style -> brand
+        # key map for history styles, passed through as is (None when absent).
+        brand_map = matrix.get('brandMap')
         out = {'ready': True,
                'matrix': {'customers': matrix.get('customers') or {},
                           'source': matrix.get('source') or {}},
@@ -1813,6 +1816,7 @@ class _PnlService:
                'pendingCube': matrix.get('pendingCube') or {},
                'pendingReady': bool(matrix.get('pendingReady')),
                'history': matrix.get('history'),
+               'brandMap': brand_map if isinstance(brand_map, dict) else None,
                'custAlias': cost['alias'],
                'costByCustomer': cost['byCust'],
                'cost2ByCustomer': cost.get('byCust2') or {},
