@@ -1637,6 +1637,9 @@ class CostIndex:
                      if isinstance(colour_map, dict) else {})
         self._col = {}
         self.families = p.get('fabricFamilies') if isinstance(p.get('fabricFamilies'), dict) else FABRIC_FAMILY_SIBLINGS
+        gp = p.get('customerGroupPrefix') if isinstance(p.get('customerGroupPrefix'), dict) else {}
+        dg = gp.get('_default')
+        self.default_group = dg if isinstance(dg, str) and dg else 'OTHER'
         roles = price_field_roles(cb)
         self._f_usd, self._f_base, self._f_cut = roles['usd'], roles['base'], roles['cut']
         self._f_rmb, self._f_e1 = roles.get('rmb'), roles.get('e1')
@@ -2428,7 +2431,8 @@ class CostIndex:
         if c.get('ddp'):
             said.append('A delivered (DDP) price: duty and freight are in it, so no import costs are added')
         grp = sku.get('group')
-        own_block = grp and self.group_pools(grp)
+        # A group with its own block (not the default group, whose 'block' is the catch-all other-tag block).
+        own_block = grp and grp != self.default_group and self.group_pools(grp)
         if own_block and sel['pool'] not in own_block and not (set(own_block) & self.base_pools()):
             said.append("This customer's own price block has no row for the style, so a regular sheet is used")
         if sel.get('named'):
