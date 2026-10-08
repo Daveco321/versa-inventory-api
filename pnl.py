@@ -2343,7 +2343,8 @@ class _PnlService:
         gp = ci.params.get('customerGroupPrefix') if isinstance(ci.params.get('customerGroupPrefix'), dict) else {}
         prefix = next((p for p, g in sorted(gp.items()) if g == group and p != '_default' and len(p) == 2), 'ZZ')
         fitc = self._QUOTE_FITS[fit][1 if sleeve == 'SS' else 0]
-        return prefix + brand + fab + '001' + fitc + self._QUOTE_PATS[pat], None
+        # Serial 000: no real style carries it, so the colour map never answers for a synthetic number.
+        return prefix + brand + fab + '000' + fitc + self._QUOTE_PATS[pat], None
 
     def _quote_res(self, eng, ci, res, fac, sku):
         """One resolution as the glossary shows it: the public cost fields, the factory, the sheet row behind the
@@ -2391,6 +2392,18 @@ class _PnlService:
             per.append(self._quote_res(eng, ci, res, fac, sku))
         ladder = ci.raw(b, 'UNKNOWN', None, None, allow_default=False, customer_group=group)
         lad = self._quote_res(eng, ci, ladder, 'UNKNOWN', sku) if ladder.get('price') is not None else None
+        # Manual costs keyed by a production ref and this style (a PO's own price): shown by ref, and used as
+        # the cost when nothing else prices the style.
+        manual_refs = []
+        for (ref, st), o in sorted(ci._ovr.get('ref_style', {}).items()):
+            if st == b:
+                res = ci.raw(b, eng.fac_of(ref), ref, None, allow_default=False, customer_group=group)
+                if res.get('level') == 'L0':
+                    q = self._quote_res(eng, ci, res, eng.fac_of(ref), sku)
+                    q['ref'] = ref
+                    manual_refs.append(q)
+        if lad is None and manual_refs:
+            lad = dict(manual_refs[0])
         comb = ci.combined(b)
         combined = None
         if comb is not None:
@@ -2401,9 +2414,10 @@ class _PnlService:
         reason = None
         if sku is None:
             reason = 'The style number cannot be decoded.'
-        elif not per and lad is None:
+        elif not per and lad is None and not manual_refs:
             reason = 'No sheet row and no manual cost prices this brand, fabric, fit, sleeve and pattern.'
-        return {'style': b, 'decoded': dec, 'combined': combined, 'ladder': lad, 'perFactory': per, 'reason': reason}
+        return {'style': b, 'decoded': dec, 'combined': combined, 'ladder': lad, 'perFactory': per, 'reason': reason,
+                'manualRefs': manual_refs}
 
     def h_quote(self, ident):
         self._require_store()

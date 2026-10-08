@@ -31,7 +31,7 @@ class SyntheticStyle(unittest.TestCase):
         s, problem = svc._quote_style_of(ci, {'brand': 'qa', 'fabric': 'qf', 'fit': 'REGULAR', 'sleeve': 'SS',
                                               'pattern': 'PRINT', 'group': 'CLUB'})
         self.assertIsNone(problem)
-        self.assertEqual(s, 'CLQAQF001SRP')          # CL is the CLUB prefix in the synthetic params
+        self.assertEqual(s, 'CLQAQF000SRP')          # CL is the CLUB prefix in the synthetic params; serial 000
         d = E.decode_sku(s, PARAMS)
         self.assertEqual((d['brand'], d['fab'], d['fit'], d['sleeve'], d['pat'], d['group']),
                          ('QA', 'QF', 'REGULAR', 'SS', 'PRINT', 'CLUB'))
@@ -39,7 +39,7 @@ class SyntheticStyle(unittest.TestCase):
     def test_defaults_and_unknown_group(self):
         svc, ci = service(), index()
         s, problem = svc._quote_style_of(ci, {'brand': 'QA', 'fabric': 'QF'})
-        self.assertEqual((s, problem), ('ZZQAQF001SLS', None))   # slim, long sleeve, solid, no group prefix
+        self.assertEqual((s, problem), ('ZZQAQF000SLS', None))   # slim, long sleeve, solid, no group prefix
         for bad, field in (({'brand': 'Q', 'fabric': 'QF'}, 'brand'), ({'brand': 'QA', 'fabric': 'Q1F'}, 'fabric'),
                            ({'brand': 'QA', 'fabric': 'QF', 'fit': 'HUGE'}, 'fit'),
                            ({'brand': 'QA', 'fabric': 'QF', 'sleeve': 'XL'}, 'sleeve'),
@@ -98,6 +98,17 @@ class QuoteOne(unittest.TestCase):
         self.assertIn('ddp', lad['flags'])
         self.assertEqual(lad['landed']['regime'], 'none')
         self.assertEqual(lad['landed']['landedU'], 9.9999)       # a delivered price: nothing added
+
+    def test_ref_style_manual_cost_shows_by_ref(self):
+        svc = service()
+        ov = [{'id': 'o2', 'scope': 'ref_style', 'key': {'ref': 'AA26009', 'style': 'ROQAQZ101SLS'}, 'fobU': 8.8888,
+               'terms': 'DDP', 'reason': 'synthetic', 'at': '2026-01-01T00:00:00Z'}]
+        ci = index(overrides=ov)
+        out = svc._quote_one(E, ci, 'ROQAQZ101SLS')           # no sheet row for fabric QZ: only the PO's own cost
+        self.assertIsNone(out['reason'])
+        self.assertEqual([m['ref'] for m in out['manualRefs']], ['AA26009'])
+        self.assertEqual((out['ladder']['fobU'], out['ladder']['level'], out['ladder']['manual']), (8.8888, 'L0', True))
+        self.assertEqual(out['ladder']['landed']['regime'], 'none')
 
     def test_skipped_rows_name_their_reason(self):
         svc, ci = service(), index()
