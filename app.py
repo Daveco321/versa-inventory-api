@@ -2923,6 +2923,13 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'src_mix_even': workbook.add_format({**base, 'bg_color': '#BFDBFE', 'bold': True}),
         'newfab_odd':   workbook.add_format({**base, 'bg_color': '#F3E8FF', 'bold': True}),
         'newfab_even':  workbook.add_format({**base, 'bg_color': '#E9D5FF', 'bold': True}),
+        # Brand band (TJX layout, Charlesy Oct 9 2026): one bordered title row above each
+        # brand's rows, so a tab reads as brand blocks (_write_rows brand_breaks)
+        'brand_band': workbook.add_format({
+            'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
+            'bg_color': '#CBD5E1', 'font_color': '#0F172A',
+            'left': 1, 'right': 1, 'top': 2, 'bottom': 2, 'border_color': STYLE_CONFIG['border_color'],
+            'align': 'left', 'valign': 'vcenter', 'indent': 1}),
     }
 
     worksheet.hide_gridlines(2)
@@ -3066,8 +3073,13 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
 
 
 def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
-                view_mode='all', headers=None, catalog_mode=False):
-    """Write data rows using headers list to determine column layout."""
+                view_mode='all', headers=None, catalog_mode=False, brand_breaks=False):
+    """Write data rows using headers list to determine column layout.
+    brand_breaks (TJX layout, Charlesy Oct 9 2026): rows are written brand by brand, each
+    brand under its own bordered band row, and the zebra restarts under every band, so a
+    tab reads as brand blocks. Within a brand the caller's order is kept.
+    Returns the last worksheet row written (len(data) when there are no bands); callers
+    anchor the size-scale grids under it."""
     if not headers:
         headers = []
     # "Landing in" (every Overseas / All Inventory export): ledger lookup index, built once per sheet
@@ -3151,9 +3163,33 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Units'
     }
 
-    for r, item in enumerate(data):
-        row = r + 1
-        even = r % 2 == 1
+    # Brand bands: group the item indexes by brand in order of first appearance (a stable
+    # sort, so the caller's order inside a brand survives). images stays keyed by the
+    # original item index.
+    seq = list(range(len(data)))
+    if brand_breaks:
+        _first = {}
+        for i, it in enumerate(data):
+            _first.setdefault(_brand_break_key(it), i)
+        seq.sort(key=lambda i: _first[_brand_break_key(data[i])])
+    band_fmt = fmts.get('brand_band') or fmts['odd']
+    row = 0            # last worksheet row written (0 = header only)
+    zebra = 0          # data rows since the last band
+    last_brand = None
+    for r in seq:
+        item = data[r]
+        if brand_breaks:
+            bkey = _brand_break_key(item)
+            if last_brand is None or bkey != last_brand:
+                row += 1
+                worksheet.set_row(row, 24)
+                worksheet.merge_range(row, 0, row, max(len(headers) - 1, 1),
+                                      item.get('brand_full') or item.get('brand') or bkey, band_fmt)
+                last_brand = bkey
+                zebra = 0
+        row += 1
+        even = zebra % 2 == 1
+        zebra += 1
         if item.get('_yellow'):
             cf, nf = fmts['yellow'], fmts['num_yellow']
         else:
@@ -3187,7 +3223,12 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
                 worksheet.write(row, 0, "Error", cf)
         else:
             worksheet.write(row, 0, "No Image", cf)
-    return len(data)
+    return row
+
+
+def _brand_break_key(item):
+    """The brand an export row belongs to, for _write_rows' brand bands."""
+    return str(item.get('brand_abbr') or item.get('brand_full') or item.get('brand') or '')
 
 
 _SIZED_SKU_BASE_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$')
@@ -3668,7 +3709,8 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
-                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode)
+                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode,
+                    brand_breaks=bool(tjx_layout and catalog_mode))
     print(f"  [build_brand_excel] Step 4: add size charts (prepack_defaults={type(prepack_defaults).__name__}, len={len(prepack_defaults) if prepack_defaults else 0})")
     try:
         _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
@@ -3696,7 +3738,8 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
                                          tjx_layout=tjx_layout)
         imgs = download_images_for_items(items, s3_base_url, use_cache=True)
         _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
-                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode)
+                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode,
+                    brand_breaks=bool(tjx_layout and catalog_mode))
         wb.close()
         print(f"  [build_brand_excel] Retry succeeded (no size charts)")
     return buf.getvalue()
@@ -3788,7 +3831,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             if gi in all_imgs:
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
-                        has_color=has_color, headers=headers, catalog_mode=catalog_mode)
+                        has_color=has_color, headers=headers, catalog_mode=catalog_mode,
+                        brand_breaks=bool(tjx_layout and catalog_mode))
         # An empty tab would render the hardcoded fallback size grids on an
         # otherwise blank sheet — skip charts entirely when there are no rows.
         if brand['items']:
@@ -3822,7 +3866,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 if gi in all_imgs:
                     local_imgs[li] = all_imgs[gi]
             _write_rows(wb, ws, brand['items'], local_imgs, fmts,
-                        has_color=has_color, headers=headers, catalog_mode=catalog_mode)
+                        has_color=has_color, headers=headers, catalog_mode=catalog_mode,
+                        brand_breaks=bool(tjx_layout and catalog_mode))
         wb.close()
         print(f"  ✓ Multi-brand retry succeeded (no size charts)")
     return buf.getvalue()
@@ -6617,15 +6662,28 @@ def apo_report_rows_route():
 # catalog feeds the page loads (read in-process, so scoping, NJ stripping and the
 # hidden-landing cuts are the server's own), routed and decorated by tjx_ats /
 # tjx_display exactly as index.html does. David's rules for the email:
-#   - TJ and TM style numbers only, every brand;
+#   - Warehouse: TJ and TM style numbers plus the Ross ones, RO and RM (Charlesy, Oct 9
+#     2026: "add RO prefix styles to the WAREHOUSE tab"; David: RM counts as RO), every brand;
+#   - Overseas: TJ and TM style numbers only;
 #   - Warehouse leaves out U.S. Polo Assn., Nicole Miller and Von Dutch (Asley's edit);
 #   - Overseas is one row per delivery (smart-routed per lot);
-#   - any row of 35 units or less is dropped.
+#   - any row of 35 units or less is dropped;
+#   - each tab is broken out by brand: a bordered brand band above every brand's rows
+#     (Charlesy, Oct 9 2026), drawn by _write_rows(brand_breaks=True) for every TJX-layout
+#     customer workbook, so Asley's manual catalog exports look the same.
 # Used by open-orders-api's 'tjxAts' report.
 _TJX_ATS_SLUG = os.environ.get('TJX_ATS_CATALOG_SLUG', 'fffwr26a')
-_TJX_ATS_PREFIXES = ('TJ', 'TM')
+_TJX_ATS_PREFIXES = ('TJ', 'TM')                    # Overseas tab
+_TJX_ATS_WH_PREFIXES = ('TJ', 'TM', 'RO', 'RM')     # Warehouse tab: TJX plus Ross
 _TJX_ATS_WH_EXCLUDE = frozenset({'USPA', 'NICOLE', 'VD'})
 _TJX_ATS_MIN = 36
+
+
+def _tjx_ats_sku_filter(prefixes):
+    """Keeps rows whose style number starts with one of `prefixes`; by-size rows are
+    hidden like every customer catalog (_hideSizedForCatalog)."""
+    allowed = tuple(str(p).upper() for p in prefixes)
+    return lambda sku: str(sku)[:2].upper() in allowed and not _is_sized_sku(sku)
 
 
 def _tjx_catalog_feed(path, key, **params):
@@ -6671,11 +6729,11 @@ def build_tjx_ats(now=None):
                       _tjx_catalog_feed('/deduction-assignments', 'assignments'),
                       _tjx_catalog_feed('/suppression-overrides', 'overrides'),
                       orders, display, now)
-    # TJ/TM styles; by-size rows are hidden like every customer catalog (_hideSizedForCatalog)
-    tj_tm = lambda sku: sku[:2].upper() in _TJX_ATS_PREFIXES and not _is_sized_sku(sku)
-    wh = b.tab_rows('ats', sku_filter=tj_tm, brand_filter=lambda k: k not in _TJX_ATS_WH_EXCLUDE,
-                    min_ats=_TJX_ATS_MIN)
-    os_rows = b.tab_rows('incoming', sku_filter=tj_tm, min_ats=_TJX_ATS_MIN)
+    # Warehouse: TJ/TM plus Ross (RO/RM) styles. Overseas: TJ/TM only.
+    wh = b.tab_rows('ats', sku_filter=_tjx_ats_sku_filter(_TJX_ATS_WH_PREFIXES),
+                    brand_filter=lambda k: k not in _TJX_ATS_WH_EXCLUDE, min_ats=_TJX_ATS_MIN)
+    os_rows = b.tab_rows('incoming', sku_filter=_tjx_ats_sku_filter(_TJX_ATS_PREFIXES),
+                         min_ats=_TJX_ATS_MIN)
     # The customer-export scrub /export-multi applies (a no-op on rows built from the
     # scoped feeds; kept so this path can never print NJ stock or an NJ-landing lot).
     wh = _customer_export_scrub(wh, 'ats', True, True, True)

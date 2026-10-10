@@ -416,7 +416,8 @@ class TjxAtsBuilder:
 
 
 def summarize(rows, overseas=False):
-    """Counts for the email body: rows, units, distinct styles and a per-brand split."""
+    """Counts for the email body: rows, units, distinct styles, a per-brand split and a
+    per-customer-prefix split (TJ/TM against the Ross RO/RM rows on the Warehouse tab)."""
     brands, order = {}, []
     for r in rows:
         b = r.get('brand_full') or r.get('brand_abbr') or ''
@@ -425,8 +426,16 @@ def summarize(rows, overseas=False):
             order.append(b)
         brands[b]['rows'] += 1
         brands[b]['units'] += int(r.get('total_ats') or 0)
+    prefixes, porder = {}, []
+    for r in rows:
+        p = str(r.get('sku') or '')[:2].upper()
+        if p not in prefixes:
+            prefixes[p] = {'prefix': p, 'rows': 0, 'units': 0}
+            porder.append(p)
+        prefixes[p]['rows'] += 1
+        prefixes[p]['units'] += int(r.get('total_ats') or 0)
     out = {'rows': len(rows), 'units': sum(int(r.get('total_ats') or 0) for r in rows),
-           'brands': [brands[b] for b in order]}
+           'brands': [brands[b] for b in order], 'prefixes': [prefixes[p] for p in porder]}
     if overseas:
         out['styles'] = len({r.get('sku') for r in rows})
     return out
