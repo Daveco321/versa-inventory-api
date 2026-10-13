@@ -44,7 +44,9 @@ DATASET = {
     'shipped': {'byCustomer': {'fields': ['cust', 'base', 'units', 'fobU', 'level', 'grade'], 'rows': [
         ['ROSS', 'ROQAQF101SLS', 100, 1.5555, 'L4a', 'B'],
         ['ROSS', 'TJQAQF522-304', 10, 1.2222, 'L0', 'A'],
-    ]}},
+    ]},
+                'pending': {'ready': True, 'byPair': {'fields': ['cust', 'base', 'units', 'invUnits', 'rev', 'fobU', 'fob', 'level', 'grade'],
+                                                      'rows': [['MARS', 'ROQAQF101SLS', 72, 2, 240.0, 1.5555, 112.0, 'L4a', 'B']]}}},
     'evidence': {'NF!F10': {'src': 'calc.xlsx', 'sheet': 'TJX', 'cell': 'F10', 'row': 10},
                  'NF!F11': {'src': 'calc.xlsx', 'sheet': 'TJX', 'cell': 'F11', 'row': 11},
                  'NF!F99': {'src': 'calc.xlsx', 'sheet': 'TJX', 'cell': 'F99', 'row': 99},
@@ -100,6 +102,14 @@ class Payload(unittest.TestCase):
         self.assertEqual(out['styleCost']['level'], 'L0')
         self.assertEqual(set(out['evidence']), {'OVR:m1'})
         self.assertEqual(out['customerCost']['fobU'], 1.2222)
+
+    def test_a_customer_that_only_shipped_awaiting_invoice_takes_the_pair_cost(self):
+        out = self.svc._style_cost_payload(E, self.idx, 'ROQAQF101SLS', 'MARS')
+        c = out['customerCost']
+        self.assertEqual((c['cust'], c['fobU'], c['units'], c['pieces'], c['awaitingInvoice']), ('MARS', 1.5555, 2, 72, True))
+        self.assertEqual((c['level'], c['grade']), ('L4a', 'B'))
+        self.assertIsNone(out['groupQuote'])                   # same cost as the style: no block quote
+        self.assertNotIn('awaitingInvoice', self.svc._style_cost_payload(E, self.idx, 'ROQAQF101SLS', 'ROSS')['customerCost'])
 
     def test_size_suffix_folds_to_the_base_and_no_customer(self):
         out = self.svc._style_cost_payload(E, self.idx, 'ROQAQF101SLS-L', None)

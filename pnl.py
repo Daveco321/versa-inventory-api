@@ -2503,9 +2503,16 @@ class _PnlService:
         if 'cust' in cf and 'base' in cf:
             for row in bc.get('rows') or []:
                 custs[(row[cf['cust']], row[cf['base']])] = row
+        # the awaiting-invoice pairs (Oct 13 2026): a customer's cost for a style it only shipped since the last invoice
+        pp = tab(tab(tab(ds.get('shipped')).get('pending')).get('byPair'))
+        pf = {n: i for i, n in enumerate(pp.get('fields') or [])}
+        pairs = {}
+        if 'cust' in pf and 'base' in pf:
+            for row in pp.get('rows') or []:
+                pairs[(row[pf['cust']], row[pf['base']])] = row
         d, inputs, settings = tab(ds.get('dict')), tab(ds.get('inputs')), tab(ds.get('settings'))
         hit = {'key': key, 'builtAt': built_at, 'started': started, 'sf': sf, 'styles': styles, 'cf': cf,
-               'custs': custs, 'evidence': tab(ds.get('evidence')),
+               'custs': custs, 'pf': pf, 'pairs': pairs, 'evidence': tab(ds.get('evidence')),
                'dict': {k: d.get(k) for k in self._WHY_DICT_KEYS}, 'customers': tab(d.get('customers')),
                'costbookGenerated': inputs.get('costbook_generated'),
                'costRuleMode': tab(settings.get('costRule')).get('mode')}
@@ -2535,6 +2542,18 @@ class _PnlService:
             if crow is None:
                 crow = idx['custs'].get((cust, base))
         cust_rec = {k: crow[cf[k]] for k in self._WHY_CUST_FIELDS if k in cf} if crow is not None else None
+        if cust_rec is None and cust:
+            # not invoiced yet: the awaiting-invoice pair carries this customer's cost (Oct 13 2026)
+            pf, prow = idx.get('pf') or {}, None
+            pairs = idx.get('pairs') or {}
+            prow = pairs.get((cust, style))
+            if prow is None:
+                prow = pairs.get((cust, base))
+            if prow is not None:
+                cust_rec = {k: prow[pf[k]] for k in ('cust', 'base', 'units', 'fobU', 'fob', 'level', 'grade') if k in pf}
+                cust_rec['pieces'] = prow[pf['units']] if 'units' in pf else None
+                cust_rec['units'] = prow[pf['invUnits']] if 'invUnits' in pf else cust_rec.get('units')
+                cust_rec['awaitingInvoice'] = True
         ids = set()
         if style_rec:
             cr = style_rec.get('costRow')
