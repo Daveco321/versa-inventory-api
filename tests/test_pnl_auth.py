@@ -157,6 +157,7 @@ ROUTE_CALLS = [
     ('/api/pnl/analytics', 'GET', None),
     ('/api/pnl/quote', 'GET', None),                        # Cost Glossary (Oct 8 2026)
     ('/api/pnl/quote/batch', 'POST', {'rows': []}),
+    ('/api/pnl/style-cost', 'GET', None),                   # Inventory Analytics (Oct 13 2026)
     ('/api/pnl', 'GET', None),
     ('/api/pnl', 'POST', {}),
     ('/api/pnl/some/unknown/path', 'GET', None),
@@ -166,7 +167,8 @@ STORE_ROUTES = {('/api/pnl/dataset', 'GET'), ('/api/pnl/costbook', 'GET'), ('/ap
                 ('/api/pnl/costbook/versions', 'GET'), ('/api/pnl/costbook/restore', 'POST'),
                 ('/api/pnl/settings', 'GET'), ('/api/pnl/settings', 'POST'),
                 ('/api/pnl/overrides', 'GET'), ('/api/pnl/overrides', 'POST'), ('/api/pnl/rotate', 'POST'),
-                ('/api/pnl/analytics', 'GET'), ('/api/pnl/quote', 'GET'), ('/api/pnl/quote/batch', 'POST')}
+                ('/api/pnl/analytics', 'GET'), ('/api/pnl/quote', 'GET'), ('/api/pnl/quote/batch', 'POST'),
+                ('/api/pnl/style-cost', 'GET')}
 
 
 def new_key():

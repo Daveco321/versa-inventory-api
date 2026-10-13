@@ -226,6 +226,7 @@ ROUTE_TABLE = (
     ('/api/pnl/analytics', ('GET',)),
     ('/api/pnl/quote', ('GET',)),               # Cost Glossary (Oct 8 2026): one quote, showing its sheet rows
     ('/api/pnl/quote/batch', ('POST',)),        # Cost Glossary: a style list -> cost sheet reference
+    ('/api/pnl/style-cost', ('GET',)),          # Inventory Analytics (Oct 13 2026): where one style's cost comes from
     ('/api/pnl', ('GET', 'POST')),
     ('/api/pnl/<path:rest>', ('GET', 'POST')),
 )
@@ -1243,6 +1244,7 @@ class _PnlService:
         self._cb_summary = {}
         self._an_memo = None        # {'key', 'builtAt', 'alias', 'byCust', 'byStyle', 'grades'}
         self._quote_memo = None     # {'key', 'ci'}: the Cost Glossary's cost index (Oct 8 2026)
+        self._why_memo = None       # {'key', 'builtAt', 'started', 'styles', 'custs', ...}: the style-cost index (Oct 13 2026)
         self.sales_matrix = None    # set by the host app after registration (invoiced-history cube getter)
         # Other stores on the same PNL_DATA_KEYS that POST /api/pnl/rotate must re-encrypt too:
         # callables () -> {label: 'rotated' | 'absent' | ...}, appended by the host app (the
@@ -2419,6 +2421,137 @@ class _PnlService:
         return {'style': b, 'decoded': dec, 'combined': combined, 'ladder': lad, 'perFactory': per, 'reason': reason,
                 'manualRefs': manual_refs}
 
+    # ── Inventory Analytics: where a style's cost comes from (Oct 13 2026) ──────────────────────────────
+    # David: "the cost shown is clickable and when I click on it it tells me exactly where it is getting that
+    # cost from". The page shows the dataset's own record of one style's cost (contracts C13 and C15): the cost
+    # used, the rule, every factory that quotes it, the sheet row behind the price with its evidence, the flags,
+    # the rows set aside, and the shipped-history row for one customer when a price block gave it another cost.
+    _WHY_STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 'fobU', 'landedU', 'level',
+                         'grade', 'rangeLo', 'rangeHi', 'factories', 'basis', 'ev', 'dutyRegime', 'costByFactory',
+                         'costRule', 'costSpread', 'costRow', 'costRowsSkipped', 'costFlags', 'kitPcs')
+    _WHY_CUST_FIELDS = ('cust', 'base', 'brand', 'fiber', 'origin', 'units', 'fobU', 'fob', 'level', 'grade',
+                        'dutyRegime', 'pieces')
+    _WHY_DICT_KEYS = ('factories', 'brands', 'levels', 'grades', 'costRules', 'flags', 'basis', 'fiberClasses',
+                      'regimes', 'categories')
+
+    def _why_index(self, key):
+        """Per dataset build: the style rows by base, the shipped-history rows by (customer, base), the evidence
+        table and the dictionary words, parsed once from the memo body. None when no dataset memo for this key
+        exists yet. Shares the dataset's freshness: a new build replaces it on the next read."""
+        with self._lock:
+            memo, hit = self._memo, self._why_memo
+            if memo is None or memo['key'] != key:
+                return hit if (hit is not None and hit['key'] == key) else None
+            if (hit is not None and hit['key'] == key and hit['builtAt'] == memo['builtAt']
+                    and hit.get('started') == memo['started']):
+                return hit
+            body, built_at, started = memo['body'], memo['builtAt'], memo['started']
+        ds = json.loads(body)
+
+        def tab(x):
+            return x if isinstance(x, dict) else {}
+        st = tab(ds.get('styles'))
+        sf = {n: i for i, n in enumerate(st.get('fields') or [])}
+        styles = {}
+        if 'base' in sf:
+            for row in st.get('rows') or []:
+                styles[row[sf['base']]] = row
+        bc = tab(tab(ds.get('shipped')).get('byCustomer'))
+        cf = {n: i for i, n in enumerate(bc.get('fields') or [])}
+        custs = {}
+        if 'cust' in cf and 'base' in cf:
+            for row in bc.get('rows') or []:
+                custs[(row[cf['cust']], row[cf['base']])] = row
+        d, inputs, settings = tab(ds.get('dict')), tab(ds.get('inputs')), tab(ds.get('settings'))
+        hit = {'key': key, 'builtAt': built_at, 'started': started, 'sf': sf, 'styles': styles, 'cf': cf,
+               'custs': custs, 'evidence': tab(ds.get('evidence')),
+               'dict': {k: d.get(k) for k in self._WHY_DICT_KEYS}, 'customers': tab(d.get('customers')),
+               'costbookGenerated': inputs.get('costbook_generated'),
+               'costRuleMode': tab(settings.get('costRule')).get('mode')}
+        with self._lock:
+            self._why_memo = hit
+        return hit
+
+    def _style_cost_payload(self, eng, idx, style, cust, key=None):
+        """The answer for one style and one customer: the style row's cost record, the customer's shipped-history
+        row, the evidence behind every cell named, the dictionary words, and the customer's price-block quote
+        when its cost differs from the style's. A style the dataset does not hold answers with a reason."""
+        base = eng.base_of(style)
+        styles, sf = idx['styles'], idx['sf']
+        srow = styles.get(style)
+        if srow is None:
+            srow = styles.get(base)
+        if srow is None and hasattr(eng, 'hist_base_of'):
+            try:
+                srow = styles.get(eng.hist_base_of(style))
+            except Exception:
+                srow = None
+        style_rec = {k: srow[sf[k]] for k in self._WHY_STYLE_FIELDS if k in sf} if srow is not None else None
+        cf = idx['cf']
+        crow = None
+        if cust:
+            crow = idx['custs'].get((cust, style))
+            if crow is None:
+                crow = idx['custs'].get((cust, base))
+        cust_rec = {k: crow[cf[k]] for k in self._WHY_CUST_FIELDS if k in cf} if crow is not None else None
+        ids = set()
+        if style_rec:
+            cr = style_rec.get('costRow')
+            if isinstance(cr, list) and len(cr) >= 2 and cr[0] and cr[1]:
+                ids.add('%s!%s' % (cr[0], cr[1]))
+            for x in style_rec.get('costRowsSkipped') or []:
+                if isinstance(x, list) and x:
+                    ids.add(str(x[0]))
+            for e in style_rec.get('ev') or []:
+                ids.add(str(e))
+        evidence = {i: idx['evidence'][i] for i in ids if i in idx['evidence']}
+        group_quote = None
+        if (cust_rec and style_rec and cust_rec.get('fobU') is not None and style_rec.get('fobU') is not None
+                and abs(float(cust_rec['fobU']) - float(style_rec['fobU'])) > 0.00005 and key is not None):
+            try:
+                grp = (idx['customers'].get(cust) or {}).get('group')
+                ci = self._quote_index(key) if grp else None
+                if ci is not None:
+                    one = self._quote_one(eng, ci, base, grp, None)
+                    best = one.get('combined') or one.get('ladder')
+                    if best:
+                        group_quote = {'group': grp, 'fobU': best.get('fobU'), 'row': best.get('row'),
+                                       'rule': best.get('rule'), 'level': best.get('level'),
+                                       'flags': best.get('flags'), 'values': best.get('values')}
+            except Exception:
+                group_quote = None
+        name = (idx['customers'].get(cust) or {}).get('name') if cust else None
+        return {'ready': True, 'style': style, 'base': base, 'customer': cust or None, 'customerName': name,
+                'styleCost': style_rec, 'customerCost': cust_rec, 'groupQuote': group_quote,
+                'evidence': evidence, 'dict': idx['dict'], 'costRuleMode': idx['costRuleMode'],
+                'datasetBuiltAt': idx['builtAt'], 'costbookGeneratedAt': idx['costbookGenerated'],
+                'reason': None if style_rec else 'This style is not in the cost dataset, so it has no cost yet.'}
+
+    def h_style_cost(self, ident):
+        """GET /api/pnl/style-cost?style=BASE&customer=CODE: where one style's cost comes from, for the Inventory
+        Analytics drill. Reads the dataset memo only; never builds or fetches on the request thread (202 while a
+        build runs). Admin gate, CORS, no-store and audit come from the route table like every /api/pnl route."""
+        self._require_store()
+        eng = self._module('engine')
+        if eng is None:
+            return self._err(503, 'PNL_NOT_CONFIGURED', reason='engine')
+        key = tuple(self.store.head(n) for n in OBJECTS)
+        if key[0] is None:
+            return self._err(409, 'NO_COSTBOOK')
+        style = str(request.args.get('style') or '').strip().upper()
+        if not style or not self._QUOTE_STYLE_RE.match(style):
+            raise _BadRequest()
+        cust = str(request.args.get('customer') or '').strip().upper()
+        if cust and not _CODE_RE.match(cust):
+            raise _BadRequest()
+        r = self._dataset_for(key, False)
+        if r.status_code not in (200, 202):
+            return r
+        idx = self._why_index(key)
+        if idx is None:
+            return _json({'building': True, 'part': 'dataset'}, 202)
+        return _json(self._style_cost_payload(eng, idx, style, cust, key))
+
     def h_quote(self, ident):
         self._require_store()
         key = self._quote_key()
@@ -2567,6 +2700,7 @@ class _PnlService:
             '/api/pnl/analytics': ('pnl_analytics', self.h_analytics),
             '/api/pnl/quote': ('pnl_quote', self.h_quote),
             '/api/pnl/quote/batch': ('pnl_quote_batch', self.h_quote_batch),
+            '/api/pnl/style-cost': ('pnl_style_cost', self.h_style_cost),
             '/api/pnl': ('pnl_root', self.h_not_found),
             '/api/pnl/<path:rest>': ('pnl_unknown', self.h_not_found),
         }
