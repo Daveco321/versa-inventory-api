@@ -2520,9 +2520,49 @@ class _PnlService:
                                        'flags': best.get('flags'), 'values': best.get('values')}
             except Exception:
                 group_quote = None
+        # The cost book's own quote when the dataset has no style row (a style only in the invoice history, like a
+        # legacy code with a manual cost) or when the cost is manual or has no sheet row behind it: it names the
+        # manual cost's basis, and it stands in for the style row so the page shows the same sections.
+        quote, manual_basis = None, None
+        if key is not None and (style_rec is None or style_rec.get('level') == 'L0' or not style_rec.get('costRow')):
+            try:
+                ci = self._quote_index(key)
+                grp = (idx['customers'].get(cust) or {}).get('group') if cust else None
+                if ci is not None:
+                    one = self._quote_one(eng, ci, base, grp, None)
+                    best = one.get('combined') or one.get('ladder')
+                    if best and best.get('fobU') is not None:
+                        quote = {'fobU': best.get('fobU'), 'level': best.get('level'), 'grade': best.get('grade'),
+                                 'rule': best.get('rule'), 'manual': bool(best.get('manual')), 'basis': best.get('basis'),
+                                 'row': best.get('row'), 'flags': list(best.get('flags') or []),
+                                 'skipped': list(best.get('skipped') or []), 'values': list(best.get('values') or []),
+                                 'factory': best.get('factory'), 'factoryName': best.get('factoryName'),
+                                 'decoded': one.get('decoded'),
+                                 'manualRefs': [{'ref': m.get('ref'), 'fobU': m.get('fobU')} for m in one.get('manualRefs') or []]}
+                        if quote['manual']:
+                            manual_basis = quote.get('basis')
+            except Exception:
+                quote = None
+        if style_rec is None and quote is not None:
+            dec = quote.get('decoded') or {}
+            row = quote.get('row') or None
+            style_rec = {'base': base, 'brand': dec.get('brand'), 'cat': dec.get('cat'), 'fab': dec.get('fab'),
+                         'fiber': dec.get('fiber'), 'fit': dec.get('fit'), 'sleeve': dec.get('sleeve'), 'pat': dec.get('pat'),
+                         'fobU': quote['fobU'], 'level': quote['level'], 'grade': quote['grade'],
+                         'costRule': quote['rule'] or ('manual' if quote['manual'] else None), 'costSpread': None,
+                         'costRow': ([row.get('sourceCode') or row.get('source'), row.get('cell'), row.get('text'),
+                                      row.get('fit'), row.get('priceSheet')] if row else None),
+                         'costRowSource': row.get('source') if row else None, 'costRowSheet': row.get('sheet') if row else None,
+                         'costRowsSkipped': [[x.get('id'), x.get('text'), x.get('priceSheet'), x.get('reason')]
+                                             for x in quote['skipped'] if isinstance(x, dict)],
+                         'costFlags': quote['flags'],
+                         'costByFactory': [[v.get('factory'), '', '', v.get('fobU'), v.get('level')]
+                                           for v in quote['values'] if isinstance(v, dict)],
+                         'factories': [], 'ev': [], 'fromQuote': True}
         name = (idx['customers'].get(cust) or {}).get('name') if cust else None
         return {'ready': True, 'style': style, 'base': base, 'customer': cust or None, 'customerName': name,
                 'styleCost': style_rec, 'customerCost': cust_rec, 'groupQuote': group_quote,
+                'quote': quote, 'manualBasis': manual_basis,
                 'evidence': evidence, 'dict': idx['dict'], 'costRuleMode': idx['costRuleMode'],
                 'datasetBuiltAt': idx['builtAt'], 'costbookGeneratedAt': idx['costbookGenerated'],
                 'reason': None if style_rec else 'This style is not in the cost dataset, so it has no cost yet.'}
