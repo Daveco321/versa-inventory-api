@@ -105,8 +105,14 @@ class MachineFeesTest(PnlTestCase):
                                     'source': {'to': '2026-03-31'}}
         svc._analytics_cost_maps = lambda key: {'byStyle': {'TTXXAA001SLS': 7.0013}, 'byCust': {}, 'byCust2': {},
                                                 'alias': {'BBB1': 'BBB'}, 'builtAt': 't'}
+        # TTXXAA004SLS (Oct 13 2026): only shipped awaiting invoice, so every stock and order count is zero; its
+        # 200 pending units come from the dataset's awaiting-invoice pairs and rank it first.
         ds = {'styles': {'fields': ['base', 'brand', 'fobU', 'onHand', 'incoming', 'openUnits'],
-                         'rows': [['TTXXAA003SLS', 'XX', None, 36, 0, 12], ['TTXXAA001SLS', 'XX', 7.0013, 1, 0, 0]]}}
+                         'rows': [['TTXXAA003SLS', 'XX', None, 36, 0, 12], ['TTXXAA001SLS', 'XX', 7.0013, 1, 0, 0],
+                                  ['TTXXAA004SLS', 'XX', None, 0, 0, 0]]},
+              'shipped': {'pending': {'byPair': {'fields': ['cust', 'base', 'units', 'invUnits', 'fobU'],
+                                                 'rows': [['AAA', 'TTXXAA004SLS', 150, 150, None], ['BBB', 'TTXXAA004SLS', 50, 50, None],
+                                                          ['AAA', 'TTXXAA001SLS', 9, 9, 7.0013]]}}}}
         svc._memo = {'key': ('e1', 'e1', 'e1'), 'body': json.dumps(ds)}
         status, body = svc.machine_missing_costs()
         self.assertEqual(status, 200, body)
@@ -114,7 +120,8 @@ class MachineFeesTest(PnlTestCase):
         self.assertEqual(body['sold'][0]['units'], 12)
         self.assertEqual(body['sold'][0]['customers'], ['BBB', 'AAA'])
         self.assertEqual((body['sold'][0]['first'], body['sold'][0]['last']), ('2026-02', '2026-03'))
-        self.assertEqual([r['base'] for r in body['active']], ['TTXXAA003SLS'])
+        self.assertEqual([r['base'] for r in body['active']], ['TTXXAA004SLS', 'TTXXAA003SLS'])
+        self.assertEqual([r['pendingUnits'] for r in body['active']], [200, 0])
         self.assertNotIn('7.0013', json.dumps(body))                     # never a cost value
         self.assertNotIn('fobU', json.dumps(body))
 

@@ -3132,6 +3132,45 @@ class PendingOct7(unittest.TestCase):
         self.assertEqual((C['ZZPC']['units'], C['ZZPC']['invUnits'], C['ZZPC']['pos']), (2 * 12 + 4, 6, 2))   # kit pieces
         self.assertEqual((C['ZZPC']['costedRev'], C['ZZPC']['costedShare']), (240.0, round(240.0 / 280.0, 3)))
 
+    def test_a_style_only_awaiting_invoice_gets_a_row_and_a_pair_cost(self):
+        # Oct 13 2026 (David: no more invoice reports). ROQAQF777SLS is in no stock, lot, open line or
+        # invoice: only the awaiting-invoice estimate names it. It still gets a styles row with the cost
+        # book's price, and the pending block publishes its (account, style) pair at that cost.
+        s = src_pending()
+        s['sales_pending']['cube']['ZZPC']['ROQAQF777SLS'] = {'2026-03': [20, 200.0], '2026-04': [5, 50.0]}
+        ds = build(s)
+        plain = build(src())
+        self.assertNotIn('ROQAQF777SLS', by(plain, 'styles', 'base'))
+        row = by(ds, 'styles', 'base')['ROQAQF777SLS']
+        sib = by(ds, 'styles', 'base')['ROQAQF201SLS']
+        self.assertIsNotNone(row['fobU'])
+        self.assertEqual((row['level'], row['grade']), (sib['level'], sib['grade']))      # same calculator row family
+        self.assertEqual((row['onHand'], row['incoming'], row['openUnits'], row['t12Units'], row['lifeUnits']), (0, 0, 0, 0, 0))
+        P = ds['shipped']['pending']
+        self.assertEqual(P['byPair']['fields'], list(E.PENDING_PAIR_FIELDS))
+        pairs = {(r['cust'], r['base']): r for r in rows({'p': P['byPair']}, 'p')}
+        self.assertEqual(set(pairs), {('ZZPC', 'ROQAQF201SLS'), ('ZZPC', 'ROQAQF777SLS')})
+        pr = pairs[('ZZPC', 'ROQAQF777SLS')]
+        self.assertEqual((pr['units'], pr['invUnits'], pr['rev'], pr['pcs']), (25, 25, 250.0, 1))
+        self.assertEqual(pr['fobU'], row['fobU'])
+        self.assertEqual(pr['fob'], E.r2(E.r2(20 * row['fobU']) + E.r2(5 * row['fobU'])))   # per-month cents summed, as the engine does
+        # a cube style with no units or value in any month, or a malformed one, gets no ghost row
+        s2 = src_pending()
+        s2['sales_pending']['cube']['ZZPC']['ROQAQF778SLS'] = {'2026-03': [0, 0.0]}
+        s2['sales_pending']['cube']['ZZPC']['ROQAQF779SLS'] = 'junk'
+        st2 = by(build(s2), 'styles', 'base')
+        self.assertNotIn('ROQAQF778SLS', st2)
+        self.assertNotIn('ROQAQF779SLS', st2)
+        self.assertEqual((pr['level'], pr['grade']), (row['level'], row['grade']))
+        # the pair's import adds are the same customs formula the company block uses, summed over its months
+        C = {r['cust']: r for r in P['byCustomer']}['ZZPC']
+        other = pairs[('ZZPC', 'ROQAQF201SLS')]
+        for k in ('duty', 'freight', 'fees', 'fob', 'rev'):
+            self.assertAlmostEqual(pr[k] + other[k], C[k], places=1, msg=k)
+        # the not-ready shape still carries the empty table
+        self.assertEqual(build(src())['shipped']['pending']['byPair'], E._table(E.PENDING_PAIR_FIELDS, []))
+        json.dumps(ds, allow_nan=False)
+
     def test_not_available_without_the_source(self):
         for s in (src(), dict(src(), sales_pending={'ready': False}), dict(src(), sales_pending={'ready': True}),
                   dict(src(), sales_pending='x'), dict(src(), sales_pending={'ready': True, 'cube': 'x'})):
@@ -3191,6 +3230,97 @@ class OrdersExportAlertOct7(unittest.TestCase):
         a, _ = run({'ageHours': 9, 'stale': False}, ok=False)                           # a failed feed: that alert only
         self.assertIsNone(a)
         self.assertIn('al_stale_orders', {x['id'] for x in build(src(orders_ok=False))['alerts']})
+
+
+class WeightPrefOct13(unittest.TestCase):
+    """R7a (David, Oct 13 2026): DKNY knits price from the 140 GSM rows. Synthetic DK rows on QH, sentinel prices."""
+    W1 = calc('GN!W1', 'GN:BASE', 1.2525, 'DK', ['QH'], 'SLIM', 'SOLID',
+              fabrication='100% POLY SOLID KNIT COLOR (125 GSM)', gsm=125)
+    W2 = calc('GN!W2', 'GN:BASE', 1.4040, 'DK', ['QH'], 'SLIM', 'SOLID',
+              fabrication='L/S 100% POLY SOLID KNIT COLOR (140 GSM)', gsm=140)
+    W3 = calc('GN!W3', 'GN:BASE', 1.3030, 'DK', ['QH'], 'SLIM', 'SOLID',
+              fabrication='100% POLY SOLID KNIT COLOR 140GSM')          # weight only in the text
+
+    def book(self, prefs=None, rows=None):
+        params = dict(PARAMS) if prefs is None else dict(PARAMS, weightPrefs=prefs)
+        return dict(COSTBOOK, params=params, records=RECORDS + list(rows if rows is not None else [self.W1, self.W2]))
+
+    def test_the_brand_weight_row_wins_over_the_lowest(self):
+        res = ci(costbook=self.book()).raw('RODKQH301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual(res['row'][0], 'GN!W2')
+        self.assertEqual(res['price'], 1.4040)
+        self.assertIn('weight_pref', res['flags'])
+        self.assertNotIn('ambiguous_rows', res['flags'])
+        self.assertIn(('GN!W1', 'other_weight'), [tuple(x) for x in res['skip']])
+        self.assertIn('140 GSM, so the rows at other weights are set aside', res['basis'])
+
+    def test_every_pref_of_the_brand_applies_whatever_the_order(self):
+        rows = [self.W1, self.W2,
+                calc('GN!P1', 'GN:BASE', 1.0000, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='PIQUE (160 GSM)', gsm=160),
+                calc('GN!P2', 'GN:BASE', 1.5000, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='PIQUE (180 GSM)', gsm=180)]
+        for prefs in ({'DK': {'KNIT': 140, 'PIQUE': 180}}, {'DK': {'PIQUE': 180, 'KNIT': 140}}):
+            res = ci(costbook=self.book(prefs=prefs, rows=rows)).raw('RODKQH301SLS', 'UNKNOWN', None, None,
+                                                                       allow_default=False)
+            self.assertEqual((res['row'][0], res['price']), ('GN!W2', 1.4040), prefs)   # the lower of the two kept
+            sk = {rid: why for rid, why in res['skip']}
+            self.assertEqual((sk['GN!W1'], sk['GN!P1'], sk['GN!P2']), ('other_weight', 'other_weight', 'tie_not_lowest'))
+            self.assertEqual(res['flags'].count('weight_pref'), 1)
+
+    def test_a_row_with_no_printed_weight_stays_and_takes_no_flag(self):
+        rows = [self.W1, self.W2, calc('GN!N1', 'GN:BASE', 1.2000, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='SOLID KNIT COLOR')]
+        res = ci(costbook=self.book(rows=rows)).raw('RODKQH301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual((res['row'][0], res['price']), ('GN!N1', 1.2000))
+        self.assertNotIn('weight_pref', res['flags'])
+        self.assertIn('ambiguous_rows', res['flags'])
+        sk = {rid: why for rid, why in res['skip']}
+        self.assertEqual((sk['GN!W1'], sk['GN!W2']), ('other_weight', 'tie_not_lowest'))
+
+    def test_named_rows_follow_the_weight_too(self):
+        rows = [calc('GN!M1', 'GN:BASE', 1.2525, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='RODKQH301SLS KNIT (125 GSM)',
+                     gsm=125, names_styles=['RODKQH301SLS']),
+                calc('GN!M2', 'GN:BASE', 1.4040, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='RODKQH301SLS KNIT (140 GSM)',
+                     gsm=140, names_styles=['RODKQH301SLS'])]
+        res = ci(costbook=self.book(rows=rows)).raw('RODKQH301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual((res['row'][0], res['price']), ('GN!M2', 1.4040))
+        self.assertIn('weight_pref', res['flags'])
+        self.assertIn(('GN!M1', 'other_weight'), [tuple(x) for x in res['skip']])
+
+    def test_weight_read_from_the_text_and_ties_at_the_weight_still_take_the_lowest(self):
+        res = ci(costbook=self.book(rows=[self.W1, self.W2, self.W3])).raw('RODKQH301SLS', 'UNKNOWN', None, None,
+                                                                            allow_default=False)
+        self.assertEqual(res['row'][0], 'GN!W3')                                  # 140 by text, the lower of the two
+        self.assertIn('weight_pref', res['flags'])
+        self.assertIn('ambiguous_rows', res['flags'])
+        sk = {rid: why for rid, why in res['skip']}
+        self.assertEqual((sk['GN!W1'], sk['GN!W2']), ('other_weight', 'tie_not_lowest'))
+
+    def test_params_replace_or_switch_off_the_table(self):
+        res = ci(costbook=self.book(prefs={'DK': {'KNIT': 125}})).raw('RODKQH301SLS', 'UNKNOWN', None, None,
+                                                                       allow_default=False)
+        self.assertEqual((res['row'][0], res['price']), ('GN!W1', 1.2525))
+        self.assertIn('weight_pref', res['flags'])                                 # by weight, not by price
+        self.assertNotIn('ambiguous_rows', res['flags'])
+        self.assertIn(('GN!W2', 'other_weight'), [tuple(x) for x in res['skip']])
+        off = ci(costbook=self.book(prefs={})).raw('RODKQH301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual(off['row'][0], 'GN!W1')                                  # plain R7: the lowest
+        self.assertIn('ambiguous_rows', off['flags'])
+        self.assertNotIn('weight_pref', off['flags'])
+        self.assertEqual(E.CostIndex(self.book(prefs={'DK': {'knit': '140', 'bad': 'x'}}), {}, [], [],
+                                     today='2026-03-02').weight_prefs, {'DK': {'KNIT': 140}})
+
+    def test_other_brands_and_other_cloths_are_untouched(self):
+        # QA has no weight rule: its QF rows price as before, and the DK rows never reach it.
+        res = ci(costbook=self.book()).raw('ROQAQF301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual(res['row'][0], 'GN!F1')
+        self.assertNotIn('weight_pref', res['flags'])
+        # a DK cloth that is not a knit keeps the lowest row
+        rows = [calc('GN!W4', 'GN:BASE', 1.2525, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='POPLIN (125 GSM)', gsm=125),
+                calc('GN!W5', 'GN:BASE', 1.4040, 'DK', ['QH'], 'SLIM', 'SOLID', fabrication='POPLIN (140 GSM)', gsm=140)]
+        res = ci(costbook=self.book(rows=rows)).raw('RODKQH301SLS', 'UNKNOWN', None, None, allow_default=False)
+        self.assertEqual(res['row'][0], 'GN!W4')
+        self.assertNotIn('weight_pref', res['flags'])
+        self.assertIn('other_weight', E.C15_REASONS)
+        self.assertIn('weight_pref', E.C15_FLAGS)
 
 
 if __name__ == '__main__':

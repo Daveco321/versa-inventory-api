@@ -1188,6 +1188,44 @@ class TestAnalyticsRoute(PnlTestCase):
         d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
         self.assertIsNone(d['brandMap'])
 
+    def test_awaiting_invoice_pairs_cost_what_the_history_lacks(self):
+        """Oct 13 2026 (David: no more invoice reports): a pair that only shipped since the last invoice takes its
+        cost from shipped.pending.byPair; an invoiced pair keeps the history's own numbers."""
+        eng = self.eng_with_history()
+        base_build = eng.build_dataset
+
+        def build_dataset(src, costbook, settings, overrides, now_iso, routing_module):
+            ds = base_build(src, costbook, settings, overrides, now_iso, routing_module)
+            ds['shipped']['pending'] = {'ready': True, 'byPair': {
+                'fields': ['cust', 'base', 'units', 'invUnits', 'rev', 'fobU', 'fob', 'duty', 'freight', 'fees', 'level', 'grade', 'pcs'],
+                'rows': [['MARS', 'ZZCCCC003', 20, 20, 200.0, SENTINEL_COST + 3, 20 * (SENTINEL_COST + 3), 5.0, 1.0, 0.0, 'L4a', 'B', 1],
+                         ['ROSS', 'ZZAAAA001', 5, 5, 55.0, SENTINEL_COST + 9, 5 * (SENTINEL_COST + 9), 9.0, 0.0, 0.0, 'L4a', 'B', 1],
+                         ['BJS', 'ZZKIT01', 72, 2, 240.0, 1.5, 108.0, 43.2, 0.0, 0.0, 'L1', 'A', 36]]}}
+            return ds
+        eng.build_dataset = build_dataset
+        h = self.harness(engine=eng)
+        h.upload()
+        cube = self.cube()
+        cube['pendingCube'] = {'ROSS': {'ZZAAAA001': {'2026-09': [5, 55.0]}}, 'MARS': {'ZZCCCC003': {'2026-09': [20, 200.0]}},
+                               'BJS': {'ZZKIT01': {'2026-09': [2, 240.0]}}}
+        h.svc.sales_matrix = lambda: cube
+        deadline = time.time() + 10
+        r = h.admin('GET', '/api/pnl/analytics')
+        while r.status_code == 202 and time.time() < deadline:
+            h.wait_idle()
+            r = h.admin('GET', '/api/pnl/analytics')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+        d = json.loads(gzip.decompress(r.data)) if r.headers.get('Content-Encoding') == 'gzip' else r.get_json()
+        self.assertEqual(d['cost2ByCustomer']['ROSS']['ZZAAAA001'],
+                         [round(10 * SENTINEL_COST / 10, 4), round(2 * SENTINEL_COST / 10, 4)])      # history wins
+        self.assertEqual(d['cost2ByCustomer']['MARS']['ZZCCCC003'],
+                         [round(20 * (SENTINEL_COST + 3) / 20, 4), round(6.0 / 20, 4)])
+        self.assertEqual(d['cost2ByCustomer']['BJS']['ZZKIT01'], [54.0, 21.6])                      # per carton
+        self.assertEqual(d['costByCustomer']['MARS'], {'ZZCCCC003': SENTINEL_COST + 3})
+        self.assertEqual(d['costByCustomer']['ROSS'], {'ZZAAAA001': SENTINEL_COST})
+        self.assertEqual(d['piecesPer']['BJS'], {'ZZKIT01': 36.0})                                  # cartons of 36
+        self.assertNotIn('MARS', d['piecesPer'])
+
     def test_pieces_per_unit_for_carton_and_kit_pairs(self):
         """piecesPer (Oct 7 2026): BJ's invoices and orders count cartons. An invoiced pair takes the engine's own
         pieces / units from shipped.byCustomer; a pair never invoiced takes the engine's rule; anything else is left
@@ -1834,6 +1872,13 @@ class TestSettingsAndParamsContracts(PnlTestCase):
         self.assertEqual(problems, [])
         self.assertEqual(dropped, ['params.extra'])
         self.assertEqual(clean['fiberByStyle'], {'ZZAAAA001SLS': 'cotton'})
+        # weightPrefs (Oct 13 2026): brand -> {cloth word: gsm} survives the validator; {} is kept (the rule off)
+        wc, wpr, wdr = pnl.validate_params(synthetic_params(weightPrefs={'dk': {'KNIT': 125}}))
+        self.assertEqual((wpr, wdr, wc['weightPrefs']), ([], [], {'DK': {'KNIT': 125}}))
+        wc, wpr, wdr = pnl.validate_params(synthetic_params(weightPrefs={}))
+        self.assertEqual((wpr, wdr, wc['weightPrefs']), ([], [], {}))
+        wc, wpr, wdr = pnl.validate_params(synthetic_params(weightPrefs={'DK': {'KNIT': 'x'}}))
+        self.assertTrue(any(x['path'] == 'params.weightPrefs.DK.KNIT' for x in wpr), wpr)
         self.assertEqual(clean['fiberByFabric'], {'ZZ': 'linen'})
         self.assertEqual(set(pnl.PARAMS_REQUIRED) - set(clean), set())
         for k in pnl.PARAMS_REQUIRED:

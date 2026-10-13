@@ -715,6 +715,7 @@ PARAMS_SCHEMA = {
     'customerGroupPrefix': ('map', ('token',), ('token',)),
     'fiberByStyle': ('map', ('style',), ('enum', _FIBERS), 50000),     # exact style -> fiber
     'fiberByFabric': ('map', ('code',), ('enum', _FIBERS)),            # fabric code -> fiber
+    'weightPrefs': ('map', ('code',), ('map', ('token',), ('int', 1, 2000)), 100),   # brand -> {cloth word: gsm}; {} turns R7a off
     'rmbBase': _n(0.5, 50),                                            # not read by the engine
     'cutFactor': _n(0.1, 2.0),                                         # not read by the engine
 }
@@ -1999,6 +2000,34 @@ class _PnlService:
         print('[PnL] analytics: dataset was built without the invoice lens; rebuilding', flush=True)
         return True
 
+    @staticmethod
+    def _pending_pair_costs(shipped, by_cust, by_cust2, pieces):
+        """Fill the cost maps from shipped.pending.byPair for every (account, style) the invoice history
+        does not already cover: fobU per piece, [factory cost, import add] per order-book unit, and the
+        pieces per unit for kit and carton programs. Returns how many pairs were added."""
+        pp = ((shipped or {}).get('pending') or {}).get('byPair') or {}
+        pf = {n: i for i, n in enumerate(pp.get('fields') or [])}
+        if not all(k in pf for k in ('cust', 'base', 'fobU')):
+            return 0
+        have2 = all(k in pf for k in ('invUnits', 'fob', 'duty', 'freight', 'fees'))
+        havep = 'units' in pf and 'invUnits' in pf
+        added = 0
+        for row in pp.get('rows') or []:
+            c, b, fob = row[pf['cust']], row[pf['base']], row[pf['fobU']]
+            if fob is None or not c or not b:
+                continue
+            if havep and row[pf['units']] and row[pf['invUnits']] and row[pf['units']] != row[pf['invUnits']]:
+                pieces.setdefault(c, {}).setdefault(b, round(row[pf['units']] / row[pf['invUnits']], 4))
+            if b not in by_cust.get(c, {}):
+                by_cust.setdefault(c, {})[b] = fob
+            if have2 and b not in by_cust2.get(c, {}):
+                u, tot = row[pf['invUnits']] or 0, row[pf['fob']]
+                if u and tot is not None:
+                    imp = (row[pf['duty']] or 0) + (row[pf['freight']] or 0) + (row[pf['fees']] or 0)
+                    by_cust2.setdefault(c, {})[b] = [round(tot / u, 4), round(imp / u, 4)]
+                    added += 1
+        return added
+
     def _analytics_cost_maps(self, key):
         """Cost joins for h_analytics, derived at most once per dataset build:
         fobU per (account, base) from shipped.byCustomer (covers every
@@ -2050,6 +2079,10 @@ class _PnlService:
                         imp = (row[f['duty']] or 0) + (row[f['freight']] or 0) + (row[f['fees']] or 0)
                         by_cust2.setdefault(row[f['cust']], {})[row[f['base']]] = [
                             round(tot / u, 4), round(imp / u, 4)]
+        # Awaiting-invoice pairs (Oct 13 2026, David: no more invoice reports): a style that only
+        # shipped since the last invoice takes its cost from the pending block, so the analytics
+        # never show its units without a cost. Invoiced pairs keep their own numbers.
+        self._pending_pair_costs(shipped, by_cust, by_cust2, pieces)
         by_style, grades, kit_styles = {}, {}, {}
         st = ds.get('styles') or {}
         sf = {n: i for i, n in enumerate(st.get('fields') or [])}
@@ -2188,7 +2221,9 @@ class _PnlService:
         """(status, payload) for GET /admin/pnl-missing-costs: style numbers with no cost anywhere.
         sold = invoiced bases (alias-folded customers) with no cost for any account and none at the
         style level; active = styles the dataset tracks now (stock, production, open orders,
-        allocations) whose cost is unknown. Units and dates only, never a cost value."""
+        allocations, shipped awaiting invoice) whose cost is unknown. Units and dates only, never a
+        cost value. pendingUnits (Oct 13 2026) = units shipped since the last invoice, from the dataset's
+        awaiting-invoice pairs, so a style listed only for those is not a phantom zero row."""
         try:
             self._require_store()
             for kind in ('engine', 'routing'):
@@ -2247,12 +2282,18 @@ class _PnlService:
             active, defaulted = [], []
             if body is not None:
                 ds = json.loads(body)
+                pend = {}
+                pp = ((ds.get('shipped') or {}).get('pending') or {}).get('byPair') or {}
+                pf = {n: i for i, n in enumerate(pp.get('fields') or [])}
+                if 'base' in pf and 'units' in pf:
+                    for pr in pp.get('rows') or []:
+                        pend[pr[pf['base']]] = pend.get(pr[pf['base']], 0) + int(pr[pf['units']] or 0)
                 st = ds.get('styles') or {}
                 sf = {n: i for i, n in enumerate(st.get('fields') or [])}
                 want = [k for k in ('brand', 'onHand', 'incoming', 'openUnits', 'apoUnits', 'lifeUnits') if k in sf]
                 if 'base' in sf and 'fobU' in sf:
                     for row in st.get('rows') or []:
-                        rec = {'base': row[sf['base']]}
+                        rec = {'base': row[sf['base']], 'pendingUnits': pend.get(row[sf['base']], 0)}
                         for k in want:
                             rec[k] = row[sf[k]]
                         if row[sf['fobU']] is None:
@@ -2264,7 +2305,7 @@ class _PnlService:
                             defaulted.append(rec)
 
             def _units(r):
-                return -((r.get('onHand') or 0) + (r.get('incoming') or 0) + (r.get('openUnits') or 0))
+                return -((r.get('onHand') or 0) + (r.get('incoming') or 0) + (r.get('openUnits') or 0) + (r.get('pendingUnits') or 0))
             active.sort(key=_units)
             defaulted.sort(key=_units)
             return 200, {'sold': sold_rows, 'active': active, 'defaulted': defaulted,

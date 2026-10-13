@@ -366,6 +366,7 @@ FLAG_LABELS = {
     'fit_as_regular': 'Modern or tailored fit priced at the regular fit',
     # contract C15
     'ambiguous_rows': 'Several sheet rows fit. The lowest is used.',
+    'weight_pref': 'This brand is priced at one fabric weight for this cloth. The row at that weight is used over the lighter or heavier rows.',
     'cross_brand': "No sheet quotes this brand. Priced from another brand's row.",
     'fit_unknown': 'Fit unknown. The regular column is used.',
     'pattern_guess': 'Regular or digital print not known. The regular print row is used.',
@@ -388,12 +389,13 @@ FLAG_LABELS = {
 # fabric code (R2), the sleeve (R3), the pattern (R4), no special finish the style does not show (R5), the column for
 # its fit (R6). Rows still tied: the lowest, flagged ambiguous_rows (R7). Never a median of rows.
 C15_FLAGS = ('ambiguous_rows', 'cross_brand', 'fit_unknown', 'pattern_guess', 'fabric_family', 'colour_row',
-             'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'group_block_missing', 'ddp')
+             'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'group_block_missing', 'ddp',
+             'weight_pref')
 C15_REASONS = ('other_brand', 'other_pattern', 'other_sleeve', 'variant_not_this_style', 'lower_confidence',
-               'tie_not_lowest')
+               'tie_not_lowest', 'other_weight')
 # costRowsSkipped order: the rows closest to the one used first.
-_REASON_ORDER = {r: i for i, r in enumerate(('tie_not_lowest', 'variant_not_this_style', 'lower_confidence',
-                                             'other_pattern', 'other_sleeve', 'other_brand'))}
+_REASON_ORDER = {r: i for i, r in enumerate(('tie_not_lowest', 'other_weight', 'variant_not_this_style',
+                                             'lower_confidence', 'other_pattern', 'other_sleeve', 'other_brand'))}
 # Cost book variant tags. A hard variant row prices only a style that shows that variant. A relative variant row
 # loses to a plain row, and competes with the others (R7) only when no plain row is left.
 HARD_VARIANTS = frozenset({'perforated', 'brushed', 'zipper', 'with_tie', 'two_side_print', 'camp_collar'})
@@ -405,6 +407,23 @@ YARN_DYE_FABRICS = frozenset({'YD', 'SP', 'CY'})
 # brand for a fabric code, the brand's own row for a sibling fabric of the same public family serves before another
 # brand's row. The public fabric reference groups these as 4-WAY STRETCH (AW, DS, WS, TW, CS); the 95/5 poly spandex
 # supershirt (SU) is the same cloth under its trade name. Plain cloths come first, then weaves, dobby last.
+# Fabric weight by brand (Oct 13 2026, David: "DKNY is 140 GSM for all knits"). When a brand's tied rows print
+# different weights for a kind of cloth (the word on the row text), the rows at the brand's weight win before the
+# lowest price does (R7a; reason other_weight for the rows set aside, flag weight_pref on the cost).
+# costbook.params.weightPrefs ({brand code: {word: gsm}}) replaces this table; an empty one turns the rule off.
+WEIGHT_PREFS = {'DK': {'KNIT': 140}}
+_GSM_RE = re.compile(r'(\d{2,3})\s*GSM', re.I)
+
+
+def _gsm_of(r):
+    """A record's fabric weight in GSM: the parser's gsm field, else the number before GSM in its text."""
+    g = r.get('gsm')
+    if isinstance(g, int) and not isinstance(g, bool) and g > 0:
+        return g
+    m = _GSM_RE.search(str(r.get('fabrication') or ''))
+    return int(m.group(1)) if m else None
+
+
 # costbook.params.fabricFamilies ({code: [sibling codes in order]}) replaces this table.
 FABRIC_FAMILY_SIBLINGS = {
     'AW': ['CS', 'SU', 'WS', 'TW', 'DS'], 'SU': ['AW', 'CS', 'WS', 'TW', 'DS'], 'CS': ['AW', 'SU', 'WS', 'TW', 'DS'],
@@ -1637,6 +1656,10 @@ class CostIndex:
                      if isinstance(colour_map, dict) else {})
         self._col = {}
         self.families = p.get('fabricFamilies') if isinstance(p.get('fabricFamilies'), dict) else FABRIC_FAMILY_SIBLINGS
+        wp = p.get('weightPrefs')
+        self.weight_prefs = ({_u(b): {_u(w): _int(g) for w, g in m.items() if isinstance(w, str) and _int(g) > 0}
+                              for b, m in wp.items() if isinstance(b, str) and isinstance(m, dict)}
+                             if isinstance(wp, dict) else WEIGHT_PREFS)
         gp = p.get('customerGroupPrefix') if isinstance(p.get('customerGroupPrefix'), dict) else {}
         dg = gp.get('_default')
         self.default_group = dg if isinstance(dg, str) and dg else 'OTHER'
@@ -1943,6 +1966,7 @@ class CostIndex:
                  'prov': bool(rfl & PROVISIONAL_FLAGS),
                  'row': rn if isinstance(rn, int) and not isinstance(rn, bool) else 10 ** 9,
                  'restated': any('SHEET_E1_IS' in str(f) for f in rfl),
+                 'text': _u(r.get('fabrication') or ''), 'gsm': _gsm_of(r),
                  'conflict': any(str(g).startswith('same_text') for g in self.conflict_of.get(r['id'], ()))}
             self.pool_brands[pool].update(brands)
             for code in dict.fromkeys(codes):
@@ -2235,7 +2259,7 @@ class CostIndex:
                                 'variant_not_this_style' if (c['tags'] & HARD_VARIANTS) - hints else None)
             named = [] if cross else [c for c in rows if c['id'] in why and self.names_style(c, b)]
             if named:
-                return self._pick_named(pool, rows, named, why, skip, sleeve, sp, known, tie_key)
+                return self._pick_named(pool, rows, named, why, skip, sleeve, sp, known, tie_key, brand)
             for c in rows:
                 if c['id'] in why:
                     if why[c['id']]:
@@ -2290,7 +2314,11 @@ class CostIndex:
                 if colour_rows and any('white' in c['tags'] for c in E):
                     E = narrow(colour_rows, 'variant_not_this_style')
                     flags.append('colour_assumed')
+            # R7a (Oct 13 2026): the brand's fabric weight, before the lowest price (_by_weight).
+            E, wg = self._by_weight(brand, E, narrow, flags)
             E = sorted(E, key=tie_key)
+            if wg and E[0]['gsm'] in wg:
+                flags.append('weight_pref')
             if len(E) > 1:
                 flags.append('ambiguous_rows')
                 skip.extend((c, 'tie_not_lowest') for c in E[1:])
@@ -2298,7 +2326,23 @@ class CostIndex:
             return {'pool': pool, 'c': E[0], 'tie': E, 'skip': skip, 'flags': flags}
         return None
 
-    def _pick_named(self, pool, rows, named, why, skip, sleeve, sp, known, tie_key):
+    def _by_weight(self, brand, E, narrow, flags):
+        """R7a (Oct 13 2026, David: "DKNY is 140 GSM for all knits"): the brand's weight for each kind of cloth
+        decides between tied rows that print different weights, before the lowest price does. Every pref of the
+        brand applies. -> (rows left, the weights applied); the caller flags weight_pref when the row it finally
+        uses prints one of those weights (a row with no printed weight stays in the tie and takes no flag)."""
+        wp = self.weight_prefs.get(brand) if brand else None
+        applied = set()
+        if wp and len(E) > 1:
+            for word, gsm in wp.items():
+                cloth = [c for c in E if word in c['text']]
+                if (len(cloth) > 1 and any(c['gsm'] == gsm for c in cloth)
+                        and any(c['gsm'] not in (None, gsm) for c in cloth)):
+                    E = narrow([c for c in E if word not in c['text'] or c['gsm'] in (None, gsm)], 'other_weight')
+                    applied.add(gsm)
+        return E, applied
+
+    def _pick_named(self, pool, rows, named, why, skip, sleeve, sp, known, tie_key, brand=None):
         """Contract C15 R0 on one sheet: the rows whose text names the style. A known fit code's sleeve decides between
         them (a row with no sleeve serves); an unknown fit code lets their own sleeves decide. Then the style's
         pattern (a row with no pattern serves), a confirmed price over one the sheet says is still needed, and R7.
@@ -2327,7 +2371,10 @@ class CostIndex:
             N = narrow(firm, 'lower_confidence')
         elif not firm:
             flags.append('price_unconfirmed')
+        N, wg = self._by_weight(brand, N, narrow, flags)
         N = sorted(N, key=tie_key)
+        if wg and N[0]['gsm'] in wg:
+            flags.append('weight_pref')
         if len(N) > 1:
             flags.append('ambiguous_rows')
             skip.extend((c, 'tie_not_lowest') for c in N[1:])
@@ -2443,6 +2490,10 @@ class CostIndex:
             said.append('The style number does not say digital print, so the regular print row is used')
         if 'price_unconfirmed' in sel['flags']:
             said.append('The sheet says this price is still needed, so it is unconfirmed')
+        if 'weight_pref' in sel['flags']:
+            g = (sel.get('c') or {}).get('gsm')
+            said.append('The brand prices this cloth at %s, so the rows at other weights are set aside'
+                        % ('%d GSM' % g if g else 'one fabric weight'))
         if 'ambiguous_rows' in sel['flags']:
             said.append('Several rows fit, so the lowest is used')
         flags = ['customer_quote'] if neutral else []
@@ -3093,6 +3144,11 @@ SHIPPED_STYLE_FIELDS = ('base', 'brand', 'cat', 'fiber', 'dedPct', 'fobShare', '
                         'origin', 'fxShare', 'fxRef', 'caShare', 'pcs')
 # shipped.pending (Oct 7 2026): awaiting-invoice estimates by estimated ship month, the company fields plus the
 # invoice units (cartons for a kit program) behind the garment count.
+# shipped.pending.byPair (Oct 13 2026): the same estimate per (account, style), so a style that only shipped since the
+# last invoice carries its cost everywhere (David: no more invoice reports; cost every style from what the platform
+# holds). units count pieces, invUnits the order-book units (cartons for a kit program); fobU is per piece.
+PENDING_PAIR_FIELDS = ('cust', 'base', 'units', 'invUnits', 'rev', 'fobU', 'fob', 'duty', 'freight', 'fees', 'level',
+                       'grade', 'pcs')
 PENDING_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp',
                   'royalty', 'contrib', 'costedShare', 'costedRev', 'revCost', 'invUnits')
 # Contract C14: lifetime invoices per account and style, costed like order lines (pieces appended: kit
@@ -4120,6 +4176,9 @@ class _Build:
         bases |= {r['base'] for r in self.lines}
         bases |= {k for k, v in feed_b.items() if v[1] or v[2]}
         bases |= {k for k, e in self.an.items() if e.get('t12') and e['t12'][0] > 0}
+        # Oct 13 2026 (David: cost every style from what the platform holds): a style that shipped and
+        # awaits its invoice has no stock, lot, open line or invoice yet. It still gets its row and cost.
+        bases |= self.pending_bases()
         self.styles, self.shipped_cost = [], {}
         for b in sorted(bases):
             dec = self.ci.decode(b)
@@ -4340,6 +4399,25 @@ class _Build:
                         'byCustomer': _table(SHIPPED_CUSTOMER_FIELDS, self.hist_rows), 'range': self.shipped_range()}
         self.shipped['pending'] = self.build_pending()
 
+    def pending_bases(self):
+        """The style keys of the awaiting-invoice estimate (shipped.pending), when the source is ready."""
+        p = self.pending_src
+        cube = p.get('cube') if isinstance(p.get('cube'), dict) else None
+        if not p.get('ready') or cube is None:
+            return set()
+        out = set()
+        for styles in cube.values():
+            if not isinstance(styles, dict):
+                continue
+            for st, months in styles.items():
+                # the same test as build_pending: a style counts only with a month that carries units or value
+                s = _u(st)
+                if s and isinstance(months, dict) and any(
+                        isinstance(v, (list, tuple)) and len(v) >= 2 and (_num(v[0]) > 0 or _num(v[1]) > 0)
+                        for v in months.values()):
+                    out.add(s)
+        return out
+
     def build_pending(self):
         """shipped.pending (Oct 7 2026): purchase orders that left the open book but have no invoice yet, as the
         open-orders archive estimates them (basis 'estimate': the units and value each PO carried when it left,
@@ -4351,6 +4429,7 @@ class _Build:
         tot = summ.get('totals') if isinstance(summ.get('totals'), dict) else {}
         sa_to = self.sa_src.get('to') if isinstance(getattr(self, 'sa_src', None), dict) else None
         out = {'ready': False, 'basis': 'estimate', 'months': [], 'byCustomer': [], 'company': _table(PENDING_FIELDS, []),
+               'byPair': _table(PENDING_PAIR_FIELDS, []),
                'totals': {'pos': _int(tot.get('pos')), 'units': _int(tot.get('units')), 'value': r2(_num(tot.get('value')))},
                'invoicesThrough': _d10(p.get('invoicesThrough')) or _d10(sa_to),
                'note': 'Shipped but not yet invoiced. An estimate from the order book: the units and value each PO '
@@ -4361,6 +4440,7 @@ class _Build:
             return out
         comp = defaultdict(lambda: defaultdict(float))
         byc = defaultdict(lambda: defaultdict(float))
+        pair = {}                      # (cust, style) -> the pair's totals and its cost record
         pos_by = {}
         for c, e in (summ.get('customers') or {}).items():
             if isinstance(e, dict):
@@ -4397,6 +4477,22 @@ class _Build:
                     rev = r2(val)
                     fob = r2(qty * r4(unit)) if unit is not None else None
                     money = line_money(rev, fob, qty, cat, fiber, sc['origin'], reg, ded, roy, self.S)
+                    pr = pair.get((cust, st))
+                    if pr is None:
+                        pr = pair[(cust, st)] = {'cust': cust, 'base': st, 'units': 0.0, 'invUnits': 0.0, 'rev': 0.0,
+                                                 'fobU': r4(unit) if unit is not None else None,
+                                                 'fob': 0.0 if unit is not None else None,
+                                                 'duty': 0.0, 'freight': 0.0, 'fees': 0.0,
+                                                 'level': sc['level'] if unit is not None else 'L7',
+                                                 'grade': max(grade_of(sc['level']), sc['cap']) if unit is not None else 'D',
+                                                 'pcs': pcs}
+                    pr['units'] += qty
+                    pr['invUnits'] += u
+                    pr['rev'] += rev
+                    if unit is not None:
+                        pr['fob'] += fob
+                        for k in ('duty', 'freight', 'fees'):
+                            pr[k] += money[k] or 0.0
                     for tgt in (comp[str(ym)[:7]], byc[cust]):
                         tgt['units'] += qty
                         tgt['invUnits'] += u
@@ -4419,7 +4515,16 @@ class _Build:
             return r
         rows = [row(('month', ym), comp[ym]) for ym in sorted(comp)]
         custs = [dict(row(('cust', c), byc[c]), pos=pos_by.get(c, 0)) for c in sorted(byc)]
-        out.update(ready=True, months=sorted(comp), company=_table(PENDING_FIELDS, rows), byCustomer=custs)
+        pairs = []
+        for k in sorted(pair):
+            pr = pair[k]
+            if pr['units'] <= 0:
+                continue
+            pairs.append(dict(pr, units=int(round(pr['units'])), invUnits=int(round(pr['invUnits'])), rev=r2(pr['rev']),
+                              fob=r2(pr['fob']) if pr['fob'] is not None else None,
+                              duty=r2(pr['duty']), freight=r2(pr['freight']), fees=r2(pr['fees'])))
+        out.update(ready=True, months=sorted(comp), company=_table(PENDING_FIELDS, rows), byCustomer=custs,
+                   byPair=_table(PENDING_PAIR_FIELDS, pairs))
         return out
 
     def shipped_range(self):
