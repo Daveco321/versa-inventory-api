@@ -30,6 +30,7 @@ import hashlib
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import worker_leader
+import tjx_sections
 from flask import Flask, request, jsonify, send_file, Response, make_response, g
 from flask_cors import CORS
 import xlsxwriter
@@ -2888,7 +2889,9 @@ def _factory_holds_health():
 def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
                      is_order=False, incoming_only=False, catalog_mode=False,
                      flow_mode=False, headers_override=None, tjx_layout=False,
-                     wh_breakdown=False):
+                     wh_breakdown=False, header_row=0):
+    """header_row: the worksheet row of the column header (0 unless a block sits above
+    it, e.g. the TJX colour key); the freeze pane follows it."""
     fmt_header = workbook.add_format({
         'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 11,
         'bg_color': STYLE_CONFIG['header_bg'], 'font_color': STYLE_CONFIG['header_text'],
@@ -2930,10 +2933,17 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
             'bg_color': '#CBD5E1', 'font_color': '#0F172A',
             'left': 1, 'right': 1, 'top': 2, 'bottom': 2, 'border_color': STYLE_CONFIG['border_color'],
             'align': 'left', 'valign': 'vcenter', 'indent': 1}),
+        # Colour section band (TJX colour-key exports, David Oct 15 2026): White Solids,
+        # Other Solids · Grey, Fancies · Checks ... inside each brand (tjx_sections)
+        'section_band': workbook.add_format({
+            'bold': True, 'font_name': STYLE_CONFIG['font_name'], 'font_size': 10,
+            'bg_color': '#F1F5F9', 'font_color': '#334155',
+            'left': 1, 'right': 1, 'top': 1, 'bottom': 1, 'border_color': '#94A3B8',
+            'align': 'left', 'valign': 'vcenter', 'indent': 2}),
     }
 
     worksheet.hide_gridlines(2)
-    worksheet.freeze_panes(1, 0)
+    worksheet.freeze_panes(header_row + 1, 0)
 
     if headers_override is not None:
         # Caller-defined column set (ship-plan line sheets) — same visual
@@ -3037,9 +3047,9 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         if _anchor_col:
             headers.insert(headers.index(_anchor_col) + 1, 'Landing in')
 
-    worksheet.set_row(0, 25)
+    worksheet.set_row(header_row, 25)
     for c, h in enumerate(headers):
-        worksheet.write(0, c, h, fmt_header)
+        worksheet.write(header_row, c, h, fmt_header)
 
     # Set column widths based on header names
     col_widths = {
@@ -3066,20 +3076,28 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Color Family': 14, 'New Fabric': 12, 'Source': 16, 'Arrival to Warehouse': 16, 'Landing in': 14,
     }
     for c, h in enumerate(headers):
-        worksheet.set_column(c, c, col_widths.get(h, 12))
+        # under the TJX colour key (header_row > 0) the bold 'Arrival to Warehouse'
+        # header gets the width it needs; every other workbook keeps its old widths
+        w = 21 if (header_row and h == 'Arrival to Warehouse') else col_widths.get(h, 12)
+        worksheet.set_column(c, c, w)
 
     worksheet.set_default_row(112.5)
     return fmts, headers
 
 
 def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
-                view_mode='all', headers=None, catalog_mode=False, brand_breaks=False):
+                view_mode='all', headers=None, catalog_mode=False, brand_breaks=False,
+                header_row=0, color_sections=False):
     """Write data rows using headers list to determine column layout.
     brand_breaks (TJX layout, Charlesy Oct 9 2026): rows are written brand by brand, each
     brand under its own bordered band row, and the zebra restarts under every band, so a
     tab reads as brand blocks. Within a brand the caller's order is kept.
-    Returns the last worksheet row written (len(data) when there are no bands); callers
-    anchor the size-scale grids under it."""
+    Returns the last worksheet row written (len(data) when there are no bands and the
+    header is row 0); callers anchor the size-scale grids under it. header_row: the
+    column header's row when a block sits above it (the TJX colour key).
+    color_sections (TJX colour-key exports, David Oct 15 2026): inside each brand the rows
+    follow tjx_sections.order (colour family, nearest other-solid colour or fancy pattern,
+    then fabrication) under a light section band per colour section."""
     if not headers:
         headers = []
     # "Landing in" (every Overseas / All Inventory export): ledger lookup index, built once per sheet
@@ -3167,26 +3185,44 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
     # sort, so the caller's order inside a brand survives). images stays keyed by the
     # original item index.
     seq = list(range(len(data)))
-    if brand_breaks:
+    sections = {}
+    if color_sections:
+        _ats_field = 'wh_ats_total' if ('Warehouse ATS' in headers and 'Total ATS' not in headers
+                                        and 'Overseas ATS' not in headers) else 'total_ats'
+        _ord = tjx_sections.order(data, _brand_break_key, _ats_field)
+        seq = [i for i, _, _ in _ord]
+        sections = {i: lab for i, _, lab in _ord}
+    elif brand_breaks:
         _first = {}
         for i, it in enumerate(data):
             _first.setdefault(_brand_break_key(it), i)
         seq.sort(key=lambda i: _first[_brand_break_key(data[i])])
     band_fmt = fmts.get('brand_band') or fmts['odd']
-    row = 0            # last worksheet row written (0 = header only)
+    sec_fmt = fmts.get('section_band') or band_fmt
+    row = header_row   # last worksheet row written (header_row = header only)
     zebra = 0          # data rows since the last band
     last_brand = None
+    last_section = None
     for r in seq:
         item = data[r]
+        bkey = _brand_break_key(item)
         if brand_breaks:
-            bkey = _brand_break_key(item)
             if last_brand is None or bkey != last_brand:
                 row += 1
                 worksheet.set_row(row, 24)
                 worksheet.merge_range(row, 0, row, max(len(headers) - 1, 1),
                                       item.get('brand_full') or item.get('brand') or bkey, band_fmt)
-                last_brand = bkey
                 zebra = 0
+                last_section = None
+        if color_sections:
+            sec = (bkey, sections.get(r))
+            if sec != last_section:
+                row += 1
+                worksheet.set_row(row, 20)
+                worksheet.merge_range(row, 0, row, max(len(headers) - 1, 1), sections.get(r) or '', sec_fmt)
+                last_section = sec
+                zebra = 0
+        last_brand = bkey
         row += 1
         even = zebra % 2 == 1
         zebra += 1
@@ -3229,6 +3265,323 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
 def _brand_break_key(item):
     """The brand an export row belongs to, for _write_rows' brand bands."""
     return str(item.get('brand_abbr') or item.get('brand_full') or item.get('brand') or '')
+
+
+# ── TJX colour key (David, Oct 15 2026) ─────────────────────────────────────
+# Every tab of a TJX-logo catalog export opens with a colour key: one line per colour
+# family (the Color Family column's values) with styles, units and share, plus a TOTAL,
+# all LIVE formulas over the tab's own rows, so editing an ATS cell updates the key.
+# Same block as the Oct 15 TJ/TM line sheets David approved. Rows 1-8 hold the key, row 9
+# is a spacer and the column header moves to row 10. A row whose Color Family is blank or
+# unexpected sorts under Fancies (tjx_sections.family_of), so the Fancies line counts
+# "anything that is not one of the four named families" and the lines always add up.
+TJX_KEY_HEADER_ROW = 9           # 0-based worksheet row of the column header
+_TJX_KEY_FAMILIES = (            # key label, Color Family value, swatch fill, swatch text
+    ('White Solids', 'White', '#FFFFFF', '#111827'),
+    ('Black Solids', 'Black', '#111827', '#FFFFFF'),
+    ('Navy & Blue Solids', 'Navy Solid', '#1E3A8A', '#FFFFFF'),   # the family holds every blue
+    ('Other Solids', 'Other Solid', '#CCFBF1', '#115E59'),
+    ('Fancies', 'Fancy', '#FDE68A', '#78350F'),
+)
+_TJX_KEY_NAMED = tuple(c for _, c, _, _ in _TJX_KEY_FAMILIES if c != 'Fancy')
+_TJX_KEY_ATS_FIELDS = (('Overseas ATS', 'total_ats'), ('Total ATS', 'total_ats'),
+                       ('Warehouse ATS', 'wh_ats_total'))
+_TJX_KEY_VIEWS = {'ats': 'Warehouse ATS', 'incoming': 'Overseas ATS', 'all': 'All Inventory ATS'}
+
+
+def _xl_col(c):
+    """0-based column index -> Excel letters."""
+    s, c = '', c + 1
+    while c:
+        c, r = divmod(c - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _xl_sheet_ref(name):
+    """'Karl Lagerfeld Paris'! with any apostrophe doubled."""
+    return "'" + str(name).replace("'", "''") + "'!"
+
+
+def _xl_str(v):
+    """A string literal inside a formula."""
+    return '"' + str(v).replace('"', '""') + '"'
+
+
+def _tjx_key_base(sku):
+    """A '-V' partial-carton row is the same style as its base SKU."""
+    s = str(sku or '')
+    return s[:-2] if s.endswith('-V') else s
+
+
+def _tjx_key_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _tjx_key_today(today=None):
+    if today is not None:
+        return today
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/New_York')).date()
+    except Exception:
+        return datetime.now().date()
+
+
+def _tjx_key_title(items, view_mode, today=None):
+    """'Nautica, DKNY  ·  Overseas ATS  ·  as of Oct 15, 2026' (no em dashes, David's copy rule)."""
+    names = []
+    for it in items:
+        b = str(it.get('brand_full') or it.get('brand') or '').strip()
+        if b and b not in names:
+            names.append(b)
+    brands = ', '.join(names) if len(names) <= 4 else f'{len(names)} brands'
+    today = _tjx_key_today(today)
+    parts = [p for p in (brands, _TJX_KEY_VIEWS.get(view_mode, 'ATS'),
+                         f'as of {today:%b} {today.day}, {today.year}') if p]
+    return '  ·  '.join(parts)
+
+
+class _TjxKeySource:
+    """One tab's ranges for the key formulas (header row through the blank row under the
+    data) plus its rows for the cached values."""
+
+    def __init__(self, headers, items, last_row, sheet=None):
+        self.ok = False
+        if 'SKU' not in headers or 'Color Family' not in headers:
+            return
+        self.ats_h = next((h for h, _ in _TJX_KEY_ATS_FIELDS if h in headers), None)
+        if self.ats_h is None:
+            return
+        ref = _xl_sheet_ref(sheet) if sheet else ''
+        top, bottom = TJX_KEY_HEADER_ROW + 1, last_row + 2
+
+        def rng(name):
+            c = _xl_col(headers.index(name))
+            return f'{ref}${c}${top}:${c}${bottom}'
+        self.sku, self.fam, self.ats = rng('SKU'), rng('Color Family'), rng(self.ats_h)
+        self.brand = rng('Brand') if 'Brand' in headers else None
+        field = dict(_TJX_KEY_ATS_FIELDS)[self.ats_h]
+        self.rows = [(str(it.get('sku') or ''), tjx_sections.family_of(it), str(it.get('brand_full') or ''),
+                      it.get(field, 0)) for it in items]
+        self.per_style = {}
+        for sku, _, _, v in self.rows:
+            if _tjx_key_num(v) and v > 0:
+                k = _tjx_key_base(sku)
+                self.per_style[k] = self.per_style.get(k, 0) + 1
+        self.ok = True
+
+    # ── formulas (one term per source tab) ──
+    def _fam(self, crit):
+        if crit is None:
+            return ''
+        if crit == 'Fancy':   # anything that is not one of the four named families, blank included
+            return '*'.join(f'({self.fam}<>"{c}")' for c in _TJX_KEY_NAMED) + '*'
+        return f'({self.fam}="{crit}")*'
+
+    def styles_term(self, crit=None, brand=None):
+        live = f'ISNUMBER({self.ats})*({self.ats}>0)'
+        base = f'LEFT({self.sku},LEN({self.sku})-2*(RIGHT({self.sku},2)="-V"))'
+        denom = (f'COUNTIFS({self.sku},{base},{self.ats},">0")'
+                 f'+COUNTIFS({self.sku},{base}&"-V",{self.ats},">0")+1-{live}')
+        b = f'({self.brand}={_xl_str(brand)})*' if brand is not None else ''
+        return f'SUMPRODUCT({self._fam(crit)}{b}{live}/({denom}))'
+
+    def units_term(self, crit=None, brand=None):
+        bcrit = f',{self.brand},{_xl_str(brand)}' if brand is not None else ''
+
+        def total():
+            return f'SUMIFS({self.ats}{bcrit})' if brand is not None else f'SUM({self.ats})'
+        if crit is None:
+            return total()
+        if crit == 'Fancy':
+            return total() + ''.join(f'-SUMIFS({self.ats},{self.fam},"{c}"{bcrit})' for c in _TJX_KEY_NAMED)
+        return f'SUMIFS({self.ats},{self.fam},"{crit}"{bcrit})'
+
+    # ── cached values, computed the way the formulas do ──
+    def _rows(self, crit, brand):
+        for sku, f, br, v in self.rows:
+            if brand is not None and br != brand:
+                continue
+            if crit is not None and f != crit:
+                continue
+            yield sku, v
+
+    def styles_val(self, crit=None, brand=None):
+        return sum(1 / self.per_style[_tjx_key_base(sku)] for sku, v in self._rows(crit, brand)
+                   if _tjx_key_num(v) and v > 0)
+
+    def units_val(self, crit=None, brand=None):
+        return sum(v for _, v in self._rows(crit, brand) if _tjx_key_num(v))
+
+
+def _tjx_key_formats(workbook):
+    font = STYLE_CONFIG['font_name']
+    edge = {'border': 1, 'border_color': '#94A3B8', 'font_name': font, 'font_size': 10,
+            'align': 'center', 'valign': 'vcenter'}
+    tot = {**edge, 'bold': True, 'bg_color': '#E2E8F0', 'top': 2, 'top_color': '#334155'}
+    return {
+        'title': workbook.add_format({'bold': True, 'font_name': font, 'font_size': 14, 'font_color': '#0F172A',
+                                      'bg_color': STYLE_CONFIG['header_bg'], 'align': 'left', 'valign': 'vcenter',
+                                      'indent': 1}),
+        'head': workbook.add_format({**edge, 'bold': True, 'bg_color': '#1F2937', 'font_color': '#FFFFFF'}),
+        'brand': workbook.add_format({**edge, 'bold': True, 'font_size': 11, 'bg_color': '#CBD5E1',
+                                      'font_color': '#0F172A', 'align': 'left', 'indent': 1}),
+        'all': workbook.add_format({**edge, 'bold': True, 'font_size': 11, 'bg_color': '#0F172A',
+                                    'font_color': '#FFFFFF', 'align': 'left', 'indent': 1}),
+        'num': workbook.add_format({**edge, 'num_format': '#,##0'}),
+        'pct': workbook.add_format({**edge, 'num_format': '0.0%'}),
+        'tot': workbook.add_format(tot),
+        'tot_num': workbook.add_format({**tot, 'num_format': '#,##0'}),
+        'tot_pct': workbook.add_format({**tot, 'num_format': '0.0%'}),
+        'fam': {crit: workbook.add_format({**edge, 'bold': True, 'bg_color': fill, 'font_color': ink})
+                for _, crit, fill, ink in _TJX_KEY_FAMILIES},
+    }
+
+
+def _write_tjx_family_block(worksheet, F, first, sources, brand=None, total_label='TOTAL'):
+    """Five family rows from worksheet row `first` plus a total row; columns A label,
+    B Styles, C Units (ATS), D share of the block total. Returns (styles, units) per family."""
+    vals = {}
+    tot_ref = f'$C${first + 6}'
+    total_units = sum(s.units_val(None, brand) for s in sources)
+    for i, (label, crit, _, _) in enumerate(_TJX_KEY_FAMILIES):
+        r = first + i
+        worksheet.set_row(r, 19)
+        worksheet.write(r, 0, label, F['fam'][crit])
+        sv = int(sum(s.styles_val(crit, brand) for s in sources) + 0.5)
+        uv = sum(s.units_val(crit, brand) for s in sources)
+        worksheet.write_formula(r, 1, '=ROUND(' + '+'.join(s.styles_term(crit, brand) for s in sources) + ',0)',
+                                F['num'], sv)
+        worksheet.write_formula(r, 2, '=' + '+'.join(s.units_term(crit, brand) for s in sources), F['num'], uv)
+        worksheet.write_formula(r, 3, f'=IF({tot_ref}=0,0,C{r + 1}/{tot_ref})', F['pct'],
+                                (uv / total_units) if total_units else 0)
+        vals[crit] = (sv, uv)
+    tr = first + 5
+    worksheet.set_row(tr, 19)
+    worksheet.write(tr, 0, total_label, F['tot'])
+    worksheet.write_formula(tr, 1, '=ROUND(' + '+'.join(s.styles_term(None, brand) for s in sources) + ',0)',
+                            F['tot_num'], int(sum(s.styles_val(None, brand) for s in sources) + 0.5))
+    worksheet.write_formula(tr, 2, '=' + '+'.join(s.units_term(None, brand) for s in sources), F['tot_num'],
+                            total_units)
+    worksheet.write_formula(tr, 3, f'=SUM(D{first + 1}:D{first + 5})', F['tot_pct'], 1 if total_units else 0)
+    return vals
+
+
+def _write_tjx_color_key(workbook, worksheet, headers, items, last_row, view_mode='ats', today=None,
+                         title=None):
+    """Write the colour key above a TJX-layout tab whose column header sits on
+    TJX_KEY_HEADER_ROW and whose last written row is last_row (0-based). The formulas
+    cover the header row through the blank row under the data, so a style inserted
+    right under the header or typed into that first empty row still counts; text in an
+    ATS cell counts as 0 (ISNUMBER). Each formula carries its value as the cached
+    result, so previews that never recalculate still read the right numbers.
+    Returns False (and writes nothing) when the tab has no Color Family or ATS column."""
+    src = _TjxKeySource(headers, items, last_row)
+    if not src.ok:
+        return False
+    F = _tjx_key_formats(workbook)
+    worksheet.set_row(0, 30)
+    worksheet.set_row(1, 19)
+    worksheet.set_row(8, 9)
+    worksheet.merge_range(0, 0, 0, max(len(headers) - 1, 1), title or _tjx_key_title(items, view_mode, today),
+                          F['title'])
+    for c, h in enumerate(['COLOR KEY', 'Styles', 'Units (ATS)', '% of Units']):
+        worksheet.write(1, c, h, F['head'])
+    _write_tjx_family_block(worksheet, F, 2, [src])
+
+    # each row's Color Family cell wears its key colour
+    fam_c = headers.index('Color Family')
+    if last_row > TJX_KEY_HEADER_ROW:
+        for _, crit, fill, ink in _TJX_KEY_FAMILIES:
+            worksheet.conditional_format(TJX_KEY_HEADER_ROW + 1, fam_c, last_row, fam_c, {
+                'type': 'cell', 'criteria': '==', 'value': f'"{crit}"',
+                'format': workbook.add_format({'bg_color': fill, 'font_color': ink, 'bold': True})})
+    return True
+
+
+def _write_tjx_summary(workbook, worksheet, tabs, title=None, today=None):
+    """The Summary tab of a TJX colour-key export (David, Oct 15 2026): every brand in the
+    workbook, then its White / Black / Navy & Blue / Other Solids / Fancies and the brand
+    total, then ALL BRANDS. LIVE formulas over the brands' tabs (SUMIFS on the Brand
+    column, so a brand inside a several-brand tab works too); each carries its value.
+    tabs: [{'name', 'headers', 'items', 'last_row', 'view'}] in workbook order.
+    One view only: the first tab's (a workbook mixing Warehouse and Overseas tabs is
+    summarised for the first tab's view, and the title says which). A brand is added up
+    over every one-brand tab of it; with none, it is read from the first tab that has it
+    (never from two several-brand tabs, which would count it twice)."""
+    usable = []
+    for t in tabs:
+        src = _TjxKeySource(t['headers'], t['items'], t['last_row'], sheet=t['name'])
+        if src.ok and src.brand is not None:
+            brands = []
+            for it in t['items']:
+                b = str(it.get('brand_full') or '')
+                if b not in brands:
+                    brands.append(b)
+            usable.append({'view': t['view'], 'src': src, 'brands': brands})
+    view = usable[0]['view'] if usable else 'ats'
+    usable = [u for u in usable if u['view'] == view]
+    order = []
+    for u in usable:
+        for b in u['brands']:
+            if b not in order:
+                order.append(b)
+    sources = {}
+    for b in order:
+        own = [u['src'] for u in usable if u['brands'] == [b]]
+        sources[b] = own or [next(u['src'] for u in usable if b in u['brands'])]
+
+    F = _tjx_key_formats(workbook)
+    worksheet.hide_gridlines(2)
+    worksheet.set_column(0, 0, 30)
+    worksheet.set_column(1, 3, 15)
+    worksheet.set_row(0, 30)
+    today = _tjx_key_today(today)
+    # the title bar runs past the table (to column H) so a long title is never cut off
+    worksheet.merge_range(0, 0, 0, 7, title or (
+        f'Color Summary  ·  {_TJX_KEY_VIEWS.get(view, "ATS")}  ·  as of {today:%b} {today.day}, {today.year}'),
+        F['title'])
+    for c, h in enumerate(['BRAND / COLOR', 'Styles', 'Units (ATS)', '% of Total']):
+        worksheet.write(1, c, h, F['head'])
+    worksheet.freeze_panes(2, 0)
+
+    fam_rows = {crit: [] for _, crit, _, _ in _TJX_KEY_FAMILIES}
+    fam_vals = {crit: [0, 0] for _, crit, _, _ in _TJX_KEY_FAMILIES}
+    r = 2
+    for b in order:
+        worksheet.set_row(r, 22)
+        worksheet.merge_range(r, 0, r, 3, b or '(no brand)', F['brand'])
+        vals = _write_tjx_family_block(worksheet, F, r + 1, sources[b], brand=b, total_label=f'{b} Total')
+        for i, (_, crit, _, _) in enumerate(_TJX_KEY_FAMILIES):
+            fam_rows[crit].append(r + 1 + i)
+            fam_vals[crit][0] += vals[crit][0]
+            fam_vals[crit][1] += vals[crit][1]
+        worksheet.set_row(r + 7, 8)
+        r += 8
+
+    # ALL BRANDS: the brand blocks added up
+    worksheet.set_row(r, 22)
+    worksheet.merge_range(r, 0, r, 3, 'ALL BRANDS', F['all'])
+    first = r + 1
+    all_units = sum(v[1] for v in fam_vals.values())
+    for i, (label, crit, _, _) in enumerate(_TJX_KEY_FAMILIES):
+        rr = first + i
+        worksheet.set_row(rr, 19)
+        worksheet.write(rr, 0, label, F['fam'][crit])
+        for c, k in ((1, 0), (2, 1)):
+            cells = ','.join(f'{_xl_col(c)}{x + 1}' for x in fam_rows[crit]) or '0'
+            worksheet.write_formula(rr, c, f'=SUM({cells})', F['num'], fam_vals[crit][k])
+        worksheet.write_formula(rr, 3, f'=IF($C${first + 6}=0,0,C{rr + 1}/$C${first + 6})', F['pct'],
+                                (fam_vals[crit][1] / all_units) if all_units else 0)
+    tr = first + 5
+    worksheet.set_row(tr, 19)
+    worksheet.write(tr, 0, 'ALL BRANDS Total', F['tot'])
+    for c, k in ((1, 0), (2, 1)):
+        worksheet.write_formula(tr, c, f'=SUM({_xl_col(c)}{first + 1}:{_xl_col(c)}{first + 5})', F['tot_num'],
+                                sum(v[k] for v in fam_vals.values()))
+    worksheet.write_formula(tr, 3, f'=SUM(D{first + 1}:D{first + 5})', F['tot_pct'], 1 if all_units else 0)
+    return True
 
 
 _SIZED_SKU_BASE_RE = re.compile(r'^[A-Z]{6}\d{3}[A-Z]{2,3}$')
@@ -3669,8 +4022,11 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
 
 def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=False,
                       catalog_mode=False, prepack_defaults=None, flow_mode=False,
-                      tjx_layout=False):
+                      tjx_layout=False, color_key=False):
     has_color = any(item.get('color') for item in items)
+    # TJX colour key above the tab (TJX-logo catalog exports, David Oct 15 2026)
+    key_on = bool(color_key and tjx_layout and catalog_mode)
+    hdr_row = TJX_KEY_HEADER_ROW if key_on else 0
 
     # Auto-detect incoming_only: all items have zero warehouse stock
     # (only applies to non-incoming view modes — incoming view already omits warehouse)
@@ -3684,7 +4040,10 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     buf = BytesIO()
     wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
     wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
-    ws = wb.add_worksheet(brand_name[:31])
+    _sheet = brand_name[:31]
+    ws_summary = wb.add_worksheet('Summary' if _sheet.lower() != 'summary' else 'Color Summary') if key_on else None
+    ws = wb.add_worksheet(_sheet)
+    _one_brand = len({_brand_break_key(it) for it in items}) <= 1
     # Monkey-patch worksheet.write to catch string-as-format bugs
     _orig_ws_write = ws.write
     def _safe_ws_write(r, c, val=None, fmt=None, *args):
@@ -3704,13 +4063,18 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                      is_order=is_order, incoming_only=incoming_only,
                                      catalog_mode=catalog_mode, flow_mode=flow_mode,
-                                     tjx_layout=tjx_layout)
+                                     tjx_layout=tjx_layout, header_row=hdr_row)
     print(f"  [build_brand_excel] Step 2: download images")
     imgs = download_images_for_items(items, s3_base_url, use_cache=True)
     print(f"  [build_brand_excel] Step 3: write {len(items)} rows, headers={headers}")
     n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
                     view_mode=view_mode, headers=headers, catalog_mode=catalog_mode,
-                    brand_breaks=bool(tjx_layout and catalog_mode))
+                    brand_breaks=bool(tjx_layout and catalog_mode) and not (key_on and _one_brand),
+                    header_row=hdr_row, color_sections=key_on)
+    if key_on:
+        _write_tjx_color_key(wb, ws, headers, items, n, view_mode=view_mode)
+        _write_tjx_summary(wb, ws_summary, [{'name': _sheet, 'headers': headers, 'items': items,
+                                             'last_row': n, 'view': view_mode}])
     print(f"  [build_brand_excel] Step 4: add size charts (prepack_defaults={type(prepack_defaults).__name__}, len={len(prepack_defaults) if prepack_defaults else 0})")
     try:
         _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=items)
@@ -3731,15 +4095,21 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
         buf = BytesIO()
         wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': f'Versa - {brand_name}', 'author': 'Versa Inventory System'})
-        ws = wb.add_worksheet(brand_name[:31])
+        ws_summary = wb.add_worksheet('Summary' if _sheet.lower() != 'summary' else 'Color Summary') if key_on else None
+        ws = wb.add_worksheet(_sheet)
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color, view_mode=view_mode,
                                          is_order=is_order, incoming_only=incoming_only,
                                          catalog_mode=catalog_mode, flow_mode=flow_mode,
-                                         tjx_layout=tjx_layout)
+                                         tjx_layout=tjx_layout, header_row=hdr_row)
         imgs = download_images_for_items(items, s3_base_url, use_cache=True)
-        _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
-                    view_mode=view_mode, headers=headers, catalog_mode=catalog_mode,
-                    brand_breaks=bool(tjx_layout and catalog_mode))
+        n = _write_rows(wb, ws, items, imgs, fmts, has_color=has_color,
+                        view_mode=view_mode, headers=headers, catalog_mode=catalog_mode,
+                        brand_breaks=bool(tjx_layout and catalog_mode) and not (key_on and _one_brand),
+                        header_row=hdr_row, color_sections=key_on)
+        if key_on:
+            _write_tjx_color_key(wb, ws, headers, items, n, view_mode=view_mode)
+            _write_tjx_summary(wb, ws_summary, [{'name': _sheet, 'headers': headers, 'items': items,
+                                                 'last_row': n, 'view': view_mode}])
         wb.close()
         print(f"  [build_brand_excel] Retry succeeded (no size charts)")
     return buf.getvalue()
@@ -3763,7 +4133,7 @@ def _safe_multi_sheet_name(raw, seen, idx, fallback_prefix='Brand'):
     return name
 
 
-def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None, tjx_layout=False, wh_breakdown=False):
+def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_mode='all', flow_mode=False, prepack_defaults=None, tjx_layout=False, wh_breakdown=False, color_key=False, summary_title=None):
     # Per-tab overrides (line-sheet cart): an entry may carry its own tab_name,
     # view_mode, flow_mode and keep_order. Anything missing falls back to the
     # workbook-global arguments, so pre-existing callers behave byte-identically.
@@ -3779,6 +4149,19 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
 
     def _tab_flow(b):
         return bool(b.get('flow_mode', flow_mode))
+
+    # TJX colour key above every tab: TJX-logo catalog exports only (the routes pass
+    # color_key); the Monday TJMAXX ATS email and every other workbook keep row 1 headers.
+    # With the key on (David, Oct 15 2026) rows follow the colour sections (tjx_sections),
+    # a one-brand tab drops its brand band (the key title names the brand) and a Summary
+    # tab comes first with every brand's colour totals.
+    key_on = bool(color_key and tjx_layout and catalog_mode)
+    hdr_row = TJX_KEY_HEADER_ROW if key_on else 0
+
+    def _tab_bands(b):
+        if not (tjx_layout and catalog_mode):
+            return False
+        return (not key_on) or len({_brand_break_key(it) for it in b['items']}) > 1
 
     for b in brands_list:
         b['items'] = b.get('items') or []
@@ -3804,6 +4187,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
 
     _seen_names = set()
+    ws_summary = wb.add_worksheet(_safe_multi_sheet_name('Summary', _seen_names, 0)) if key_on else None
+    key_tabs = []
     for bi, brand in enumerate(brands_list):
         safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _seen_names, bi)
         ws = wb.add_worksheet(safe)
@@ -3823,7 +4208,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                          catalog_mode=catalog_mode, view_mode=_tab_view(brand),
                                          flow_mode=_tab_flow(brand), tjx_layout=tjx_layout,
-                                         wh_breakdown=wh_breakdown)
+                                         wh_breakdown=wh_breakdown, header_row=hdr_row)
         start, count = offsets[bi]
         local_imgs = {}
         for li in range(count):
@@ -3832,7 +4217,12 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 local_imgs[li] = all_imgs[gi]
         n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
                         has_color=has_color, headers=headers, catalog_mode=catalog_mode,
-                        brand_breaks=bool(tjx_layout and catalog_mode))
+                        brand_breaks=_tab_bands(brand), header_row=hdr_row, color_sections=key_on)
+        if key_on:
+            _write_tjx_color_key(wb, ws, headers, brand['items'], n, view_mode=_tab_view(brand),
+                                 title=brand.get('key_title'))
+            key_tabs.append({'name': safe, 'headers': headers, 'items': brand['items'], 'last_row': n,
+                             'view': _tab_view(brand)})
         # An empty tab would render the hardcoded fallback size grids on an
         # otherwise blank sheet — skip charts entirely when there are no rows.
         if brand['items']:
@@ -3840,6 +4230,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 _add_size_charts(wb, ws, n + 2, prepack_defaults=prepack_defaults, items=brand['items'])
             except Exception as e:
                 print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
+    if key_on:
+        _write_tjx_summary(wb, ws_summary, key_tabs, title=summary_title)
 
     try:
         wb.close()
@@ -3852,22 +4244,31 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
         _retry_seen = set()
+        ws_summary = wb.add_worksheet(_safe_multi_sheet_name('Summary', _retry_seen, 0)) if key_on else None
+        key_tabs = []
         for bi, brand in enumerate(brands_list):
             safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _retry_seen, bi)
             ws = wb.add_worksheet(safe)
             fmts, headers = _setup_worksheet(wb, ws, has_color=has_color,
                                              catalog_mode=catalog_mode, view_mode=_tab_view(brand),
                                              flow_mode=_tab_flow(brand), tjx_layout=tjx_layout,
-                                             wh_breakdown=wh_breakdown)
+                                             wh_breakdown=wh_breakdown, header_row=hdr_row)
             start, count = offsets[bi]
             local_imgs = {}
             for li in range(count):
                 gi = start + li
                 if gi in all_imgs:
                     local_imgs[li] = all_imgs[gi]
-            _write_rows(wb, ws, brand['items'], local_imgs, fmts,
-                        has_color=has_color, headers=headers, catalog_mode=catalog_mode,
-                        brand_breaks=bool(tjx_layout and catalog_mode))
+            n = _write_rows(wb, ws, brand['items'], local_imgs, fmts,
+                            has_color=has_color, headers=headers, catalog_mode=catalog_mode,
+                            brand_breaks=_tab_bands(brand), header_row=hdr_row, color_sections=key_on)
+            if key_on:
+                _write_tjx_color_key(wb, ws, headers, brand['items'], n, view_mode=_tab_view(brand),
+                                     title=brand.get('key_title'))
+                key_tabs.append({'name': safe, 'headers': headers, 'items': brand['items'], 'last_row': n,
+                                 'view': _tab_view(brand)})
+        if key_on:
+            _write_tjx_summary(wb, ws_summary, key_tabs, title=summary_title)
         wb.close()
         print(f"  ✓ Multi-brand retry succeeded (no size charts)")
     return buf.getvalue()
@@ -5342,10 +5743,12 @@ def export_single():
 
         print(f"[Export] {fname}: {len(data)} items, view={view_mode}, flow={flow_mode}, prepack_rules={len(prepack_defaults)}")
 
+        # TJX-logo catalog exports open with the live colour key (David, Oct 15 2026)
         xl_bytes = build_brand_excel(fname, data, s3_url, view_mode=view_mode,
                                      is_order=is_order, catalog_mode=catalog_mode,
                                      prepack_defaults=prepack_defaults,
-                                     flow_mode=flow_mode, tjx_layout=tjx_layout)
+                                     flow_mode=flow_mode, tjx_layout=tjx_layout,
+                                     color_key=tjx_layout and req.get('color_key') is not False)
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -5436,11 +5839,15 @@ def export_multi():
         if not brands_data:
             return jsonify({"error": "Empty brands"}), 400
 
+        # TJX-logo catalog exports open with the live colour key on every tab (David, Oct 15 2026)
         xl_bytes = build_multi_brand_excel(brands_data, s3_url,
                                            catalog_mode=catalog_mode, view_mode=view_mode,
                                            flow_mode=flow_mode,
                                            prepack_defaults=prepack_defaults,
-                                           tjx_layout=tjx_layout)
+                                           tjx_layout=tjx_layout,
+                                           color_key=tjx_layout and req.get('color_key') is not False,
+                                           summary_title=(str(req.get('summary_title'))[:120]
+                                                          if req.get('summary_title') else None))
         ts = datetime.now().strftime('%Y-%m-%d')
         return send_file(BytesIO(xl_bytes),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
