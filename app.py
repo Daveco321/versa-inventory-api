@@ -11087,7 +11087,14 @@ def _catalog_scope_for_slug(slug):
                            keep_blank_values=True))
     except Exception:
         q = {}
-    if any(q.get(f) for f in _AUTHZ_ALL_BRAND_FLAGS):
+    # 'all_brands' on a regular catalog is the builder's "Combined Tile" checkbox: the page
+    # merges the SELECTED brands into one extra tile; it never meant every brand, so it
+    # widens the scope only when the link names no brand at all (David, Oct 15 2026).
+    # The segment flags (wh_/os_all_brands,
+    # whose brand lists the builder drops) and 'all' still mean every brand.
+    _listed = [b for b in str(q.get('brands') or '').split(',') if b.strip() and b.strip().upper() != '__SEG__']
+    if (any(q.get(f) for f in _AUTHZ_ALL_BRAND_FLAGS if f != 'all_brands')
+            or (q.get('all_brands') and not _listed)):
         scope['all'] = True
         return scope
     for key in ('brands', 'wh_brands', 'os_brands'):
