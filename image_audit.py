@@ -579,13 +579,57 @@ def clean_seen(s):
 FALLBACK_MODEL = os.environ.get('IMAGE_AUDIT_FALLBACK_MODEL', 'claude-opus-5')
 
 
-def ask_model(client, content):
-    """(response, model used). Plain messages.create, the call the platform's agent already makes
-    with this server's SDK; the refusal fallback goes in as request fields so no SDK version can
-    reject it. A 400/404 (fallback option or model not available to this key) retries without the
-    option, then on the platform's agent model."""
+class _Block:
+    def __init__(self, d):
+        self.type = d.get('type')
+        self.text = d.get('text') or ''
+
+
+class _Resp:
+    """The few fields vision_batch reads, from a raw /v1/messages JSON reply."""
+    def __init__(self, j):
+        self.stop_reason = j.get('stop_reason')
+        self.stop_details = j.get('stop_details')
+        self.content = [_Block(b) for b in (j.get('content') or []) if isinstance(b, dict)]
+
+
+def _ask_raw(post, base):
+    """The server's own requests-based /v1/messages helper (what AI Suggestions uses)."""
+    used = MODEL
+    r = post(dict(base, model=MODEL), timeout=180)
+    if r.status_code in (400, 404) and FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        print(f"[image-audit] {MODEL} rejected ({r.status_code}): {r.text[:300]}", flush=True)
+        used = FALLBACK_MODEL
+        r = post(dict(base, model=FALLBACK_MODEL), timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f'HTTP {r.status_code}: {r.text[:300]}')
+    return _Resp(r.json()), used
+
+
+def ask_model(client, content, post=None, mode=None):
+    """(response, model used). First the SDK's plain messages.create, with the refusal fallback
+    passed as request fields so no SDK version can reject it; a 400/404 retries without the
+    option, then on the platform's agent model. If the SDK cannot connect from this worker
+    (seen on the live server, Oct 15 2026), the server's requests-based helper takes over, and
+    mode['raw'] keeps the rest of the build on it."""
     base = dict(max_tokens=8000, system=SYSTEM_PROMPT, messages=[{'role': 'user', 'content': content}],
                 output_config={'effort': 'low', 'format': {'type': 'json_schema', 'schema': RESULT_SCHEMA}})
+    if post and (client is None or (mode or {}).get('raw')):
+        return _ask_raw(post, base)
+    try:
+        return _ask_sdk(client, base)
+    except Exception as e:
+        if post and type(e).__name__ in ('APIConnectionError', 'APITimeoutError'):
+            print(f"[image-audit] SDK cannot connect ({type(e).__name__}: {e}; cause {e.__cause__!r}); "
+                  f"using the requests helper", flush=True)
+            if mode is not None:
+                mode['raw'] = True
+                mode['sdk_error'] = f'{type(e).__name__}: {e} ({e.__cause__!r})'[:300]
+            return _ask_raw(post, base)
+        raise
+
+
+def _ask_sdk(client, base):
     c = client.with_options(timeout=150.0, max_retries=2)
     tries = [dict(model=MODEL, extra_headers={'anthropic-beta': 'server-side-fallback-2026-07-01'},
                   extra_body={'fallbacks': 'default'}),
@@ -606,7 +650,7 @@ def ask_model(client, content):
     raise last
 
 
-def vision_batch(client, batch, today):
+def vision_batch(client, batch, today, post=None, mode=None):
     """Judge up to BATCH pairs in one request. Returns {pair id: verdict record}; pairs the
     model did not answer (refusal, error) are simply absent and retried next run."""
     content = []
@@ -617,7 +661,7 @@ def vision_batch(client, batch, today):
         content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
                                                     'data': base64.standard_b64encode(p['jpeg']).decode()}})
     content.append({'type': 'text', 'text': f'Judge these {len(batch)} photos and return one entry per photo id.'})
-    resp, used = ask_model(client, content)
+    resp, used = ask_model(client, content, post=post, mode=mode)
     if getattr(resp, 'stop_reason', None) == 'refusal':
         print(f"[image-audit] vision batch declined ({getattr(resp, 'stop_details', None)})", flush=True)
         return {}
@@ -732,14 +776,16 @@ def write_workbook(missing_rows, flagged_rows):
 # ── registration ─────────────────────────────────────────────────────────────
 def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overrides, dropbox_codes,
                                 color_map, server_photo, anthropic_client, identity, off_loop=None,
-                                is_leader=None, start_scheduler=True, photo_hosts=()):
+                                is_leader=None, start_scheduler=True, photo_hosts=(), anthropic_post=None):
     """Wire the routes and the Monday pre-build. Hooks (all callables):
       items() -> list of inventory item dicts      overrides() -> {KEY: override dict}
       dropbox_codes() -> set of image codes         color_map() -> {KEY: raw color}
       server_photo(sku, brand) -> bytes|None        anthropic_client() -> anthropic.Anthropic
       identity() -> request identity dict           off_loop(fn, *a) -> run CPU work off the gevent loop
       is_leader() -> bool
-    photo_hosts: extra host names (CloudFront) an override image URL may be fetched from."""
+    photo_hosts: extra host names (CloudFront) an override image URL may be fetched from.
+    anthropic_post(payload, timeout=) -> requests.Response: the server's raw /v1/messages helper,
+    used when the SDK cannot connect."""
     from flask import jsonify, request, send_file
 
     public_base = f'https://{s3_bucket}.s3.{region}.amazonaws.com/'
@@ -1024,13 +1070,14 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
         checked_new = 0
         client = None
         vision_errors = []
+        mode = {}
         if todo and VISION_ON:
             try:
                 client = anthropic_client()
             except Exception as e:
                 vision_errors.append(f'client: {e}'[:300])
-                log(f"[image-audit] vision unavailable: {e}")
-        if todo and client is not None:
+                log(f"[image-audit] SDK client unavailable: {e}")
+        if todo and VISION_ON and (client is not None or anthropic_post is not None):
             batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
 
             def judge(b):
@@ -1045,7 +1092,7 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
                         items_.append({'id': p['id'], 'color': p['color'], 'hint': p['hint'],
                                        'source': p['source'], 'etag': p['pkey'],
                                        'jpeg': j or jpeg640[p['pkey']]})
-                    return vision_batch(client, items_, day)
+                    return vision_batch(client, items_, day, post=anthropic_post, mode=mode)
                 except Exception as e:
                     vision_errors.append(f'{type(e).__name__}: {e}'[:300])
                     log(f"[image-audit] vision batch failed: {e}")
@@ -1136,6 +1183,8 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
                    'unchecked': over_cap + unreadable + not_judged, 'over_cap': over_cap,
                    'unreadable': unreadable, 'not_judged': not_judged,
                    'vision_error': vision_errors[0] if vision_errors else '',
+                   'vision_path': 'requests helper' if mode.get('raw') else 'sdk',
+                   'sdk_error': mode.get('sdk_error', ''),
                    'seconds': round(time.time() - t0), 'built_at': now_et().isoformat(timespec='seconds')}
         return xlsx, summary
 

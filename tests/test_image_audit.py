@@ -301,6 +301,48 @@ class TestVision(unittest.TestCase):
         self.assertEqual(seen, [(ia.MODEL, True), (ia.MODEL, False), (ia.FALLBACK_MODEL, False)])
         self.assertEqual(out['p1']['by'], ia.FALLBACK_MODEL)
 
+    def test_connection_error_switches_to_the_requests_helper(self):
+        class APIConnectionError(Exception):
+            pass
+        cl = FakeClient()
+
+        def boom(**kw):
+            raise APIConnectionError('Connection error.')
+        cl.messages.create = boom
+        posted = []
+
+        class R:
+            def __init__(self, status, body):
+                self.status_code, self._b = status, body
+                self.text = json.dumps(body)
+
+            def json(self):
+                return self._b
+
+        def post(payload, timeout=None):
+            posted.append(payload['model'])
+            if payload['model'] == ia.MODEL and len(posted) == 1:
+                return R(404, {'error': 'model not found'})
+            ids = [b['text'].split('id=')[1].split(' ')[0] for b in payload['messages'][0]['content']
+                   if b['type'] == 'text' and 'id=' in b['text']]
+            photos = [{'id': i, 'seen_main_color': 'white', 'seen_other_colors': '', 'seen_pattern': 'solid',
+                       'photo_problem': 'none', 'verdict': 'match', 'severity': 'none', 'reason': ''} for i in ids]
+            self.assertNotIn('fallbacks', payload)
+            return R(200, {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': json.dumps({'photos': photos})}]})
+        mode = {}
+        out = ia.vision_batch(cl, self.batch(), 'd', post=post, mode=mode)
+        self.assertTrue(mode['raw'])
+        self.assertIn('APIConnectionError', mode['sdk_error'])
+        self.assertEqual(posted, [ia.MODEL, ia.FALLBACK_MODEL])
+        self.assertEqual(out['p1']['by'], ia.FALLBACK_MODEL)
+        # the rest of the build stays on the helper (the SDK is not tried again)
+        cl.messages.create = lambda **kw: self.fail('SDK retried')
+        out = ia.vision_batch(cl, self.batch(), 'd', post=post, mode=mode)
+        self.assertEqual(out['p1']['verdict'], 'match')
+        # no SDK client at all: straight to the helper
+        out = ia.vision_batch(None, self.batch(), 'd', post=post, mode={})
+        self.assertEqual(len(out), 2)
+
     def test_refusal_returns_nothing(self):
         self.assertEqual(ia.vision_batch(FakeClient(stop='refusal'), self.batch(), 'd'), {})
 

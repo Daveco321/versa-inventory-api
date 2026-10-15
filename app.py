@@ -21765,7 +21765,8 @@ try:
                                 anthropic_client=_ai_agent_client, identity=_request_identity,
                                 off_loop=_off_loop, is_leader=worker_leader.is_leader,
                                 start_scheduler=os.environ.get('IMAGE_AUDIT_SCHEDULER', 'on') != 'off',
-                                photo_hosts=(urlparse(CLOUDFRONT_URL).hostname,))
+                                photo_hosts=(urlparse(CLOUDFRONT_URL).hostname,),
+                                anthropic_post=_anthropic_post_with_retry)
 except Exception as _image_audit_err:
     print(f'[ImageAudit] NOT registered: {_image_audit_err}', flush=True)
 
