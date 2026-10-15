@@ -82,8 +82,11 @@ class KeyBase(Base):
 
 class Layout(KeyBase):
     def test_summary_first_then_the_tabs(self):
+        # a workbook with a Warehouse and an Overseas tab gets a Summary for each view
         wf, _ = self.render_key()
-        self.assertEqual(wf.sheetnames, ['Summary', 'Warehouse', 'Overseas'])
+        self.assertEqual(wf.sheetnames, ['Warehouse Summary', 'Overseas Summary', 'Warehouse', 'Overseas'])
+        wf, _ = self.render_key(tab_list=[tabs()[0]])
+        self.assertEqual(wf.sheetnames, ['Summary', 'Warehouse'])
 
     def test_header_moves_under_the_key_and_freezes_there(self):
         wf, _ = self.render_key()
@@ -164,7 +167,8 @@ class Layout(KeyBase):
         t[0]['key_title'] = 'My warehouse title'
         wf, _ = self.render_key(tab_list=t, summary_title='My summary')
         self.assertEqual(wf['Warehouse'].cell(1, 1).value, 'My warehouse title')
-        self.assertEqual(wf['Summary'].cell(1, 1).value, 'My summary')
+        self.assertEqual(wf['Warehouse Summary'].cell(1, 1).value, 'My summary  ·  Warehouse ATS')
+        self.assertEqual(wf['Overseas Summary'].cell(1, 1).value, 'My summary  ·  Overseas ATS')
 
 
 class Values(KeyBase):
@@ -205,8 +209,9 @@ class Values(KeyBase):
 class Summary(KeyBase):
     def test_every_brand_then_all_brands(self):
         wf, wv = self.render_key()
-        sm = parse_summary(wv['Summary'])
+        sm = parse_summary(wv['Warehouse Summary'])
         self.assertEqual(list(sm), ['Brand A', 'Brand B', 'ALL BRANDS'])
+        self.assertEqual(parse_summary(wv['Overseas Summary'])['Brand A']['total'], [2, 572])
         a = sm['Brand A']
         self.assertEqual(list(a['colors']), FAMS)
         self.assertEqual([a['colors'][f][1] for f in FAMS], [940, 500, 0, 0, 100])
@@ -217,7 +222,7 @@ class Summary(KeyBase):
         self.assertEqual(a['colors']['Navy & Blue Solids'][2], [])
         self.assertEqual([sm['ALL BRANDS']['colors'][f][1] for f in FAMS], [940, 500, 800, 60, 100])
         self.assertEqual(sm['ALL BRANDS']['total'], [5, 2400])
-        ws = wf['Summary']
+        ws = wf['Warehouse Summary']
         self.assertEqual(ws.cell(2, 1).value, 'BRAND / COLOR / FABRICATION')
         self.assertEqual(ws.cell(4, 3).value,
                          "=SUMIFS('Warehouse'!$K$10:$K$24,'Warehouse'!$G$10:$G$24,\"White\",'Warehouse'!$C$10:$C$24,\"Brand A\")")
@@ -294,11 +299,12 @@ class Gating(KeyBase):
         self.assertEqual(ws.cell(8, 3).value, 1540)
         self.assertEqual(ws.cell(11, 1).value, 'White Solids')     # no brand band on one brand
 
-    def test_monday_email_workbook_is_unchanged(self):
+    def test_monday_email_uses_the_colour_key_format(self):
+        # David, Oct 15 2026: the TJMAXX ATS workbook switched to the colour-key format
         import inspect
         src = inspect.getsource(self.app.export_tjx_ats)
-        self.assertIn('build_multi_brand_excel(', src)
-        self.assertNotIn('color_key', src)
+        self.assertIn('color_key=True', src)
+        self.assertIn("'key_title'", src)
 
 
 class Routes(KeyBase):
@@ -384,13 +390,15 @@ class ReviewFixes(KeyBase):
              {'brand_name': 'AO', 'tab_name': 'AO', 'view_mode': 'incoming', 'flow_mode': True, 'keep_order': True,
               'items': os_}]
         wf, wv = self.render_key(tab_list=t)
-        sm = parse_summary(wv['Summary'])['Brand A']
+        sm = parse_summary(wv['Warehouse Summary'])['Brand A']
         self.assertEqual([sm['colors'][f][1] for f in FAMS] + [sm['total'][1]], [100, 50, 0, 0, 0, 150])
-        forms = [wf['Summary'].cell(r, 3).value for r in range(3, wf['Summary'].max_row + 1)]
+        forms = [wf['Warehouse Summary'].cell(r, 3).value for r in range(3, wf['Warehouse Summary'].max_row + 1)]
         forms = [f for f in forms if isinstance(f, str)]
         self.assertTrue(any("'A1'!" in f and "'A2'!" in f for f in forms))
         self.assertFalse(any("'AO'!" in f for f in forms))
-        self.assertIn('Warehouse ATS', wf['Summary'].cell(1, 1).value)
+        self.assertIn('Warehouse ATS', wf['Warehouse Summary'].cell(1, 1).value)
+        os_sum = parse_summary(wv['Overseas Summary'])['Brand A']
+        self.assertEqual(os_sum['total'], [1, 999])
 
     def test_arrival_width_only_changes_under_the_key(self):
         wf, _ = self.render_key(tab_list=[tabs()[1]])

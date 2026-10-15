@@ -3565,6 +3565,46 @@ def _write_tjx_color_key(workbook, worksheet, headers, items, last_row, view_mod
     return True
 
 
+_TJX_SUMMARY_NAMES = {'ats': 'Warehouse Summary', 'incoming': 'Overseas Summary', 'all': 'All Inventory Summary'}
+
+
+def _tjx_key_views(brands_list, tab_view):
+    """The views of a colour-key workbook's tabs that hold rows, in tab order."""
+    out = []
+    for b in brands_list:
+        v = tab_view(b)
+        if b.get('items') and v not in out:
+            out.append(v)
+    return out or ['ats']
+
+
+def _tjx_add_summary_sheets(workbook, views, seen):
+    """Summary tab(s) first in the workbook: one 'Summary' for a one-view workbook, else
+    one per view ('Warehouse Summary', 'Overseas Summary') so every view is summarised."""
+    if not views:
+        return []
+    if len(views) == 1:
+        return [(views[0], workbook.add_worksheet(_safe_multi_sheet_name('Summary', seen, 0)))]
+    return [(v, workbook.add_worksheet(_safe_multi_sheet_name(_TJX_SUMMARY_NAMES.get(v, 'Summary'), seen, i)))
+            for i, v in enumerate(views)]
+
+
+_TJX_VIEW_WORDS = {'ats': 'Warehouse', 'incoming': 'Overseas', 'all': 'All Inventory'}
+
+
+def _tjx_write_summaries(workbook, summaries, key_tabs, title=None):
+    # A title may carry '{view}' (Warehouse / Overseas); without it, a workbook with
+    # several summaries gets the view appended so the tabs read apart.
+    for v, ws in summaries:
+        tabs = [t for t in key_tabs if t['view'] == v]
+        t_ = title
+        if title and '{view}' in title:
+            t_ = title.replace('{view}', _TJX_VIEW_WORDS.get(v, 'ATS'))
+        elif title and len(summaries) > 1:
+            t_ = f'{title}  \u00b7  {_TJX_KEY_VIEWS.get(v, "ATS")}'
+        _write_tjx_summary(workbook, ws, tabs, title=t_)
+
+
 def _write_tjx_summary(workbook, worksheet, tabs, title=None, today=None):
     """The Summary tab of a TJX colour-key export (David, Oct 15 2026): every brand in the
     workbook; under it each colour family's total (White / Black / Navy & Blue / Other
@@ -4347,7 +4387,8 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
     wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
 
     _seen_names = set()
-    ws_summary = wb.add_worksheet(_safe_multi_sheet_name('Summary', _seen_names, 0)) if key_on else None
+    key_views = _tjx_key_views(brands_list, _tab_view) if key_on else []
+    summaries = _tjx_add_summary_sheets(wb, key_views, _seen_names)
     key_tabs = []
     for bi, brand in enumerate(brands_list):
         safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _seen_names, bi)
@@ -4391,7 +4432,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
             except Exception as e:
                 print(f"  ⚠ Size charts failed for {brand.get('brand_name','?')} (non-fatal): {e}")
     if key_on:
-        _write_tjx_summary(wb, ws_summary, key_tabs, title=summary_title)
+        _tjx_write_summaries(wb, summaries, key_tabs, summary_title)
 
     try:
         wb.close()
@@ -4404,7 +4445,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
         wb = xlsxwriter.Workbook(buf, {'in_memory': True, 'strings_to_formulas': False})
         wb.set_properties({'title': 'Versa Multi-Brand Export', 'author': 'Versa Inventory System'})
         _retry_seen = set()
-        ws_summary = wb.add_worksheet(_safe_multi_sheet_name('Summary', _retry_seen, 0)) if key_on else None
+        summaries = _tjx_add_summary_sheets(wb, key_views, _retry_seen)
         key_tabs = []
         for bi, brand in enumerate(brands_list):
             safe = _safe_multi_sheet_name(brand.get('tab_name') or brand.get('brand_name'), _retry_seen, bi)
@@ -4428,7 +4469,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                 key_tabs.append({'name': safe, 'headers': headers, 'items': brand['items'], 'last_row': n,
                                  'view': _tab_view(brand)})
         if key_on:
-            _write_tjx_summary(wb, ws_summary, key_tabs, title=summary_title)
+            _tjx_write_summaries(wb, summaries, key_tabs, summary_title)
         wb.close()
         print(f"  ✓ Multi-brand retry succeeded (no size charts)")
     return buf.getvalue()
@@ -7237,7 +7278,10 @@ def apo_report_rows_route():
 #   - any row of 35 units or less is dropped;
 #   - each tab is broken out by brand: a bordered brand band above every brand's rows
 #     (Charlesy, Oct 9 2026), drawn by _write_rows(brand_breaks=True) for every TJX-layout
-#     customer workbook, so Asley's manual catalog exports look the same.
+#     customer workbook, so Asley's manual catalog exports look the same;
+#   - since Oct 15 2026 (David) the colour-key format of the TJX catalog exports: a live
+#     key on each tab, rows by colour section then fabrication inside each brand, and a
+#     Warehouse Summary + Overseas Summary tab first.
 # Used by open-orders-api's 'tjxAts' report.
 _TJX_ATS_SLUG = os.environ.get('TJX_ATS_CATALOG_SLUG', 'fffwr26a')
 _TJX_ATS_PREFIXES = ('TJ', 'TM')                    # Overseas tab
@@ -7329,14 +7373,22 @@ def export_tjx_ats():
     if fmt == 'json':
         return jsonify(res)
     try:
+        stamp = datetime.fromisoformat(res['summary']['asOf'])
+        as_of = f'{stamp:%b} {stamp.day}, {stamp.year}'
+        # David, Oct 15 2026: the email workbook in the colour-key format of the TJX catalog
+        # exports: a live key on each tab, rows by colour section then fabrication inside
+        # each brand band, and a Warehouse Summary + Overseas Summary with every brand's
+        # colour totals and their fabrications
         tabs = [{'brand_name': 'Warehouse', 'tab_name': 'Warehouse', 'view_mode': 'ats', 'flow_mode': False,
-                 'keep_order': True, 'items': res['warehouse']},
+                 'keep_order': True, 'items': res['warehouse'],
+                 'key_title': f'TJMAXX ATS  \u00b7  Warehouse  \u00b7  as of {as_of}'},
                 {'brand_name': 'Overseas', 'tab_name': 'Overseas', 'view_mode': 'incoming', 'flow_mode': True,
-                 'keep_order': True, 'items': res['overseas']}]
+                 'keep_order': True, 'items': res['overseas'],
+                 'key_title': f'TJMAXX ATS  \u00b7  Overseas  \u00b7  as of {as_of}'}]
         xl_bytes = build_multi_brand_excel(tabs, S3_PHOTOS_URL, catalog_mode=True, view_mode='ats',
                                            flow_mode=False, prepack_defaults=_fresh_prepack_defaults(),
-                                           tjx_layout=True)
-        stamp = datetime.fromisoformat(res['summary']['asOf'])
+                                           tjx_layout=True, color_key=True,
+                                           summary_title=f'TJMAXX ATS  \u00b7  {{view}} Color Summary  \u00b7  as of {as_of}')
         resp = send_file(BytesIO(xl_bytes),
                          mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                          as_attachment=True, download_name=f'TJMAXX ATS {stamp:%m.%d.%y}.xlsx')
