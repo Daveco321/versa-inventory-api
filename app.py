@@ -3308,6 +3308,11 @@ def _xl_str(v):
     return '"' + str(v).replace('"', '""') + '"'
 
 
+def _xl_crit(v):
+    """A SUMIFS / COUNTIFS criterion that matches v literally (~ * ? escaped)."""
+    return _xl_str(str(v).replace('~', '~~').replace('*', '~*').replace('?', '~?'))
+
+
 def _tjx_key_base(sku):
     """A '-V' partial-carton row is the same style as its base SKU."""
     s = str(sku or '')
@@ -3361,9 +3366,18 @@ class _TjxKeySource:
             return f'{ref}${c}${top}:${c}${bottom}'
         self.sku, self.fam, self.ats = rng('SKU'), rng('Color Family'), rng(self.ats_h)
         self.brand = rng('Brand') if 'Brand' in headers else None
+        self.fab = rng('Fabrication') if 'Fabrication' in headers else None
         field = dict(_TJX_KEY_ATS_FIELDS)[self.ats_h]
         self.rows = [(str(it.get('sku') or ''), tjx_sections.family_of(it), str(it.get('brand_full') or ''),
                       it.get(field, 0)) for it in items]
+        # fabrication group per row (the style's fabric code, else its folded text) and the
+        # fabrication texts each text group holds (a text group is matched on its texts)
+        self.fgroups = [tjx_sections.fabric_group(it) for it in items]
+        self.fab_text = [str(it.get('fabrication') or '') for it in items]
+        self.group_texts = {}
+        for g, t in zip(self.fgroups, self.fab_text):
+            if g.startswith('text:'):
+                self.group_texts.setdefault(g, set()).add(t)
         self.per_style = {}
         for sku, _, _, v in self.rows:
             if _tjx_key_num(v) and v > 0:
@@ -3372,6 +3386,26 @@ class _TjxKeySource:
         self.ok = True
 
     # ── formulas (one term per source tab) ──
+    def _fg_ok(self, fg):
+        return fg is None or fg.startswith('code:') or (self.fab is not None and fg in self.group_texts)
+
+    def _fg_cond(self, fg):
+        """SUMPRODUCT factor for one fabrication group."""
+        if fg is None:
+            return ''
+        if fg.startswith('code:'):
+            return f'(MID({self.sku},5,2)="{fg[5:]}")*'
+        return '((' + '+'.join(f'({self.fab}={_xl_str(t)})' for t in sorted(self.group_texts[fg])) + ')>0)*'
+
+    def _fg_crits(self, fg):
+        """SUMIFS criteria pairs for one fabrication group: one list per alternative."""
+        if fg is None:
+            return ['']
+        if fg.startswith('code:'):
+            return [f',{self.sku},"????{fg[5:]}*"']
+        esc = lambda t: t.replace('~', '~~').replace('*', '~*').replace('?', '~?')
+        return [f',{self.fab},{_xl_str(esc(t))}' for t in sorted(self.group_texts[fg])]
+
     def _fam(self, crit):
         if crit is None:
             return ''
@@ -3379,40 +3413,71 @@ class _TjxKeySource:
             return '*'.join(f'({self.fam}<>"{c}")' for c in _TJX_KEY_NAMED) + '*'
         return f'({self.fam}="{crit}")*'
 
-    def styles_term(self, crit=None, brand=None):
+    def styles_term(self, crit=None, brand=None, fg=None):
         live = f'ISNUMBER({self.ats})*({self.ats}>0)'
         base = f'LEFT({self.sku},LEN({self.sku})-2*(RIGHT({self.sku},2)="-V"))'
         denom = (f'COUNTIFS({self.sku},{base},{self.ats},">0")'
                  f'+COUNTIFS({self.sku},{base}&"-V",{self.ats},">0")+1-{live}')
         b = f'({self.brand}={_xl_str(brand)})*' if brand is not None else ''
-        return f'SUMPRODUCT({self._fam(crit)}{b}{live}/({denom}))'
+        return f'SUMPRODUCT({self._fam(crit)}{b}{self._fg_cond(fg)}{live}/({denom}))'
 
-    def units_term(self, crit=None, brand=None):
-        bcrit = f',{self.brand},{_xl_str(brand)}' if brand is not None else ''
-
-        def total():
-            return f'SUMIFS({self.ats}{bcrit})' if brand is not None else f'SUM({self.ats})'
-        if crit is None:
-            return total()
-        if crit == 'Fancy':
-            return total() + ''.join(f'-SUMIFS({self.ats},{self.fam},"{c}"{bcrit})' for c in _TJX_KEY_NAMED)
-        return f'SUMIFS({self.ats},{self.fam},"{crit}"{bcrit})'
+    def units_term(self, crit=None, brand=None, fg=None):
+        bcrit = f',{self.brand},{_xl_crit(brand)}' if brand is not None else ''
+        terms = []
+        for gcrit in self._fg_crits(fg):
+            def total():
+                if brand is None and not gcrit:
+                    return f'SUM({self.ats})'
+                return f'SUMIFS({self.ats}{bcrit}{gcrit})'
+            if crit is None:
+                terms.append(total())
+            elif crit == 'Fancy':
+                terms.append(total() + ''.join(f'-SUMIFS({self.ats},{self.fam},"{c}"{bcrit}{gcrit})'
+                                               for c in _TJX_KEY_NAMED))
+            else:
+                terms.append(f'SUMIFS({self.ats},{self.fam},"{crit}"{bcrit}{gcrit})')
+        return '+'.join(terms)
 
     # ── cached values, computed the way the formulas do ──
-    def _rows(self, crit, brand):
-        for sku, f, br, v in self.rows:
+    def _rows(self, crit, brand, fg=None):
+        for (sku, f, br, v), g, t in zip(self.rows, self.fgroups, self.fab_text):
             if brand is not None and br != brand:
                 continue
             if crit is not None and f != crit:
                 continue
+            if fg is not None:
+                if fg.startswith('code:'):
+                    s_ = sku.upper()
+                    if not (len(s_) >= 6 and s_[4:6] == fg[5:]):
+                        continue
+                elif t not in self.group_texts.get(fg, ()):
+                    continue
             yield sku, v
 
-    def styles_val(self, crit=None, brand=None):
-        return sum(1 / self.per_style[_tjx_key_base(sku)] for sku, v in self._rows(crit, brand)
+    def styles_val(self, crit=None, brand=None, fg=None):
+        return sum(1 / self.per_style[_tjx_key_base(sku)] for sku, v in self._rows(crit, brand, fg)
                    if _tjx_key_num(v) and v > 0)
 
-    def units_val(self, crit=None, brand=None):
-        return sum(v for _, v in self._rows(crit, brand) if _tjx_key_num(v))
+    def units_val(self, crit=None, brand=None, fg=None):
+        return sum(v for _, v in self._rows(crit, brand, fg) if _tjx_key_num(v))
+
+    def fabric_groups(self, crit, brand):
+        """[(group, label)] of one colour family for one brand, the biggest group first; the
+        label is the group's most-stocked fabrication text."""
+        tot, label_units = {}, {}
+        for (sku, f, br, v), g, t in zip(self.rows, self.fgroups, self.fab_text):
+            if br != brand or f != crit or not _tjx_key_num(v):
+                continue
+            tot[g] = tot.get(g, 0) + v
+            label_units.setdefault(g, {})
+            label_units[g][t] = label_units[g].get(t, 0) + v
+        out = []
+        for g in sorted(tot, key=lambda g: (-tot[g], g)):
+            if not self._fg_ok(g):
+                continue
+            texts = label_units[g]
+            out.append((g, max(texts, key=lambda t: (texts[t], t)) or '(no fabrication)'))
+        return out
 
 
 def _tjx_key_formats(workbook):
@@ -3502,9 +3567,11 @@ def _write_tjx_color_key(workbook, worksheet, headers, items, last_row, view_mod
 
 def _write_tjx_summary(workbook, worksheet, tabs, title=None, today=None):
     """The Summary tab of a TJX colour-key export (David, Oct 15 2026): every brand in the
-    workbook, then its White / Black / Navy & Blue / Other Solids / Fancies and the brand
-    total, then ALL BRANDS. LIVE formulas over the brands' tabs (SUMIFS on the Brand
-    column, so a brand inside a several-brand tab works too); each carries its value.
+    workbook; under it each colour family's total (White / Black / Navy & Blue / Other
+    Solids / Fancies) with that colour's fabrications listed underneath, then the brand
+    total; then ALL BRANDS by colour. LIVE formulas over the brands' tabs (SUMIFS on the
+    Brand column, so a brand inside a several-brand tab works too, and on the style number's
+    fabric code for the fabrication lines); each formula carries its value.
     tabs: [{'name', 'headers', 'items', 'last_row', 'view'}] in workbook order.
     One view only: the first tab's (a workbook mixing Warehouse and Overseas tabs is
     summarised for the first tab's view, and the title says which). A brand is added up
@@ -3533,18 +3600,103 @@ def _write_tjx_summary(workbook, worksheet, tabs, title=None, today=None):
         sources[b] = own or [next(u['src'] for u in usable if b in u['brands'])]
 
     F = _tjx_key_formats(workbook)
+    font = STYLE_CONFIG['font_name']
+    sub = {'border': 1, 'border_color': '#CBD5E1', 'font_name': font, 'font_size': 9, 'valign': 'vcenter',
+           'font_color': '#334155', 'bg_color': '#F8FAFC'}
+    f_sub_lab = workbook.add_format({**sub, 'align': 'left', 'indent': 2, 'text_wrap': True})
+    f_sub_num = workbook.add_format({**sub, 'align': 'center', 'num_format': '#,##0'})
+    f_sub_pct = workbook.add_format({**sub, 'align': 'center', 'num_format': '0.0%'})
     worksheet.hide_gridlines(2)
-    worksheet.set_column(0, 0, 30)
+    worksheet.set_column(0, 0, 58)
     worksheet.set_column(1, 3, 15)
     worksheet.set_row(0, 30)
     today = _tjx_key_today(today)
-    # the title bar runs past the table (to column H) so a long title is never cut off
-    worksheet.merge_range(0, 0, 0, 7, title or (
-        f'Color Summary  ·  {_TJX_KEY_VIEWS.get(view, "ATS")}  ·  as of {today:%b} {today.day}, {today.year}'),
+    worksheet.merge_range(0, 0, 0, 5, title or (
+        f'Color Summary  \u00b7  {_TJX_KEY_VIEWS.get(view, "ATS")}  \u00b7  as of {today:%b} {today.day}, {today.year}'),
         F['title'])
-    for c, h in enumerate(['BRAND / COLOR', 'Styles', 'Units (ATS)', '% of Total']):
+    for c, h in enumerate(['BRAND / COLOR / FABRICATION', 'Styles', 'Units (ATS)', '% of Total']):
         worksheet.write(1, c, h, F['head'])
     worksheet.freeze_panes(2, 0)
+
+    def block(r, srcs, brand, total_label):
+        """Colour lines with their fabrications from worksheet row r, then the total row.
+        Returns (next row, {crit: (row, styles, units)})."""
+        tot_row = None   # filled once known: the % formulas point at it
+        pending_pct = []
+        out = {}
+        total_units = sum(s_.units_val(None, brand) for s_ in srcs)
+        for label, crit, _, _ in _TJX_KEY_FAMILIES:
+            worksheet.set_row(r, 19)
+            worksheet.write(r, 0, label, F['fam'][crit])
+            sv = int(sum(s_.styles_val(crit, brand) for s_ in srcs) + 0.5)
+            uv = sum(s_.units_val(crit, brand) for s_ in srcs)
+            worksheet.write_formula(r, 1, '=ROUND(' + '+'.join(s_.styles_term(crit, brand) for s_ in srcs) + ',0)',
+                                    F['num'], sv)
+            worksheet.write_formula(r, 2, '=' + '+'.join(s_.units_term(crit, brand) for s_ in srcs), F['num'], uv)
+            pending_pct.append((r, F['pct'], uv))
+            out[crit] = (r, sv, uv)
+            r += 1
+            # this colour's fabrications, the biggest first (merged over the brand's tabs). A
+            # line is one fabrication name: fabric codes printing the same name share a line,
+            # and style numbers with no fabric code join the line of their name (else
+            # 'Other fabrications'). The line holding those is the colour minus the other
+            # lines, so the lines under a colour always add up to it.
+            colour_row = r - 1
+            lines, rest_labels = {}, []
+            for s_ in srcs:
+                for g, lab in s_.fabric_groups(crit, brand):
+                    if g.startswith('code:'):
+                        ln = lines.setdefault(tjx_sections.fabric_key(lab), {'label': lab, 'codes': [], 'rest': False})
+                        if g not in ln['codes']:
+                            ln['codes'].append(g)
+                    elif lab not in rest_labels:
+                        rest_labels.append(lab)
+            for ln in lines.values():
+                ln['u'] = sum(s_.units_val(crit, brand, g) for s_ in srcs for g in ln['codes'])
+                ln['s'] = int(sum(s_.styles_val(crit, brand, g) for s_ in srcs for g in ln['codes']) + 0.5)
+            code_u = sum(ln['u'] for ln in lines.values())
+            code_s = sum(ln['s'] for ln in lines.values())
+            if rest_labels:
+                key = tjx_sections.fabric_key(rest_labels[0]) if len(rest_labels) == 1 else None
+                if key is not None and key in lines:
+                    ln = lines[key]
+                else:
+                    ln = lines.setdefault(key or '\x00other', {'label': rest_labels[0] if key else 'Other fabrications',
+                                                               'codes': [], 's': 0, 'u': 0})
+                ln['rest'] = True
+                ln['u'] += uv - code_u
+                ln['s'] += sv - code_s
+            order_l = sorted(lines.values(), key=lambda ln: (-ln['u'], ln['label']))
+            for i, ln in enumerate(order_l):
+                ln['row'] = r + i
+            for ln in order_l:
+                rr = ln['row']
+                worksheet.set_row(rr, 17)
+                worksheet.write(rr, 0, ln['label'], f_sub_lab)
+                if ln.get('rest'):
+                    others = [o['row'] for o in order_l if o is not ln]
+                    sform = f'=B{colour_row + 1}' + ''.join(f'-B{x + 1}' for x in others)
+                    uform = f'=C{colour_row + 1}' + ''.join(f'-C{x + 1}' for x in others)
+                else:
+                    sform = '=ROUND(' + '+'.join(s_.styles_term(crit, brand, g) for s_ in srcs for g in ln['codes']) + ',0)'
+                    uform = '=' + '+'.join(s_.units_term(crit, brand, g) for s_ in srcs for g in ln['codes'])
+                worksheet.write_formula(rr, 1, sform, f_sub_num, ln['s'])
+                worksheet.write_formula(rr, 2, uform, f_sub_num, ln['u'])
+                pending_pct.append((rr, f_sub_pct, ln['u']))
+            r += len(order_l)
+        tot_row = r
+        worksheet.set_row(r, 19)
+        worksheet.write(r, 0, total_label, F['tot'])
+        worksheet.write_formula(r, 1, '=ROUND(' + '+'.join(s_.styles_term(None, brand) for s_ in srcs) + ',0)',
+                                F['tot_num'], int(sum(s_.styles_val(None, brand) for s_ in srcs) + 0.5))
+        worksheet.write_formula(r, 2, '=' + '+'.join(s_.units_term(None, brand) for s_ in srcs), F['tot_num'],
+                                total_units)
+        fam_pct = '+'.join(f'D{out[c][0] + 1}' for _, c, _, _ in _TJX_KEY_FAMILIES)
+        worksheet.write_formula(r, 3, f'={fam_pct}', F['tot_pct'], 1 if total_units else 0)
+        for pr, fmt, uv in pending_pct:
+            worksheet.write_formula(pr, 3, f'=IF($C${tot_row + 1}=0,0,C{pr + 1}/$C${tot_row + 1})', fmt,
+                                    (uv / total_units) if total_units else 0)
+        return r + 1, out
 
     fam_rows = {crit: [] for _, crit, _, _ in _TJX_KEY_FAMILIES}
     fam_vals = {crit: [0, 0] for _, crit, _, _ in _TJX_KEY_FAMILIES}
@@ -3552,15 +3704,15 @@ def _write_tjx_summary(workbook, worksheet, tabs, title=None, today=None):
     for b in order:
         worksheet.set_row(r, 22)
         worksheet.merge_range(r, 0, r, 3, b or '(no brand)', F['brand'])
-        vals = _write_tjx_family_block(worksheet, F, r + 1, sources[b], brand=b, total_label=f'{b} Total')
-        for i, (_, crit, _, _) in enumerate(_TJX_KEY_FAMILIES):
-            fam_rows[crit].append(r + 1 + i)
-            fam_vals[crit][0] += vals[crit][0]
-            fam_vals[crit][1] += vals[crit][1]
-        worksheet.set_row(r + 7, 8)
-        r += 8
+        r, out = block(r + 1, sources[b], b, f'{b} Total')
+        for _, crit, _, _ in _TJX_KEY_FAMILIES:
+            fam_rows[crit].append(out[crit][0])
+            fam_vals[crit][0] += out[crit][1]
+            fam_vals[crit][1] += out[crit][2]
+        worksheet.set_row(r, 8)
+        r += 1
 
-    # ALL BRANDS: the brand blocks added up
+    # ALL BRANDS: each colour line of every brand block added up
     worksheet.set_row(r, 22)
     worksheet.merge_range(r, 0, r, 3, 'ALL BRANDS', F['all'])
     first = r + 1
@@ -4027,6 +4179,9 @@ def build_brand_excel(brand_name, items, s3_base_url, view_mode='all', is_order=
     # TJX colour key above the tab (TJX-logo catalog exports, David Oct 15 2026)
     key_on = bool(color_key and tjx_layout and catalog_mode)
     hdr_row = TJX_KEY_HEADER_ROW if key_on else 0
+    if key_on:
+        items = [dict(it, tjx_color_family=tjx_sections.normalize_family(it.get('tjx_color_family')))
+                 for it in items]
 
     # Auto-detect incoming_only: all items have zero warehouse stock
     # (only applies to non-incoming view modes — incoming view already omits warehouse)
@@ -4165,6 +4320,11 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
 
     for b in brands_list:
         b['items'] = b.get('items') or []
+        if key_on:
+            # one canonical Color Family per row ('white ' -> White, blank -> Fancy), so
+            # the cell, its section band, the key and the Summary always agree
+            b['items'] = [dict(it, tjx_color_family=tjx_sections.normalize_family(it.get('tjx_color_family')))
+                          for it in b['items']]
         if b.get('keep_order'):
             continue  # curated tab: the caller's row order IS the layout
         sort_key = 'total_ats' if catalog_mode else 'total_warehouse'
@@ -4220,7 +4380,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                         brand_breaks=_tab_bands(brand), header_row=hdr_row, color_sections=key_on)
         if key_on:
             _write_tjx_color_key(wb, ws, headers, brand['items'], n, view_mode=_tab_view(brand),
-                                 title=brand.get('key_title'))
+                                 title=(str(brand.get('key_title'))[:160] if brand.get('key_title') else None))
             key_tabs.append({'name': safe, 'headers': headers, 'items': brand['items'], 'last_row': n,
                              'view': _tab_view(brand)})
         # An empty tab would render the hardcoded fallback size grids on an
@@ -4264,7 +4424,7 @@ def build_multi_brand_excel(brands_list, s3_base_url, catalog_mode=False, view_m
                             brand_breaks=_tab_bands(brand), header_row=hdr_row, color_sections=key_on)
             if key_on:
                 _write_tjx_color_key(wb, ws, headers, brand['items'], n, view_mode=_tab_view(brand),
-                                     title=brand.get('key_title'))
+                                     title=(str(brand.get('key_title'))[:160] if brand.get('key_title') else None))
                 key_tabs.append({'name': safe, 'headers': headers, 'items': brand['items'], 'last_row': n,
                                  'view': _tab_view(brand)})
         if key_on:

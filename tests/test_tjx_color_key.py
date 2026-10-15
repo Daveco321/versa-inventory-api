@@ -40,6 +40,31 @@ def tabs():
              'keep_order': True, 'items': [dict(r) for r in OS]}]
 
 
+FAMS = ['White Solids', 'Black Solids', 'Navy & Blue Solids', 'Other Solids', 'Fancies']
+
+
+def parse_summary(ws):
+    """{brand: {'colors': {label: [styles, units, [(fabric, styles, units), ...]]}, 'total': [styles, units]},
+    'ALL BRANDS': {...}} read from a values workbook's Summary tab."""
+    out, cur, color = {}, None, None
+    for r in range(3, ws.max_row + 1):
+        a, b, c = ws.cell(r, 1).value, ws.cell(r, 2).value, ws.cell(r, 3).value
+        if a is None:
+            continue
+        if b is None and c is None:                       # brand band / ALL BRANDS band
+            cur = out.setdefault(a, {'colors': {}, 'total': None})
+            color = None
+        elif a in FAMS:
+            color = a
+            cur['colors'][a] = [b, c, []]
+        elif str(a).endswith(' Total'):
+            cur['total'] = [b, c]
+            color = None
+        elif color:
+            cur['colors'][color][2].append((a, b, c))
+    return out
+
+
 def col_b(ws, rows):
     return [ws.cell(r, 2).value if ws.cell(r, 2).value is not None else ws.cell(r, 1).value for r in rows]
 
@@ -180,37 +205,68 @@ class Values(KeyBase):
 class Summary(KeyBase):
     def test_every_brand_then_all_brands(self):
         wf, wv = self.render_key()
-        ws, sv = wf['Summary'], wv['Summary']
-        labels = [ws.cell(r, 1).value for r in range(3, 25)]
-        self.assertEqual(labels[:8], ['Brand A', 'White Solids', 'Black Solids', 'Navy & Blue Solids',
-                                      'Other Solids', 'Fancies', 'Brand A Total', None])
-        self.assertEqual(labels[8:15], ['Brand B', 'White Solids', 'Black Solids', 'Navy & Blue Solids',
-                                        'Other Solids', 'Fancies', 'Brand B Total'])
-        self.assertEqual(labels[16], 'ALL BRANDS')
-        # Brand A comes from the Warehouse tab (its first tab); mixed views: no Deliveries column
-        self.assertEqual(ws.cell(2, 3).value, 'Units (ATS)')
-        self.assertEqual([sv.cell(r, 3).value for r in range(4, 10)], [940, 500, 0, 0, 100, 1540])
-        self.assertEqual([sv.cell(r, 2).value for r in range(4, 10)], [1, 1, 0, 0, 1, 3])
+        sm = parse_summary(wv['Summary'])
+        self.assertEqual(list(sm), ['Brand A', 'Brand B', 'ALL BRANDS'])
+        a = sm['Brand A']
+        self.assertEqual(list(a['colors']), FAMS)
+        self.assertEqual([a['colors'][f][1] for f in FAMS], [940, 500, 0, 0, 100])
+        self.assertEqual([a['colors'][f][0] for f in FAMS], [1, 1, 0, 0, 1])
+        self.assertEqual(a['total'], [3, 1540])
+        # each colour lists its fabrications underneath
+        self.assertEqual(a['colors']['White Solids'][2], [('Synthetic Fabric', 1, 940)])
+        self.assertEqual(a['colors']['Navy & Blue Solids'][2], [])
+        self.assertEqual([sm['ALL BRANDS']['colors'][f][1] for f in FAMS], [940, 500, 800, 60, 100])
+        self.assertEqual(sm['ALL BRANDS']['total'], [5, 2400])
+        ws = wf['Summary']
+        self.assertEqual(ws.cell(2, 1).value, 'BRAND / COLOR / FABRICATION')
         self.assertEqual(ws.cell(4, 3).value,
                          "=SUMIFS('Warehouse'!$K$10:$K$24,'Warehouse'!$G$10:$G$24,\"White\",'Warehouse'!$C$10:$C$24,\"Brand A\")")
-        self.assertEqual([sv.cell(r, 3).value for r in range(20, 26)], [940, 500, 800, 60, 100, 2400])
-        self.assertAlmostEqual(sv.cell(25, 4).value, 1.0)
+        self.assertIn('"????XX*"', ws.cell(5, 3).value)       # the fabrication line under White
 
     def test_a_brand_with_its_own_tab_is_read_from_it(self):
         both = [{'brand_name': 'All Brands', 'tab_name': 'All Brands', 'view_mode': 'ats', 'keep_order': True,
                  'items': [dict(r) for r in WH]},
                 {'brand_name': 'Brand A', 'tab_name': 'Brand A', 'view_mode': 'ats', 'keep_order': True,
                  'items': [dict(r) for r in WH[:4]]}]
-        wf, _ = self.render_key(tab_list=both)
+        wf, wv = self.render_key(tab_list=both)
         ws = wf['Summary']
-        self.assertIn("'Brand A'!", ws.cell(4, 3).value)        # Brand A: its own tab
-        self.assertIn("'All Brands'!", ws.cell(12, 3).value)    # Brand B: only in All Brands
+        forms = {}
+        for r in range(3, ws.max_row + 1):
+            v = ws.cell(r, 3).value
+            if isinstance(v, str) and '"Brand A"' in v:
+                forms.setdefault('A', []).append(v)
+            if isinstance(v, str) and '"Brand B"' in v:
+                forms.setdefault('B', []).append(v)
+        self.assertTrue(all("'Brand A'!" in f and "'All Brands'!" not in f for f in forms['A']))
+        self.assertTrue(all("'All Brands'!" in f for f in forms['B']))
+        sm = parse_summary(wv['Summary'])
+        self.assertEqual(sm['ALL BRANDS']['total'], [5, 2400])
 
     def test_overseas_summary_has_no_deliveries_column(self):
         _, wv = self.render_key(tab_list=[tabs()[1]])
         sv = wv['Summary']
-        self.assertEqual([sv.cell(2, c).value for c in range(1, 5)], ['BRAND / COLOR', 'Styles', 'Units (ATS)', '% of Total'])
-        self.assertEqual([sv.cell(r, 3).value for r in range(4, 10)], [500, 0, 0, 0, 72, 572])
+        self.assertEqual([sv.cell(2, c).value for c in range(1, 5)],
+                         ['BRAND / COLOR / FABRICATION', 'Styles', 'Units (ATS)', '% of Total'])
+        sm = parse_summary(sv)
+        self.assertEqual([sm['Brand A']['colors'][f][1] for f in FAMS], [500, 0, 0, 0, 72])
+        self.assertEqual(sm['Brand A']['total'], [2, 572])
+
+    def test_fabrication_lines_add_up_to_their_colour(self):
+        items = [row('TJCCCT001SLS', 'CCC', 'Brand C', 100, fabrication='100% Cotton'),
+                 row('TJCCPE002SLS', 'CCC', 'Brand C', 500, fabrication='95% Polyester / 5% Spandex'),
+                 row('TJCCCT003SLS', 'CCC', 'Brand C', 400, fabrication='100% cotton'),
+                 row('TJCCPE002SLS-V', 'CCC', 'Brand C', 40, fabrication='95% Poly 5% Spandex (V)'),
+                 row('TJCCPE009SLP', 'CCC', 'Brand C', 70, tjx_color_family='Fancy', color='Navy Check',
+                     fabrication='95% Polyester / 5% Spandex')]
+        one = [{'brand_name': 'C', 'tab_name': 'C', 'view_mode': 'ats', 'keep_order': True, 'items': items}]
+        _, wv = self.render_key(tab_list=one)
+        sm = parse_summary(wv['Summary'])['Brand C']
+        white = sm['colors']['White Solids']
+        self.assertEqual(white[:2], [3, 1040])
+        # PE first (540 incl. the -V row, one style), then CT (500, two styles)
+        self.assertEqual(white[2], [('95% Polyester / 5% Spandex', 1, 540), ('100% cotton', 2, 500)])
+        self.assertEqual(sm['colors']['Fancies'][2], [('95% Polyester / 5% Spandex', 1, 70)])
+        self.assertEqual(sm['total'], [4, 1110])
 
 
 class Gating(KeyBase):
@@ -316,8 +372,8 @@ class ReviewFixes(KeyBase):
         self.assertEqual([ws.cell(r, 2).value for r in range(3, 9)], [1, 0, 0, 0, 3, 4])
         self.assertAlmostEqual(ws.cell(8, 4).value, 1.0)
         self.assertIn('<>"White"', wf['C'].cell(7, 2).value)
-        sv = wv['Summary']
-        self.assertEqual([sv.cell(r, 3).value for r in range(4, 10)], [100, 0, 0, 0, 60, 160])
+        sm = parse_summary(wv['Summary'])['Brand C']
+        self.assertEqual([sm['colors'][f][1] for f in FAMS] + [sm['total'][1]], [100, 0, 0, 0, 60, 160])
 
     def test_summary_adds_a_brand_over_its_one_brand_tabs_of_one_view(self):
         a1 = [row('TJAAPE001SLS', 'AAA', 'Brand A', 100)]
@@ -328,11 +384,12 @@ class ReviewFixes(KeyBase):
              {'brand_name': 'AO', 'tab_name': 'AO', 'view_mode': 'incoming', 'flow_mode': True, 'keep_order': True,
               'items': os_}]
         wf, wv = self.render_key(tab_list=t)
-        sv = wv['Summary']
-        self.assertEqual([sv.cell(r, 3).value for r in range(4, 10)], [100, 50, 0, 0, 0, 150])
-        self.assertIn("'A1'!", wf['Summary'].cell(4, 3).value)
-        self.assertIn("'A2'!", wf['Summary'].cell(4, 3).value)
-        self.assertNotIn("'AO'!", wf['Summary'].cell(9, 3).value)
+        sm = parse_summary(wv['Summary'])['Brand A']
+        self.assertEqual([sm['colors'][f][1] for f in FAMS] + [sm['total'][1]], [100, 50, 0, 0, 0, 150])
+        forms = [wf['Summary'].cell(r, 3).value for r in range(3, wf['Summary'].max_row + 1)]
+        forms = [f for f in forms if isinstance(f, str)]
+        self.assertTrue(any("'A1'!" in f and "'A2'!" in f for f in forms))
+        self.assertFalse(any("'AO'!" in f for f in forms))
         self.assertIn('Warehouse ATS', wf['Summary'].cell(1, 1).value)
 
     def test_arrival_width_only_changes_under_the_key(self):
@@ -343,6 +400,33 @@ class ReviewFixes(KeyBase):
 
     def test_fabric_key_keeps_percent_with_its_fibre(self):
         self.assertNotEqual(T.fabric_key('65% Polyester / 35% Cotton'), T.fabric_key('65% Cotton / 35% Polyester'))
+
+
+class ReviewFixes2(KeyBase):
+    def test_style_numbers_without_a_fabric_code_go_on_a_remainder_line(self):
+        items = [row('TJCCPE001SLS', 'CCC', 'Brand C', 100, fabrication='Stretch'),
+                 row('TJCC5501', 'CCC', 'Brand C', 40, fabrication='Stretch'),        # no two-letter code
+                 row('TJCC5502-04', 'CCC', 'Brand C', 10, fabrication='Linen')]
+        one = [{'brand_name': 'C', 'tab_name': 'C', 'view_mode': 'ats', 'keep_order': True, 'items': items}]
+        wf, wv = self.render_key(tab_list=one)
+        white = parse_summary(wv['Summary'])['Brand C']['colors']['White Solids']
+        self.assertEqual(white[:2], [3, 150])
+        self.assertEqual(white[2], [('Stretch', 1, 100), ('Other fabrications', 2, 50)])
+
+    def test_family_values_are_normalised(self):
+        items = [row('TJCCPE001SLS', 'CCC', 'Brand C', 100, tjx_color_family='white '),
+                 row('TJCCPE002SLS', 'CCC', 'Brand C', 50, tjx_color_family=None)]
+        one = [{'brand_name': 'C', 'tab_name': 'C', 'view_mode': 'ats', 'keep_order': True, 'items': items}]
+        wf, wv = self.render_key(tab_list=one)
+        ws = wv['C']
+        self.assertEqual([ws.cell(r, 3).value for r in range(3, 9)], [100, 0, 0, 0, 50, 150])
+        cells = [ws.cell(r, 7).value for r in range(11, 16) if ws.cell(r, 2).value]
+        self.assertEqual(sorted(cells), ['Fancy', 'White'])
+
+    def test_two_part_colour_names_go_by_the_first_half(self):
+        self.assertEqual(T.other_solid_group('Lt Pink Solid / Khaki Multi Horse'), 'Pink')
+        self.assertEqual(T.other_solid_group('Burgundy Solid / Dark Mauve Horse'), 'Red')
+        self.assertEqual(T.fancy_group('White Grnd Navy & Blue Tick'), 'Checks')
 
 
 if __name__ == '__main__':

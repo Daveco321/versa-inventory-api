@@ -25,7 +25,7 @@ OTHER_SOLID_GROUPS = (
     ('Grey', r'gr[ae]y|silver|charcoal|slate|smoke|pewter|graphite|ash|steel|stone grey'),
     ('Khaki & Brown', r'khaki|tan|brown|camel|taupe|stone|sand|beige|buttermilk|oatmeal|mocha|coffee|bamboo|'
                       r'chocolate|cognac|caramel|tobacco|bark|mushroom|natural|ecru|almond|wheat|toffee|'
-                      r'cream|ivory|bone|putty|chino|olive drab|peanut'),
+                      r'cream|ivory|bone|putty|chino|olive drab|peanut|oat'),
     ('Green', r'green|olive|sage|mint|forest|hunter|emerald|lime|moss|army|jade|pistachio|kelly|'
               r'seafoam|spruce'),
     ('Pink', r'pink|rose|blush|salmon|coral|fuchsia|magenta|peach|flamingo'),
@@ -41,28 +41,40 @@ OTHER_SOLID_LAST = 'More Colors'
 
 # Fancies: index.html classifyColorPatterns, plus the words the catalog's colour names use
 # for checks (grid, graph, checker, 'Pld') and stripes (lines) that the brand page lacks
-_STRIPE = re.compile(r'stripe|\blines\b', re.I)
-_GEO = re.compile(r'\bgeo\b|\bgeometric\b|\btriangles?\b|\bdots?\b|\bdotted\b|\bpolka\b|\bpin\s*dots?\b|'
+_STRIPE = re.compile(r'stripe|\blines\b|\bstrps?\b|\bstr\b|\bstp\b', re.I)
+_GEO = re.compile(r'geo\b|\bcrc\b|\bsqr\b|\bgeometric\b|\btriangles?\b|\bdots?\b|\bdotted\b|\bpolka\b|\bpin\s*dots?\b|'
                   r'\bpindots?\b|\bcircles?\b|\bdiamonds?\b|\bsquares?\b|\bhexagons?\b|\boctagons?\b|'
                   r'\bovals?\b|\bchevrons?\b|\bmedallions?\b|\bfoulard\b|\bpaisley\b|\bneat\b|\bstars?\b', re.I)
 _CHECK = re.compile(r'\bchecks?\b|\bchecked\b|\bcheckered\b|\bplaids?\b|\bwindowpanes?\b|\bgingham\b|'
                     r'\btattersall\b|\btartan\b|\bhoundstooth\b|\bmadras\b|\bgrids?\b|\bgraph\b|'
-                    r'\bcheckers?\b|\bcheckerboard\b|\bpld\b', re.I)
+                    r'\bcheckers?\b|\bcheckerboard\b|\bpld\b|\bticks?\b|\bchks?\b', re.I)
 FANCY_ORDER = ('Checks', 'Stripes', 'Geos', 'Prints')
 
 
+_FAMILY_CANON = {f.casefold(): f for f in FAMILY_ORDER}
+
+
+def normalize_family(value):
+    """'White ', 'white' -> 'White'; '', None or anything unknown -> 'Fancy' (classifyColor('')
+    is a fancy)."""
+    return _FAMILY_CANON.get(str(value or '').strip().casefold(), 'Fancy')
+
+
 def family_of(item):
-    """The row's Color Family; an empty one counts as a fancy (classifyColor(''))."""
-    f = str(item.get('tjx_color_family') or '').strip()
-    return f if f in FAMILY_ORDER else 'Fancy'
+    """The row's Color Family, normalised (see normalize_family)."""
+    return normalize_family(item.get('tjx_color_family'))
 
 
 def other_solid_group(color):
     c = str(color or '')
+    head = re.split(r'\s+/\s+', c)[0].strip()
+    c = head or c
+    best = None
     for name, rx in _OTHER_RES:
-        if rx.search(c):
-            return name
-    return OTHER_SOLID_LAST
+        m = rx.search(c)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), name)
+    return best[1] if best else OTHER_SOLID_LAST
 
 
 def fancy_group(color):
@@ -116,10 +128,10 @@ _MODERN = re.compile(r'^[A-Z0-9]{2}[A-Z]{4}[A-Z0-9]{3}[A-Z]{2,4}$')
 
 
 def fabric_group(item):
-    """The fabrication group: the style number's fabric code (chars 5-6) on modern style
-    numbers, else the folded fabrication text."""
+    """The fabrication group: the style number's fabric code (characters 5-6, when they are
+    two letters), else the folded fabrication text."""
     base = style_of(item.get('sku')).upper()
-    if _MODERN.match(base):
+    if len(base) >= 6 and base[4:6].isalpha() and base[4:6].isascii():
         return 'code:' + base[4:6]
     return 'text:' + fabric_key(item.get('fabrication'))
 
