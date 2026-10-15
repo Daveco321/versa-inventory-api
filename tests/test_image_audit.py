@@ -242,7 +242,7 @@ class FakeClient:
         self.calls = []
         self.decide = decide or (lambda p: ('match', 'none'))
         self.stop = stop
-        self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(create=self._create))
+        self.messages = types.SimpleNamespace(create=self._create)
 
     def with_options(self, **kw):
         return self
@@ -273,8 +273,8 @@ class TestVision(unittest.TestCase):
         self.assertEqual(kw['model'], ia.MODEL)
         self.assertEqual(kw['output_config']['effort'], 'low')
         self.assertEqual(kw['output_config']['format']['type'], 'json_schema')
-        self.assertEqual(kw['fallbacks'], 'default')
-        self.assertIn('server-side-fallback-2026-07-01', kw['betas'])
+        self.assertEqual(kw['extra_body'], {'fallbacks': 'default'})
+        self.assertEqual(kw['extra_headers'], {'anthropic-beta': 'server-side-fallback-2026-07-01'})
         self.assertNotIn('tool_choice', kw)
         self.assertEqual(sum(1 for b in kw['messages'][0]['content'] if b['type'] == 'image'), 2)
         self.assertEqual(out['p1']['verdict'], 'mismatch')
@@ -282,6 +282,24 @@ class TestVision(unittest.TestCase):
         self.assertEqual(out['p2']['severity'], '')
         self.assertNotIn('—', out['p1']['reason'])
         self.assertIn('color', out['p1']['reason'])
+
+    def test_rejected_option_or_model_falls_back(self):
+        cl = FakeClient()
+        orig = cl._create
+        seen = []
+
+        class Rejected(Exception):
+            status_code = 400
+
+        def create(**kw):
+            seen.append((kw['model'], 'extra_body' in kw))
+            if 'extra_body' in kw or kw['model'] == ia.MODEL:
+                raise Rejected('synthetic 400')
+            return orig(**kw)
+        cl.messages.create = create
+        out = ia.vision_batch(cl, self.batch(), 'd')
+        self.assertEqual(seen, [(ia.MODEL, True), (ia.MODEL, False), (ia.FALLBACK_MODEL, False)])
+        self.assertEqual(out['p1']['by'], ia.FALLBACK_MODEL)
 
     def test_refusal_returns_nothing(self):
         self.assertEqual(ia.vision_batch(FakeClient(stop='refusal'), self.batch(), 'd'), {})
@@ -297,7 +315,7 @@ class TestVision(unittest.TestCase):
                 o['photo_problem'], o['verdict'] = 'not_product', 'unclear'
             r.content[1].text = json.dumps(data)
             return r
-        cl.beta.messages.create = create
+        cl.messages.create = create
         b = self.batch()
         b[0]['source'] = 'swatch'
         out = ia.vision_batch(cl, b, 'd')

@@ -576,6 +576,36 @@ def clean_seen(s):
                           flags=re.I).replace('  ', ' '))
 
 
+FALLBACK_MODEL = os.environ.get('IMAGE_AUDIT_FALLBACK_MODEL', 'claude-opus-5')
+
+
+def ask_model(client, content):
+    """(response, model used). Plain messages.create, the call the platform's agent already makes
+    with this server's SDK; the refusal fallback goes in as request fields so no SDK version can
+    reject it. A 400/404 (fallback option or model not available to this key) retries without the
+    option, then on the platform's agent model."""
+    base = dict(max_tokens=8000, system=SYSTEM_PROMPT, messages=[{'role': 'user', 'content': content}],
+                output_config={'effort': 'low', 'format': {'type': 'json_schema', 'schema': RESULT_SCHEMA}})
+    c = client.with_options(timeout=150.0, max_retries=2)
+    tries = [dict(model=MODEL, extra_headers={'anthropic-beta': 'server-side-fallback-2026-07-01'},
+                  extra_body={'fallbacks': 'default'}),
+             dict(model=MODEL)]
+    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        tries.append(dict(model=FALLBACK_MODEL))
+    last = None
+    for t in tries:
+        try:
+            return c.messages.create(**base, **t), t['model']
+        except Exception as e:
+            if getattr(e, 'status_code', None) in (400, 404):
+                last = e
+                print(f"[image-audit] {t['model']} call rejected ({getattr(e, 'status_code', '')}): "
+                      f"{str(e)[:300]}", flush=True)
+                continue
+            raise
+    raise last
+
+
 def vision_batch(client, batch, today):
     """Judge up to BATCH pairs in one request. Returns {pair id: verdict record}; pairs the
     model did not answer (refusal, error) are simply absent and retried next run."""
@@ -587,11 +617,7 @@ def vision_batch(client, batch, today):
         content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
                                                     'data': base64.standard_b64encode(p['jpeg']).decode()}})
     content.append({'type': 'text', 'text': f'Judge these {len(batch)} photos and return one entry per photo id.'})
-    resp = client.with_options(timeout=150.0, max_retries=2).beta.messages.create(
-        model=MODEL, max_tokens=8000, system=SYSTEM_PROMPT,
-        messages=[{'role': 'user', 'content': content}],
-        output_config={'effort': 'low', 'format': {'type': 'json_schema', 'schema': RESULT_SCHEMA}},
-        betas=['server-side-fallback-2026-07-01'], fallbacks='default')
+    resp, used = ask_model(client, content)
     if getattr(resp, 'stop_reason', None) == 'refusal':
         print(f"[image-audit] vision batch declined ({getattr(resp, 'stop_details', None)})", flush=True)
         return {}
@@ -611,7 +637,7 @@ def vision_batch(client, batch, today):
         seen = seen_text(o.get('seen_main_color'), o.get('seen_other_colors'), o.get('seen_pattern'))
         out[pid] = {'etag': want[pid]['etag'], 'color': want[pid]['color'], 'verdict': v, 'severity': sev,
                     'kind': 'blank' if prob == 'blank' else ('not_product' if prob == 'not_product' else ''),
-                    'seen': seen, 'reason': us_copy(o.get('reason', '')), 'checked': today, 'by': MODEL}
+                    'seen': seen, 'reason': us_copy(o.get('reason', '')), 'checked': today, 'by': used}
     return out
 
 
@@ -997,10 +1023,12 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
         unreadable = len(new) - len(todo)
         checked_new = 0
         client = None
+        vision_errors = []
         if todo and VISION_ON:
             try:
                 client = anthropic_client()
             except Exception as e:
+                vision_errors.append(f'client: {e}'[:300])
                 log(f"[image-audit] vision unavailable: {e}")
         if todo and client is not None:
             batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
@@ -1019,6 +1047,7 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
                                        'jpeg': j or jpeg640[p['pkey']]})
                     return vision_batch(client, items_, day)
                 except Exception as e:
+                    vision_errors.append(f'{type(e).__name__}: {e}'[:300])
                     log(f"[image-audit] vision batch failed: {e}")
                     return {}
             fresh = {}
@@ -1106,6 +1135,7 @@ def register_image_audit_routes(app, *, get_s3, s3_bucket, region, items, overri
                    'flagged': len(flagged), 'by_result': counts, 'checked_new': checked_new,
                    'unchecked': over_cap + unreadable + not_judged, 'over_cap': over_cap,
                    'unreadable': unreadable, 'not_judged': not_judged,
+                   'vision_error': vision_errors[0] if vision_errors else '',
                    'seconds': round(time.time() - t0), 'built_at': now_et().isoformat(timespec='seconds')}
         return xlsx, summary
 
