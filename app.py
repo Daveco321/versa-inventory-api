@@ -11034,7 +11034,9 @@ _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/expor
                         # Inventory Aging (Oct 5 2026): the review copy proxies with the machine key
                         '/api/inventory-aging', '/api/inventory-aging/trend',
                         # P&L fee rates and the no-cost style list (Oct 6 2026; never a cost value)
-                        '/admin/pnl-fees', '/admin/pnl-missing-costs'}
+                        '/admin/pnl-fees', '/admin/pnl-missing-costs',
+                        # Missing Image and Mismatch Report, Monday email (Oct 15 2026)
+                        '/export-image-audit', '/admin/image-audit/status'}
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
@@ -11776,7 +11778,8 @@ def authz_gate():
             if method == 'POST' and path in ('/admin/claude-uploads', '/admin/override-images/move',
                                              '/admin/banner-rules/upsert', '/admin/photos/refresh',
                                              '/admin/factory-holds', '/admin/aging/seed',
-                                             '/admin/pnl-fees', '/admin/color-map/rows'):
+                                             '/admin/pnl-fees', '/admin/color-map/rows',
+                                             '/admin/image-audit/build', '/admin/image-audit/verdicts'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -21729,6 +21732,42 @@ try:
                           caller_identity=_caller_identity)
 except Exception as _email_agent_err:
     print(f'[EmailAgent] NOT registered: {_email_agent_err}', flush=True)
+
+
+# ── Missing Image and Mismatch Report (Monday email, Oct 15 2026) ───────────
+# image_audit.py mirrors the desktop catalog's photo chain and color lookup for
+# every inventory card, judges each (photo, color name) pair once with Claude and
+# caches the verdict in S3, and builds the two-tab workbook the open-orders
+# platform emails on Mondays (report key imageAudit). Routes check the machine key
+# or a staff admin session inline. Wrapped so a failure never blocks boot.
+def _image_audit_items():
+    with _inv_lock:
+        return list(_inventory.get('items') or [])
+
+
+def _image_audit_overrides():
+    with _overrides_lock:
+        return dict(_style_overrides)
+
+
+def _image_audit_server_photo(sku, brand):
+    raw, _ct = _fetch_raw_image(str(sku or '').upper().split('.')[0], str(brand or '').upper())
+    return raw
+
+
+try:
+    from urllib.parse import urlparse
+    from image_audit import register_image_audit_routes
+    register_image_audit_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, region=AWS_REGION,
+                                items=_image_audit_items, overrides=_image_audit_overrides,
+                                dropbox_codes=lambda: set(_dropbox_photo_index.keys()),
+                                color_map=_apo_color_map, server_photo=_image_audit_server_photo,
+                                anthropic_client=_ai_agent_client, identity=_request_identity,
+                                off_loop=_off_loop, is_leader=worker_leader.is_leader,
+                                start_scheduler=os.environ.get('IMAGE_AUDIT_SCHEDULER', 'on') != 'off',
+                                photo_hosts=(urlparse(CLOUDFRONT_URL).hostname,))
+except Exception as _image_audit_err:
+    print(f'[ImageAudit] NOT registered: {_image_audit_err}', flush=True)
 
 
 # ── Profit & Loss (ADMIN ONLY): /api/pnl/* ───────────────────────────────────
