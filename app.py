@@ -18869,6 +18869,7 @@ def _ai_tool_build_line_sheet(params):
     _hl_hidden, _hl_visible = _hidden_landing_maps() if customer_view else ({}, {})
     tabs_out = []
     summary = []
+    tab_meta = []   # (tab, its summary entry, curated skus tab?, tab spec) for the passes after the loop
     with _production_lock:
         prods_all = list(_production_data)
     prod_by_base = {}
@@ -18893,6 +18894,10 @@ def _ai_tool_build_line_sheet(params):
                                                   for i, x in enumerate(tabs_in) if i >= _LINE_SHEET_MAX_TABS],
                         'max_tabs': _LINE_SHEET_MAX_TABS})
     for ti, t in enumerate(tabs_in[:_LINE_SHEET_MAX_TABS]):
+        # Known before the item loop: an overseas tab skips the customer-view
+        # hidden-landing gate there (Oct 16 2026).
+        stock = (t.get('stock') or 'any').strip().lower()
+        view_mode = 'incoming' if stock == 'overseas' else ('ats' if stock == 'warehouse' else 'all')
         skus_req = []
         seen_req = set()
         for s in (t.get('skus') or []):
@@ -18991,7 +18996,11 @@ def _ai_tool_build_line_sheet(params):
                 # One-time NJ exception: the order the removed NJ units cover leaves with them.
                 if _one_time_nj_first(base):
                     _ta += _one_time_nj_cover(dict(r, sku=base), _nj + _cut)
-                if _hid and _tw <= 0 and _inc <= 0:
+                # Not on an overseas tab (Oct 16 2026): the maps key on the EXACT ledger
+                # style, so a base whose only lot lands NJ dropped here even when its -V
+                # has a visible lot the overseas deck shows. The overseas pass below
+                # decides from the deck's own number and names what it leaves off.
+                if _hid and _tw <= 0 and _inc <= 0 and stock != 'overseas':
                     continue   # only supply is a hidden-landing production
             item = {'sku': base, 'brand_abbr': r['brand_abbr'],
                     'brand_full': (BRAND_FULL_NAMES or {}).get(r['brand_abbr'], r['brand_abbr']),
@@ -19017,12 +19026,11 @@ def _ai_tool_build_line_sheet(params):
             items = _annotate_items_for_prepack(items)
         except Exception:
             pass
-        stock = (t.get('stock') or 'any').strip().lower()
-        view_mode = 'incoming' if stock == 'overseas' else ('ats' if stock == 'warehouse' else 'all')
         name = t.get('title') or f"{(t.get('brand') or (t.get('brands') or ['Styles'])[0])} {view_mode}"
         tabs_out.append({'brand_name': str(name), 'tab_name': str(name), 'items': items,
                          'view_mode': view_mode, 'flow_mode': False, 'keep_order': True})
         entry = {'tab': str(name), 'styles': len(items)}
+        tab_meta.append((tabs_out[-1], entry, bool(skus_req), t))
         if missing_req:
             entry['skus_not_found'] = missing_req
         if over_cap:
@@ -19035,6 +19043,93 @@ def _ai_tool_build_line_sheet(params):
         summary.append(entry)
     if not tabs_out:
         return {'error': 'no styles matched any tab filters', 'tabs': summary}
+    # Overseas tabs print OVERSEAS availability only (Oct 16 2026). 'total_ats' above
+    # is the style's whole ATS and _setup_worksheet's Overseas ATS column prints it, so
+    # a style with 6,732 in the warehouse and 468 incoming read 7,200 overseas. The
+    # number now comes from the overseas deck's own computation (_pres_stock_cards:
+    # assignments win, then smart routing via _pres_route_sku, the deck's fallbacks,
+    # suppressed landed lots, hidden-landing lots out in customer view), run once per
+    # distinct arrival window across the build, so a sheet and a deck can never
+    # disagree. By-size rows are not styles there either; a base's -V variant adds to
+    # its base like the sheet row.
+    os_meta = [m for m in tab_meta if m[0]['view_mode'] == 'incoming']
+    if os_meta:
+        # A filter tab's arrival window (what _ai_agent_filter picked its styles by)
+        # goes to the deck too: only lots inside it count and the number scales, and
+        # customer view never counts a hidden lot. Tabs with no window share one run.
+        # A skus tab ignores the window and min_units like every other filter (Oct 16 2026).
+        def _os_window(spec, curated):
+            if curated:
+                return (None, None)
+            return tuple(_apo_parse_date(spec.get(k)) if spec.get(k) else None
+                         for k in ('arrive_before', 'arrive_after'))
+        _os_skus = {}
+        for t, _e, curated, spec in os_meta:
+            _os_skus.setdefault(_os_window(spec, curated), set()).update(it['sku'] for it in t['items'])
+        _os_by_win, _os_feed_ok = {}, True
+        try:
+            for win, skus in _os_skus.items():
+                _wp = {k: d.isoformat() for k, d in zip(('arrive_before', 'arrive_after'), win) if d}
+                _got = _pres_stock_cards('overseas', customer_view, _pres_filter_spec({'skus': sorted(skus)}), _wp)
+                _by = {}
+                for c in _got.get('cards') or []:
+                    _b = _ai_agent_base(c.get('sku'))   # the sheet's own base rule
+                    _by[_b] = _by.get(_b, 0) + int(c.get('number') or 0)
+                _os_by_win[win] = _by
+                _os_feed_ok = _os_feed_ok and bool((_got.get('stats') or {}).get('orders_feed_ok', True))
+        except Exception as e:
+            # Never fall back to total ATS: a sheet that silently prints warehouse
+            # stock as overseas is worse than no sheet.
+            import traceback
+            traceback.print_exc()
+            return {'error': f'could not work out overseas availability: {e}'}
+        for t, entry, curated, spec in os_meta:
+            _by = _os_by_win[_os_window(spec, curated)]
+            # min_units picked a filter tab's styles on GROSS incoming; it applies again
+            # to the routed number so no row prints below it (Oct 16 2026).
+            mu = 0 if curated else int(spec.get('min_units') or 0)
+            keep, gone, low = [], [], []
+            for it in t['items']:
+                n = int(_by.get(it['sku'], 0) or 0)
+                if n <= 0:
+                    gone.append(it['sku'])
+                elif mu and n < mu:
+                    low.append(it['sku'])
+                else:
+                    keep.append(dict(it, total_ats=n))
+            if not curated:
+                # The filter ordered by gross total ATS, warehouse included; the column
+                # is the routed number now, so sort on it, stable (Oct 16 2026).
+                keep.sort(key=lambda it: -it['total_ats'])
+            t['items'] = keep
+            entry['styles'] = len(keep)
+            if gone:
+                # Never drop silently: the styles on a curated tab, a count otherwise.
+                entry['styles_without_overseas_availability'] = gone if curated else len(gone)
+            if low:
+                entry['styles_below_min_units'] = len(low)
+            _win = _os_window(spec, curated)
+            if _win != (None, None):
+                # Say which window the tab was cut to, so an empty tab explains itself.
+                entry['arrival_window'] = {k: d.isoformat() for k, d in zip(('arrive_before', 'arrive_after'), _win) if d}
+            if not keep:
+                entry['skipped'] = True
+                # Never blame committed demand by default: a window with no lot inside it,
+                # or no production at all, empties a tab too (Oct 16 2026).
+                entry['reason'] = (f'nothing left overseas at {mu:,} units or more' if low
+                                   else "no overseas availability arriving inside this tab's arrival window"
+                                   if _win != (None, None) else 'no overseas availability left for these styles')
+        tabs_out = [t for t in tabs_out if t['items']]
+        if not tabs_out:
+            return {'error': 'nothing is available overseas for these filters', 'tabs': summary}
+        _os_note = {'overseas_ats': ('overseas availability only: warehouse stock is not included, and '
+                                     'committed demand is split between warehouse and production by '
+                                     'smart routing, the same numbers as an overseas presentation'),
+                    'open_orders_feed_ok': _os_feed_ok}
+        if any(w != (None, None) for w in _os_by_win):
+            _os_note['arrival_window'] = ('a tab with an arrival window counts only the lots arriving '
+                                          'inside it, the same as an overseas presentation')
+        summary.append(_os_note)
     if wh_breakdown:
         try:
             _split = _wh_split_by_base([it['sku'] for t in tabs_out for it in t['items']])
@@ -19054,9 +19149,12 @@ def _ai_tool_build_line_sheet(params):
                 if rec and not rec.get('exact', True):
                     _inferred.append(it['sku'])
         for t in tabs_out:
+            # An overseas tab already holds only styles with overseas availability
+            # (the pass above); its gross incoming no longer decides (Oct 16 2026).
             keep = [it for it in t['items']
-                    if it['wh_ats_total'] > 0
-                    or (t.get('view_mode') != 'ats' and int(it.get('incoming') or 0) > 0)]
+                    if (int(it.get('total_ats') or 0) > 0 if t.get('view_mode') == 'incoming' else
+                        (it['wh_ats_total'] > 0
+                         or (t.get('view_mode') != 'ats' and int(it.get('incoming') or 0) > 0)))]
             _dropped += len(t['items']) - len(keep)
             t['items'] = keep
         # Per-tab counts must describe the file that is sent, not the styles
@@ -21293,6 +21391,8 @@ _AI_AGENT_TOOLS = [
                      'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
                      'exactly-curated tab in your order; skus overrides every other filter on that tab. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
+                     'On stock:"overseas" tabs Overseas ATS is the smart-routed overseas availability, and styles with '
+                     'nothing left overseas are left off and listed in the tab summary. '
                      'Up to 30 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
                      'first, each tab named by the brand), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
                      'stock:"warehouse", split_by_brand:true}. customer_prefixes = first two letters of the '

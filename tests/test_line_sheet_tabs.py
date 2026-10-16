@@ -48,10 +48,19 @@ class LineSheetTabs(unittest.TestCase):
         a = self.app
         self._saved = {k: getattr(a, k) for k in (
             '_ai_agent_agg_inventory', '_ai_agent_enrich', 'build_multi_brand_excel', 'get_s3',
-            '_production_data', '_fresh_prepack_defaults', '_hidden_landing_maps', '_wh_split_by_base')}
+            '_production_data', '_fresh_prepack_defaults', '_hidden_landing_maps', '_wh_split_by_base',
+            '_pres_stock_cards')}
         self.built = {}
         self.agg = AGG
         a._ai_agent_agg_inventory = lambda: self.agg
+        # Overseas tabs read their number from the overseas deck's computation
+        # (Oct 16 2026); these tests are about tab layout, so every incoming unit
+        # of the synthetic rows counts as available (test_line_sheet_overseas.py
+        # covers the real numbers).
+        a._pres_stock_cards = lambda source, cv, spec, params: {
+            'cards': [{'sku': s, 'base': s, 'number': r['incoming']} for s, r in self.agg.items()
+                      if r['incoming'] > 0 and (not spec['sku_set'] or s in spec['sku_set'])],
+            'stats': {'orders_feed_ok': True}}
         a._ai_agent_enrich = lambda r: ('White Solid', 'Slim Fit', 'Poly')
         a._production_data = []
         a._fresh_prepack_defaults = lambda: None
