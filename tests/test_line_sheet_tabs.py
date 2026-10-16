@@ -53,13 +53,18 @@ class LineSheetTabs(unittest.TestCase):
         self.built = {}
         self.agg = AGG
         a._ai_agent_agg_inventory = lambda: self.agg
-        # Overseas tabs read their number from the overseas deck's computation
-        # (Oct 16 2026); these tests are about tab layout, so every incoming unit
-        # of the synthetic rows counts as available (test_line_sheet_overseas.py
-        # covers the real numbers).
+        # Overseas and warehouse tabs read their number from the matching deck's
+        # computation (Oct 16 2026); these tests are about tab layout, so every
+        # incoming unit (overseas) or warehouse unit (NJ out in customer view) of the
+        # synthetic rows counts as available (test_line_sheet_overseas.py and
+        # test_line_sheet_warehouse.py cover the real numbers).
+        def _deck_number(source, cv, r):
+            if source == 'warehouse':
+                return r['total_warehouse'] - (r['nj'] if cv else 0)
+            return r['incoming']
         a._pres_stock_cards = lambda source, cv, spec, params: {
-            'cards': [{'sku': s, 'base': s, 'number': r['incoming']} for s, r in self.agg.items()
-                      if r['incoming'] > 0 and (not spec['sku_set'] or s in spec['sku_set'])],
+            'cards': [{'sku': s, 'base': s, 'number': _deck_number(source, cv, r)} for s, r in self.agg.items()
+                      if _deck_number(source, cv, r) > 0 and (not spec['sku_set'] or s in spec['sku_set'])],
             'stats': {'orders_feed_ok': True}}
         a._ai_agent_enrich = lambda r: ('White Solid', 'Slim Fit', 'Poly')
         a._production_data = []
@@ -111,9 +116,11 @@ class LineSheetTabs(unittest.TestCase):
         out = self.app._ai_tool_build_line_sheet({'tabs': [
             {'customer_prefixes': ['TJ', 'TM'], 'stock': 'warehouse', 'split_by_brand': True}]})
         self.assertNotIn('error', out)
+        # Rows sort by the warehouse number they print (Oct 16 2026): 500 in the
+        # warehouse above 100 in the warehouse + 900 incoming.
         self.assertEqual(self._tabs(), [
             ('Vince Camuto', ['TMVCZZ905SLS']),
-            ('Nautica', ['TMNAZZ902SLS', 'TJNAZZ901SLS']),
+            ('Nautica', ['TJNAZZ901SLS', 'TMNAZZ902SLS']),
             ('DKNY', ['TMDKZZ904SLS']),
             ('Chaps', ['TJCHZZ906SLS']),
         ])

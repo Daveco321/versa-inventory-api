@@ -274,15 +274,21 @@ class OverseasTabs(_Base):
         self.sheet([{'title': 'A', 'skus': [S_SPLIT], 'stock': 'overseas'},
                     {'title': 'B', 'skus': [S_ROUTED], 'stock': 'overseas'},
                     {'title': 'C', 'skus': [S_SPLIT], 'stock': 'warehouse'}])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], 'overseas')
+        # one overseas run for A and B; the warehouse tab has its own (Oct 16 2026)
+        self.assertEqual(sorted(c[0] for c in calls), ['overseas', 'warehouse'])
 
-    def test_no_overseas_tab_never_runs_the_routing(self):
-        def boom(*a, **k):
-            raise AssertionError('must not run')
-        self.app._pres_stock_cards = boom
-        out = self.sheet([{'title': 'WH', 'skus': [S_SPLIT], 'stock': 'warehouse'}])
+    def test_no_overseas_tab_never_runs_the_overseas_routing(self):
+        calls = []
+        real = self._saved['_pres_stock_cards']
+
+        def spy(*a, **k):
+            calls.append(a[0])
+            return real(*a, **k)
+        self.app._pres_stock_cards = spy
+        out = self.sheet([{'title': 'WH', 'skus': [S_SPLIT], 'stock': 'warehouse'},
+                          {'title': 'ALL', 'skus': [S_SPLIT]}])
         self.assertNotIn('error', out)
+        self.assertNotIn('overseas', calls)
 
     # row order: a filter tab sorts on the number it prints
     def test_filter_tab_rows_sort_by_the_overseas_number(self):
@@ -482,6 +488,9 @@ class ArrivalWindows(_Base):
                     {'title': 'D', 'skus': [S_WIN], 'stock': 'overseas', 'arrive_before': '2026-12-31'},
                     {'title': 'F', 'search': '941', 'stock': 'overseas', 'arrive_after': '2027-01-01'},
                     {'title': 'E', 'skus': [S_WIN], 'stock': 'warehouse'}])
+        # the warehouse tab has its own run, with no window (Oct 16 2026)
+        self.assertEqual([c[3] for c in calls if c[0] == 'warehouse'], [{}])
+        calls = [c for c in calls if c[0] == 'overseas']
         self.assertEqual(len(calls), 3)
         self.assertEqual(sorted((sorted(c[3].items()) for c in calls), key=str),
                          sorted([[], [('arrive_before', '2026-12-31')], [('arrive_after', '2027-01-01')]], key=str))
@@ -495,8 +504,9 @@ class ArrivalWindows(_Base):
 
 
 class OtherTabsUnchanged(_Base):
-    """f. Warehouse and All tabs, and the per-warehouse columns, print exactly what
-    they printed before the overseas fix (values pinned from the old code)."""
+    """f. All tabs, and the per-warehouse columns, print exactly what they printed
+    before the overseas fix (values pinned from the old code). Warehouse tabs print
+    the warehouse deck's number since Oct 16 2026 (test_line_sheet_warehouse.py)."""
 
     BASES = [S_SPLIT, S_ROUTED, S_NONE, S_WHONLY, S_NJLOT]
 
@@ -504,7 +514,8 @@ class OtherTabsUnchanged(_Base):
         self.sheet([{'title': 'WH', 'skus': self.BASES, 'stock': 'warehouse'},
                     {'title': 'ALL', 'skus': self.BASES}])
         pinned = {S_SPLIT: 7200, S_ROUTED: 900, S_NONE: 5000, S_WHONLY: 350, S_NJLOT: 3100}
-        self.assertEqual(self.printed(0), pinned)
+        self.assertEqual(self.printed(0), {S_SPLIT: 6732, S_ROUTED: 400, S_NONE: 5000, S_WHONLY: 350,
+                                           S_NJLOT: 100})
         self.assertEqual(self.printed(1), pinned)
         self.assertEqual([t['view_mode'] for t in self.built['tabs']], ['ats', 'all'])
         self.assertEqual(self.items(0)[S_ROUTED]['incoming'], 2000)
@@ -514,13 +525,14 @@ class OtherTabsUnchanged(_Base):
         self.sheet([{'title': 'WH', 'skus': self.BASES, 'stock': 'warehouse'},
                     {'title': 'ALL', 'skus': self.BASES}], customer_view=True)
         pinned = {S_SPLIT: 7200, S_ROUTED: 900, S_NONE: 5000, S_WHONLY: 300, S_NJLOT: 2100}
-        self.assertEqual(self.printed(0), pinned)
+        self.assertEqual(self.printed(0), {S_SPLIT: 6732, S_ROUTED: 400, S_NONE: 5000, S_WHONLY: 300,
+                                           S_NJLOT: 100})
         self.assertEqual(self.printed(1), pinned)
 
     def test_filter_tabs_unchanged(self):
         self.sheet([{'title': 'WH', 'brands': ['NAUTICA'], 'stock': 'warehouse'},
                     {'title': 'ALL', 'brands': ['DKNY']}])
-        self.assertEqual(self.printed(0), {S_SPLIT: 7200, S_NONE: 5000, S_WHCOVER: 2400, S_ROUTED: 900,
+        self.assertEqual(self.printed(0), {S_SPLIT: 6732, S_NONE: 5000, S_WHCOVER: 400, S_ROUTED: 400,
                                            S_WHONLY: 350})
         self.assertEqual(self.printed(1), {S_NJLOT: 3100, S_AS_OS: 2400, S_AS_WH: 2400, S_VAR: 1400})
 
