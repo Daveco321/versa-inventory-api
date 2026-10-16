@@ -16760,6 +16760,25 @@ def factory_report_download(jid):
 _ai_agent_sdk_client = None
 
 
+def _ai_agent_http_client(anthropic):
+    """The SDK's HTTP client with a plain ssl.SSLContext (Oct 16 2026).
+
+    The SDK's transport (httpx2/httpcore2) verifies TLS through truststore by
+    default, and truststore's SSLContext recurses forever inside gevent's
+    monkey-patched ssl (RecursionError in the verify_mode setter). Every SDK
+    call from a gevent worker then failed as 'Connection error.', which took
+    down the ATS mailbox, the platform chat and the image audit's SDK path.
+    Handing the client an ordinary context (certifi's CA bundle, the one
+    requests already uses here) never touches truststore."""
+    import ssl
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    return anthropic.DefaultHttpxClient(verify=ctx)
+
+
 def _ai_agent_client():
     global _ai_agent_sdk_client
     if _ai_agent_sdk_client is None:
@@ -16767,7 +16786,14 @@ def _ai_agent_client():
         key = os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDE_API_KEY')
         if not key:
             raise RuntimeError('ANTHROPIC_API_KEY not configured')
-        _ai_agent_sdk_client = anthropic.Anthropic(api_key=key)
+        try:
+            http_client = _ai_agent_http_client(anthropic)
+        except Exception as e:
+            # An SDK without DefaultHttpxClient: its own default is the best left.
+            print(f'[AI-Agent] plain-SSL http client unavailable ({e}); using the SDK default', flush=True)
+            http_client = None
+        _ai_agent_sdk_client = (anthropic.Anthropic(api_key=key, http_client=http_client) if http_client
+                                else anthropic.Anthropic(api_key=key))
     return _ai_agent_sdk_client
 
 
