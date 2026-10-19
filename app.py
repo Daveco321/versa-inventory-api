@@ -7302,8 +7302,14 @@ def _tjx_catalog_feed(path, key, **params):
     A fresh app context is required: a test request inside a live request reuses the
     caller's app context, and with it g._authz_ident, so the feed would come back
     unscoped (the machine key's full view: NJ stock, hidden-landing lots)."""
+    # The email keeps its own brand rules (TJ/TM overseas; TJ/TM + Ross RO/RM warehouse minus
+    # USPA, Nicole Miller, Von Dutch), so the catalog's brand list must not narrow it. Since
+    # the Oct 15 catalog-scope change it did, and Ross JNY/Beene/Reebok/Black Label and the
+    # Von Dutch and Beene overseas rows vanished (David, Oct 19 2026). The flag lives in the
+    # WSGI environ, which an outside HTTP request cannot set.
     with app.app_context(), app.test_client() as c:
-        r = c.get(path, query_string=dict(params, catalog_slug=_TJX_ATS_SLUG))
+        r = c.get(path, query_string=dict(params, catalog_slug=_TJX_ATS_SLUG),
+                  environ_base={'versa.tjx_ats_all_brands': True})
     if r.status_code != 200:
         raise RuntimeError(f'{path} returned HTTP {r.status_code}')
     if path in _SCOPE_FILTERS and r.headers.get('X-Catalog-Scope') != _TJX_ATS_SLUG:
@@ -11792,6 +11798,9 @@ def authz_gate():
                 or (method == 'POST' and path in _AUTHZ_CATALOG_POSTS)):
             slug = (request.args.get('catalog_slug') or '').strip()
             scope = _catalog_scope_for_slug(slug) if slug else None
+            if (scope is not None and slug == _TJX_ATS_SLUG
+                    and request.environ.get('versa.tjx_ats_all_brands') is True):
+                scope = dict(scope, all=True)   # in-process TJMAXX ATS email only (Oct 19 2026)
             if scope is not None:
                 g._catalog_scope = scope
                 return None
@@ -19297,6 +19306,11 @@ _PRES_CATEGORY_TITLES = {'big_tall': 'Big & Tall', 'short_sleeve': 'Short Sleeve
                          'button_down': 'Button Down'}
 _PRES_VIEW_LABELS = {'warehouse': 'Warehouse ATS', 'overseas': 'Overseas ATS', 'all': 'Warehouse + Overseas ATS'}
 _PRES_MAX_CARDS = 240
+# Arrival suppression is OFF (David, Oct 19 2026): it hid any lot arriving within 14
+# days whose size matched the warehouse stock within 10%, so a program shipping the
+# same carton count every month lost a real in-transit lot (RONAPE201SLS/207SLS,
+# TF26078, 8,352 u each). The desktop, the TJX email mirror and the phone are off too.
+_ARRIVAL_SUPPRESSION = False
 _PRES_SUPPRESS_SECONDS = 14 * 24 * 3600   # desktop _SUPPRESS_WINDOW_MS
 _PRES_SUPPRESS_TOL = 0.10                 # desktop _SUPPRESS_TOLERANCE
 _PRES_LANDED_WINDOW_DAYS = 30             # desktop _LANDED_WINDOW_DAYS
@@ -19714,7 +19728,7 @@ def _wh_applied_for_sku(sku, q, ctx, now, today):
         landing = str(pr.get('warehouse') or '').strip().upper()
         hidden = landing in _HIDDEN_LANDING_WH
         sup = False
-        if sku not in ctx['no_suppress'] and arr and units > 0:
+        if _ARRIVAL_SUPPRESSION and sku not in ctx['no_suppress'] and arr and units > 0:
             gap = abs((now - datetime(arr.year, arr.month, arr.day)).total_seconds())
             if gap <= _PRES_SUPPRESS_SECONDS:
                 twin = (q['nj'] if landing == 'NJ' else q['abfi']) if hidden else max(0, wh_all - q['nj'] - q['abfi'])
@@ -20202,7 +20216,7 @@ def _pres_stock_cards(source, customer_view, spec, params):
             landing = str(p.get('warehouse') or '').strip().upper()
             hidden = landing in _HIDDEN_LANDING_WH
             sup = False
-            if sku not in no_suppress and arr and units > 0:
+            if _ARRIVAL_SUPPRESSION and sku not in no_suppress and arr and units > 0:
                 gap = abs((now - datetime(arr.year, arr.month, arr.day)).total_seconds())
                 if gap <= _PRES_SUPPRESS_SECONDS:
                     # A batch that lands into NJ / ABFI compares with that stock; any other
@@ -20224,7 +20238,7 @@ def _pres_stock_cards(source, customer_view, spec, params):
         # one-time NJ exception: its landed NJ stock sits on the style's size rows
         one_nj = _one_time_nj_sized_nj(sku, merged) if _one_time_nj_first(sku) else 0
         smart = None
-        if source != 'all' and deductions > 0 and a not in ('warehouse', 'overseas') \
+        if deductions > 0 and a not in ('warehouse', 'overseas') \
                 and (source == 'overseas' or inc > 0):
             smart = _pres_route_sku(dict(q, nj=q['nj'] + one_nj) if one_nj else q, lots,
                                     orders_by_sku.get(sku, []), apo_by_sku.get(sku, []),
@@ -20263,6 +20277,20 @@ def _pres_stock_cards(source, customer_view, spec, params):
             cover = (min(deductions, (nj + abfi + one_nj) + (adj_inc - vis_inc))
                      if customer_view and _one_time_nj_first(sku) else 0)
             number = (wh_view + vis_inc - (deductions - cover)) if customer_view else (wh_all + adj_inc - deductions)
+            # What routing leaves in the warehouse, so the chip only says 'In Warehouse'
+            # when there is something there to sell (David, Oct 19 2026: a 135,120 card
+            # read 'In Warehouse · TR' with every unit still on the water).
+            if a == 'overseas':
+                wh_applied = 0
+            elif a == 'warehouse':
+                wh_applied = deductions
+            elif smart is not None and inc > 0:
+                wh_applied = smart['wh']
+            elif inc > 0:
+                wh_applied = min(deductions, wh_all)
+            else:
+                wh_applied = deductions
+            wh_sell = wh_all - wh_applied - ((nj + abfi) if customer_view else 0)
         if deductions > 0 and source != 'all':
             stats['assigned' if a in ('warehouse', 'overseas') else
                   ('smart_routed' if smart is not None else 'fifo_fallback')] += 1
@@ -20295,7 +20323,7 @@ def _pres_stock_cards(source, customer_view, spec, params):
         if not customer_view:
             wh_cols += (('NJ', 'nj'), ('ABFI', 'abfi'))
         wh_names = [n for n, k in wh_cols if q[k] > 0]
-        if source == 'overseas' or (source == 'all' and wh_view <= 0):
+        if source == 'overseas' or (source == 'all' and (wh_view <= 0 or wh_sell <= 0)):
             chip = ('Arrives ' + _apo_fmt_date(first_arr) if first_arr else 'Arrival TBD', 'arr')
         else:
             chip = ('In Warehouse · ' + ', '.join(wh_names), 'wh') if wh_names else None

@@ -280,22 +280,24 @@ class InputsAndSafety(unittest.TestCase):
         self.assertEqual(res['stats']['inputs']['duplicateRowsMerged'], 1)
         self.assertEqual(kinds(rows(res, '1', 'DUP')), {'warehouse': 400})
 
-    def test_arrival_suppression_and_override(self):
+    def test_arrival_suppression_is_off(self):
+        # A lot arriving inside 14 days with the warehouse holding the same units used to be
+        # treated as landed; suppression is off (David, Oct 19 2026), so it stays supply,
+        # with or without an override.
         items = [item('SUP', wh=1000, orders=100)]
         ledger = [lot('SUP', 1000, arrival='2026-03-10', ref='ZZ26071')]
-        res = run(items, ledger, [order('1', 'SUP', 100, '2026-04-01')])
-        self.assertEqual([s['type'] for s in res['skus']['SUP']['slots']], ['warehouse'])
-        self.assertTrue(res['ledgerUse'][0]['suppressed'])
-        res = run(items, ledger, [order('1', 'SUP', 100, '2026-04-01')], ri={'suppression_overrides': ['sup']})
-        self.assertEqual([s['type'] for s in res['skus']['SUP']['slots']], ['warehouse', 'production'])
-        self.assertFalse(res['ledgerUse'][0]['suppressed'])
+        for ri in (None, {'suppression_overrides': ['sup']}):
+            res = run(items, ledger, [order('1', 'SUP', 100, '2026-04-01')], ri=ri) if ri else \
+                run(items, ledger, [order('1', 'SUP', 100, '2026-04-01')])
+            self.assertEqual([s['type'] for s in res['skus']['SUP']['slots']], ['warehouse', 'production'])
+            self.assertFalse(res['ledgerUse'][0]['suppressed'])
 
     def test_suppression_window_uses_now(self):
         items = [item('WIN', wh=1000, orders=100)]
         ledger = [lot('WIN', 1000, arrival='2026-02-16')]   # exactly 14 days before TODAY
         mid = run(items, ledger, [order('1', 'WIN', 100, '2026-04-01')])
         late = run(items, ledger, [order('1', 'WIN', 100, '2026-04-01')], ri={'now': '2026-03-02T17:09:00'})
-        self.assertTrue(mid['ledgerUse'][0]['suppressed'])
+        self.assertFalse(mid['ledgerUse'][0]['suppressed'])    # suppression off (Oct 19 2026)
         self.assertFalse(late['ledgerUse'][0]['suppressed'])
         self.assertEqual((mid['stats']['clock']['source'], late['stats']['clock']['source']),
                          ('midnight', 'routing_inputs.now'))

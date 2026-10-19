@@ -2535,19 +2535,19 @@ class KitShippedMoney(unittest.TestCase):
 
 
 class SuppressedSupplyStyles(unittest.TestCase):
-    def test_suppressed_batches_are_not_incoming(self):
+    def test_landed_looking_batch_still_counts(self):
         s = src()
-        # Arrival lands on the build day and the warehouse holds the same units: routing suppresses it.
+        # Arrival lands on the build day and the warehouse holds the same units. Arrival
+        # suppression is off (David, Oct 19 2026), so the batch stays incoming supply.
         s['inventory']['items'] = s['inventory']['items'] + [inv('ROQAQF221SLS', tr=200)]
         s['ledger']['rows'] = s['ledger']['rows'] + [led('TT26021', 'ROQAQF221SLS', 200, etd='2026-01-16')]
         ds = build(s)
         p = by(ds, 'production', 'ref')['TT26021']
-        self.assertIn('suppressed', p['flags'])
+        self.assertNotIn('suppressed', p['flags'])
         st = by(ds, 'styles', 'base')['ROQAQF221SLS']
-        self.assertEqual((st['incoming'], st['incomingFob'], st['atsFreeProd']), (0, 0.0, 0))
-        self.assertEqual((st['onHand'], st['atsFreeStock']), (200, st['ats']))
+        self.assertEqual((st['onHand'], st['incoming']), (200, 200))
         self.assertIn('TT', st['factories'])                              # the maker is still named
-        self.assertEqual(ds['totals']['production']['suppressedUnits'], 200)   # totals keep them apart
+        self.assertEqual(ds['totals']['production']['suppressedUnits'], 0)     # nothing suppressed now
 
 
 class RawStockCells(unittest.TestCase):

@@ -150,11 +150,14 @@ class OverseasTab(unittest.TestCase):
         rows = {r['po_ref']: r['total_ats'] for r in b.tab_rows('incoming')}
         self.assertEqual(rows, {'ZZ26012': 100, 'ZZ26013': 200})
 
-    def test_landed_lot_is_suppressed(self):
-        # a lot that arrived 3 days ago with the same units now in the warehouse is not supply
+    def test_landed_looking_lot_still_shows(self):
+        # a lot dated 3 days ago with the same units in the warehouse used to be dropped as
+        # 'landed'; arrival suppression is off (David, Oct 19 2026), so it stays on the tab
         b = build([inv('TJAAXX014SLS', wh=300, incoming=300)],
                   [lot('TJAAXX014SLS', 300, 'ZZ26014', arrival='2026-02-27')])
-        self.assertEqual(b.tab_rows('incoming'), [])
+        rows = b.tab_rows('incoming')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['total_ats'], 300)
 
     def test_hidden_landing_lots_never_show(self):
         b = build([inv('TJAAXX015SLS', incoming=300)],

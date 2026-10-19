@@ -182,6 +182,7 @@ ENGINE_CUSTOMER_NAMES = {
 HIDDEN_LANDING = frozenset({'NJ', 'AE', 'AW', 'ABFI'})   # index.html HIDDEN_LANDING_WH
 SUPPRESS_WINDOW_SECONDS = 14 * 24 * 3600                  # _SUPPRESS_WINDOW_MS
 SUPPRESS_TOLERANCE = 0.10                                 # _SUPPRESS_TOLERANCE
+ARRIVAL_SUPPRESSION = False   # off everywhere (David, Oct 19 2026), see app.py _ARRIVAL_SUPPRESSION
 LANDED_WINDOW_DAYS = 30                                   # _LANDED_WINDOW_DAYS
 GATE_MIN_UNITS = 100                                      # reconciliation gate floor
 GATE_SHARE = 0.10                                         # reconciliation gate share
@@ -376,7 +377,7 @@ def build_lots(sku, q, ledger_items, no_suppress, now):
         landing = _u(p.get('warehouse'))
         hidden = landing in HIDDEN_LANDING
         sup = False
-        if not exempt and arr and units > 0:
+        if ARRIVAL_SUPPRESSION and not exempt and arr and units > 0:
             gap = abs((now - _dt(arr)).total_seconds())
             if gap <= SUPPRESS_WINDOW_SECONDS:
                 # NJ-landing batches compare with NJ stock, AE/AW/ABFI with ABFI; any other

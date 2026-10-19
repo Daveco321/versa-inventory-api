@@ -18,6 +18,7 @@ import pnl_routing as R
 HIDDEN_LANDING_WH = frozenset({'NJ', 'AE', 'AW', 'ABFI'})
 SUPPRESS_WINDOW_SECONDS = 14 * 24 * 60 * 60   # index.html _SUPPRESS_WINDOW_MS
 SUPPRESS_TOLERANCE = 0.10
+ARRIVAL_SUPPRESSION = False   # off everywhere (David, Oct 19 2026), see app.py _ARRIVAL_SUPPRESSION
 STOCK_FIELDS = ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi')
 NAMED_WAREHOUSES = (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa'))
 NO_DATE = 'TBD'   # the browser prints an em dash; David's copy rule forbids them (Oct 5 2026)
@@ -123,6 +124,8 @@ class TjxAtsBuilder:
 
     # ── arrival suppression (index.html _isProductionSuppressed / _getSuppressedIncoming) ──
     def _suppressed(self, warehouse_qty, p, sku):
+        if not ARRIVAL_SUPPRESSION:
+            return False
         if sku and str(sku).upper() in self.no_suppress:
             return False
         if not p['arrival'] or p['units'] <= 0:
