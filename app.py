@@ -7455,7 +7455,9 @@ def apo_report_rows_route():
 _TJX_ATS_SLUG = os.environ.get('TJX_ATS_CATALOG_SLUG', 'fffwr26a')
 _TJX_ATS_PREFIXES = ('TJ', 'TM')                    # Overseas tab
 _TJX_ATS_WH_PREFIXES = ('TJ', 'TM', 'RO', 'RM')     # Warehouse tab: TJX plus Ross
-_TJX_ATS_WH_EXCLUDE = frozenset({'USPA', 'NICOLE', 'VD'})
+# Brands TJX does not buy: out of BOTH tabs (David, Oct 19 2026; the Oct 5 version left
+# Von Dutch on the Overseas tab to match Asley's copy).
+_TJX_ATS_EXCLUDE = frozenset({'USPA', 'NICOLE', 'VD'})
 _TJX_ATS_MIN = 36
 
 
@@ -7471,7 +7473,7 @@ def _tjx_catalog_feed(path, key, **params):
     A fresh app context is required: a test request inside a live request reuses the
     caller's app context, and with it g._authz_ident, so the feed would come back
     unscoped (the machine key's full view: NJ stock, hidden-landing lots)."""
-    # The email keeps its own brand rules (TJ/TM overseas; TJ/TM + Ross RO/RM warehouse minus
+    # The email keeps its own brand rules (TJ/TM overseas; TJ/TM + Ross RO/RM warehouse; both minus
     # USPA, Nicole Miller, Von Dutch), so the catalog's brand list must not narrow it. Since
     # the Oct 15 catalog-scope change it did, and Ross JNY/Beene/Reebok/Black Label and the
     # Von Dutch and Beene overseas rows vanished (David, Oct 19 2026). The flag lives in the
@@ -7515,11 +7517,12 @@ def build_tjx_ats(now=None):
                       _tjx_catalog_feed('/deduction-assignments', 'assignments'),
                       _tjx_catalog_feed('/suppression-overrides', 'overrides'),
                       orders, display, now)
-    # Warehouse: TJ/TM plus Ross (RO/RM) styles. Overseas: TJ/TM only.
+    # Warehouse: TJ/TM plus Ross (RO/RM) styles. Overseas: TJ/TM only. Neither tab
+    # carries U.S. Polo Assn., Nicole Miller or Von Dutch.
     wh = b.tab_rows('ats', sku_filter=_tjx_ats_sku_filter(_TJX_ATS_WH_PREFIXES),
-                    brand_filter=lambda k: k not in _TJX_ATS_WH_EXCLUDE, min_ats=_TJX_ATS_MIN)
+                    brand_filter=lambda k: k not in _TJX_ATS_EXCLUDE, min_ats=_TJX_ATS_MIN)
     os_rows = b.tab_rows('incoming', sku_filter=_tjx_ats_sku_filter(_TJX_ATS_PREFIXES),
-                         min_ats=_TJX_ATS_MIN)
+                         brand_filter=lambda k: k not in _TJX_ATS_EXCLUDE, min_ats=_TJX_ATS_MIN)
     # The customer-export scrub /export-multi applies (a no-op on rows built from the
     # scoped feeds; kept so this path can never print NJ stock or an NJ-landing lot).
     wh = _customer_export_scrub(wh, 'ats', True, True, True)
