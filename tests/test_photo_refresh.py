@@ -53,7 +53,7 @@ class PhotoRefreshTests(unittest.TestCase):
                                   {'sku': 'TMBEAW545SLD-V', 'brand_abbr': 'BEN'},
                                   {'sku': 'TMBEPU546SLS', 'brand_abbr': 'BEN'}]}
         a.load_overrides_from_s3 = lambda: None
-        a.save_overrides_to_s3 = lambda snap=None: self.saves.append(dict(snap)) or True
+        a.save_overrides_to_s3 = lambda snap=None, **kw: self.saves.append(dict(snap)) or True
         a._backup_overrides_to_s3 = lambda d: None
         a.trigger_background_generation = lambda: None
         a._s3_overrides_etag = 'etag'

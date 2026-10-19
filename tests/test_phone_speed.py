@@ -696,7 +696,7 @@ class SaveEvictionTests(_Base):
                   'trigger_background_generation', '_overrides_last_saved'):
             self.keep(a, n)
         a.load_overrides_from_s3 = lambda: None
-        a.save_overrides_to_s3 = lambda snap=None: True
+        a.save_overrides_to_s3 = lambda snap=None, **kw: True
         a._backup_overrides_to_s3 = lambda d: None
         a._invalidate_cloudfront = lambda paths: None
         a.trigger_background_generation = lambda: None
@@ -796,7 +796,7 @@ class SaveAtomicityTests(_Base):
     def test_the_save_route_writes_the_merged_map_it_built(self):
         import inspect
         src = inspect.getsource(self.app.save_overrides)
-        self.assertIn('save_overrides_to_s3(merged)', src)
+        self.assertIn('save_overrides_to_s3(merged, if_match=loaded_etag)', src)
 
 
 class RunClaimTests(ExportRebuildTests):

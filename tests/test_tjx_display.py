@@ -71,9 +71,11 @@ class ColorTests(unittest.TestCase):
         self.assertEqual('White Solid', d.color_display('ZQNASU201SLS-L', 'NAUTICA'))
         self.assertEqual('Navy Solid', d.color_display('zqnasu201sls-m', 'NAUTICA'))
 
-    def test_empty_base_override_hides_the_sized_override(self):
+    def test_sized_override_colour_beats_an_empty_base_override(self):
+        # Oct 19 2026: the row's own colour override wins; a base record without a
+        # colour used to hide it (index.html getStyleColorInfo changed the same way).
         d = make(overrides={'ZQNASU201SLS': {}, 'ZQNASU201SLS-L': {'color': 'Red Solid'}})
-        self.assertEqual('', d.color_display('ZQNASU201SLS-L', 'NAUTICA'))
+        self.assertEqual('Red Solid', d.color_display('ZQNASU201SLS-L', 'NAUTICA'))
 
     def test_fallback_keys(self):
         k = T.style_color_fallback_keys

@@ -832,8 +832,10 @@ class TjxDisplay:
         SKUs only), base SKU, and the XX_NNN fallback keys. None when no hit."""
         full = _js_trim((sku or '').upper())
         base = full.split('-')[0]
-        ov = _js_or(self.overrides.get(base), self.overrides.get(full), {})
-        color = _js_get(ov, 'color')
+        # The row's own colour override first, then the style's (index.html getStyleColorInfo,
+        # Oct 19 2026): a base record holding only a fit used to hide the -V's colour.
+        color = _js_or(_js_get(_js_or(self.overrides.get(full), {}), 'color'),
+                       _js_get(_js_or(self.overrides.get(base), {}), 'color'))
         if _truthy(color):
             return {'display': color, 'ground': color, 'hasPrint': False}
         raw = self.color_map.get(full) if '-' in full else None

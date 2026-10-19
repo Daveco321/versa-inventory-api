@@ -365,6 +365,7 @@ _img_cache = {}  # base_style → image result (shared across all size variants)
 
 # --- Dropbox Photos Cache ---
 _dropbox_photo_index = {}   # image_code (uppercase) → file_path on disk
+_dropbox_photo_hashes = {}  # image_code → Dropbox content_hash at the last listing (Oct 19 2026)
 _dropbox_thumb_cache = {}   # image_code → thumbnail bytes (for Excel exports)
 _dropbox_photo_lock = threading.Lock()
 _dropbox_photos_last_sync = 0
@@ -477,11 +478,15 @@ def load_overrides_from_s3():
         print(f"  ⚠ Override load error: {e}")
         _overrides_loaded = True  # mark loaded on error
 
-def save_overrides_to_s3(snap=None):
+def save_overrides_to_s3(snap=None, if_match=None):
     """Save style overrides to S3. snap = the exact map to write (default: the
     current one). Afterwards this worker holds that map under the new ETag as one
     pair, so a reload that finished mid-upload (it would carry the OLD map) can
-    never leave old data under the new ETag."""
+    never leave old data under the new ETag.
+    if_match = the ETag the merge was based on: S3 then refuses the write when
+    another save landed first, and this returns 'conflict' so the caller reloads,
+    re-merges and retries (Oct 19 2026: two saves on the two workers both merged
+    against the same version and the second dropped the first one's keys)."""
     global _s3_overrides_etag, _style_overrides
     try:
         s3 = get_s3()
@@ -489,12 +494,21 @@ def save_overrides_to_s3(snap=None):
             if snap is None:
                 snap = _style_overrides
             data = json.dumps(snap)
-        resp = s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=S3_OVERRIDES_KEY,
-            Body=data.encode('utf-8'),
-            ContentType='application/json'
-        )
+        put = dict(Bucket=S3_BUCKET, Key=S3_OVERRIDES_KEY, Body=data.encode('utf-8'),
+                   ContentType='application/json')
+        if if_match:
+            try:
+                resp = s3.put_object(IfMatch=f'"{if_match}"', **put)
+            except ClientError as e:
+                code = str(e.response.get('Error', {}).get('Code', ''))
+                if code in ('PreconditionFailed', '412', 'ConditionalRequestConflict', '409'):
+                    print(f"  ↻ Overrides changed on S3 since {if_match[:8]}; re-merging", flush=True)
+                    return 'conflict'
+                raise
+            except TypeError:
+                resp = s3.put_object(**put)   # an S3 client without conditional writes
+        else:
+            resp = s3.put_object(**put)
         etag = resp.get('ETag', '').strip('"')
         with _overrides_lock:
             _style_overrides = snap
@@ -1107,6 +1121,20 @@ def is_bottoms_style(sku):
     return len(base) >= 6 and base[4:6] in BOTTOMS_FABRIC_CODES
 
 
+def _photo_no_serial_fallback(sku, brand_abbr=''):
+    """True when the fabric-blind '<brand>_<serial>' photo keys must not be used.
+    Bottoms (VD pants served the same-serial shirt photo) and sportswear: polos,
+    rugbys, tees and henleys share serial numbers with dress shirts, so GB_040 is a
+    dress shirt, never the ROGBPL040SSR polo (David, Oct 19 2026). Their photo comes
+    from an override file or the sportswear folder; otherwise no photo is shown."""
+    if is_bottoms_style(sku):
+        return True
+    try:
+        return _py_get_item_category(sku, brand_abbr) == 'sportswear'
+    except Exception:
+        return False
+
+
 def pants_image_keys(sku, brand_abbr):
     """The PANTS-SPECIFIC photo keys the catalog tile already uses, so an
     export shows the same photo (David, Sep 24 2026: TMDVBAP10SCP and
@@ -1580,6 +1608,7 @@ def sync_dropbox_photos():
         }
 
         new_index = {}  # image_code (uppercase) → dropbox_path
+        new_hashes = {}  # image_code → Dropbox content_hash of the indexed file (Oct 19 2026)
         new_sportswear_index = {}  # sportswear filename (uppercase) → True
         cursor = None
         total_files = 0
@@ -1685,6 +1714,7 @@ def sync_dropbox_photos():
                 # Prefer .jpg over .png if duplicates exist
                 if key not in new_index or lower.endswith('.jpg'):
                     new_index[key] = entry['path_display']
+                    new_hashes[key] = entry.get('content_hash')
                 total_files += 1
 
                 # ── Sportswear sub-index ──────────────────────────────────
@@ -1693,7 +1723,10 @@ def sync_dropbox_photos():
                 # Use the literal filename (no separator normalization) because
                 # sportswear filenames don't contain dashes — they're solid like
                 # GBPJ012, GBPJ012SL, GBPH002.
-                if '/sportswear/' in path_lower:
+                # Any folder whose name contains 'sportswear': the real one is
+                # 'GEOFFREY BEENE/=SPORTSWEAR', which the old '/sportswear/' test
+                # never matched, so this index sat empty (Oct 19 2026).
+                if any('sportswear' in seg for seg in path_lower.split('/')[:-1]):
                     sw_key = re.sub(r'\s*copy\s*\d*$', '', name_no_ext,
                                     flags=re.IGNORECASE).strip().upper()
                     new_sportswear_index[sw_key] = True
@@ -1701,6 +1734,7 @@ def sync_dropbox_photos():
                     # get_dropbox_thumbnail(matched_filename) can find the bytes.
                     if sw_key not in new_index or lower.endswith('.jpg'):
                         new_index[sw_key] = entry['path_display']
+                        new_hashes[sw_key] = entry.get('content_hash')
 
             if not data.get('has_more'):
                 break
@@ -1713,12 +1747,16 @@ def sync_dropbox_photos():
                 timeout=60
             )
             if resp.status_code != 200:
-                print(f"[Dropbox Photos] Continue error: {resp.status_code}", flush=True)
-                break
+                # Keep the previous full index: installing only the pages read so far
+                # would drop every photo on the missing pages (Oct 19 2026).
+                print(f"[Dropbox Photos] Continue error: {resp.status_code}; keeping the previous index", flush=True)
+                return
             data = resp.json()
 
+        global _dropbox_photo_hashes
         with _dropbox_photo_lock:
             _dropbox_photo_index = new_index
+            _dropbox_photo_hashes = new_hashes
             _dropbox_photos_last_sync = time.time()
 
         # Swap in the fresh sportswear sub-index and invalidate the match cache.
@@ -1915,9 +1953,10 @@ def prewarm_dropbox_cache():
         except Exception as e:
             print(f"[Dropbox Pre-warm] Could not list S3 sync folder: {e}", flush=True)
 
-        # If everything is on disk AND S3, nothing to do
+        # If everything is on disk AND S3, nothing to download (changed files are next)
         if not to_download and s3_synced.issuperset(_dropbox_photo_index.keys()):
             print(f"[Dropbox Pre-warm] ✓ All {total} images on disk and S3", flush=True)
+            _refresh_changed_dropbox_photos()
             return
 
         downloaded = [0]
@@ -1988,11 +2027,105 @@ def prewarm_dropbox_cache():
                 _download_one(key)
 
         print(f"[Dropbox Pre-warm] ✓ Done! {downloaded[0]} new downloads, {s3_uploaded[0]} synced to S3, {failed[0]} failed", flush=True)
+        _refresh_changed_dropbox_photos()
     finally:
         try:
             os.unlink(lock_file)
         except Exception:
             pass
+
+
+# ── Photos replaced in Dropbox under the SAME name (Oct 19 2026) ──
+# The pre-warm above only fetches codes missing from disk or S3, so a photo the team
+# replaced in Dropbox kept its old copy on the platform forever (about 28% of the
+# mirror differed). Each listing now records Dropbox's content_hash per code; a code
+# whose hash differs from the one recorded for the platform's copy is re-fetched
+# through _refresh_photo_code (disk, thumbnail, S3 mirror, CDN, caches).
+_DBX_HASH_MANIFEST_KEY = f"{S3_DROPBOX_SYNC_PREFIX}/_content_hashes.json"
+
+
+def _dropbox_content_hash(data):
+    """Dropbox's content_hash: SHA-256 of the concatenated SHA-256 of each 4 MiB block."""
+    block = 4 * 1024 * 1024
+    digests = b''.join(hashlib.sha256(data[i:i + block]).digest() for i in range(0, len(data), block))
+    return hashlib.sha256(digests).hexdigest()
+
+
+def _refresh_changed_dropbox_photos():
+    with _dropbox_photo_lock:
+        hashes = dict(_dropbox_photo_hashes or {})
+    if not hashes:
+        return
+    s3 = get_s3()
+    try:
+        manifest = json.loads(s3.get_object(Bucket=S3_BUCKET, Key=_DBX_HASH_MANIFEST_KEY)['Body'].read())
+        if not isinstance(manifest, dict):
+            manifest = {}
+    except Exception:
+        manifest = {}
+    etags = {}
+    try:
+        for page in s3.get_paginator('list_objects_v2').paginate(Bucket=S3_BUCKET, Prefix=S3_DROPBOX_SYNC_PREFIX + '/'):
+            for obj in page.get('Contents', []):
+                name = obj['Key'].rsplit('/', 1)[-1]
+                if not name.startswith('_'):
+                    etags[os.path.splitext(name)[0].upper()] = str(obj.get('ETag') or '').strip('"')
+    except Exception as e:
+        print(f"[Dropbox Photos] Could not list the S3 mirror for the freshness check: {e}", flush=True)
+        return
+    todo, recorded = [], 0
+    for code, h in hashes.items():
+        if not h or manifest.get(code) == h:
+            continue
+        if code not in manifest:
+            # First sighting: when the disk copy already is this Dropbox file and the S3
+            # mirror holds the same bytes, just record it (no download, no CDN purge).
+            disk = _get_disk_cache_path(code)
+            data = None
+            for ext in ('.jpg', '.png'):
+                if os.path.exists(disk + ext):
+                    try:
+                        with open(disk + ext, 'rb') as f:
+                            data = f.read()
+                    except OSError:
+                        data = None
+                    break
+            if (data is not None and _dropbox_content_hash(data) == h
+                    and etags.get(code) == hashlib.md5(data).hexdigest()):
+                manifest[code] = h
+                recorded += 1
+                continue
+        todo.append(code)
+    print(f"[Dropbox Photos] Freshness: {recorded} confirmed current, {len(todo)} to refresh", flush=True)
+    refreshed = [0]
+
+    def _one(code):
+        try:
+            r = _refresh_photo_code(code)
+        except Exception as e:
+            r = {'ok': False, 'error': str(e)[:200]}
+        if r.get('ok'):
+            manifest[code] = hashes[code]
+            refreshed[0] += 1
+            if refreshed[0] % 50 == 0:
+                try:   # keep the pre-warm lock fresh and save progress on long runs
+                    os.utime('/tmp/dropbox_prewarm.lock', None)
+                    s3.put_object(Bucket=S3_BUCKET, Key=_DBX_HASH_MANIFEST_KEY,
+                                  Body=json.dumps(manifest).encode('utf-8'), ContentType='application/json')
+                except Exception:
+                    pass
+    try:
+        from gevent.pool import Pool
+        Pool(size=3).map(_one, todo)
+    except ImportError:
+        for c in todo:
+            _one(c)
+    try:
+        s3.put_object(Bucket=S3_BUCKET, Key=_DBX_HASH_MANIFEST_KEY,
+                      Body=json.dumps(manifest).encode('utf-8'), ContentType='application/json')
+    except Exception as e:
+        print(f"[Dropbox Photos] Could not save the freshness manifest: {e}", flush=True)
+    print(f"[Dropbox Photos] Freshness: refreshed {refreshed[0]} of {len(todo)} changed photos", flush=True)
 
 
 DROPBOX_THUMB_CACHE_DIR = os.path.join(os.path.dirname(DROPBOX_DISK_CACHE), 'dropbox_thumbs')
@@ -2098,12 +2231,26 @@ def get_image_cached(item, s3_base_url):
     for non-override fallback images (CloudFront / Dropbox / brand folder).
     """
     sku = item.get('sku', '')
+    sku_u = str(sku).strip().upper()
     base_style = get_base_style(sku)
+    # A row only inherits a BASE photo when the base is a real style (8+ characters,
+    # the desktop _imgBaseStyleFor rule) and the row has no photo of its own. Dashed
+    # styles like BEN-22-116 / LUCK-BLK-SL split to 'BEN' / 'LUCK', which are not
+    # styles: the whole SKU is the style (David, Oct 19 2026: three BEN styles and the
+    # black and burgundy Lucky shirts exported one shared photo).
+    if len(base_style) < 8:
+        base_style = sku_u
 
     # ── PRIORITY 1: Platform base64 override (checked BEFORE cache lookup) ──
-    # Snapshot under lock so we don't race with /overrides POST.
+    # Snapshot under lock so we don't race with /overrides POST. The row's own
+    # record first, then the style's (a photo saved on a -V wins on that row).
     with _overrides_lock:
-        override_data = _style_overrides.get(base_style)
+        override_data = None
+        for _k in ([sku_u] if sku_u != base_style else []) + [base_style]:
+            _o = _style_overrides.get(_k)
+            if _o and isinstance(_o, dict) and _o.get('image'):
+                override_data = _o
+                break
 
     if override_data and isinstance(override_data, dict) and override_data.get('image'):
         import base64, hashlib
@@ -2169,6 +2316,26 @@ def get_image_cached(item, s3_base_url):
             # Fall through to fallback chain if override processing fails
             pass
 
+    # ── The row's OWN photo file (a -V or variant SKU) wins over the style's ──
+    # Cached per SKU; None means 'checked, it has none' and is retried on the next
+    # export because download_images_for_items clears failed entries (Oct 19 2026:
+    # BUCHPT309SLS and BUCHPT309SLS-V exported one photo although each has its own).
+    if sku_u != base_style:
+        _own_key = 'sku:' + sku_u
+        with _img_lock:
+            _own = _img_cache.get(_own_key, 'MISS')
+        if _own == 'MISS':
+            _own = _process_image_from_url(f"{S3_OVERRIDES_IMG_URL}/{sku_u}.jpg")
+            with _img_lock:
+                _img_cache[_own_key] = _own
+        if _own:
+            return {
+                'image_data': BytesIO(_own['raw_bytes']),
+                'x_scale': _own['x_scale'], 'y_scale': _own['y_scale'],
+                'x_offset': _own['x_offset'], 'y_offset': _own['y_offset'],
+                'object_position': 1, 'url': _own['url']
+            }
+
     # ── No override (or override failed) — use cache + fallback chain ──
     with _img_lock:
         if base_style in _img_cache:
@@ -2190,11 +2357,8 @@ def get_image_cached(item, s3_base_url):
     #    so try the full sku first and only then the base. Looking up the base
     #    alone made those styles export as "No Image" even though the catalog
     #    showed them fine (Black Label line sheet, Aug 2026).
-    base_style_for_url = get_base_style(sku)
-    sku_u = str(sku).upper()
-    override_candidates = [sku_u] if sku_u != base_style_for_url else []
-    override_candidates.append(base_style_for_url)
-    for _cand in override_candidates:
+    # (the row's own full-SKU file was tried above; this is the style's file)
+    for _cand in [base_style]:
         # S3 direct, not CloudFront — see the matching note in _fetch_raw_image:
         # server-side reads must always see the current file (edge POPs held a
         # replaced image for up to 24h; querystring busting is a no-op here).
@@ -2210,14 +2374,16 @@ def get_image_cached(item, s3_base_url):
     #      generic Dropbox call because that one uses extract_image_code's
     #      prefix_number scheme, which doesn't match sportswear filenames.
     if not result:
-        sw_match = find_sportswear_image_match(get_base_style(sku),
+        sw_match = find_sportswear_image_match(base_style,
                                                item.get('brand_abbr', item.get('brand', '')))
         if sw_match:
             result = get_dropbox_thumbnail(sw_match)
 
     # Bottoms never use the brand+serial rungs below (fabric-blind keys —
     # VD pants were exporting the same-serial shirt photo). See is_bottoms_style.
-    _no_serial_fallback = is_bottoms_style(sku)
+    # Sportswear neither: GB_040 is a dress shirt, never the ROGBPL040SSR polo
+    # (David, Oct 19 2026). No photo beats the wrong garment.
+    _no_serial_fallback = _photo_no_serial_fallback(sku, item.get('brand_abbr', item.get('brand', '')))
 
     # 2.7. Bottoms: the pants-specific keys the catalog tile uses (VD_P10 in
     #      Dropbox, then the VD_P32 swatch), never the fabric-blind VD_010.
@@ -2264,14 +2430,17 @@ def get_image_cached(item, s3_base_url):
 
 
 def download_images_for_items(items, s3_base_url, use_cache=True):
-    """Download images for all items using thread pool. Deduplicates by base_style."""
+    """Download images for all items using thread pool. Deduplicates by full SKU:
+    get_image_cached resolves each row's own photo, then its style's (Oct 19 2026,
+    grouping by the text before the first dash gave a -V and dashed styles such as
+    BEN-22-116 / BEN-22-117 one shared photo). Its caches keep repeated fetches cheap."""
     results = {}
 
-    # Deduplicate: only fetch once per unique base_style
-    style_to_indices = {}  # base_style → list of item indices
-    unique_items = {}      # base_style → first item with that style
+    # Deduplicate: only fetch once per unique SKU
+    style_to_indices = {}  # SKU → list of item indices
+    unique_items = {}      # SKU → first item with that SKU
     for i, item in enumerate(items):
-        base_style = get_base_style(item.get('sku', ''))
+        base_style = str(item.get('sku', '') or '').strip().upper()
         if base_style not in style_to_indices:
             style_to_indices[base_style] = []
             unique_items[base_style] = item
@@ -7664,67 +7833,75 @@ def save_overrides():
         # and rewrote the canonical file with only the payload — wiping every
         # override (restored from a local backup; the async overrides_backups
         # writer had silently stopped in March 2026). S3 is the source of truth.
-        load_overrides_from_s3()
-        with _overrides_lock:
-            current = dict(_style_overrides)
-            loaded_etag = _s3_overrides_etag
-        # If the reload failed AND memory holds nothing, refuse to merge-save —
-        # the result would overwrite the canonical file with just this payload.
-        # replace_all is exempt: its payload IS the whole intended state.
-        if not current and not loaded_etag and not req.get('replace_all', False):
-            return jsonify({"error": "Overrides not loaded from S3 — save refused to avoid data loss. Retry shortly."}), 503
+        # Reload, merge and write with a conditional put; when another save landed on S3
+        # in between (the other worker, or a second tab), reload and merge again so
+        # neither save's keys are lost (Oct 19 2026).
+        success = False
+        for _attempt in range(3):
+            load_overrides_from_s3()
+            with _overrides_lock:
+                current = dict(_style_overrides)
+                loaded_etag = _s3_overrides_etag
+            # If the reload failed AND memory holds nothing, refuse to merge-save —
+            # the result would overwrite the canonical file with just this payload.
+            # replace_all is exempt: its payload IS the whole intended state.
+            if not current and not loaded_etag and not req.get('replace_all', False):
+                return jsonify({"error": "Overrides not loaded from S3 — save refused to avoid data loss. Retry shortly."}), 503
 
-        # SAFETY: merge incoming into current — never allow a smaller payload to wipe existing data
-        # Incoming keys add/update; keys not present in incoming are preserved from S3 state.
-        # replace_all=True is the explicit opt-out: the payload becomes the entire dict,
-        # which is the only way to delete an override key through this endpoint.
-        incoming_count = len(overrides)
-        current_count = len(current)
-        if req.get('replace_all', False):
-            merged = dict(overrides)
-            if incoming_count < current_count:
-                print(f"  ⚠ replace_all: shrinking overrides {current_count} → {incoming_count}")
-        else:
-            merged = dict(current)
-            merged.update(overrides)
-            if incoming_count < current_count:
-                # Merge only — do not shrink
-                print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
+            # SAFETY: merge incoming into current — never allow a smaller payload to wipe existing data
+            # Incoming keys add/update; keys not present in incoming are preserved from S3 state.
+            # replace_all=True is the explicit opt-out: the payload becomes the entire dict,
+            # which is the only way to delete an override key through this endpoint.
+            incoming_count = len(overrides)
+            current_count = len(current)
+            if req.get('replace_all', False):
+                merged = dict(overrides)
+                if incoming_count < current_count:
+                    print(f"  ⚠ replace_all: shrinking overrides {current_count} → {incoming_count}")
+            else:
+                merged = dict(current)
+                merged.update(overrides)
+                if incoming_count < current_count:
+                    # Merge only — do not shrink
+                    print(f"  ⚠ Incoming overrides ({incoming_count}) < current ({current_count}), merging (not replacing)")
 
-        # Per-key tombstones: the frontend's delete flow removes a key from its map,
-        # but merge mode preserves missing keys — so UI deletions never persisted
-        # (the editor's "deletion may not persist" toast). 'deleted' lists exact keys
-        # to remove; a key also present in 'overrides' wins (kept), so delete+recreate
-        # in one save can never lose the new value. Ignored under replace_all (the
-        # payload is already the entire dict there).
-        deleted_applied = 0
-        deleted_keys = req.get('deleted') or []
-        if deleted_keys and not req.get('replace_all', False):
-            for k in deleted_keys:
-                if isinstance(k, str) and k not in overrides and merged.pop(k, None) is not None:
-                    deleted_applied += 1
-            if deleted_applied:
-                print(f"  🗑 Tombstones applied: {deleted_applied} of {len(deleted_keys)} keys removed")
+            # Per-key tombstones: the frontend's delete flow removes a key from its map,
+            # but merge mode preserves missing keys — so UI deletions never persisted
+            # (the editor's "deletion may not persist" toast). 'deleted' lists exact keys
+            # to remove; a key also present in 'overrides' wins (kept), so delete+recreate
+            # in one save can never lose the new value. Ignored under replace_all (the
+            # payload is already the entire dict there).
+            deleted_applied = 0
+            deleted_keys = req.get('deleted') or []
+            if deleted_keys and not req.get('replace_all', False):
+                for k in deleted_keys:
+                    if isinstance(k, str) and k not in overrides and merged.pop(k, None) is not None:
+                        deleted_applied += 1
+                if deleted_applied:
+                    print(f"  🗑 Tombstones applied: {deleted_applied} of {len(deleted_keys)} keys removed")
 
-        # Styles whose photo was added, replaced, cleared or deleted (cache and
-        # CloudFront invalidation). A removed photo must be evicted too, or this
-        # worker keeps serving it.
-        def _img_of(d):
-            return d.get('image') if isinstance(d, dict) else None
-        changed_styles = [
-            style for style in set(current) | set(merged)
-            if _img_of(merged.get(style)) != _img_of(current.get(style))
-        ]
+            # Styles whose photo was added, replaced, cleared or deleted (cache and
+            # CloudFront invalidation). A removed photo must be evicted too, or this
+            # worker keeps serving it.
+            def _img_of(d):
+                return d.get('image') if isinstance(d, dict) else None
+            changed_styles = [
+                style for style in set(current) | set(merged)
+                if _img_of(merged.get(style)) != _img_of(current.get(style))
+            ]
 
-        with _overrides_lock:
-            _style_overrides = merged
-        global _overrides_last_saved
-        _overrides_last_saved = time.time()
+            with _overrides_lock:
+                _style_overrides = merged
+            global _overrides_last_saved
+            _overrides_last_saved = time.time()
 
-        # Async backup before saving canonical file
-        threading.Thread(target=_backup_overrides_to_s3, args=(merged,), daemon=True).start()
-
-        success = save_overrides_to_s3(merged)
+            success = save_overrides_to_s3(merged, if_match=loaded_etag)
+            if success != 'conflict':
+                break
+        if success == 'conflict':
+            return jsonify({"error": "Overrides were being saved by someone else at the same moment. Please save again."}), 409
+        if success:
+            threading.Thread(target=_backup_overrides_to_s3, args=(merged,), daemon=True).start()
 
         if success:
             # Invalidate CloudFront cache for changed override images — instant update
@@ -9374,9 +9551,10 @@ def _fetch_raw_image(base_style, brand_abbr):
     """Download raw image bytes: base64 override → S3 override → Dropbox → S3 brand folder"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     image_code = extract_image_code(base_style, brand_abbr)
-    # Bottoms never use the brand+serial rungs (fabric-blind keys — VD pants
-    # were serving the same-serial shirt photo). See is_bottoms_style.
-    _no_serial_fallback = is_bottoms_style(base_style)
+    # Bottoms and sportswear never use the brand+serial rungs (fabric-blind keys:
+    # VD pants served the same-serial shirt photo, GB polos and rugbys a GB dress
+    # shirt). See _photo_no_serial_fallback.
+    _no_serial_fallback = _photo_no_serial_fallback(base_style, brand_abbr)
 
     # 0. Platform base64 override (highest priority)
     override_data = _style_overrides.get(base_style)

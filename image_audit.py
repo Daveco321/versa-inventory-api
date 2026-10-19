@@ -254,7 +254,8 @@ def color_name(ovr, cmap, sku, brand):
     """getStyleColorInfo().display -> (name, came_from_override)."""
     full = str(sku or '').upper().strip()
     b = full.split('-')[0]
-    oc = (ovr.get(b) or ovr.get(full) or {}).get('color')
+    # the row's own colour override first, then the style's (Oct 19 2026)
+    oc = (ovr.get(full) or {}).get('color') or (ovr.get(b) or {}).get('color')
     if oc:
         return str(oc), True
     raw = cmap.get(full) if '-' in full else None
