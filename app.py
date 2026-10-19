@@ -21088,8 +21088,8 @@ def _ai_tool_build_presentation(params):
                           'deduction_assigned': st['assigned']}
         out['quantity_basis'] = ('the platform number for this view: smart routing splits committed/allocated '
                                  'between warehouse and overseas (APO/VW bookings and pre-picks FIFO inside the '
-                                 'engine), manual and virtual allocations deducted, deduction assignments honoured, '
-                                 'landed lots suppressed' + ('; NJ/ABFI stock and NJ/AE/AW/ABFI-landing lots excluded'
+                                 'engine), manual and virtual allocations deducted, deduction assignments honoured'
+                                 + ('; NJ/ABFI stock and NJ/AE/AW/ABFI-landing lots excluded'
                                                              if customer_view else ''))
         if not st['orders_feed_ok']:
             out['routing_warning'] = 'open orders feed was unavailable, so styles with orders fell back to FIFO'
@@ -21533,7 +21533,7 @@ _AI_AGENT_TOOLS = [
                      "source 'warehouse' = stock on hand now; each card shows its warehouse ATS and which warehouse. "
                      "source 'overseas' = on production; each card shows its overseas ATS and 'Arrives <date>'. "
                      "source 'all' = both in one deck. Stock numbers are the platform's own (smart routing, "
-                     "allocations, landed-lot suppression). source 'open_orders' = ONE customer's current open POs "
+                     "allocations). source 'open_orders' = ONE customer's current open POs "
                      "(customer required, e.g. 'Ross'; a partial name that matches several accounts, like 'TJX', "
                      "returns customers_matched so you can pick one or pass combine_customers true). For a deck of "
                      "SPECIFIC POs ('make a presentation of these POs: ...'), pass pos with the exact PO numbers "
