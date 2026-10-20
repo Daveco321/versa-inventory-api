@@ -62,8 +62,8 @@ def short_date(d):
 # ── Production (index.html loadProductionFromS3, CATALOG_MODE) ──
 def map_production(rows):
     """The page's PRODUCTION_DATA: hidden-landing lots dropped (the catalog feed already
-    drops them), arrival = the port date when column G is filled, else ETD + 45 days
-    (55 for pants)."""
+    drops them), arrival = the port date when column G is filled, else ETD + 55 days
+    (60 for pants and for any style on a Pinnacle production order, R.transit_days)."""
     out = []
     for i, p in enumerate(rows or []):
         wh = str((p or {}).get('warehouse') or '').strip().upper()
@@ -74,7 +74,7 @@ def map_production(rows):
         if p.get('port_dated') and p.get('arrival'):
             arrival = ledger_date(p.get('arrival'))
         else:
-            arrival = (etd + timedelta(days=R.TRANSIT_DAYS_PANTS if R.is_pants(style) else R.TRANSIT_DAYS)
+            arrival = (etd + timedelta(days=R.transit_days(R.is_pants(style), p.get('production')))
                        if etd else None)
         out.append({'i': i, 'raw': p, 'production': str(p.get('production') or ''),
                     'poName': str(p.get('poName') or ''), 'style': style, 'units': _int(p.get('units')),

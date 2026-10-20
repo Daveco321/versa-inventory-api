@@ -4007,7 +4007,10 @@ class _Build:
         if not etd:
             return None
         pants = self.rt.is_pants(b) if hasattr(self.rt, 'is_pants') else (b[6:7] == 'P' or b[4:6] in BOTTOM_FABRICS)
-        days = getattr(self.rt, 'TRANSIT_DAYS_PANTS', 55) if pants else getattr(self.rt, 'TRANSIT_DAYS', 45)
+        if hasattr(self.rt, 'transit_days'):
+            days = self.rt.transit_days(pants, row.get('production'))
+        else:
+            days = getattr(self.rt, 'TRANSIT_DAYS_PANTS', 60) if pants else getattr(self.rt, 'TRANSIT_DAYS', 55)
         return (date.fromisoformat(etd) + timedelta(days=days)).isoformat()
 
     def build_production(self):

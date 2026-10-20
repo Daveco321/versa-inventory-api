@@ -914,8 +914,9 @@ def load_production_from_dropbox():
         # When G is present, it OVERRIDES column F's ETD entirely:
         #   - arrival = G + 10 days  (port-to-warehouse leg)
         #   - etd     = G - 27 days  (factory ship-to-port lead time)
-        # When G is empty, fall back to column F ETD + the frontend's transit math
-        # (45 days for shirts since Jul 2026 — was 37 — 55 for pants; applied frontend-side).
+        # When G is empty, fall back to column F ETD + the transit math applied by each
+        # consumer (inventory: 55 days, 60 for pants and Pinnacle since Oct 20 2026,
+        # see _inventory_transit_days; /factory-view has its own FACTORY_VIEW_TRANSIT).
         # Column H (Shipment #) is admin-only metadata for grouping physical shipments
         # within the same Production#. Never appears in exports.
         from datetime import timedelta as _td
@@ -1027,7 +1028,7 @@ def load_production_from_dropbox():
                 # backdate. Only /factory-view consumes it (see etd_raw above).
                 'etd_raw': etd_raw,
                 # arrival is only set when David provided column G. None means
-                # "frontend, please apply your transit rule based on category".
+                # "consumer, please apply your transit rule (category + factory)".
                 'arrival': arrival,
                 'port_dated': port_arrival_dt is not None,
                 # FOB flag: ETD column had "be ready" / "FOB ..." instead of a
@@ -2615,7 +2616,7 @@ def _landing_index():
     One production number covers many styles AND can land one style in two
     warehouses (DP26014 on TJDKPK022SLS: a JTW lot and a TR lot), so a ref is
     never looked up on its own. Arrival text follows the page's rule and format
-    (ledger arrival, else ETD + 45 / 55 for pants; e.g. 'Sep 24, 2026')."""
+    (ledger arrival, else _apo_prod_arrival's ETD + transit; e.g. 'Sep 24, 2026')."""
     rows = _ledger_rows()   # loads the ledger on a cold worker
     by_ref, by_style = {}, {}
     by_ref_b, by_style_b = {}, {}
@@ -6739,10 +6740,27 @@ def _norm_ledger_date(v):
 def _apo_fmt_date(d):
     return f'{d.strftime("%b")} {d.day}, {d.year}' if d else ''
 
+# Ex-factory to US warehouse days for a lot with no port date (David, Oct 20 2026;
+# was 45 / 55): 55 for shirts and every other category, 60 for pants, and 60 for any
+# style on a Pinnacle (PC) production order. The same rule lives in index.html
+# _transitDaysFor, the phone app's getProdArrival and the routing module's
+# transit_days (tests/test_transit_days.py keeps the Python copies equal).
+_INV_TRANSIT_DAYS = 55
+_INV_TRANSIT_DAYS_PANTS = 60
+_INV_TRANSIT_DAYS_PINNACLE = 60
+_INV_PINNACLE_PREFIXES = ('PC',)
+
+
+def _inventory_transit_days(pants, production_ref=''):
+    if str(production_ref or '').strip().upper().startswith(_INV_PINNACLE_PREFIXES):
+        return _INV_TRANSIT_DAYS_PINNACLE
+    return _INV_TRANSIT_DAYS_PANTS if pants else _INV_TRANSIT_DAYS
+
+
 def _apo_prod_arrival(p, pants):
     """Effective arrival for a production row, mirroring the frontend's
     loadProductionFromS3 transit rule: the ledger's real arrival (port date
-    + 10) when present, else ETD + 45 days (55 for pants). Rows with neither
+    + 10) when present, else ETD + _inventory_transit_days. Rows with neither
     date are genuinely TBD."""
     from datetime import timedelta
     ad = _apo_parse_date(p.get('arrival'))
@@ -6750,7 +6768,7 @@ def _apo_prod_arrival(p, pants):
         return ad
     etd = _apo_parse_date(p.get('etd'))
     if etd:
-        return etd + timedelta(days=55 if pants else 45)
+        return etd + timedelta(days=_inventory_transit_days(pants, p.get('production')))
     return None
 
 # A2000 open orders come from the open-orders platform's public feed; cached
@@ -7082,8 +7100,8 @@ def build_apo_brandcolor_excel(customer, exclude_tokens=None, dollars=False):
         if not b or units <= 0:
             continue
         prod_by_base.setdefault(b, []).append(p)
-    # (sorted per style below — the effective arrival is transit-rule dependent
-    # and the pants/45-vs-55 split is a property of the style)
+    # (sorted per style below — the effective arrival is transit-rule dependent:
+    # the pants split is a property of the style, the Pinnacle rule of the lot)
 
     d_cust_avg, d_brand_avg = _apo_avg_price_maps() if dollars else ({}, {})
 
@@ -15791,10 +15809,36 @@ def export_predictions():
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Transit constants for the factory page's arrival math. THIS PAGE ONLY
-# (David, Jul 21 2026): sail time is a flat ETD + 35 days — no pants split —
-# and a port-dated row keeps its ATD + 10 arrival. The office platforms keep
-# their own 45/55 rule; nothing here feeds them.
-FACTORY_VIEW_TRANSIT = {'default_days': 35, 'pants_days': 35}
+# (David, Jul 21 2026; pants + Pinnacle split Oct 20 2026): ETD + 35 days for
+# shirts and every other category, 45 for pants, 45 for any style on a Pinnacle
+# (PC) production order. A port-dated row keeps its ATD + 10 arrival. The
+# inventory platform keeps its own rule (_inventory_transit_days); nothing
+# here feeds it. The Open Order Platform uses the same 35/45 rule as this page.
+FACTORY_VIEW_TRANSIT = {'default_days': 35, 'pants_days': 45, 'pinnacle_days': 45,
+                        'pinnacle_prefixes': ['PC']}
+
+
+def _factory_view_arrival(row):
+    """A ledger row's arrival on the factory page, as ISO text: the port-dated
+    arrival when column G is filled, else ETD + FACTORY_VIEW_TRANSIT days, else
+    None. Computed here with the REAL production # so masked external lots
+    (EXT-n) still get their factory's transit."""
+    if row.get('arrival'):
+        return row.get('arrival')
+    if row.get('fob_flag'):
+        return None
+    etd = _apo_parse_date(row.get('etd'))
+    if not etd:
+        return None
+    t = FACTORY_VIEW_TRANSIT
+    ref = str(row.get('production') or '').strip().upper()
+    if ref.startswith(tuple(t['pinnacle_prefixes'])):
+        days = t['pinnacle_days']
+    elif _py_is_bottom(str(row.get('style') or '')):
+        days = t['pants_days']
+    else:
+        days = t['default_days']
+    return (etd + timedelta(days=days)).isoformat()
 
 # Module-level cache for the FULL open-orders list (all customers, unfiltered).
 # Deliberately separate from _fetch_open_orders() above — that one is uncached
@@ -16034,7 +16078,9 @@ def factory_view():
             'units': row.get('units', 0),
             'brand': row.get('brand', ''),
             'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
-            'arrival': row.get('arrival'),
+            # Server-side arrival (port date, else ETD + FACTORY_VIEW_TRANSIT), so the
+            # page, the weekly email and the Excel report all read the same date.
+            'arrival': _factory_view_arrival(row),
             'port_dated': bool(row.get('port_dated')),
             'fob_flag': bool(row.get('fob_flag')),
             'fob_note': row.get('fob_note', ''),
@@ -16068,7 +16114,9 @@ def factory_view():
                 'style': style,
                 'units': row.get('units', 0),
                 'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
-                'arrival': row.get('arrival'),
+                # Computed from the real production # before it is masked, so an
+                # external Pinnacle lot keeps its longer transit in the routing.
+                'arrival': _factory_view_arrival(row),
                 'port_dated': bool(row.get('port_dated')),
                 'fob_flag': bool(row.get('fob_flag')),
                 'landing': str(row.get('warehouse') or '').strip().upper(),

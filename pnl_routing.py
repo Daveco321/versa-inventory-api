@@ -158,7 +158,7 @@ from datetime import date, datetime, timedelta
 
 __all__ = [
     'route_all', 'route_sku', 'engine_totals', 'merge_inventory', 'build_lots', 'line_key',
-    'line_keys', 'parse_date', 'parse_datetime', 'is_pants', 'to_int', 'RoutingInputError',
+    'line_keys', 'parse_date', 'parse_datetime', 'is_pants', 'transit_days', 'to_int', 'RoutingInputError',
     'ENGINE_FOB_CODES', 'ENGINE_CUSTOMER_NAMES', 'ROUTING_LABELS', 'DEFAULT_OPTIONS',
 ]
 
@@ -186,8 +186,13 @@ ARRIVAL_SUPPRESSION = False   # off everywhere (David, Oct 19 2026), see app.py 
 LANDED_WINDOW_DAYS = 30                                   # _LANDED_WINDOW_DAYS
 GATE_MIN_UNITS = 100                                      # reconciliation gate floor
 GATE_SHARE = 0.10                                         # reconciliation gate share
-TRANSIT_DAYS = 45                                         # loadProductionFromS3 transit
-TRANSIT_DAYS_PANTS = 55
+# Ex-factory to US warehouse days for a lot with no port date (index.html
+# _transitDaysFor). David, Oct 20 2026: 55 for shirts and every other category,
+# 60 for pants, and 60 for any style on a Pinnacle (PC) production order. Was 45/55.
+TRANSIT_DAYS = 55
+TRANSIT_DAYS_PANTS = 60
+TRANSIT_DAYS_PINNACLE = 60
+PINNACLE_PREFIXES = ('PC',)                               # Production # prefix, app.py FACTORY_NAMES
 BOTTOM_FABRIC_CODES = frozenset({'BC', 'BR', 'BH', 'BA'})  # SPORTSWEAR_BOTTOM_CODES
 FAR_DATE = date(2099, 1, 1)
 FAR_DT = datetime(2099, 1, 1)
@@ -289,6 +294,15 @@ def is_pants(sku):
     return len(base) >= 6 and base[4:6] in BOTTOM_FABRIC_CODES
 
 
+def transit_days(pants, production_ref=''):
+    """Days from ex-factory to US warehouse for a lot with no port date. A Pinnacle (PC)
+    production order takes TRANSIT_DAYS_PINNACLE whatever the category; otherwise pants
+    take TRANSIT_DAYS_PANTS and everything else TRANSIT_DAYS."""
+    if str(production_ref or '').strip().upper().startswith(PINNACLE_PREFIXES):
+        return TRANSIT_DAYS_PINNACLE
+    return TRANSIT_DAYS_PANTS if pants else TRANSIT_DAYS
+
+
 def line_key(order):
     """The P&L line id: 'ctrlNo|STYLE'. ctrlNo alone repeats across a PO's styles."""
     return f"{str((order or {}).get('ctrlNo') or '').strip()}|{_u((order or {}).get('style'))}"
@@ -373,7 +387,7 @@ def build_lots(sku, q, ledger_items, no_suppress, now):
         if p.get('port_dated') and p.get('arrival'):
             arr = parse_date(p.get('arrival'))
         else:
-            arr = (etd + timedelta(days=TRANSIT_DAYS_PANTS if pants else TRANSIT_DAYS)) if etd else None
+            arr = (etd + timedelta(days=transit_days(pants, p.get('production')))) if etd else None
         landing = _u(p.get('warehouse'))
         hidden = landing in HIDDEN_LANDING
         sup = False
