@@ -164,10 +164,22 @@ class WarehouseTabs(_WhBase):
         self.assertEqual(e['styles_below_min_units'], 2)
         self.assertNotIn('styles_without_warehouse_availability', e)
 
-    def test_skus_tab_ignores_min_units(self):
-        out = self.sheet([{'title': 'WH', 'skus': [S_ROUTED], 'stock': 'warehouse', 'min_units': 1000}])
+    def test_skus_tab_honors_min_units(self):
+        # A minimum is about the number printed, curated tab or not (Oct 23 2026).
+        out = self.sheet([{'title': 'WH', 'skus': [S_SPLIT, S_ROUTED], 'stock': 'warehouse', 'min_units': 1000}])
+        self.assertEqual(self.printed(), {S_SPLIT: 6732})
+        e = self.entry(out, 'WH')
+        self.assertEqual(e['styles'], 1)
+        self.assertEqual(e['styles_below_min_units'], [S_ROUTED])
+
+    def test_skus_tab_without_min_units_keeps_every_style(self):
+        out = self.sheet([{'title': 'WH', 'skus': [S_ROUTED], 'stock': 'warehouse'}])
         self.assertEqual(self.printed(), {S_ROUTED: 400})
         self.assertNotIn('styles_below_min_units', self.entry(out, 'WH'))
+
+    def test_min_units_keeps_a_row_exactly_at_the_minimum(self):
+        self.sheet([{'title': 'WH', 'skus': [S_ROUTED], 'stock': 'warehouse', 'min_units': 400}])
+        self.assertEqual(self.printed(), {S_ROUTED: 400})
 
     # emptied tabs
     def test_a_tab_left_empty_is_skipped_with_a_neutral_reason(self):

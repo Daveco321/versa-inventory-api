@@ -327,9 +327,17 @@ class OverseasTabs(_Base):
         self.assertEqual(e['styles_below_min_units'], 1)
         self.assertIn('600', e['reason'])
 
-    def test_skus_tab_ignores_min_units(self):
-        # skus overrides every other filter on a tab (the tool's contract).
-        out = self.sheet([{'title': 'OS', 'skus': [S_ROUTED], 'stock': 'overseas', 'min_units': 600}])
+    def test_skus_tab_honors_min_units(self):
+        # skus overrides every other filter on a tab, but a minimum is about the number
+        # printed, so a curated row below it is left off and named (Oct 23 2026).
+        out = self.sheet([{'title': 'OS', 'skus': [S_WHCOVER, S_ROUTED], 'stock': 'overseas', 'min_units': 600}])
+        self.assertEqual(self.printed(), {S_WHCOVER: 2000})
+        e = self.entry(out, 'OS')
+        self.assertEqual(e['styles'], 1)
+        self.assertEqual(e['styles_below_min_units'], [S_ROUTED])
+
+    def test_skus_tab_without_min_units_keeps_every_style(self):
+        out = self.sheet([{'title': 'OS', 'skus': [S_ROUTED], 'stock': 'overseas'}])
         self.assertEqual(self.printed(), {S_ROUTED: 500})
         self.assertNotIn('styles_below_min_units', self.entry(out, 'OS'))
 

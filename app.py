@@ -19117,6 +19117,11 @@ def _line_sheet_split_by_brand(t, customer_view=False, keep_title=False):
     return out
 
 
+def _line_sheet_min(spec):
+    """A tab's min_units in whole units; 0 when it is unset or unreadable."""
+    return max(0, _pres_int((spec or {}).get('min_units')))
+
+
 def _ai_tool_build_line_sheet(params):
     # warehouse_breakdown is set by the mailbox (email_agent.py), never by the
     # MCP connector or the platform chat, so their sheets are byte-identical to
@@ -19341,8 +19346,10 @@ def _ai_tool_build_line_sheet(params):
         for t, entry, curated, spec in metas:
             _by = by_win[window_of(spec, curated)]
             # min_units picked a filter tab's styles on GROSS stock; it applies again
-            # to the routed number so no row prints below it (Oct 16 2026).
-            mu = 0 if curated else int(spec.get('min_units') or 0)
+            # to the routed number so no row prints below it (Oct 16 2026). A skus tab
+            # gets it too: a minimum is about the number printed, not about which
+            # styles were picked (Oct 23 2026).
+            mu = _line_sheet_min(spec)
             keep, gone, low = [], [], []
             for it in t['items']:
                 n = int(_by.get(it['sku'], 0) or 0)
@@ -19362,7 +19369,7 @@ def _ai_tool_build_line_sheet(params):
                 # Never drop silently: the styles on a curated tab, a count otherwise.
                 entry[f'styles_without_{source}_availability'] = gone if curated else len(gone)
             if low:
-                entry['styles_below_min_units'] = len(low)
+                entry['styles_below_min_units'] = low if curated else len(low)
             _win = window_of(spec, curated)
             if _win != (None, None):
                 # Say which window the tab was cut to, so an empty tab explains itself.
@@ -19380,7 +19387,8 @@ def _ai_tool_build_line_sheet(params):
         # A filter tab's arrival window (what _ai_agent_filter picked its styles by)
         # goes to the deck too: only lots inside it count and the number scales, and
         # customer view never counts a hidden lot. Tabs with no window share one run.
-        # A skus tab ignores the window and min_units like every other filter (Oct 16 2026).
+        # A skus tab ignores the window like every other filter (Oct 16 2026); min_units
+        # still applies to the number it prints (Oct 23 2026).
         def _os_window(spec, curated):
             if curated:
                 return (None, None)
@@ -19432,6 +19440,25 @@ def _ai_tool_build_line_sheet(params):
                                           'and committed demand is split between warehouse and production by '
                                           'smart routing, the same numbers as a warehouse presentation'),
                         'open_orders_feed_ok': _wh_feed_ok})
+    # All-stock tabs print the style's whole ATS. Their filter applied min_units to
+    # GROSS stock (warehouse plus incoming, before committed and allocated), so it
+    # applies again to the number printed (Oct 23 2026).
+    all_meta = [m for m in tab_meta if m[0]['view_mode'] == 'all' and _line_sheet_min(m[3])]
+    for t, entry, curated, spec in all_meta:
+        mu = _line_sheet_min(spec)
+        low = [it['sku'] for it in t['items'] if int(it.get('total_ats') or 0) < mu]
+        if not low:
+            continue
+        t['items'] = [it for it in t['items'] if int(it.get('total_ats') or 0) >= mu]
+        entry['styles'] = len(t['items'])
+        entry['styles_below_min_units'] = low if curated else len(low)
+        if not t['items']:
+            entry['skipped'] = True
+            entry['reason'] = f'nothing left at {mu:,} units or more'
+    if all_meta:
+        tabs_out = [t for t in tabs_out if t['items']]
+        if not tabs_out:
+            return {'error': 'nothing is available at the minimum asked for these filters', 'tabs': summary}
     if wh_breakdown:
         try:
             _split = _wh_split_by_base([it['sku'] for t in tabs_out for it in t['items']])
@@ -19440,7 +19467,7 @@ def _ai_tool_build_line_sheet(params):
             import traceback
             traceback.print_exc()
             return {'error': f'could not work out per-warehouse availability: {e}'}
-        _inferred, _dropped = [], 0
+        _inferred, _dropped = set(), 0
         for t in tabs_out:
             for it in t['items']:
                 rec = _split.get(it['sku'])
@@ -19449,7 +19476,9 @@ def _ai_tool_build_line_sheet(params):
                     it[key] = int((rec or {}).get(col, 0) or 0)
                 it['wh_ats_total'] = int((rec or {}).get('total', 0) or 0)
                 if rec and not rec.get('exact', True):
-                    _inferred.append(it['sku'])
+                    _inferred.add(it['sku'])
+        _meta_of = {id(m[0]): m for m in tab_meta}
+        _min_emptied = {}
         for t in tabs_out:
             # An overseas tab already holds only styles with overseas availability
             # (the pass above); its gross incoming no longer decides (Oct 16 2026).
@@ -19458,6 +19487,19 @@ def _ai_tool_build_line_sheet(params):
                         (it['wh_ats_total'] > 0
                          or (t.get('view_mode') != 'ats' and int(it.get('incoming') or 0) > 0)))]
             _dropped += len(t['items']) - len(keep)
+            # A warehouse tab prints Warehouse ATS, and that is the number a minimum
+            # is about. The filter only checked units on hand before committed and
+            # allocated came out: BUCHPT601SLS had 2,004 on hand with 1,980 allocated
+            # and printed 24 on an emailed 36-minimum sheet (Oct 23 2026).
+            _m = _meta_of.get(id(t))
+            mu = _line_sheet_min(_m[3]) if (_m and t.get('view_mode') == 'ats') else 0
+            if mu:
+                low = [it['sku'] for it in keep if it['wh_ats_total'] < mu]
+                if low:
+                    keep = [it for it in keep if it['wh_ats_total'] >= mu]
+                    _m[1]['styles_below_min_units'] = low if _m[2] else len(low)
+                    if not keep:
+                        _min_emptied[t['tab_name']] = mu
             t['items'] = keep
         # Per-tab counts must describe the file that is sent, not the styles
         # before the drop; a tab that ends up empty is named as left out.
@@ -19467,16 +19509,23 @@ def _ai_tool_build_line_sheet(params):
                 e['styles'] = _kept[e['tab']]
                 if not _kept[e['tab']]:
                     e['skipped'] = True
-                    e['reason'] = 'no warehouse ATS left after committed stock'
+                    e['reason'] = (f"nothing left in the warehouse at {_min_emptied[e['tab']]:,} units or more"
+                                   if e['tab'] in _min_emptied else 'no warehouse ATS left after committed stock')
         tabs_out = [t for t in tabs_out if t['items']]
         if not tabs_out:
+            if _min_emptied:
+                return {'error': 'nothing is available in the warehouse at the minimum asked for these filters',
+                        'tabs': summary}
             return {'error': 'nothing is available from a warehouse for these filters'}
+        # Only styles that are in the file sent: a style left off is no longer inferred.
+        _sent = {it['sku'] for t in tabs_out for it in t['items']}
         summary.append({'warehouse_breakdown': True,
                         'by_size_rows_excluded': True,
                         'styles_dropped_no_warehouse_stock': _dropped,
                         'columns': 'JTW ATS / TR ATS / DCW ATS / QA ATS add up to Warehouse ATS',
-                        'styles_split_exactly': sum(1 for t in tabs_out for it in t['items']) - len(_inferred),
-                        'styles_where_the_warehouse_was_inferred': sorted(set(_inferred))})
+                        'styles_split_exactly': sum(1 for t in tabs_out for it in t['items']
+                                                    if it['sku'] not in _inferred),
+                        'styles_where_the_warehouse_was_inferred': sorted(_inferred & _sent)})
     try:
         pd_snap = _fresh_prepack_defaults()
     except Exception:
@@ -21584,7 +21633,9 @@ _AI_AGENT_TOOLS = [
                      "tanzine, cobalt, blueberry, seaspray, deep sea, denim, cerulean, sapphire, azure, cyan; and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
                      "search (substring of style #), customer_prefixes (first 2 letters of the style #, e.g. ['TJ','TM']), "
-                     "stock (any|warehouse|overseas), min_units, "
+                     "stock (any|warehouse|overseas), min_units (here it counts units on hand and/or incoming BEFORE "
+                     "committed and allocated come out, so it is not an ATS minimum: a style can pass it with 0 "
+                     "available; build_line_sheet and build_presentation apply min_units to the ATS they print), "
                      "arrive_before/arrive_after (YYYY-MM-DD, filters styles with production arriving in that window and "
                      "reports qualifying_po_units). Totals cover ALL matches even when rows are truncated. "
                      "Use for ANY quantity/availability question."),
@@ -21710,10 +21761,14 @@ _AI_AGENT_TOOLS = [
      'description': ('Build a real multi-tab EXCEL line sheet (a spreadsheet) with embedded photos and return a download URL. '
                      'tabs = list of filter objects (same filters as query_inventory, plus title) — OR give a tab '
                      'an explicit skus list (base style #s, e.g. hand-picked from query_inventory results) for an '
-                     'exactly-curated tab in your order; skus overrides every other filter on that tab. '
+                     'exactly-curated tab in your order; skus overrides every other filter on that tab except min_units. '
                      'customer_view=true for customer-facing columns (no committed/allocated), false for full admin. '
                      'On stock:"overseas" and stock:"warehouse" tabs the ATS column is the smart-routed availability '
                      'of that stock only, and styles with none left are left off and listed in the tab summary. '
+                     'min_units is the smallest ATS a row may print, checked against the ATS number the sheet prints '
+                     '(warehouse, overseas or total) on every tab, skus tabs included: whenever the user gives a '
+                     'minimum ("36 pc minimum", "at least 500 available") put min_units on EVERY tab. Rows below it '
+                     'are left off and reported as styles_below_min_units. '
                      'Up to 30 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
                      'first, each tab named by the brand), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
                      'stock:"warehouse", split_by_brand:true}. customer_prefixes = first two letters of the '
@@ -21861,6 +21916,7 @@ build_line_sheet creates a real Excel file with photos and returns download_url.
 PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "lookbook", "photo cards" or "N tiles/cards per page" ALWAYS means build_presentation (a print-ready PDF of photo cards), never build_line_sheet and never a spreadsheet. Map the request straight onto its parameters. Example: "B&T in stock and incoming for everything but Shaq, one for warehouse and one for overseas, 8 tiles per page" = two calls, {source:'warehouse', category:'big_tall', exclude_brands:['SHAQ']} and {source:'overseas', category:'big_tall', exclude_brands:['SHAQ']}. Example: "Ross's big and tall styles on order with PO #, units, cost and ship window" = {source:'open_orders', customer:'Ross', category:'big_tall'}. Put each link in your final message as <a href="URL" target="_blank">Download the presentation</a>.
 COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. When the user names a season, pass it as season (for example "Fall 2025") and never turn it into months yourself: Fall is June to November and Spring is December to May, the same as the Past Selling season chips, so your number always equals the screen's. Give units first, then dollars, name the period exactly (say which months a season covers), and always state the history_label cut-off. Repeat any note the tool returns. For colours in CURRENT stock use query_inventory instead.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
+MINIMUMS: when the user asks for a minimum quantity ("36 pc minimum", "only styles with 500+ available"), pass min_units on every build_line_sheet tab and on build_presentation. They apply it to the ATS they print. query_inventory's min_units counts stock before committed and allocated come out, so a style it returns can have less available than the minimum, even 0: never quote one as meeting an ATS minimum on that filter alone.
 """
 
 _AI_AGENT_PLATFORM_TAIL = """A curated selection also goes through the saveLineSheetViews action's skus param.
