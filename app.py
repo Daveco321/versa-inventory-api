@@ -20096,6 +20096,14 @@ def _pres_brand_keys(values):
     return keys
 
 
+# Pants (P##), blazers (B##) and vests (V##) are modern style numbers whose serial
+# is a letter + 2 digits. _APO_MODERN_RE wants 3 digits, so open-order and pitch
+# decks filed them under OTHER with no logo or colour (DD's Discounts USPA pants
+# DDUSDPP10SRS / DDUSDPP01SRS, Oct 27 2026). Decks only: the allocation reports
+# still read _apo_style_brand_abbr as before.
+_PRES_LETTER_SERIAL_RE = re.compile(r'^[A-Z]{6}[PBV]\d\d[A-Z]{2,3}$')
+
+
 def _pres_card_brand(sku, feed_brand=''):
     """Brand key the way the desktop settles it: style override, LUCK/VP prefixes,
     the feed brand when it is a known brand, else the SKU's brand code."""
@@ -20111,7 +20119,10 @@ def _pres_card_brand(sku, feed_brand=''):
     ab = {'NM': 'NICOLE'}.get(ab, ab)
     if ab in (BRAND_FULL_NAMES or {}) or ab in _PRES_BRAND_EXTRA:
         return ab
-    return _apo_style_brand_abbr(base) or ab or 'OTHER'
+    code = _apo_style_brand_abbr(base)
+    if not code and _PRES_LETTER_SERIAL_RE.match(base):
+        code = SKU_BRAND_CODE_MAP.get(base[2:4], '')
+    return code or ab or 'OTHER'
 
 
 def _pres_fit_line(base):
