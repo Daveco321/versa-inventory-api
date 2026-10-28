@@ -1606,6 +1606,12 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     styles do not change. FILTERS read _py_filter_categories (Oct 28 2026)."""
     if not category or category in ('all', 'any'):
         return True
+    if not for_prepack and category in _AI_LABEL_CATEGORIES:
+        return _ai_category_label(_py_style_key(sku).split('-')[0], brand_abbr) == _AI_LABEL_CATEGORIES[category]
+    if not for_prepack and category in _AI_SLEEVE_CATEGORIES:
+        base = _py_style_key(sku).split('-')[0]
+        return (_ai_category_label(base, brand_abbr) == 'Sportswear'
+                and _py_sleeve_from_style(sku) == _AI_SLEEVE_CATEGORIES[category])
     if not for_prepack and category in _PY_FILTER_CATEGORIES:
         return category in _py_filter_categories(sku, brand_abbr)
     if category == 'sportswear':
@@ -1683,6 +1689,68 @@ def _export_category(sku, brand_abbr='', fabrication=''):
     if _py_is_young_men(base):
         return 'Sportswear'   # shackets, overshirts, knits (David, Sep 28 2026: Young Men fabrics are Sportswear)
     return 'Dress Shirt'      # long and short sleeve, Big & Tall
+
+
+# ── Sleeve from the style number (David, Oct 28 2026) ──────────────────────
+# "Split short sleeve and long sleeve sportswear from the style number ... SS is
+# short, SL is long": the fit code, the two letters before the collar letter. Live
+# sportswear on Oct 28 2026: SS 116 styles (Beene polos, Von Dutch shackets), SL 90.
+# The Big & Tall fits follow the same Style Rules: TB short sleeve, BT and WB long.
+# Bottoms have no sleeve and blazers and vests are tailoring. A number with no fit in
+# that place (old keys, keys with no collar letter such as ROJNAW051SL) takes the
+# sleeve its data names, the way the category filters read it (_py_legacy_sleeve).
+# Von Dutch is the exception: its PS wovens end in letters that only look like a fit
+# ("...PSS"), so only an override naming the sleeve decides them. The desktop's
+# sleeveFromStyle (the sidebar Sleeve filter) is the same rule. The AI tools read this;
+# the category FILTERS, size packs and photos keep their own rules.
+def _py_sleeve_from_style(sku):
+    """'short', 'long' or '' (no sleeve, or the style number does not say)."""
+    s = _py_style_key(sku)
+    base = s.split('-')[0]
+    if not base or _py_is_bottom(base) or _py_is_blazer(base) or _py_is_vd_jewelry(base):
+        return ''
+    if not _py_is_legacy_key(s):
+        fit = _py_extract_fit_code(base)
+        if _py_is_short_sleeve(base):
+            return 'short'
+        if fit in _PY_LONG_SLEEVE_FIT_CODES:
+            return 'long'
+        if fit in _PY_ALL_FIT_CODES:
+            return ''   # a real fit that names no sleeve
+    if _py_is_vd_apparel(s):
+        ov = _style_overrides.get(s) or _style_overrides.get(base) or {}
+        txt = str(ov.get('fit') or '') if isinstance(ov, dict) else ''
+        if re.search(r'short\s*sleeve', txt, re.I):
+            return 'short'
+        if re.search(r'long\s*sleeve', txt, re.I):
+            return 'long'
+        return ''
+    return _py_legacy_sleeve(sku) or ''
+
+
+# Categories the AI tools take on top of the platform's filter categories: the
+# export's Category column (one per style, so a tab per category holds every style
+# exactly once) and sportswear by sleeve. No page or phone filter uses these names.
+_AI_LABEL_CATEGORIES = {
+    'dress_shirt': 'Dress Shirt', 'dress_shirts': 'Dress Shirt',
+    'dress_pants': 'Dress Pants', 'dress_pant': 'Dress Pants',
+    'shorts': 'Shorts',
+    'shirt_tie_set': 'Shirt & Tie Set', 'shirt_tie_sets': 'Shirt & Tie Set', 'shirt_and_tie_set': 'Shirt & Tie Set',
+}
+_AI_SLEEVE_CATEGORIES = {
+    'sportswear_short_sleeve': 'short', 'sportswear_ss': 'short', 'short_sleeve_sportswear': 'short',
+    'sportswear_long_sleeve': 'long', 'sportswear_ls': 'long', 'sportswear_sl': 'long',
+    'long_sleeve_sportswear': 'long',
+}
+
+
+def _ai_category_label(base, brand_abbr):
+    """The Category column label of one style, with the fabrication the label reads."""
+    try:
+        fab = _apo_fabrication(base) or ''
+    except Exception:
+        fab = ''
+    return _export_category(base, brand_abbr, fab) or 'Dress Shirt'
 
 
 def _fresh_prepack_defaults():
@@ -6661,7 +6729,8 @@ def _apo_style_color(base, brand_abbr):
 
 # "All Shades of Blue" (boss via David, Sep 8 2026) — mirrors the desktop/phone
 # _BLUE_FAMILY: every blue SHADE word, chambray excluded (a fabric, not a colour).
-_APO_BLUE_FAMILY = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b|\bteal\b|\btanzine\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b')
+# Tanzine is NOT a blue: the DKNY 104 knit "Tanzine Solid" is tan (David, Oct 28 2026).
+_APO_BLUE_FAMILY = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b|\bteal\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b')
 # Denim doubles as a wash word ("Denim Grey Solid" is a grey shirt): it only counts
 # as blue when no other colour word leads the phrase (mirrors the frontend _isBlueLead).
 _APO_NON_BLUE_WORDS = re.compile(r'\b(?:grey|gray|black|white|red|pink|green|brown|tan|khaki|olive|burgundy|wine|purple|plum|orange|yellow|gold|silver|charcoal|ivory|cream|beige|camel|rust|coral|lilac|lavender|mint|sage)\b')
@@ -17345,6 +17414,10 @@ def _ai_agent_filter(params):
             if str(full).upper() == bu:
                 brand_keys.add(str(abbr).upper())
     category = (params.get('category') or '').strip().lower() or None
+    # A tab made by split_by_category / split_sleeve: (Category label, sleeve or None).
+    # Internal only, never in a tool schema.
+    cat_group = params.get('_category_group')
+    cat_group = tuple(cat_group) if isinstance(cat_group, (list, tuple)) and len(cat_group) == 2 else None
     fabric_codes = {str(f).strip().upper() for f in (params.get('fabric_codes') or []) if str(f).strip()}
     color_q = (params.get('color') or '').strip().lower() or None
     search = (params.get('search') or '').strip().upper() or None
@@ -17408,6 +17481,13 @@ def _ai_agent_filter(params):
                     if not _py_is_vest(base):
                         continue
                 elif not _py_matches_category(base, r['brand_abbr'], category):
+                    continue
+            except Exception:
+                continue
+        if cat_group is not None:
+            try:
+                _split = {cat_group[0]} if cat_group[1] is not None else ()
+                if _line_sheet_category_of(base, r['brand_abbr'], _split) != cat_group:
                     continue
             except Exception:
                 continue
@@ -19258,8 +19338,9 @@ def _ai_tool_build_sales_sheet(params):
 _LINE_SHEET_TAB_CAP = 2000
 # Tabs per workbook. Was 4, which made "one tab per brand" impossible: a 12-brand
 # sheet silently lost 8 brands (David, Oct 2 2026). Tabs past this are named in
-# the result, never dropped silently.
-_LINE_SHEET_MAX_TABS = 30
+# the result, never dropped silently. 30 -> 60 (Oct 28 2026): every brand by
+# category is 36 tabs on the live feed, and the styles are the same either way.
+_LINE_SHEET_MAX_TABS = 60
 # Feed brand codes with no entry in the brand-name maps. KLP is how the feed
 # spells Karl Lagerfeld on TJX styles; without this the tab reads "KLP".
 _LINE_SHEET_BRAND_TITLES = {'KLP': 'Karl Lagerfeld Paris'}
@@ -19333,6 +19414,120 @@ def _line_sheet_split_by_brand(t, customer_view=False, keep_title=False):
     return out
 
 
+# Category tabs (David, Oct 28 2026: "line sheets by category by brand"). The
+# categories are the export's Category column (_export_category), so the tab a
+# style sits on always agrees with the Category it prints, and every style lands
+# on exactly one tab. Fixed order; a category with no styles makes no tab.
+_LINE_SHEET_CATEGORY_TABS = (('Dress Shirt', 'Dress Shirts'), ('Sportswear', 'Sportswear'),
+                             ('Dress Pants', 'Dress Pants'), ('Shorts', 'Shorts'),
+                             ('Blazer', 'Blazers'), ('Vest', 'Vests'),
+                             ('Shirt & Tie Set', 'Shirt & Tie Sets'), ('Accessories', 'Accessories'))
+# split_sleeve, only when the user asks: a category's tab becomes short sleeve, long
+# sleeve and, where they exist, bottoms and styles whose number names no sleeve.
+_LINE_SHEET_SLEEVE_PARTS = (('short', 'SS'), ('long', 'LS'), ('bottoms', 'Bottoms'), ('other', 'Other'))
+_LINE_SHEET_SLEEVE_SPLITTABLE = {'sportswear': 'Sportswear', 'dress_shirt': 'Dress Shirt',
+                                 'dress_shirts': 'Dress Shirt'}
+_LINE_SHEET_SPLIT_KEYS = ('split_by_brand', 'split_by_category', 'split_sleeve', 'title')
+
+
+def _line_sheet_sleeve_labels(t):
+    """The Category labels a tab splits by sleeve. true means sportswear, the one asked for."""
+    v = t.get('split_sleeve')
+    if v is True or (isinstance(v, str) and v.strip().lower() in ('true', 'yes', '1')):
+        return {'Sportswear'}
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple)):
+        return set()
+    out = set()
+    for x in v:
+        k = re.sub(r'[\s\-]+', '_', str(x or '').strip().lower())
+        if k in _LINE_SHEET_SLEEVE_SPLITTABLE:
+            out.add(_LINE_SHEET_SLEEVE_SPLITTABLE[k])
+    return out
+
+
+def _line_sheet_category_of(base, brand_abbr, sleeve_labels=()):
+    """(Category label, sleeve part or None) of one style: the part only for a label
+    that splits by sleeve ('short', 'long', 'bottoms' or 'other')."""
+    label = _ai_category_label(base, brand_abbr)
+    if label not in sleeve_labels:
+        return (label, None)
+    if _py_is_bottom(base):
+        return (label, 'bottoms')
+    return (label, _py_sleeve_from_style(base) or 'other')
+
+
+def _line_sheet_category_name(prefix, label, suffix=None):
+    """'<prefix> <category>[ - <suffix>]' within Excel's 31 characters. The brand words
+    go first ('Karl Lagerfeld Paris Dress Shirts' -> 'Karl Lagerfeld Dress Shirts'), then
+    the suffix is cut; the category itself is never cut."""
+    words = str(prefix or '').split()
+
+    def build(ws, suf):
+        name = ' '.join(ws + [label]).strip()
+        return f'{name} - {suf}' if suf else name
+    name = build(words, suffix)
+    while len(name) > 31 and len(words) > 1:
+        words = words[:-1]
+        name = build(words, suffix)
+    if len(name) > 31 and suffix:
+        room = 31 - len(build(words, None)) - 3
+        name = build(words, str(suffix)[:room].rstrip()) if room > 0 else build(words, None)
+    return name[:31]
+
+
+def _line_sheet_split_by_category(t, suffix=None, brand_named=False):
+    """Expand one tab spec with split_by_category (or split_sleeve) into one tab per
+    Category in a fixed order, each named '<brand> <category>'. Every other filter of
+    the parent stays, its category included (big_tall + split_by_category = the Big &
+    Tall styles by category). A curated skus tab keeps the caller's order per category.
+    brand_named: the parent is one brand's tab from split_by_brand, titled by the brand."""
+    sleeve_labels = _line_sheet_sleeve_labels(t)
+    prefix = ''
+    if brand_named:
+        prefix = t.get('title') or ''
+    else:
+        brands = t.get('brands') or ([t['brand']] if t.get('brand') else [])
+        names = {_line_sheet_brand_title(b) for b in brands if str(b or '').strip()}
+        if len(names) == 1:
+            prefix = names.pop()
+        elif t.get('title'):
+            prefix, suffix = t['title'], None   # the title already says it
+    tab_names = dict(_LINE_SHEET_CATEGORY_TABS)
+    part_names = dict(_LINE_SHEET_SLEEVE_PARTS)
+    rank = {lab: i for i, (lab, _n) in enumerate(_LINE_SHEET_CATEGORY_TABS)}
+    part_rank = {p: i for i, (p, _n) in enumerate(_LINE_SHEET_SLEEVE_PARTS)}
+
+    def sort_key(g):
+        return (rank.get(g[0], len(rank)), part_rank.get(g[1], -1) if g[1] else -1, g[0])
+
+    def name_of(g):
+        label = tab_names.get(g[0], g[0])
+        if g[1]:
+            label = f'{label} {part_names.get(g[1], g[1])}'
+        return _line_sheet_category_name(prefix, label, suffix)
+
+    base_spec = {k: v for k, v in t.items() if k not in _LINE_SHEET_SPLIT_KEYS}
+    if t.get('skus'):
+        agg = _ai_agent_agg_inventory()
+        groups = {}
+        for s in t.get('skus') or []:
+            r = agg.get(_ai_agent_base(str(s or '').strip().upper()))
+            g = (_line_sheet_category_of(r['style'], r['brand_abbr'], sleeve_labels)
+                 if r is not None else ('Not found', None))
+            groups.setdefault(g, []).append(s)
+        out = []
+        for g in sorted(groups, key=sort_key):
+            sub = dict(base_spec, skus=groups[g], title=name_of(g))
+            out.append(sub)
+        return out
+
+    rows, _ = _ai_agent_filter(t)
+    groups = {_line_sheet_category_of(r['style'], r['brand_abbr'], sleeve_labels) for r in rows}
+    return [dict(base_spec, _category_group=g, title=name_of(g)) for g in sorted(groups, key=sort_key)]
+
+
 def _line_sheet_min(spec):
     """A tab's min_units in whole units; 0 when it is unset or unreadable."""
     return max(0, _pres_int((spec or {}).get('min_units')))
@@ -19365,10 +19560,21 @@ def _ai_tool_build_line_sheet(params):
     # Two split tabs in one workbook would both make a "Nautica" tab: only then
     # does each keep its own title as a suffix to tell them apart.
     n_split = sum(1 for t in tabs_in if isinstance(t, dict) and t.get('split_by_brand'))
+
+    def _by_cat(t):
+        return bool(t.get('split_by_category')) or bool(_line_sheet_sleeve_labels(t))
+    n_cat = sum(1 for t in tabs_in if isinstance(t, dict) and _by_cat(t))
     for t in tabs_in:
         if not isinstance(t, dict):
             continue
-        if t.get('split_by_brand'):
+        if _by_cat(t):
+            # Brand first, then category ("by category by brand", Oct 28 2026)
+            subs = (_line_sheet_split_by_brand(t, customer_view) if t.get('split_by_brand') else [t])
+            for sub in subs:
+                expanded.extend(_line_sheet_split_by_category(
+                    sub, suffix=(t.get('title') if n_cat > 1 else None),
+                    brand_named=bool(t.get('split_by_brand'))))
+        elif t.get('split_by_brand'):
             expanded.extend(_line_sheet_split_by_brand(t, customer_view, keep_title=n_split > 1))
         else:
             expanded.append(t)
@@ -21854,10 +22060,13 @@ _AI_AGENT_TOOLS = [
     {'name': 'query_inventory',
      'description': ("Query LIVE inventory aggregated per base style. Filters: brands (abbr like NAUTICA or full name), "
                      "category (long_sleeve|short_sleeve|pants|sportswear|big_tall|young_men|accessories|blazers|button_down — blazers includes vests; "
-                     "button_down = dress shirts whose collar letter is a button-down style), "
+                     "button_down = dress shirts whose collar letter is a button-down style; long_sleeve and short_sleeve are DRESS SHIRTS "
+                     "only. Also the export's Category column: dress_shirt|dress_pants|shorts|shirt_tie_set, and sportswear by sleeve, read "
+                     "from the style number's fit code: sportswear_short_sleeve (SS, Big & Tall TB) | sportswear_long_sleeve (SL, Big & "
+                     "Tall BT/WB)), "
                      "fabric_codes (2-letter SKU codes), color (color word, or buckets: solids/fancies/white/black/navy — "
                      "the navy bucket is 'All Shades of Blue': navy, blue, indigo, serenity, periwinkle, turquoise, aqua, teal, "
-                     "tanzine, cobalt, blueberry, seaspray, deep sea, denim, cerulean, sapphire, azure, cyan; and any color name containing "
+                     "cobalt, blueberry, seaspray, deep sea, denim, cerulean, sapphire, azure, cyan; and any color name containing "
                      "'dobby' counts as a SOLID even with stripe/check words), "
                      "search (substring of style #), customer_prefixes (first 2 letters of the style #, e.g. ['TJ','TM']), "
                      "stock (any|warehouse|overseas), min_units (here it counts units on hand and/or incoming BEFORE "
@@ -21996,9 +22205,18 @@ _AI_AGENT_TOOLS = [
                      '(warehouse, overseas or total) on every tab, skus tabs included: whenever the user gives a '
                      'minimum ("36 pc minimum", "at least 500 available") put min_units on EVERY tab. Rows below it '
                      'are left off and reported as styles_below_min_units. '
-                     'Up to 30 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
+                     'Up to 60 tabs. split_by_brand=true on a tab turns it into one tab per brand (biggest '
                      'first, each tab named by the brand), so "tabs by brand" is ONE tab spec, e.g. {customer_prefixes:["TJ","TM"], '
-                     'stock:"warehouse", split_by_brand:true}. customer_prefixes = first two letters of the '
+                     'stock:"warehouse", split_by_brand:true}. split_by_category=true turns a tab into one tab per category, '
+                     'the categories of the sheet\'s Category column in this order: Dress Shirts, Sportswear, Dress Pants, Shorts, '
+                     'Blazers, Vests, Shirt & Tie Sets, Accessories (only those with styles), each tab named "<brand> <category>"; '
+                     'with split_by_brand as well it is every brand by category, so "line sheets by category by brand" is ONE tab '
+                     'spec {split_by_brand:true, split_by_category:true} plus the user\'s other filters. split_sleeve:["sportswear"] '
+                     'ONLY when the user asks to split sportswear by sleeve: the Sportswear tab becomes "Sportswear SS" (short '
+                     'sleeve) and "Sportswear LS" (long sleeve), read from the style number\'s fit code, the two letters before the '
+                     'last letter (SS = short sleeve, SL = long sleeve; Big & Tall TB short, BT/WB long), plus "Sportswear Bottoms" '
+                     'and "Sportswear Other" (no sleeve in the number) when there are any; it implies split_by_category. Add '
+                     '"dress_shirt" only when the user asks to split dress shirts by sleeve too. customer_prefixes = first two letters of the '
                      'style # (TJ, TM, AM...). A tab holds every matching style (service guard at 2,000, which no single '
                      'brand reaches, so never warn about a style cap unless the result says truncated). '
                      'Takes up to a minute, longer for very large tabs. Present the returned download_url '
@@ -22015,6 +22233,8 @@ _AI_AGENT_TOOLS = [
              'search': {'type': 'string'},
              'customer_prefixes': {'type': 'array', 'items': {'type': 'string'}},
              'split_by_brand': {'type': 'boolean'},
+             'split_by_category': {'type': 'boolean'},
+             'split_sleeve': {'type': 'array', 'items': {'type': 'string', 'enum': ['sportswear', 'dress_shirt']}},
              'limit': {'type': 'integer'}}}},
          'customer_view': {'type': 'boolean'}, 'filename': {'type': 'string'}},
          'required': ['tabs']}},
@@ -22144,6 +22364,7 @@ PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "look
 COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. When the user names a season, pass it as season (for example "Fall 2025") and never turn it into months yourself: Fall is June to November and Spring is December to May, the same as the Past Selling season chips, so your number always equals the screen's. Give units first, then dollars, name the period exactly (say which months a season covers), and always state the history_label cut-off. Repeat any note the tool returns. For colours in CURRENT stock use query_inventory instead.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
 MINIMUMS: when the user asks for a minimum quantity ("36 pc minimum", "only styles with 500+ available"), pass min_units on every build_line_sheet tab and on build_presentation. They apply it to the ATS they print. query_inventory's min_units counts stock before committed and allocated come out, so a style it returns can have less available than the minimum, even 0: never quote one as meeting an ATS minimum on that filter alone.
+CATEGORIES: "by category" means the categories of the sheet's Category column: Dress Shirts, Sportswear, Dress Pants, Shorts, Blazers, Vests, Shirt & Tie Sets, Accessories. A line sheet "by category" is ONE build_line_sheet tab with split_by_category:true; "by category by brand", "each brand by category" or "a tab per brand per category" adds split_by_brand:true to that same tab. The long_sleeve and short_sleeve categories are DRESS SHIRTS only; polos, tees and other sportswear are Sportswear. Split sportswear into short and long sleeve ONLY when the user asks for it: split_sleeve:["sportswear"] on the tab, or category sportswear_short_sleeve / sportswear_long_sleeve when they want one sleeve only ("short sleeve polos"). The sleeve comes from the style number's fit code, the two letters before the last letter: SS = short sleeve, SL = long sleeve.
 """
 
 _AI_AGENT_PLATFORM_TAIL = """A curated selection also goes through the saveLineSheetViews action's skus param.

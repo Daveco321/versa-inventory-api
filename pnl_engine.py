@@ -433,8 +433,9 @@ FABRIC_FAMILY_SIBLINGS = {
 # sheet's WHITE row and its COLOR row (contract C15 R5, Oct 7 2026); a style with no pattern letter reads its
 # pattern from it (fancies are prints).
 COLOUR_CLASSES = ('white', 'black', 'navy', 'other_solids', 'fancies')
+# Tanzine is not a blue: the DKNY 104 knit "Tanzine Solid" is tan (David, Oct 28 2026).
 _COLOUR_BLUE_RE = re.compile(r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b|'
-                             r'\bteal\b|\btanzine\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|'
+                             r'\bteal\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b|'
                              r'\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b')
 _COLOUR_NONBLUE_RE = re.compile(r'\b(?:grey|gray|black|white|red|pink|green|brown|tan|khaki|olive|burgundy|wine|purple|'
                                 r'plum|orange|yellow|gold|silver|charcoal|ivory|cream|beige|camel|rust|coral|lilac|'

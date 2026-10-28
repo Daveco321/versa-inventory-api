@@ -446,9 +446,10 @@ _COLOR_ABBR = {'BLK': 'Black', 'WHT': 'White', 'BLU': 'Blue', 'NVY': 'Navy', 'GR
 
 # ── classifyColor (the frontend version, index.html ~46133-46210) ───────────
 
+# Tanzine is not a blue: the DKNY 104 knit "Tanzine Solid" is tan (David, Oct 28 2026).
 _BLUE_FAMILY = re.compile(
     r'\bnavy\b|\bblue\b|\bindigo\b|\bserenity\b|\bperiwinkle\b|\bturq[ou]+ise\b|\baqua\b'
-    r'|\bteal\b|\btanzine\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b'
+    r'|\bteal\b|\bcobalt\b|\bblueberry\b|\bseaspray\b|\bdeep sea\b|\bdenim\b'
     r'|\bcerulean\b|\bsapphire\b|\bazure\b|\bcyan\b', _A)
 _NON_BLUE_WORDS = re.compile(
     r'\b(?:grey|gray|black|white|red|pink|green|brown|tan|khaki|olive|burgundy|wine|purple'
