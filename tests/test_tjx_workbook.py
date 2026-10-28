@@ -28,7 +28,7 @@ OS = [row('TJAAXX001SLS', 'AAA', 'Brand A', 300, po_ref='ZZ26001', production='Z
           arrival='Nov 3, 2026', tjx_source='Overseas', incoming=300),
       row('TJCCXX020SLS', 'CCC', 'Brand C', 72, po_ref='ZZ26002', production='ZZ26002',
           arrival='TBD', tjx_source='Overseas', incoming=72)]
-WH_COLS = 11          # IMAGE .. Total ATS
+WH_COLS = 12          # IMAGE .. Total ATS (Category after Brand since Oct 28 2026)
 
 
 def tabs():
@@ -78,7 +78,7 @@ class BrandBands(Base):
     def test_warehouse_tab_is_broken_out_by_brand(self):
         ws = self.render()['Warehouse']
         # header 1; band 2; Brand A rows 3-5; band 6; Brand B rows 7-8; band 9; Brand C row 10
-        self.assertEqual(merged_above(ws, 10), ['A2:K2', 'A6:K6', 'A9:K9'])
+        self.assertEqual(merged_above(ws, 10), ['A2:L2', 'A6:L6', 'A9:L9'])
         self.assertEqual([ws['A2'].value, ws['A6'].value, ws['A9'].value], ['Brand A', 'Brand B', 'Brand C'])
         self.assertEqual([ws.cell(r, 2).value for r in (3, 4, 5, 7, 8, 10)],
                          ['TJAAXX001SLS', 'TJAAXX002SLS', 'TMAAXX003SLS', 'ROBBXX010SLS', 'RMBBXX011SLS',
@@ -102,7 +102,7 @@ class BrandBands(Base):
 
     def test_overseas_tab_gets_bands_too(self):
         ws = self.render()['Overseas']
-        self.assertEqual(merged_above(ws, 5), ['A2:N2', 'A4:N4'])
+        self.assertEqual(merged_above(ws, 5), ['A2:O2', 'A4:O4'])
         self.assertEqual([ws['A2'].value, ws['B3'].value, ws['A4'].value, ws['B5'].value],
                          ['Brand A', 'TJAAXX001SLS', 'Brand C', 'TJCCXX020SLS'])
 
@@ -124,7 +124,7 @@ class BrandBands(Base):
         t = tabs()
         t[0]['items'] = [dict(WH[0]), dict(WH[3]), dict(WH[1]), dict(WH[5]), dict(WH[4]), dict(WH[2])]
         ws = self.render(tab_list=t)['Warehouse']
-        self.assertEqual(merged_above(ws, 10), ['A2:K2', 'A6:K6', 'A9:K9'])
+        self.assertEqual(merged_above(ws, 10), ['A2:L2', 'A6:L6', 'A9:L9'])
         self.assertEqual([ws.cell(r, 2).value for r in (3, 4, 5, 7, 8, 10)],
                          ['TJAAXX001SLS', 'TJAAXX002SLS', 'TMAAXX003SLS', 'ROBBXX010SLS', 'RMBBXX011SLS',
                           'TJCCXX020SLS'])

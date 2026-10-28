@@ -146,7 +146,7 @@ class Layout(KeyBase):
         wf, _ = self.render_key()
         ws = wf['Overseas']
         self.assertEqual(col_b(ws, range(11, 15)), ['White Solids', 'TJAAXX001SLS', 'TJAAXX001SLS', 'Fancies · Prints'])
-        self.assertEqual([ws.cell(r, 13).value for r in (12, 13)], ['Nov 3, 2026', 'Jan 3, 2027'])
+        self.assertEqual([ws.cell(r, 14).value for r in (12, 13)], ['Nov 3, 2026', 'Jan 3, 2027'])
 
     def test_pictures_stay_on_their_rows(self):
         imgs = {i: fake_image() for i in range(len(WH))}
@@ -192,16 +192,16 @@ class Values(KeyBase):
     def test_formulas_cover_header_to_the_blank_row(self):
         wf, _ = self.render_key()
         ws = wf['Warehouse']      # data + bands end on row 23, blank row 24
-        self.assertEqual(ws.cell(3, 3).value, '=SUMIFS($K$10:$K$24,$G$10:$G$24,"White")')
-        self.assertIn('ISNUMBER($K$10:$K$24)', ws.cell(3, 2).value)
-        self.assertEqual(ws.cell(8, 3).value, '=SUM($K$10:$K$24)')
+        self.assertEqual(ws.cell(3, 3).value, '=SUMIFS($L$10:$L$24,$H$10:$H$24,"White")')
+        self.assertIn('ISNUMBER($L$10:$L$24)', ws.cell(3, 2).value)
+        self.assertEqual(ws.cell(8, 3).value, '=SUM($L$10:$L$24)')
         self.assertEqual(ws.cell(8, 4).value, '=SUM(D3:D7)')
 
     def test_colour_family_cells_are_painted(self):
         wf, _ = self.render_key()
         ws = wf['Warehouse']
         rules = [(str(rng.sqref), [r.formula for r in rs]) for rng, rs in ws.conditional_formatting._cf_rules.items()]
-        self.assertEqual([sq for sq, _ in rules], ['G11:G23'])
+        self.assertEqual([sq for sq, _ in rules], ['H11:H23'])
         crits = sorted(f[0] for _, fs in rules for f in fs)
         self.assertEqual(crits, sorted(['"White"', '"Black"', '"Navy Solid"', '"Other Solid"', '"Fancy"']))
 
@@ -225,7 +225,7 @@ class Summary(KeyBase):
         ws = wf['Warehouse Summary']
         self.assertEqual(ws.cell(2, 1).value, 'BRAND / COLOR / FABRICATION')
         self.assertEqual(ws.cell(4, 3).value,
-                         "=SUMIFS('Warehouse'!$K$10:$K$24,'Warehouse'!$G$10:$G$24,\"White\",'Warehouse'!$C$10:$C$24,\"Brand A\")")
+                         "=SUMIFS('Warehouse'!$L$10:$L$24,'Warehouse'!$H$10:$H$24,\"White\",'Warehouse'!$C$10:$C$24,\"Brand A\")")
         self.assertIn('"????XX*"', ws.cell(5, 3).value)       # the fabrication line under White
 
     def test_a_brand_with_its_own_tab_is_read_from_it(self):
@@ -402,9 +402,9 @@ class ReviewFixes(KeyBase):
 
     def test_arrival_width_only_changes_under_the_key(self):
         wf, _ = self.render_key(tab_list=[tabs()[1]])
-        self.assertEqual(round(wf['Overseas'].column_dimensions['M'].width), 22)
+        self.assertEqual(round(wf['Overseas'].column_dimensions['N'].width), 22)
         wf, _ = self.render_key(tab_list=[tabs()[1]], color_key=False)
-        self.assertEqual(round(wf['Overseas'].column_dimensions['M'].width), 17)
+        self.assertEqual(round(wf['Overseas'].column_dimensions['N'].width), 17)
 
     def test_fabric_key_keeps_percent_with_its_fibre(self):
         self.assertNotEqual(T.fabric_key('65% Polyester / 35% Cotton'), T.fabric_key('65% Cotton / 35% Polyester'))
@@ -428,7 +428,7 @@ class ReviewFixes2(KeyBase):
         wf, wv = self.render_key(tab_list=one)
         ws = wv['C']
         self.assertEqual([ws.cell(r, 3).value for r in range(3, 9)], [100, 0, 0, 0, 50, 150])
-        cells = [ws.cell(r, 7).value for r in range(11, 16) if ws.cell(r, 2).value]
+        cells = [ws.cell(r, 8).value for r in range(11, 16) if ws.cell(r, 2).value]
         self.assertEqual(sorted(cells), ['Fancy', 'White'])
 
     def test_two_part_colour_names_go_by_the_first_half(self):

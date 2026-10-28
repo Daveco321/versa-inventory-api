@@ -1482,6 +1482,64 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     # Non-overlapping categories fall through to the primary-category equality check
     return _py_get_item_category(sku, brand_abbr) == category
 
+
+# ── Category column (David, Oct 28 2026) ───────────────────────────────────
+# "Whether it's a dress shirt / dress pant, sportswear, etc." on every line-sheet
+# export, admin and customer alike: one label per style, read from the style
+# number with the platform's own category rules. The filter categories overlap
+# (one style can sit under several), so the label picks the product, and it
+# differs from the filters in three places on purpose:
+#   - Bottoms in the Young Men bottoms fabrics (BA/BC/BR/BH, the Von Dutch
+#     pinstripe pants and Bermudas) are Sportswear, like every Young Men fabric
+#     (David, Sep 28 2026); the filters also list them under Dress Pants. Other
+#     bottoms (a P## serial) are Dress Pants, or Shorts in a Bermuda fit.
+#   - A Shaq tie carries its T in the THIRD place (JCTSH...). The filters read a
+#     T anywhere in the first three, so the JTSHST Big & Tall dress shirts (a T
+#     in the customer code) sit under Accessories there.
+#   - Von Dutch jewelry (rings, pendants) is an accessory, not a shirt.
+# Old stock keys that do not follow the style-number layout (WACHA18, NAU-008,
+# BEN-22, 1661337, BJNASSP27 ...) are dress shirts, as the platform files them:
+# their ledger PO names and overrides say so (Oct 28 2026 check). Their letters
+# are never read by position, so BJNASSP27's "SS" is not taken for a shacket fabric.
+_EXPORT_SHORTS_FITS = {'BE', 'BH', 'BA', 'BD', 'BC', 'BF', 'BJ', 'BK', 'BM'}   # Bermuda fits (Sep 18 2026 sheet)
+_EXPORT_VD_JEWELRY_RE = re.compile(r'^(SS|ST|B)VD(NP|R)\d')   # SSVDNP001C, SSVDR001, STVDR003, BVDNP007R
+_EXPORT_STYLE_RE = re.compile(r'^[A-Z0-9]{2}[A-Z]{4}[A-Z0-9]{3}[A-Z]{2,4}$')   # same shape as _SIZED_ROW_BASE_RE
+
+
+def _export_category(sku, brand_abbr='', fabrication=''):
+    """The Category column's label for one export row: 'Dress Shirt', 'Dress Pants',
+    'Shorts', 'Sportswear', 'Blazer', 'Vest' or 'Accessories' ('' only for a blank
+    SKU). brand_abbr is the row's feed brand key (CHAPS, SHAQ ...); fabrication is
+    the row's printed fabrication (the jewelry and tie overrides name them)."""
+    s = str(sku or '').strip().upper()
+    parts = [p for p in re.split(r'[\s\-]+', s) if p]
+    if not parts:
+        return ''
+    base = parts[0]   # size suffixes come after a dash or a space ('KHGBWS002SLS 17')
+    brand = str(brand_abbr or '').strip().upper() or _apo_style_brand_abbr(base)
+    if brand == 'CHAPS' and base.startswith('CTH'):
+        return 'Accessories'   # ties & hankies
+    if brand == 'SHAQ' and base[2:3] == 'T':
+        return 'Accessories'   # JCTSH... ties
+    fab_up = str(fabrication or '').upper()
+    if _EXPORT_VD_JEWELRY_RE.match(base) or 'JEWEL' in fab_up or 'TIE & HANK' in fab_up:
+        return 'Accessories'   # jewelry; the tie overrides read "... Tie & Hanky"
+    if not _EXPORT_STYLE_RE.match(base):
+        return 'Dress Shirt'
+    if _py_is_bottom(base):
+        if base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES:
+            return 'Sportswear'
+        return 'Shorts' if _py_extract_fit_code(base) in _EXPORT_SHORTS_FITS else 'Dress Pants'
+    # Same order as _py_get_item_category: sportswear collar and fabric, then blazers, then Young Men
+    if base[-1] in _PY_SPORTSWEAR_COLLARS or base[4:6] in _PY_SPORTSWEAR_FABRICS:
+        return 'Sportswear'
+    if _py_is_blazer(base):
+        return 'Vest' if _py_is_vest(base) else 'Blazer'
+    if _py_is_young_men(base):
+        return 'Sportswear'   # shackets, overshirts, knits (David, Sep 28 2026: Young Men fabrics are Sportswear)
+    return 'Dress Shirt'      # long and short sleeve, Big & Tall
+
+
 def _fresh_prepack_defaults():
     """Reload prepack rules from S3 and return a snapshot list.
 
@@ -3217,13 +3275,20 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         if _anchor_col:
             headers.insert(headers.index(_anchor_col) + 1, 'Landing in')
 
+    # "Category" (David, Oct 28 2026): what each style is (Dress Shirt, Dress Pants,
+    # Sportswear ...), right after Brand on every layout: admin and customer view,
+    # every catalog link, the AI chat / MCP / mailbox line sheets, and the caller-
+    # defined column sets too (ship plans, Customer Selling, the weekly APO report).
+    if 'Category' not in headers and 'Brand' in headers:
+        headers.insert(headers.index('Brand') + 1, 'Category')
+
     worksheet.set_row(header_row, 25)
     for c, h in enumerate(headers):
         worksheet.write(header_row, c, h, fmt_header)
 
     # Set column widths based on header names
     col_widths = {
-        'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Color': 18,
+        'IMAGE': COL_WIDTH_UNITS, 'SKU': 20, 'Brand': 20, 'Category': 14, 'Color': 18,
         'Fit': 12, 'Fabrication': 35, 'Delivery': 14, 'Qty Selected': 14,
         'Production #': 16, 'PO Name': 30, 'PO Ref #': 22, 'Factory': 14,
         'JTW': 12, 'TR': 12, 'DCW': 12, 'QA': 12, 'NJ': 12, 'ABFI': 12, 'Incoming': 12,
@@ -3283,6 +3348,8 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'IMAGE': lambda item: '',
         'SKU': lambda item: item.get('sku', ''),
         'Brand': lambda item: item.get('brand_full', ''),
+        'Category': lambda item: _export_category(item.get('sku'), item.get('brand_abbr') or item.get('brand'),
+                                                  item.get('fabrication')),
         'Color': lambda item: item.get('color', ''),
         'Fit': lambda item: item.get('fit', 'N/A'),
         'Fabrication': lambda item: item.get('fabrication', 'Standard Fabric'),
@@ -5964,10 +6031,12 @@ def build_overseas_summary_excel(title, items, s3_base_url, catalog_mode=False):
     fmt_sku_even = wb.add_format({**base, 'bg_color': '#F8FAFC', 'bold': True, 'align': 'left'})
 
     # ── Headers ──
-    headers = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication',
+    # Category after Brand, like every other line sheet (David, Oct 28 2026)
+    headers = ['IMAGE', 'SKU', 'Brand', 'Category', 'Color', 'Fit', 'Fabrication',
                'Production', 'Factory', 'PO', 'Ex-Factory', 'Arrival', 'Landing in',
                'Produced', 'Deducted', 'Flow ATS']
-    col_widths = [COL_WIDTH_UNITS, 22, 12, 20, 12, 32, 22, 14, 22, 14, 14, 14, 12, 12, 12]
+    col_widths = [COL_WIDTH_UNITS, 22, 12, 14, 20, 12, 32, 22, 14, 22, 14, 14, 14, 12, 12, 12]
+    col = {h: i for i, h in enumerate(headers)}
     # "Landing in" (Sep 10 2026): each production's landing warehouse from the ledger
     try:
         _landing_idx = _landing_index()
@@ -6040,24 +6109,26 @@ def build_overseas_summary_excel(title, items, s3_base_url, catalog_mode=False):
         else:
             ws.write(row, 0, "No Image", cf)
 
-        ws.write(row, 1, item.get('sku', ''), sf)
-        ws.write(row, 2, item.get('brand_abbr', ''), cf)
-        ws.write(row, 3, item.get('color', ''), cf)
-        ws.write(row, 4, item.get('fit', ''), cf)
-        ws.write(row, 5, item.get('fabrication', ''), cf)
-        ws.write(row, 6, item.get('production', ''), cf)
+        ws.write(row, col['SKU'], item.get('sku', ''), sf)
+        ws.write(row, col['Brand'], item.get('brand_abbr', ''), cf)
+        ws.write(row, col['Category'], _export_category(item.get('sku'), item.get('brand_abbr'),
+                                                        item.get('fabrication')), cf)
+        ws.write(row, col['Color'], item.get('color', ''), cf)
+        ws.write(row, col['Fit'], item.get('fit', ''), cf)
+        ws.write(row, col['Fabrication'], item.get('fabrication', ''), cf)
+        ws.write(row, col['Production'], item.get('production', ''), cf)
         # Factory abbreviation only (matches every other export)
-        ws.write(row, 7, _factory_label(item.get('production')), cf)
-        ws.write(row, 8, item.get('po', ''), cf)
-        ws.write(row, 9, item.get('ex_factory', ''), cf)
-        ws.write(row, 10, item.get('arrival', ''), cf)
-        ws.write(row, 11, _landing_in_label({'sku': item.get('sku'), 'production': item.get('production'),
-                                             'arrival': item.get('arrival'), 'incoming': item.get('produced') or 0},
-                                            _landing_idx, catalog_mode), cf)
-        ws.write(row, 12, item.get('produced', 0), nf)
+        ws.write(row, col['Factory'], _factory_label(item.get('production')), cf)
+        ws.write(row, col['PO'], item.get('po', ''), cf)
+        ws.write(row, col['Ex-Factory'], item.get('ex_factory', ''), cf)
+        ws.write(row, col['Arrival'], item.get('arrival', ''), cf)
+        ws.write(row, col['Landing in'], _landing_in_label({'sku': item.get('sku'), 'production': item.get('production'),
+                                                            'arrival': item.get('arrival'), 'incoming': item.get('produced') or 0},
+                                                           _landing_idx, catalog_mode), cf)
+        ws.write(row, col['Produced'], item.get('produced', 0), nf)
         deducted = item.get('deducted', 0)
-        ws.write(row, 13, deducted, deducted_fmt if deducted else nf)
-        ws.write(row, 14, item.get('flow_ats', 0), ats_fmt)
+        ws.write(row, col['Deducted'], deducted, deducted_fmt if deducted else nf)
+        ws.write(row, col['Flow ATS'], item.get('flow_ats', 0), ats_fmt)
 
         row += 1
         data_row_idx += 1
