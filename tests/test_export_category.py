@@ -74,10 +74,11 @@ class Labels(unittest.TestCase):
         self.assertEqual(self.lab('ZZVDXX001', 'VD', 'Jewelry'), 'Accessories')   # override fabrication
         self.assertEqual(self.lab('CTH01', '', '100% Polyester - Tie & Hanky'), 'Accessories')
 
-    def test_shaq_shirts_with_a_t_customer_code_are_not_ties(self):
-        # the T of the JT customer code is not the tie T (JCTSH...)
+    def test_jcpenney_shaq_sets(self):
+        # the T of the JT customer code is not the tie T (JCTSH...): Big & Tall shirt & tie sets
         for sku in ('JTSHST049BTP', 'JTSHST002BBS', 'JTSHST005TTP'):
-            self.assertEqual(self.lab(sku, 'SHAQ'), 'Dress Shirt', sku)
+            self.assertEqual(self.lab(sku, 'SHAQ'), 'Shirt & Tie Set', sku)
+        self.assertEqual(self.lab('JCSHTP009BBS', 'SHAQ'), 'Dress Shirt')   # JC twill Big & Tall, not a set
 
     def test_old_keys_are_dress_shirts(self):
         for sku, brand in (('WACHA18', 'CHAPS'), ('1661337', 'NAUTICA'), ('NAU-008-BLACK XL', 'NAUTICA'),

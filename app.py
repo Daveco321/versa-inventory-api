@@ -1131,7 +1131,7 @@ def _photo_no_serial_fallback(sku, brand_abbr=''):
     if is_bottoms_style(sku):
         return True
     try:
-        return _py_get_item_category(sku, brand_abbr) == 'sportswear'
+        return _py_get_item_category(sku, brand_abbr, structural=True) == 'sportswear'
     except Exception:
         return False
 
@@ -1365,8 +1365,111 @@ def _py_is_big_tall(sku):
         return base[9:11] in _PY_BT_FIT_CODES
     return False
 
-def _py_get_item_category(sku, brand_abbr):
-    """Returns category string matching frontend getDetailedCategory() values."""
+# ── Filter-category fixes (David, Oct 28 2026) ─────────────────────────────
+# Mirrored in the desktop index.html and the phone App.jsx (same names, camelCase).
+#   - Shaq ties carry their T in the THIRD place (JCTSH...). A T in the customer code
+#     (JTSHST..., JCPenney's Big & Tall shirt & tie sets) is not a tie.
+#   - Von Dutch jewelry (rings, pendants) is Accessories, and every other Von Dutch style
+#     shows under Sportswear and Young Men only: graphic wovens sold in S-XL, shackets,
+#     pinstripe pants and Bermudas.
+#   - A key whose fit code cannot be read (old keys such as WACHA18, BJNASSP27, 1661337,
+#     LUCK-22-170-SL, or a size written after a space) files under Long or Short Sleeve
+#     only where the data names the sleeve: the keys below, an override that says the
+#     sleeve, or a fit code at the end of the key. Old keys are never read by position.
+# Size packs, ribbons, photos, colours and fit labels keep their own rules: the
+# for_prepack path and the structural helpers do not use any of this.
+_VD_JEWELRY_RE = re.compile(r'^(SS|ST|B)VD(NP|R)\d')   # SSVDNP001C, SSVDR001, STVDR003, BVDNP007R
+_STYLE_SHAPE_RE = re.compile(r'^[A-Z0-9]{2}[A-Z]{4}[A-Z0-9]{3}[A-Z]{2,4}$')   # the style-number layout
+_LEGACY_SLEEVE_KEYS = (
+    ('WACHA18', 'long'), ('WACHA19', 'long'),   # ledger POs "WA-CHAPS-4WAY STRETCH-RF/TF"
+    ('CU-NAUSP27', 'long'),                      # ledger PO "CUS-NAU-LS-AW-ECOM39"
+    ('BJNALSP27', 'long'),                       # LS in the key (David, Oct 28 2026)
+    ('BJNASSP27', 'short'),                      # SS in the key, ledger PO "BJS-NAU-AW-SR-P"
+    ('1661336', 'short'), ('1661337', 'short'), ('1661338', 'short'),   # Costco Nautica short sleeve M/L/XL
+)
+_LEGACY_TOKEN_TAIL = r'(?:BD|[SPABDCEYFGJKHLWX]{0,2})$'   # a collar letter or two may follow the fit
+_LEGACY_SHORT_RE = re.compile(r'(?:SS|SR)' + _LEGACY_TOKEN_TAIL)
+_LEGACY_LONG_RE = re.compile(r'(?:SL|RF|TF|MF|CF|BT|BB|TT)' + _LEGACY_TOKEN_TAIL)
+
+
+def _py_style_key(sku):
+    """The style part of a feed key: a size written after a space is not part of it."""
+    s = str(sku or '').strip().upper()
+    return s.split()[0] if s else ''
+
+
+def _py_is_vd_jewelry(sku):
+    return bool(_VD_JEWELRY_RE.match(_py_style_key(sku).split('-')[0]))
+
+
+def _py_is_vd_apparel(sku, brand_abbr=''):
+    """Every Von Dutch style that is not jewelry (brand key VD, or VD in the style number)."""
+    s = _py_style_key(sku)
+    if not s or _py_is_vd_jewelry(s):
+        return False
+    return str(brand_abbr or '').strip().upper() == 'VD' or s[2:4] == 'VD'
+
+
+def _py_is_legacy_key(sku):
+    """True for a key that does not follow the style-number layout (NAU-008, WACHA18, 1661337)."""
+    return not _STYLE_SHAPE_RE.match(_py_style_key(sku).split('-')[0])
+
+
+def _py_fit_unreadable(sku):
+    s = _py_style_key(sku)
+    return _py_extract_fit_code(s) not in _PY_ALL_FIT_CODES
+
+
+def _py_legacy_sleeve(sku):
+    """'long', 'short' or None for a key whose fit code cannot be read: a key the data
+    names (_LEGACY_SLEEVE_KEYS), then an override that says the sleeve, then a fit code
+    at the end of the key (MATAYA08SL, LUCK-22-170-SL, TJCHPK07SLBD, BONAU001SLSS)."""
+    s = str(sku or '').strip().upper()
+    for key, sleeve in _LEGACY_SLEEVE_KEYS:
+        if s.startswith(key):
+            return sleeve
+    ov = _style_overrides.get(s) or _style_overrides.get(s.split('-')[0]) or {}   # plain read, like _apo_fit_label
+    fit = str(ov.get('fit') or '') if isinstance(ov, dict) else ''
+    if re.search(r'short\s*sleeve', fit, re.I):
+        return 'short'
+    if re.search(r'long\s*sleeve', fit, re.I):
+        return 'long'
+    key = _py_style_key(s)
+    if key.endswith('-V'):
+        key = key[:-2]   # partial-carton variant
+    last = key.split('-')[-1] if key else ''
+    if _LEGACY_SHORT_RE.search(last):
+        return 'short'
+    if _LEGACY_LONG_RE.search(last):
+        return 'long'
+    return None
+
+
+def _py_get_item_category(sku, brand_abbr, structural=False):
+    """Returns category string matching frontend getDetailedCategory() values.
+    structural=True is the pre-Oct 28 2026 read, by position only, for the photo
+    fallback (_photo_no_serial_fallback), so photos never move with the filter fixes."""
+    if structural:
+        return _py_item_category_by_position(sku, brand_abbr, shaq_any_t=True)
+    s = _py_style_key(sku)
+    brand_up = str(brand_abbr or '').strip().upper()
+    base = s.split('-')[0]
+    if ((brand_up == 'CHAPS' and base.startswith('CTH')) or (brand_up == 'SHAQ' and base[2:3] == 'T')
+            or _py_is_vd_jewelry(s)):
+        return 'accessories'
+    if _py_is_vd_apparel(s, brand_up):
+        return 'sportswear'
+    if _py_is_legacy_key(s):
+        return 'short_sleeve' if _py_legacy_sleeve(sku) == 'short' else 'long_sleeve'
+    cat = _py_item_category_by_position(s, brand_up, shaq_any_t=False)
+    if cat in ('long_sleeve', 'short_sleeve') and _py_fit_unreadable(s):
+        return 'short_sleeve' if _py_legacy_sleeve(sku) == 'short' else 'long_sleeve'
+    return cat
+
+
+def _py_item_category_by_position(sku, brand_abbr, shaq_any_t=True):
+    """The category read from the style number's positions: the rules before Oct 28 2026
+    (shaq_any_t keeps the old 'T anywhere in the first three' Shaq tie test)."""
     base = sku.split('-')[0].upper()
     # Brand code lives at positions 2-3 of the base SKU.
     sku_brand = base[2:4] if len(base) >= 4 else ''
@@ -1389,7 +1492,7 @@ def _py_get_item_category(sku, brand_abbr):
     brand_up = (brand_abbr or '').upper()
     if brand_up == 'CHAPS' and base.startswith('CTH'):
         return 'accessories'
-    if brand_up == 'SHAQ' and len(base) >= 3 and 'T' in base[:3]:
+    if brand_up == 'SHAQ' and len(base) >= 3 and ('T' in base[:3] if shaq_any_t else base[2] == 'T'):
         return 'accessories'
     # Blazers/Vests (B##/V## serial) — tailored category, takes precedence over
     # the sleeve split exactly like the frontend getDetailedCategory (a GB blazer
@@ -1452,6 +1555,47 @@ def _py_is_button_down(sku, brand_abbr=''):
     # sportswear or an accessory (long/short sleeve, big & tall).
     return _py_get_item_category(sku, brand_abbr) not in ('pants', 'sportswear', 'accessories')
 
+_PY_FILTER_CATEGORIES = ('long_sleeve', 'short_sleeve', 'big_tall', 'pants', 'sportswear',
+                         'blazers', 'young_men', 'accessories')
+
+
+def _py_filter_categories(sku, brand_abbr=''):
+    """The category FILTERS a style shows under (inclusive: a BC Carpenter is pants,
+    sportswear and young men). Mirrors the desktop filterCategories(). The Oct 28 2026
+    fixes (see _LEGACY_SLEEVE_KEYS) on top of the Sep 2026 rules; a style none of them
+    touch shows under exactly the filters it did before."""
+    s = _py_style_key(sku)
+    if not s:
+        return set()
+    primary = _py_get_item_category(sku, brand_abbr)
+    if primary == 'accessories':
+        return {'accessories'}
+    if _py_is_vd_apparel(s, brand_abbr):
+        return {'sportswear', 'young_men'}
+    if _py_is_legacy_key(s) or (primary in ('long_sleeve', 'short_sleeve') and _py_fit_unreadable(s)):
+        # Never read by position: the sleeve the data names, if any
+        sleeve = _py_legacy_sleeve(sku)
+        return {sleeve + '_sleeve'} if sleeve else set()
+    cats = set()
+    sportswear = _py_is_sportswear(s, brand_abbr)
+    if sportswear:
+        cats.add('sportswear')
+    if _py_is_pants(s, brand_abbr):
+        cats.add('pants')
+    if _py_is_blazer(s):
+        cats.add('blazers')
+    if _py_is_young_men(s):
+        cats.add('young_men')
+    if not sportswear:
+        if _py_is_short_sleeve(s):
+            cats.add('short_sleeve')
+        elif _py_is_long_sleeve_shirt(s) and not _py_is_blazer(s):
+            cats.add('long_sleeve')
+    if primary in ('big_tall', 'accessories'):
+        cats.add(primary)
+    return cats
+
+
 def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     """Inclusive category matcher. One SKU can match multiple categories
     (e.g. a BC Carpenter matches 'pants', 'sportswear', AND 'young_men').
@@ -1459,9 +1603,11 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
     polo, tee, henley or any Young Men/Sportswear fabric is Sportswear, and a
     blazer/vest is not a long-sleeve shirt (Sep 23 2026). for_prepack keeps the
     old inclusive sleeve read for prepack RULES only, so size packs on those
-    styles do not change."""
+    styles do not change. FILTERS read _py_filter_categories (Oct 28 2026)."""
     if not category or category in ('all', 'any'):
         return True
+    if not for_prepack and category in _PY_FILTER_CATEGORIES:
+        return category in _py_filter_categories(sku, brand_abbr)
     if category == 'sportswear':
         return _py_is_sportswear(sku, brand_abbr)
     if category == 'pants':
@@ -1486,33 +1632,25 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
 # ── Category column (David, Oct 28 2026) ───────────────────────────────────
 # "Whether it's a dress shirt / dress pant, sportswear, etc." on every line-sheet
 # export, admin and customer alike: one label per style, read from the style
-# number with the platform's own category rules. The filter categories overlap
-# (one style can sit under several), so the label picks the product, and it
-# differs from the filters in three places on purpose:
-#   - Bottoms in the Young Men bottoms fabrics (BA/BC/BR/BH, the Von Dutch
-#     pinstripe pants and Bermudas) are Sportswear, like every Young Men fabric
-#     (David, Sep 28 2026); the filters also list them under Dress Pants. Other
-#     bottoms (a P## serial) are Dress Pants, or Shorts in a Bermuda fit.
-#   - A Shaq tie carries its T in the THIRD place (JCTSH...). The filters read a
-#     T anywhere in the first three, so the JTSHST Big & Tall dress shirts (a T
-#     in the customer code) sit under Accessories there.
-#   - Von Dutch jewelry (rings, pendants) is an accessory, not a shirt, and every
-#     other Von Dutch style is Sportswear: its wovens are graphic prints sold in
-#     S-XL (the Von Dutch size packs are the only letter-sized shirt packs), so
-#     they are not the dress shirts the sleeve filters file them as.
+# number with the same rules as the category filters (_py_filter_categories): Shaq
+# ties, Von Dutch jewelry and Von Dutch Sportswear as above. The filters overlap (one
+# style can sit under several), so the label picks the product:
+#   - Bottoms in the Young Men bottoms fabrics (BA/BC/BR/BH) are Sportswear, like every
+#     Young Men fabric (David, Sep 28 2026). Other bottoms (a P## serial) are Dress
+#     Pants, or Shorts in a Bermuda fit.
+#   - JCPenney's Shaq JTSHST styles are Big & Tall shirt & tie sets: Shirt & Tie Set.
+#   - B## is a Blazer and V## a Vest, though one filter (Blazers/Vests) holds both.
 # Old stock keys that do not follow the style-number layout (WACHA18, NAU-008,
 # BEN-22, 1661337, BJNASSP27 ...) are dress shirts, as the platform files them:
 # their ledger PO names and overrides say so (Oct 28 2026 check). Their letters
 # are never read by position, so BJNASSP27's "SS" is not taken for a shacket fabric.
 _EXPORT_SHORTS_FITS = {'BE', 'BH', 'BA', 'BD', 'BC', 'BF', 'BJ', 'BK', 'BM'}   # Bermuda fits (Sep 18 2026 sheet)
-_EXPORT_VD_JEWELRY_RE = re.compile(r'^(SS|ST|B)VD(NP|R)\d')   # SSVDNP001C, SSVDR001, STVDR003, BVDNP007R
-_EXPORT_STYLE_RE = re.compile(r'^[A-Z0-9]{2}[A-Z]{4}[A-Z0-9]{3}[A-Z]{2,4}$')   # same shape as _SIZED_ROW_BASE_RE
 
 
 def _export_category(sku, brand_abbr='', fabrication=''):
     """The Category column's label for one export row: 'Dress Shirt', 'Dress Pants',
-    'Shorts', 'Sportswear', 'Blazer', 'Vest' or 'Accessories' ('' only for a blank
-    SKU). brand_abbr is the row's feed brand key (CHAPS, SHAQ ...); fabrication is
+    'Shorts', 'Sportswear', 'Blazer', 'Vest', 'Shirt & Tie Set' or 'Accessories' (''
+    only for a blank SKU). brand_abbr is the row's feed brand key (CHAPS, SHAQ ...); fabrication is
     the row's printed fabrication (the jewelry and tie overrides name them)."""
     s = str(sku or '').strip().upper()
     parts = [p for p in re.split(r'[\s\-]+', s) if p]
@@ -1524,12 +1662,14 @@ def _export_category(sku, brand_abbr='', fabrication=''):
         return 'Accessories'   # ties & hankies
     if brand == 'SHAQ' and base[2:3] == 'T':
         return 'Accessories'   # JCTSH... ties
+    if brand == 'SHAQ' and base.startswith('JT'):
+        return 'Shirt & Tie Set'   # JCPenney Big & Tall sets, ledger "SHIRT & TIE SET-BB/TT" (David, Oct 28 2026)
     fab_up = str(fabrication or '').upper()
-    if _EXPORT_VD_JEWELRY_RE.match(base) or 'JEWEL' in fab_up or 'TIE & HANK' in fab_up:
+    if _VD_JEWELRY_RE.match(base) or 'JEWEL' in fab_up or 'TIE & HANK' in fab_up:
         return 'Accessories'   # jewelry; the tie overrides read "... Tie & Hanky"
     if brand == 'VD':
         return 'Sportswear'    # shackets, graphic wovens, pinstripe pants, Bermudas
-    if not _EXPORT_STYLE_RE.match(base):
+    if not _STYLE_SHAPE_RE.match(base):
         return 'Dress Shirt'
     if _py_is_bottom(base):
         if base[4:6] in _PY_SPORTSWEAR_BOTTOM_CODES:
