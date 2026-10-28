@@ -28,7 +28,6 @@ class Labels(unittest.TestCase):
                            ('AMDKPK001SSS', 'DKNY'),        # short sleeve
                            ('HANASU201BBB', 'NAUTICA'),     # Big & Tall
                            ('BUCHOX001TBS', 'CHAPS'),       # short sleeve Big & Tall
-                           ('ROVDTS120WBK', 'VD'),          # Von Dutch Big & Tall
                            ('AMNASU820SLP-V', 'NAUTICA'),   # partial-carton variant
                            ('AMNASU100SLP-L-FBA', 'NAUTICA'),   # by-size row
                            ('KHGBWS002SLS 17', 'BEENE')):   # size after a space
@@ -44,8 +43,17 @@ class Labels(unittest.TestCase):
     def test_young_men_bottoms_are_sportswear(self):
         # BA/BC/BR/BH are the Young Men bottoms fabrics: Von Dutch pinstripe pants and Bermudas
         for sku in ('TMVDBAP07SCP', 'BUVDBA010SCP', 'ROVDBA008SCP', 'BUVDBAP14THS',
-                    'BUVDBAP17BHS', 'BUVDBAP18BKS', 'ZZVDBCP01SRS'):
+                    'BUVDBAP17BHS', 'BUVDBAP18BKS', 'ZZGBBCP01SRS'):
             self.assertEqual(self.lab(sku), 'Sportswear', sku)
+
+    def test_von_dutch_is_sportswear(self):
+        # graphic wovens in S-XL, Big & Tall included; the brand key decides, so a
+        # DV typo in the style number still reads Von Dutch
+        for sku in ('TTVDTS075PSP', 'TTVDAW003PSD', 'CIVDTS128SSS', 'ROVDTS120WBK',
+                    'NOVDTS056PSP M', 'PMDVBA008SCP'):
+            self.assertEqual(self.lab(sku, 'VD'), 'Sportswear', sku)
+        self.assertEqual(self.lab('TTVDTS075PSP'), 'Sportswear')   # brand read from the style number
+        self.assertEqual(self.lab('SSVDNP001C', 'VD'), 'Accessories')   # jewelry still wins
 
     def test_sportswear(self):
         for sku in ('BRGBPO001SSM', 'BRGBPL002SLM', 'BRGBPW027SSZ', 'ROGBRB001SLM',   # polos, rugby

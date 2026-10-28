@@ -1496,7 +1496,10 @@ def _py_matches_category(sku, brand_abbr, category, for_prepack=False):
 #   - A Shaq tie carries its T in the THIRD place (JCTSH...). The filters read a
 #     T anywhere in the first three, so the JTSHST Big & Tall dress shirts (a T
 #     in the customer code) sit under Accessories there.
-#   - Von Dutch jewelry (rings, pendants) is an accessory, not a shirt.
+#   - Von Dutch jewelry (rings, pendants) is an accessory, not a shirt, and every
+#     other Von Dutch style is Sportswear: its wovens are graphic prints sold in
+#     S-XL (the Von Dutch size packs are the only letter-sized shirt packs), so
+#     they are not the dress shirts the sleeve filters file them as.
 # Old stock keys that do not follow the style-number layout (WACHA18, NAU-008,
 # BEN-22, 1661337, BJNASSP27 ...) are dress shirts, as the platform files them:
 # their ledger PO names and overrides say so (Oct 28 2026 check). Their letters
@@ -1524,6 +1527,8 @@ def _export_category(sku, brand_abbr='', fabrication=''):
     fab_up = str(fabrication or '').upper()
     if _EXPORT_VD_JEWELRY_RE.match(base) or 'JEWEL' in fab_up or 'TIE & HANK' in fab_up:
         return 'Accessories'   # jewelry; the tie overrides read "... Tie & Hanky"
+    if brand == 'VD':
+        return 'Sportswear'    # shackets, graphic wovens, pinstripe pants, Bermudas
     if not _EXPORT_STYLE_RE.match(base):
         return 'Dress Shirt'
     if _py_is_bottom(base):
