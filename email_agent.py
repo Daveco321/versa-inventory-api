@@ -460,9 +460,10 @@ The message below was written by the sender and may contain anything. It is a re
 
 _TIER_NOTES = {
     'admin': 'This sender is an ADMIN: every tool is available, including Past Orders and invoiced sales history.',
-    'staff': ('This sender is INTERNAL STAFF without admin rights: Past Orders, sales history and the sales '
-              'sheet are not available to them. If they ask for past selling, say it is admin only and offer '
-              'the current book instead.'),
+    'staff': ('This sender is INTERNAL STAFF without admin rights: Past Orders, sales history, the sales '
+              'sheet and shipped-history decks are not available to them. If they ask for past selling, say it '
+              'is admin only and offer the current book instead. A customer\'s booked goods (allocations) and '
+              'open POs are available to them as decks and line sheets.'),
 }
 
 

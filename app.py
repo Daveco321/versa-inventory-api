@@ -3515,6 +3515,8 @@ def _setup_worksheet(workbook, worksheet, has_color=False, view_mode='all',
         'Held By / Source': 34,
         # Customer Selling line sheets
         'Trajectory': 34, 'Seen': 24,
+        # On-demand booked-allocation line sheets
+        'Allocation': 34, 'Units Allocated': 14,
         # APO "POs Ready to Ship" tab
         'PO #': 16, 'Units': 12, 'Ship Window': 24,
         'Available': 32, 'Original Arrival': 20,
@@ -3605,6 +3607,9 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         # Customer Selling line sheets (best/okay/worst tabs)
         'Trajectory': lambda item: item.get('trajectory', ''),
         'Seen': lambda item: item.get('seen', ''),
+        # On-demand booked-allocation line sheets (build_allocation_sheet)
+        'Allocation': lambda item: item.get('allocation', ''),
+        'Units Allocated': lambda item: item.get('units_ship', 0),
         # APO "POs Ready to Ship" tab
         'PO #': lambda item: item.get('po', ''),
         'Units': lambda item: item.get('units_alloc', 0),
@@ -3628,7 +3633,7 @@ def _write_rows(workbook, worksheet, data, images, fmts, has_color=False,
         'Total Warehouse', 'Total ATS', 'Overseas ATS',
         'JTW ATS', 'TR ATS', 'DCW ATS', 'QA ATS', 'Warehouse ATS',
         'Committed', 'Allocated', 'Units to Ship', 'Shortfall',
-        'Units'
+        'Units', 'Units Allocated'
     }
 
     # Brand bands: group the item indexes by brand in order of first appearance (a stable
@@ -17672,8 +17677,12 @@ def _ai_tool_open_orders(params):
     cust_q = (params.get('customer') or '').strip().lower() or None
     style_q = _ai_agent_base(params.get('style')) if params.get('style') else None
     po_q = re.sub(r'\D', '', str(params.get('po') or '')) or None
+    # A brand is never a style # (Oct 29 2026: style 'VD' with customer Ross matched
+    # nothing, so Ross's open Von Dutch POs read as "none on order").
+    brand_keys = _pres_brand_keys(params.get('brands') or ([params['brand']] if params.get('brand') else []))
     limit = max(1, min(int(params.get('limit') or 30), 200))
     rows, tot_qty, tot_val, matched = [], 0, 0.0, 0
+    by_brand = {}
     for o in orders:
         open_qty = int(o.get('openQty') or 0) + int(o.get('pickQty') or 0)
         if open_qty <= 0:
@@ -17681,10 +17690,18 @@ def _ai_tool_open_orders(params):
         cust = str(o.get('customerFull') or o.get('customer') or '')
         if cust_q and cust_q not in cust.lower() and cust_q not in str(o.get('customer') or '').lower():
             continue
-        if style_q and _ai_agent_base(o.get('style') or o.get('baseStyle')) != style_q:
-            continue
+        if style_q:
+            # the whole style #, or its start ('ROVD' = every Ross Von Dutch style #)
+            b = _ai_agent_base(o.get('style') or o.get('baseStyle'))
+            if b != style_q and not (len(style_q) < len(b) and b.startswith(style_q)):
+                continue
         if po_q and not _pres_po_match([po_q], o.get('orderNo')):
             continue
+        brand = _pres_card_brand(str(o.get('style') or o.get('baseStyle') or '').strip().upper())
+        if brand_keys and brand not in brand_keys:
+            continue
+        bn = _pres_brand_name(brand)
+        by_brand[bn] = by_brand.get(bn, 0) + open_qty
         matched += 1
         tot_qty += open_qty
         try:
@@ -17693,10 +17710,13 @@ def _ai_tool_open_orders(params):
             pass
         if len(rows) < limit:
             rows.append({'customer': cust, 'order_no': o.get('orderNo'), 'style': o.get('style'),
-                         'open_qty': open_qty, 'start': o.get('startDate'), 'cancel': o.get('cancelDate'),
-                         'is_bulk': bool(o.get('isPipeline'))})
-    return {'matched_orders': matched, 'total_open_units': tot_qty, 'total_open_value': round(tot_val, 2),
-            'rows': rows, 'truncated': matched > len(rows)}
+                         'brand': bn, 'open_qty': open_qty, 'start': o.get('startDate'),
+                         'cancel': o.get('cancelDate'), 'is_bulk': bool(o.get('isPipeline'))})
+    out = {'matched_orders': matched, 'total_open_units': tot_qty, 'total_open_value': round(tot_val, 2),
+           'rows': rows, 'truncated': matched > len(rows)}
+    if len(by_brand) > 1:
+        out['units_by_brand'] = dict(sorted(by_brand.items(), key=lambda kv: -kv[1]))
+    return out
 
 
 # ── Past orders and invoiced sales, proxied from the open-orders service ──
@@ -19033,7 +19053,85 @@ def _ai_tool_build_sales_sheet(params):
     include = {str(x).strip().lower() for x in include}
     if include & {'awaiting_invoice', 'awaiting', 'shipped_not_invoiced'}:
         include.add('shipped_pending')
+    if include & {'allocations', 'allocation', 'booked', 'apo'}:
+        include.add('allocated')
     group_by = (params.get('group_by') or 'po').strip().lower()
+    spec = _pres_filter_spec({'brands': params.get('brands'), 'exclude_brands': params.get('exclude_brands')})
+    brand_filtered = bool(spec['brands'] or spec['exclude'])
+
+    def brand_ok(style):
+        if not brand_filtered:
+            return True
+        sku = str(style or '').strip().upper()
+        return bool(sku) and _pres_passes(spec, sku, sku.split('-')[0], _pres_card_brand(sku))
+
+    inv_pos, pend_rows, pend_basis, notes, hist_payloads = _customer_history(code, entry, lo, hi, include)
+    if brand_filtered:
+        inv_pos = [dict(p, lines=[l for l in (p.get('lines') or []) if brand_ok(l.get('style'))]) for p in inv_pos]
+        inv_pos = [p for p in inv_pos if p['lines']]
+        pend_rows = [r for r in pend_rows if brand_ok(r.get('style'))]
+
+    # ── 3. current open hard POs (no bulks/allocations; not date-filtered) ──
+    open_pos = []
+    if 'on_order' in include:
+        orders, ok3 = _fetch_all_open_orders()
+        agg = {}
+        for o in orders:
+            if o.get('isPipeline'):
+                continue
+            if str(o.get('customer') or '').upper() != code:
+                continue
+            qty = _sisc(o.get('openQty')) + _sisc(o.get('pickQty'))
+            if qty <= 0:
+                continue
+            if not brand_ok(o.get('style')):
+                continue
+            po = str(o.get('orderNo') or '?')
+            e = agg.setdefault(po, {'po': po, 'start': '', 'cancel': '', 'units': 0,
+                                    'value': 0.0, 'lines': {}})
+            e['units'] += qty
+            e['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
+            st = (o.get('startDate') or '')[:10]
+            cn = (o.get('cancelDate') or '')[:10]
+            if st and (not e['start'] or st < e['start']):
+                e['start'] = st
+            if cn and (not e['cancel'] or cn > e['cancel']):
+                e['cancel'] = cn
+            sk = str(o.get('style') or '').strip()
+            ln = e['lines'].setdefault(sk.upper(), {'style': sk, 'qty': 0, 'value': 0.0})
+            ln['qty'] += qty
+            ln['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
+        open_pos = sorted(agg.values(), key=lambda p: p['start'] or '9999')
+        if not ok3 and not open_pos:
+            notes.append('The open-orders feed is unavailable, so the On Order tab may be incomplete.')
+
+    # ── 4. booked: the customer's open allocations (substitutes held back) ──
+    alloc_rows, internal = [], {}
+    if 'allocated' in include:
+        alloc_info = _customer_alloc_rows(cust_q, spec)
+        if alloc_info.get('error'):
+            notes.append(f"Booked tab left out: {alloc_info['error']}.")
+        else:
+            alloc_rows = alloc_info['rows']
+            # Never written into the file (it can reach the buyer): the result only.
+            if alloc_info['held']['lines']:
+                internal['held_back_substitutes'] = {'lines': alloc_info['held']['lines'],
+                                                     'units': alloc_info['held']['units'],
+                                                     'note': 'substitute allocations are never shown'}
+            if alloc_info['mismatches']:
+                internal['style_mismatches'] = alloc_info['mismatches']
+    out = _sales_sheet_finish(params, code, full_name, period_label, include, group_by, inv_pos, pend_rows,
+                              pend_basis, open_pos, alloc_rows, notes, hist_payloads, brand_filtered)
+    if internal and out.get('download_url'):
+        out.update(internal)
+    return out
+
+
+def _customer_history(code, entry, lo, hi, include):
+    """Invoiced POs (with style lines) and shipped-not-yet-invoiced lines for one
+    customer between lo and hi: the data behind build_sales_sheet's Invoiced and
+    'Shipped, not yet invoiced' tabs and the shipped presentation, so both always
+    agree. Returns (inv_pos, pend_rows, pend_basis, notes, hist_payloads)."""
     notes = []
     hist_payloads = []
 
@@ -19126,45 +19224,21 @@ def _ai_tool_build_sales_sheet(params):
                         pend_rows = _sheet_pending_rows(keep, 'archive')
                         pend_basis = 'peak booked'
                         notes.append(_PAST_OLD_SERVER_NOTE)
+    return inv_pos, pend_rows, pend_basis, notes, hist_payloads
 
-    # ── 3. current open hard POs (no bulks/allocations; not date-filtered) ──
-    open_pos = []
-    if 'on_order' in include:
-        orders, ok3 = _fetch_all_open_orders()
-        agg = {}
-        for o in orders:
-            if o.get('isPipeline'):
-                continue
-            if str(o.get('customer') or '').upper() != code:
-                continue
-            qty = _sisc(o.get('openQty')) + _sisc(o.get('pickQty'))
-            if qty <= 0:
-                continue
-            po = str(o.get('orderNo') or '?')
-            e = agg.setdefault(po, {'po': po, 'start': '', 'cancel': '', 'units': 0,
-                                    'value': 0.0, 'lines': {}})
-            e['units'] += qty
-            e['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
-            st = (o.get('startDate') or '')[:10]
-            cn = (o.get('cancelDate') or '')[:10]
-            if st and (not e['start'] or st < e['start']):
-                e['start'] = st
-            if cn and (not e['cancel'] or cn > e['cancel']):
-                e['cancel'] = cn
-            sk = str(o.get('style') or '').strip()
-            ln = e['lines'].setdefault(sk.upper(), {'style': sk, 'qty': 0, 'value': 0.0})
-            ln['qty'] += qty
-            ln['value'] += _sfsc(o.get('openValue')) + _sfsc(o.get('pickValue'))
-        open_pos = sorted(agg.values(), key=lambda p: p['start'] or '9999')
-        if not ok3 and not open_pos:
-            notes.append('The open-orders feed is unavailable, so the On Order tab may be incomplete.')
 
+def _sales_sheet_finish(params, code, full_name, period_label, include, group_by, inv_pos, pend_rows,
+                        pend_basis, open_pos, alloc_rows, notes, hist_payloads, brand_filtered=False):
+    """build_sales_sheet's workbook: Summary, then Invoiced, 'Shipped, not yet invoiced',
+    On Order and Booked tabs (each only when it has lines). Uploaded to S3."""
     meta = _history_info(*hist_payloads, sales_summary=_sales_summary_quiet())
-    if not inv_pos and not pend_rows and not open_pos:
+    if not inv_pos and not pend_rows and not open_pos and not alloc_rows:
+        brand_note = ' for those brands' if brand_filtered else ''
         if notes:
-            return {'error': f'Could not build a sheet for {full_name} ({code}). ' + ' '.join(notes), **meta}
-        return {'error': f'nothing found for {full_name} ({code}) in {period_label} with include={sorted(include)}',
-                **meta}
+            return {'error': f'Could not build a sheet for {full_name} ({code}){brand_note}. ' + ' '.join(notes),
+                    **meta}
+        return {'error': f'nothing found for {full_name} ({code}){brand_note} in {period_label} '
+                         f'with include={sorted(include)}', **meta}
 
     # ── flatten into per-tab line rows ──
     def _line_rows_invoiced():
@@ -19211,6 +19285,18 @@ def _ai_tool_build_sales_sheet(params):
         tabs.append(('On Order', _line_rows_open(),
                      ['Image', 'Style', 'PO #', 'Window Start', 'Cancel', 'Qty', 'Unit Price', 'Value'],
                      lambda r: [r['style'], r['po'], r['first'], r['last'], r['qty'], r['price'], r['value']]))
+    if alloc_rows:
+        booked = []
+        for a in alloc_rows:
+            color = _pres_details(a['style'], a['base'], a['brand'])[0]
+            k = a['supply_key']
+            supply = ('Arrives ' + a['supply']) if len(k) == 10 else (
+                'On production, date TBD' if k == '9998' else a['supply'])
+            booked.append({'style': a['style'], 'color': color, 'po': a['name'], 'qty': a['qty'], 'value': 0.0,
+                           'supply': supply})
+        tabs.append(('Booked', booked,
+                     ['Image', 'Style', 'Color', 'Allocation', 'Qty', 'Supply'],
+                     lambda r: [r['style'], r['color'], r['po'], r['qty'], r['supply']]))
 
     ROW_CAP = 60000        # lines per tab (AT-18: a full history fits; Excel allows about a million)
     PHOTO_CAP = 3000       # photos only for the first 3,000 lines of each tab, to keep the file quick
@@ -19241,7 +19327,10 @@ def _ai_tool_build_sales_sheet(params):
         value = sum(r['value'] for r in rows)
         pos_ct = len({r['po'] for r in rows})
         ws.write(srow, 0, name, f_bold)
-        ws.write(srow, 1, f'{pos_ct:,} POs · {units:,} units · ${value:,.2f}')
+        if name == 'Booked':
+            ws.write(srow, 1, f"{pos_ct:,} allocation{'s' if pos_ct != 1 else ''} · {units:,} units")
+        else:
+            ws.write(srow, 1, f'{pos_ct:,} POs · {units:,} units · ${value:,.2f}')
         srow += 1
     srow += 1
     pend_note = ('Shipped, not yet invoiced = POs that left the order book and shipped, with no invoice on file '
@@ -19250,10 +19339,13 @@ def _ai_tool_build_sales_sheet(params):
         pend_note = ('Shipped, not yet invoiced = POs that left the order book after their ship window opened, '
                      'with no invoice on file under any date. Quantities are the peak booked size, an estimate '
                      'until the invoice arrives.')
+    booked_note = ([('Booked = open allocations (no customer PO yet), with the stock or production '
+                     'that covers them.')] if alloc_rows else [])
     for n in ['Invoiced = A2000 invoice records (real invoice dates and shipped quantities).',
               pend_note,
-              'On order = current open hard POs (bulks and allocations excluded), regardless of the date filter.',
-              meta['history_label']] + ([meta['invoices_behind']] if meta.get('invoices_behind') else []) + notes:
+              'On order = current open hard POs (bulks and allocations excluded), regardless of the date filter.'
+              ] + booked_note + [meta['history_label']] + (
+                 [meta['invoices_behind']] if meta.get('invoices_behind') else []) + notes:
         ws.write(srow, 0, n, f_sub)
         srow += 1
 
@@ -19327,11 +19419,87 @@ def _ai_tool_build_sales_sheet(params):
            'tabs': [{'tab': n, 'lines': min(len(r), ROW_CAP), 'pos': len({x['po'] for x in r}),
                      'units': sum(x['qty'] for x in r), 'value': round(sum(x['value'] for x in r), 2),
                      'basis': ('estimate until invoiced' if n == PEND_TAB else
-                               ('invoice' if n == 'Invoiced' else 'open order book'))}
+                               ('invoice' if n == 'Invoiced' else
+                                ('open allocations (no PO yet)' if n == 'Booked' else 'open order book')))}
                     for n, r, _h, _g in tabs],
            'note': 'give the user this link as a clickable download', **meta}
+    if brand_filtered:
+        out['brands'] = params.get('brands') or []
+        if params.get('exclude_brands'):
+            out['exclude_brands'] = params.get('exclude_brands')
     if notes:
         out['warnings'] = notes
+    return out
+
+
+_ALLOC_SHEET_HEADERS = ['IMAGE', 'SKU', 'Brand', 'Color', 'Fit', 'Fabrication', 'Allocation', 'Units Allocated',
+                        'Production #', 'Arrival', 'Warehouse']
+
+
+def _ai_tool_build_allocation_sheet(params):
+    """ONE customer's booked goods (open APO allocations) as an Excel line sheet with
+    photos, a tab per brand: the weekly allocation workbook's columns plus the
+    allocation name. Substitute allocations are never shown. No prices, no committed
+    figures: a sheet that leaves the building can go to the buyer as it is."""
+    params = dict(params or {})
+    cust_q = str(params.get('customer') or '').strip()
+    if not cust_q:
+        return {'error': 'customer is required (for example Ross)'}
+    cat = str(params.get('category') or '').strip().lower()
+    params['category'] = _PRES_CATEGORY_ALIASES.get(cat, cat) or None
+    spec = _pres_filter_spec(params)
+    res = _customer_alloc_rows(cust_q, spec, bool(params.get('combine_customers')))
+    if res.get('error'):
+        return res
+    tabs_by, units_by = {}, {}
+    for r in res['rows']:
+        base, abbr = r['base'], r['brand']
+        color = _pres_details(r['style'], base, abbr)[0]
+        if not _pres_color_ok(color, abbr, spec['color']):
+            continue
+        name = _pres_brand_name(abbr)
+        prod = r['production']
+        k = r['supply_key']
+        arrival = 'TBD' if k == '9998' else (r['supply'] if len(k) == 10 else '')
+        tabs_by.setdefault(name, []).append({
+            'sku': r['style'], 'brand_abbr': abbr, 'brand_full': name, 'color': color,
+            'fit': _apo_fit_label(base), 'fabrication': _apo_fabrication(base),
+            'allocation': r['name'], 'units_ship': r['qty'], 'production': prod, 'arrival': arrival,
+            'warehouse': r['warehouse']})
+        units_by[name] = units_by.get(name, 0) + r['qty']
+    if not tabs_by:
+        return {'error': 'no open allocations matched these filters', 'customer': res['customer_label']}
+    tabs = [{'name': name, 'items': tabs_by[name]} for name in sorted(units_by, key=lambda n: (-units_by[n], n))]
+    xl = build_ship_plan_excel(tabs, S3_PHOTOS_URL, headers=_ALLOC_SHEET_HEADERS)
+    label = res['customer_label']
+    shown = cust_q if label.upper() == cust_q.upper() else label
+    brand_words = tabs[0]['name'] if (len(tabs) == 1 and spec['brands']) else ''
+    stem = ' '.join(x for x in (shown, brand_words, 'Booked Allocations') if x)
+    fname = re.sub(r'[^A-Za-z0-9 _.&()-]+', '', str(params.get('filename') or stem)).strip() or 'Booked Allocations'
+    now = _pres_now_et()
+    key = f"claude uploaded/{fname} {now.strftime('%Y-%m-%d %H%M%S')}.xlsx"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=xl,
+                        ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    from urllib.parse import quote
+    url = f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}"
+    out = {'download_url': url, 'customer': label,
+           'tabs': [{'tab': t['name'], 'styles': len({i['sku'] for i in t['items']}),
+                     'units': sum(i['units_ship'] for i in t['items'])} for t in tabs],
+           'styles': len({r['style'] for r in res['rows']}),
+           'units': sum(units_by.values()),
+           'allocations': sorted({i['allocation'] for t in tabs for i in t['items']}),
+           'columns': _ALLOC_SHEET_HEADERS[1:],
+           'basis': ('open allocations on the APO file (no customer PO yet); Production # / Arrival / Warehouse = '
+                     'what covers them, warehouse stock first, then production by arrival'),
+           'note': 'give the user this link as a clickable download'}
+    if res['held']['lines']:
+        out['held_back_substitutes'] = {'lines': res['held']['lines'], 'units': res['held']['units'],
+                                        'note': 'substitute allocations are never shown'}
+    if not res['held']['subs_check_ok']:
+        out['substitute_check_warning'] = ('the open-orders substitute list could not be fully read, so only '
+                                           'allocations named SUB were certainly held back')
+    if res['mismatches']:
+        out['style_mismatches'] = res['mismatches']
     return out
 
 
@@ -21163,13 +21331,448 @@ def _pres_order_cards(params, spec):
     return out
 
 
-def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_cost=True, doc_title='Presentation'):
+# ── Customer decks and sheets: booked allocations, shipped history (Oct 29 2026) ──
+# David: "train the email bot to create line sheets and presentations that showcase
+# current allocations for a specific customer, by brand if requested". The first ask
+# was Ross x Von Dutch: what is on order, what already shipped and when, and the
+# spring booked goods (an allocation with no PO yet).
+#
+# BOOKED = the customer's open APO allocations (Dropbox APO.csv, the /apo feed). APO
+# names customers in free text ('ROSS', 'Ross', 'BURLINGTON ', 'MACY BACKSTAGE'), never
+# by A2000 code, so names are matched on their own terms here. Substitute allocations
+# are ALWAYS held back (apo_subs, David Oct 6 2026), here as in the Big 3 reports: a
+# file that leaves the building must never show the buyer a substitute.
+#
+# SUPPLY on a booked line follows the weekly allocation workbook's documented simple
+# rule (build_apo_brandcolor_excel): free warehouse stock first, then production FIFO
+# by arrival, restricted stock and hidden-landing lots last. When the allocated style
+# has no stock and no production at all, but the allocation names its production
+# ('... PC26051') and that production carries the same customer, brand, serial, fit
+# and collar under another fabric code, the line takes that production's arrival and
+# the mismatch is reported: the platform matches allocations by exact style, so the
+# production's style counts as available to sell (a Ross spring booking, Oct 29 2026).
+
+_APO_CUST_ALIASES = {
+    # A2000 codes and common spellings -> the APO customer name (normalized)
+    'ROSS STORES': 'ROSS', 'ROSS DRESS FOR LESS': 'ROSS',
+    'BURL': 'BURLINGTON', 'BURLINGTON STORES': 'BURLINGTON', 'BURLINGTON COAT FACTORY': 'BURLINGTON',
+    'TJMA': 'TJX', 'MARS': 'TJX', 'TJ MAXX': 'TJX', 'TJMAXX': 'TJX', 'MARSHALLS': 'TJX',
+    'TJXUK': 'TKX', 'TJX UK': 'TKX', 'TK MAXX': 'TKX', 'TKMAXX': 'TKX',
+    'TJXAU': 'TKX AUSTRALIA', 'TJX AUSTRALIA': 'TKX AUSTRALIA', 'TK MAXX AUSTRALIA': 'TKX AUSTRALIA',
+    'MACY1': 'MACY BACKSTAGE', 'BACKSTAGE': 'MACY BACKSTAGE', 'MACYS BACKSTAGE': 'MACY BACKSTAGE',
+    'MACYS': 'MACY',
+    'DDS': 'DD', 'DDS DISCOUNTS': 'DD', 'DD DISCOUNTS': 'DD',
+    'COST': 'COSTCO US', 'COSTCO USA': 'COSTCO US', 'COST1': 'COSTCO CANADA',
+    'HALF': 'HALF PRICE', 'HALFPRICE': 'HALF PRICE',
+    'HAMR': 'HAMRICK', 'HAMRICKS': 'HAMRICK',
+    'NORD': 'NORDSTROM', 'NORDSTROM RACK': 'NORDSTROM',
+    'MENS': 'MEN WARHOUSE', 'MENS WEARHOUSE': 'MEN WARHOUSE', 'MEN WEARHOUSE': 'MEN WARHOUSE',
+    'MULT': 'PROMODA', 'MULT1': 'PROMODA', 'GLOB': 'BBZ',
+    'PEER': 'WALMART PEERLESS', 'PEERLESS': 'WALMART PEERLESS', 'WALM1': 'WALMART',
+    'BEAL': 'BEALL', 'BEALLS': 'BEALL', 'FORM': 'FORMAN', 'FORMAN MILLS': 'FORMAN',
+    'KOHLS': 'KOHL', 'JCPENNEY': 'JCP', 'JC PENNEY': 'JCP', 'BJ': 'BJS', 'PETER HARRIS': 'PETER',
+}
+_APO_PROD_TOKEN = re.compile(r'\b([A-Z]{2}\d{5})\b')
+_ALLOC_NAME_CAP = 32
+
+
+def _apo_cust_norm(s):
+    """'Macy's Backstage ' -> 'MACYS BACKSTAGE', 'WALMART-PEERLESS' -> 'WALMART PEERLESS'."""
+    s = str(s or '').upper().replace("'", '').replace('’', '')
+    return re.sub(r'[^A-Z0-9]+', ' ', s).strip()
+
+
+def _apo_customer_names():
+    """{normalized customer: [names as typed in APO]} for every customer with an open allocation."""
+    with _apo_lock:
+        rows = list(_apo_data or [])
+    if not rows:
+        try:
+            load_apo_from_dropbox()
+        except Exception:
+            pass
+        with _apo_lock:
+            rows = list(_apo_data or [])
+    out = {}
+    for a in rows:
+        raw = str((a or {}).get('customer') or '')
+        n = _apo_cust_norm(raw)
+        if n and _pres_int((a or {}).get('qty')) > 0:
+            lst = out.setdefault(n, [])
+            if raw not in lst:
+                lst.append(raw)
+    return out
+
+
+def _apo_customer_resolve(query, combine=False):
+    """({normalized APO customer names}, None) or (set(), error dict). An exact name or
+    a known alias wins ('Ross' = ROSS, 'BURL' = BURLINGTON); then whole words ('Macy
+    Backstage'); then any part of a name. Several customers only with combine."""
+    names = _apo_customer_names()
+    q = _apo_cust_norm(query)
+    if not q:
+        return set(), {'error': 'customer is required (for example Ross)'}
+    q = _APO_CUST_ALIASES.get(q, q)
+    if q in names:
+        return {q}, None
+    hits = [n for n in names if n.startswith(q + ' ') or q.startswith(n + ' ')] or \
+        [n for n in names if q in n]
+    if not hits:
+        return set(), {'error': f"no open allocations for '{query}'",
+                       'allocation_customers': sorted(names),
+                       'hint': ('these are the customers with open allocations; never substitute a '
+                                'different customer for the one asked about')}
+    if len(hits) > 1 and not combine:
+        return set(), {'error': 'several allocation customers match that name',
+                       'customers_matched': sorted(hits),
+                       'hint': ('call again with one exact name from customers_matched, or set '
+                                'combine_customers true for one combined deck')}
+    return set(hits), None
+
+
+def _alloc_supply_ctx():
+    """What the booked-line supply rule reads: inventory per base (one row per exact SKU
+    first, physical stock summed and committed/allocated at the largest magnitude, the
+    BUGBSA002SLS merge rule) and the production ledger per base and per production #."""
+    with _inv_lock:
+        items = list(_inventory.get('items') or [])
+    per_sku = {}
+    for it in items:
+        sku = str(it.get('sku') or '').strip().upper()
+        if not sku:
+            continue
+        m = per_sku.setdefault(sku, {'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'abfi': 0,
+                                     'incoming': 0, 'committed': 0, 'allocated': 0})
+        for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming'):
+            m[k] += _pres_int(it.get(k))
+        for k in ('committed', 'allocated'):
+            v = _pres_int(it.get(k))
+            if abs(v) > abs(m[k]):
+                m[k] = v
+    inv = {}
+    for sku, m in per_sku.items():
+        b = get_base_style(sku)
+        if not b:
+            continue
+        d = inv.setdefault(b, {k: 0 for k in m})
+        for k, v in m.items():
+            d[k] += v
+    by_base, by_no = {}, {}
+    for p in _ledger_rows():
+        st = str(p.get('style') or '').strip().upper()
+        if not st or _pres_int(p.get('units')) <= 0:
+            continue
+        by_base.setdefault(get_base_style(st), []).append(p)
+        no = str(p.get('production') or '').strip().upper()
+        if no:
+            by_no.setdefault(no, []).append(p)
+    return {'inv': inv, 'by_base': by_base, 'by_no': by_no}
+
+
+def _alloc_twin_lots(base, names, ctx):
+    """(production style, its lots) when the allocated style has no stock and no
+    production, an allocation name names a production, and that production carries the
+    same customer, brand, serial, fit and collar under another fabric code. Else (None, [])."""
+    if len(base) < 10:
+        return None, []
+    for name in names:
+        for no in _APO_PROD_TOKEN.findall(str(name or '').upper()):
+            twins = {}
+            for p in ctx['by_no'].get(no, []):
+                st = get_base_style(str(p.get('style') or '').strip().upper())
+                if st != base and len(st) == len(base) and st[:4] == base[:4] and st[6:] == base[6:]:
+                    twins.setdefault(st, []).append(p)
+            if len(twins) == 1:
+                st = next(iter(twins))
+                return st, twins[st]
+    return None, []
+
+
+def _alloc_supply_texts(base, qtys, names, ctx):
+    """Supply for one style's booked lines, in order, from ONE pool: [(text, sort key,
+    production #s, took warehouse stock)] plus the twin (production style or None).
+    Texts: 'In warehouse', '<arrival date>' (the last lot a line needs), 'TBD'
+    (production without a date) or 'Not on production'. The files never name a twin:
+    they may go to the buyer, so the mismatch travels in the tool result only."""
+    inv = ctx['inv'].get(base)
+    lots = list(ctx['by_base'].get(base, []))
+    twin = None
+    if not lots and not (inv and (inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa'] + inv['nj'] + inv['abfi']
+                                  + inv['incoming']) > 0):
+        twin, lots = _alloc_twin_lots(base, names, ctx)
+    total = sum(qtys)
+    wh_free = wh_free_r = 0
+    if inv:
+        restricted = sum(max(0, inv.get(k, 0)) for k in _RESTRICTED_KEYS)
+        wh_all = inv['jtw'] + inv['tr'] + inv['dcw'] + inv['qa'] + restricted
+        # committed/allocated are NEGATIVE in the feed and 'allocated' already holds
+        # this customer's booked units: add them back (the weekly workbook's rule)
+        free_all = max(0, min(wh_all, wh_all + inv['committed'] + inv['allocated'] + total))
+        wh_free_r = min(free_all, restricted)
+        wh_free = free_all - wh_free_r
+    try:
+        pants = bool(_py_is_bottom(base))
+    except Exception:
+        pants = False
+
+    def arr(p):
+        try:
+            return _apo_prod_arrival(p, pants)
+        except Exception:
+            return None
+    last = datetime.max.date()
+    visible = sorted([p for p in lots if str(p.get('warehouse') or '').upper() not in _HIDDEN_LANDING_WH],
+                     key=lambda p: (arr(p) is None, arr(p) or last))
+    hidden = sorted([p for p in lots if str(p.get('warehouse') or '').upper() in _HIDDEN_LANDING_WH],
+                    key=lambda p: (arr(p) is None, arr(p) or last))
+    pool = [['wh', wh_free, None, '']] + \
+        [['lot', _pres_int(p.get('units')), arr(p), str(p.get('production') or '').strip()] for p in visible] + \
+        [['wh', wh_free_r, None, '']] + \
+        [['lot', _pres_int(p.get('units')), arr(p), str(p.get('production') or '').strip()] for p in hidden]
+    out = []
+    for q in qtys:
+        need, used_wh, gate, tbd, pulls = q, False, None, False, []
+        for slot in pool:
+            if need <= 0:
+                break
+            take = min(need, slot[1])
+            if take <= 0:
+                continue
+            slot[1] -= take
+            need -= take
+            if slot[0] == 'wh':
+                used_wh = True
+                continue
+            if slot[3] and slot[3] not in pulls:
+                pulls.append(slot[3])
+            if slot[2] is None:
+                tbd = True
+            elif gate is None or slot[2] > gate:
+                gate = slot[2]
+        if tbd:
+            text, key = 'TBD', '9998'
+        elif gate:
+            text, key = _apo_fmt_date(gate), gate.isoformat()
+        elif used_wh and need <= 0:
+            text, key = 'In warehouse', '0000'
+        elif used_wh:
+            text, key = 'Part in warehouse', '0001'
+        else:
+            text, key = 'Not on production', '9999'
+        out.append((text, key, pulls, used_wh))
+    return out, twin
+
+
+def _customer_alloc_rows(cust_q, spec, combine=False):
+    """One customer's open allocations as booked lines (substitutes held back), each with
+    its supply. Returns {'rows', 'customers', 'held', 'mismatches', 'stats'} or {'error'}."""
+    names, err = _apo_customer_resolve(cust_q, combine)
+    if err:
+        return err
+    raw_by_norm = _apo_customer_names()
+    seen, kept, hidden = set(), [], []
+    subs_ok = po_map_ok = True
+    for n in sorted(names):
+        for raw in raw_by_norm.get(n, []):
+            key = raw.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rep = _apo_report_rows(raw)
+            kept.extend(rep['rows'])
+            hidden.extend(rep['hidden'])
+            subs_ok = subs_ok and bool(rep['subs_ok'])
+            po_map_ok = po_map_ok and bool(rep['po_map_ok'])
+    prefixes = sorted({r.strip() for n in names for r in raw_by_norm.get(n, []) if r.strip()}, key=len, reverse=True)
+
+    def short(name):
+        s = str(name or '').strip()
+        for p in prefixes:
+            rest = s[len(p):]
+            if s.upper().startswith(p.upper()) and not (rest[:1].isalnum()):
+                s = re.sub(r'^[\s\-:|/,.]+', '', rest)
+                break
+        s = s or str(name or '').strip()
+        return s if len(s) <= _ALLOC_NAME_CAP else s[:_ALLOC_NAME_CAP - 1].rstrip() + '…'
+    lines = {}
+    for a in kept:
+        sku = str(a.get('style') or '').strip().upper()
+        qty = _pres_int(a.get('qty'))
+        if not sku or qty <= 0:
+            continue
+        base = sku.split('-')[0]
+        brand = _pres_card_brand(sku)
+        if not _pres_passes(spec, sku, base, brand):
+            continue
+        name = str(a.get('po') or '').strip()
+        ln = lines.setdefault((sku, name), {'style': sku, 'base': base, 'brand': brand, 'name': name,
+                                            'short': short(name), 'qty': 0})
+        ln['qty'] += qty
+    ctx = _alloc_supply_ctx() if lines else None
+    by_base = {}
+    for ln in lines.values():
+        by_base.setdefault(ln['base'], []).append(ln)
+    mismatches = []
+    for base, lst in by_base.items():
+        lst.sort(key=lambda x: (x['name'], x['style']))
+        texts, twin = _alloc_supply_texts(base, [x['qty'] for x in lst], [x['name'] for x in lst], ctx)
+        inv = ctx['inv'].get(base) or {}
+        whs = [n for n, k in (('JTW', 'jtw'), ('TR', 'tr'), ('DCW', 'dcw'), ('QA', 'qa')) if inv.get(k, 0) > 0]
+        for x, (text, key, pulls, used_wh) in zip(lst, texts):
+            x['supply'], x['supply_key'], x['twin'] = text, key, twin
+            x['production'] = ', '.join(pulls)
+            x['warehouse'] = (', '.join(whs) or 'In warehouse') if used_wh else ''
+        if twin:
+            nos = sorted({no for x in lst for no in _APO_PROD_TOKEN.findall(x['name'].upper())})
+            mismatches.append({'allocated_style': base, 'production_style': twin,
+                               'production': ', '.join(nos), 'units': sum(x['qty'] for x in lst),
+                               'note': (f'Booked as {base}, but production {", ".join(nos)} carries it as {twin}. '
+                                        f'Allocations match by exact style, so {twin} counts as available '
+                                        f'to sell on the platform.')})
+    rows = sorted(lines.values(), key=lambda x: (x['name'], -x['qty'], x['style']))
+    label = ' + '.join(sorted({max(raw_by_norm.get(n, [n]), key=len).strip() for n in names}))
+
+    def in_scope(a):
+        sku = str(a.get('style') or '').strip().upper()
+        return bool(sku) and _pres_passes(spec, sku, sku.split('-')[0], _pres_card_brand(sku))
+    held = apo_subs.summary([a for a in hidden if in_scope(a)], [], subs_ok, 0, po_map_ok=po_map_ok)
+    return {'rows': rows, 'customers': sorted(names), 'customer_label': label,
+            'held': {'lines': held['lines'], 'units': held['units'], 'styles': held['styles'],
+                     'subs_check_ok': held['subs_ok'] and held['po_map_ok']},
+            'mismatches': sorted(mismatches, key=lambda m: m['allocated_style']),
+            'stats': {'allocation_lines': len(kept), 'allocation_units': sum(_pres_int(a.get('qty')) for a in kept)}}
+
+
+def _pres_alloc_cards(params, spec):
+    """One card per allocated style: a row per allocation (name, units, supply)."""
+    if not str(params.get('customer') or '').strip():
+        return {'error': "customer is required for source 'allocations' (for example 'Ross')"}
+    res = _customer_alloc_rows(params.get('customer'), spec, bool(params.get('combine_customers')))
+    if res.get('error'):
+        return res
+    min_units = _pres_int(params.get('min_units'))
+    by_sku = {}
+    for r in res['rows']:
+        card = by_sku.setdefault(r['style'], {'sku': r['style'], 'base': r['base'], 'brand': r['brand'], 'lines': []})
+        card['lines'].append({'po': r['short'], 'units': r['qty'], 'cost': 0, 'when': r['supply'],
+                              'date': r['supply_key'], 'name': r['name']})
+    cards = []
+    for card in by_sku.values():
+        total = sum(x['units'] for x in card['lines'])
+        if total < min_units:
+            continue
+        color, fit, fab = _pres_details(card['sku'], card['base'], card['brand'])
+        if not _pres_color_ok(color, card['brand'], spec['color']):
+            continue
+        cards.append(dict(card, color=color, fab=fab, fit=fit, number=total, first=card['lines'][0]['name']))
+    return {'cards': cards, 'customers': {res['customer_label']: sum(c['number'] for c in cards)},
+            'held': res['held'], 'mismatches': res['mismatches'], 'stats': res['stats']}
+
+
+def _customer_period(params):
+    """(lo, hi, label) from from/to, else month, else year: the build_sales_sheet rule."""
+    from_q = str(params.get('from') or '').strip()
+    to_q = str(params.get('to') or '').strip()
+    year_q = str(params.get('year') or '').strip()
+    month_q = str(params.get('month') or '').strip()
+    if not from_q and not to_q:
+        if month_q:
+            from_q, to_q = month_q + '-01', month_q + '-31'
+        elif year_q:
+            from_q, to_q = year_q + '-01-01', year_q + '-12-31'
+    label = (f"{from_q or 'start of history'} to {to_q or 'today'}" if (from_q or to_q) else 'Full history')
+    return from_q or '0000-00-00', to_q or '9999-99-99', label
+
+
+def _pres_shipped_cards(params, spec):
+    """One card per style the customer was shipped: a row per PO with units, cost and the
+    ship date (invoice date; 'est.' for shipped-awaiting-invoice estimates). Same data and
+    rules as build_sales_sheet's Invoiced and 'Shipped, not yet invoiced' tabs."""
+    cust_q = str(params.get('customer') or '').strip()
+    if not cust_q:
+        return {'error': "customer is required for source 'shipped' (for example 'Ross')"}
+    code, err, entry = _sales_resolve_customer_ex(cust_q)
+    if err:
+        return err
+    full_name = (entry or {}).get('full') or code
+    lo, hi, period = _customer_period(params)
+    inv_pos, pend_rows, _basis, notes, payloads = _customer_history(
+        code, entry, lo, hi, {'invoiced', 'shipped_pending'})
+    meta = _history_info(*payloads, sales_summary=_sales_summary_quiet())
+    by_sku, timeline = {}, {}
+    skipped = {'lines': 0, 'units': 0}
+
+    def add(style, po, qty, cost, when, d, status):
+        sku = str(style or '').strip().upper()
+        base = get_base_style(sku)
+        if not sku or qty <= 0:
+            return
+        brand = _pres_card_brand(sku)
+        if not _pres_passes(spec, sku, base, brand):
+            return
+        if not _APO_MODERN_RE.match(base) and not _PRES_LETTER_SERIAL_RE.match(base):
+            # legacy invoice labels (JONESNY, NAU-AST): no photo to show, so no card
+            skipped['lines'] += 1
+            skipped['units'] += qty
+            return
+        card = by_sku.setdefault(sku, {'sku': sku, 'base': base, 'brand': brand, 'lines': []})
+        card['lines'].append({'po': po, 'units': qty, 'cost': cost, 'when': when, 'date': d})
+        t = timeline.setdefault((po, status), {'po': po, 'date': d, 'status': status, 'styles': set(),
+                                               'units': 0, 'value': 0.0})
+        t['date'] = max(t['date'], d)
+        t['styles'].add(sku)
+        t['units'] += qty
+        t['value'] += qty * cost
+    for p in inv_pos:
+        d = str(p.get('lastInv') or p.get('firstInv') or '')[:10]
+        dd = _apo_parse_date(d)
+        for l in (p.get('lines') or []):
+            q = _sisc(l.get('qty'))
+            v = _sfsc(l.get('value'))
+            add(l.get('style'), str(p.get('po') or ''), q, round(v / q, 2) if q else 0.0,
+                _apo_fmt_date(dd) if dd else d, d, 'Invoiced')
+    for r in pend_rows:
+        d = str(r.get('last') or r.get('first') or '')[:10]
+        dd = _apo_parse_date(d)
+        if not r.get('style'):
+            skipped['lines'] += 1
+            skipped['units'] += _sisc(r.get('qty'))
+            continue
+        add(r['style'], str(r.get('po') or ''), _sisc(r.get('qty')), _sfsc(r.get('price')),
+            (_apo_fmt_date(dd) if dd else d) + ' est.', d,
+            str(r.get('status') or '') or 'Shipped, awaiting invoice (estimate)')
+    min_units = _pres_int(params.get('min_units'))
+    cards = []
+    for card in by_sku.values():
+        card['lines'].sort(key=lambda x: (x['date'], x['po']), reverse=True)
+        total = sum(x['units'] for x in card['lines'])
+        if total < min_units:
+            continue
+        color, fit, fab = _pres_details(card['sku'], card['base'], card['brand'])
+        if not _pres_color_ok(color, card['brand'], spec['color']):
+            continue
+        cards.append(dict(card, color=color, fab=fab, fit=fit, number=total, first=card['lines'][0]['date']))
+    pos = sorted(({**t, 'styles': len(t['styles']), 'value': round(t['value'], 2)} for t in timeline.values()),
+                 key=lambda t: (t['date'], t['po']), reverse=True)
+    return {'cards': cards, 'customers': {full_name: sum(c['number'] for c in cards)}, 'code': code,
+            'customer_full': full_name, 'period': period, 'pos': pos, 'meta': meta, 'notes': notes,
+            'legacy_skipped': skipped}
+
+
+def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_cost=True, doc_title='Presentation',
+                     cover=None):
     """Draw the deck (the platform's Presentation Mode layout, in points: 1 CSS px of
-    the HTML deck = 0.75 pt). Returns (pdf bytes, page count)."""
+    the HTML deck = 0.75 pt). Returns (pdf bytes, page count).
+    A group may carry 'opts' for its own pages (customer decks put a booked, an on-order
+    and a shipped section in one PDF): po_hdr, date_hdr, total_label, show_cost,
+    count_word, more_word, headline, footer_note. A table line with 'when' prints that
+    text in the date column instead of a ship window. cover(c, PW, PH, total_pages)
+    draws a first page; the page numbers count it."""
     from reportlab.lib.pagesizes import landscape
     from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.lib.utils import simpleSplit
     PW, PH = landscape(letter)
+    go = {}   # the options of the group being drawn
     M = 25.2                                   # 0.35 in page margin
     X0, X1, YT, YB = M, PW - M, PH - M, M
     cols = max(2, density // 2)
@@ -21229,14 +21832,15 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
             ht = 3 + (max(f_num * 1.25, ch_h if chip else 0) if same else f_num * 1.25 + 2 + ch_h)
             rows.append(('stat', (num, nw, chip, same, ch_h), ht))
         else:
-            hdr = ['PO #', 'Units'] + (['Cost'] if show_cost else []) + ['Ship window']
+            sc = go.get('show_cost', show_cost)
+            hdr = [go.get('po_hdr', 'PO #'), 'Units'] + (['Cost'] if sc else []) + [go.get('date_hdr', 'Ship window')]
             fonts = ['Courier-Bold'] + ['Helvetica'] * (len(hdr) - 1)
             body = []
             for ln in cd['lines']:
                 row = [ln['po'], f"{ln['units']:,}"]
-                if show_cost:
+                if sc:
                     row.append(f"${ln['cost']:,.2f}" if ln['cost'] else '')
-                row.append(_pres_window(ln['start'], ln['cancel']))
+                row.append(ln['when'] if ln.get('when') is not None else _pres_window(ln['start'], ln['cancel']))
                 body.append(row)
             fs, gapc = f_tab, 4.0
             widths = []
@@ -21340,14 +21944,15 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
                 if n_more:
                     c.setFont('Helvetica-Oblique', fs)
                     c.setFillColor(MUTED)
+                    word = go.get('more_word', 'PO')
                     c.drawString(tx, ry - row_h / 2 - fs * 0.34,
-                                 f"+ {n_more} more PO{'s' if n_more != 1 else ''} ({more_units:,} units)")
+                                 f"+ {n_more} more {word}{'s' if n_more != 1 else ''} ({more_units:,} units)")
                     ry -= row_h
                 if show_total:
                     c.setFont('Helvetica-Bold', f_chip)
                     c.setFillColor(GREEN)
                     c.drawString(tx, ry - 2 - (f_chip * 1.45) / 2 - f_chip * 0.34,
-                                 f"Total on order: {total_units:,} units")
+                                 f"{go.get('total_label', 'Total on order')}: {total_units:,} units")
             cur -= ht
 
     pages = []
@@ -21360,8 +21965,15 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
     c = pdf_canvas.Canvas(buf, pagesize=(PW, PH))
     c.setTitle(doc_title)
     c.setAuthor('Versa Group')
-    total = len(pages)
+    off = 1 if cover else 0
+    total = len(pages) + off
+    if cover:
+        cover(c, PW, PH, total)
+        if pages:
+            c.showPage()
     for pi, (g, chunk, part, parts) in enumerate(pages):
+        go.clear()
+        go.update(g.get('opts') or {})
         if pi:
             c.showPage()
         lh = 30.0
@@ -21386,12 +21998,13 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
             meta = f"{date_label} · {n} style{'s' if n != 1 else ''} · {units:,} units"
         if orders_mode:
             npo = len({ln['po'] for cd in g['cards'] for ln in cd['lines']})
-            meta += f" · {npo} PO{'s' if npo != 1 else ''}"
+            word = go.get('count_word', 'PO')
+            meta += f" · {npo} {word}{'s' if npo != 1 else ''}"
         if parts > 1:
             meta += f" · {part} of {parts}"
         c.setFillColor(MUTED)
         c.setFont('Helvetica-Bold', 7.1)
-        c.drawRightString(X1, hy + lh / 2 + 2.2, fit_text(headline, 'Helvetica-Bold', 7.1, 262))
+        c.drawRightString(X1, hy + lh / 2 + 2.2, fit_text(go.get('headline') or headline, 'Helvetica-Bold', 7.1, 262))
         c.setFont('Helvetica', 7.1)
         c.drawRightString(X1, hy + lh / 2 - 8.1, meta)
         rule_y = hy - 4.5
@@ -21404,7 +22017,9 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
         c.setFont('Helvetica', 6.4)
         c.setFillColor(FAINT)
         c.drawString(X0, YB + 3, 'Versa Group LLC · Original Brands')
-        c.drawRightString(X1, YB + 3, f'{date_label} · Page {pi + 1} of {total}')
+        c.drawRightString(X1, YB + 3, f'{date_label} · Page {pi + 1 + off} of {total}')
+        if go.get('footer_note'):
+            c.drawCentredString((X0 + X1) / 2, YB + 3, fit_text(go['footer_note'], 'Helvetica', 6.4, X1 - X0 - 330))
         gtop, gbot, gap = rule_y - 1.2 - 7.5, YB + 10.5 + 6, 7.5
         cw = (X1 - X0 - gap * (cols - 1)) / cols
         chh = (gtop - gbot - gap) / 2
@@ -21413,6 +22028,418 @@ def _pres_render_pdf(groups, headline, date_label, density, orders_mode, show_co
             draw_card(cd, X0 + k * (cw + gap), gtop - r * (chh + gap) - chh, cw, chh)
     c.save()
     return buf.getvalue(), total
+
+
+_PRES_SECTION_ALIASES = {
+    'allocations': 'allocations', 'allocation': 'allocations', 'allocated': 'allocations', 'booked': 'allocations',
+    'booking': 'allocations', 'bookings': 'allocations', 'apo': 'allocations',
+    'open_orders': 'open_orders', 'on_order': 'open_orders', 'orders': 'open_orders', 'open': 'open_orders',
+    'pos': 'open_orders', 'open_pos': 'open_orders',
+    'shipped': 'shipped', 'history': 'shipped', 'shipped_history': 'shipped', 'invoiced': 'shipped',
+    'past': 'shipped', 'past_orders': 'shipped', 'sold': 'shipped',
+}
+_PRES_SECTION_ORDER = ('allocations', 'open_orders', 'shipped')
+_PRES_SECTION_LABEL = {'allocations': 'Booked', 'open_orders': 'On Order', 'shipped': 'Shipped'}
+
+
+def _pres_section_list(raw):
+    """sections param -> canonical names in the deck's order (booked, on order, shipped)."""
+    if isinstance(raw, str):
+        raw = re.split(r'[,;/+&]|\band\b', raw)
+    got = set()
+    for x in raw or []:
+        k = _PRES_SECTION_ALIASES.get(re.sub(r'[\s\-]+', '_', str(x or '').strip().lower()))
+        if k:
+            got.add(k)
+    return [s for s in _PRES_SECTION_ORDER if s in got]
+
+
+def _pres_customer_deck(src, params, spec, density, admin_ok):
+    """Decks about ONE customer: booked allocations ('allocations'), shipped history
+    ('shipped', admins only) or all of it in one PDF ('account': a summary page, then a
+    Booked, an On Order and a Shipped section, each brand on its own pages)."""
+    notes = []
+    if src == 'account':
+        sections = _pres_section_list(params.get('sections')) or list(_PRES_SECTION_ORDER)
+    else:
+        sections = [src]
+    if 'shipped' in sections and not admin_ok:
+        if sections == ['shipped']:
+            return {'error': 'Shipped history (invoices and past orders) is available to admins only.',
+                    'admin_only': True}
+        sections.remove('shipped')
+        notes.append('Shipped history is admin only, so the deck shows booked and on-order goods only.')
+    cust_q = str(params.get('customer') or '').strip()
+    if not cust_q:
+        return {'error': f"customer is required for source '{src}' (for example 'Ross')"}
+    results, empty = {}, {}
+    for s in sections:
+        if s == 'allocations':
+            r = _pres_alloc_cards(params, spec)
+        elif s == 'open_orders':
+            r = _pres_order_cards({k: v for k, v in params.items() if k != 'pos'}, spec)
+        else:
+            r = _pres_shipped_cards(params, spec)
+        if r.get('customers_matched') or r.get('ambiguous_customer'):
+            return dict(r, section=s)
+        if r.get('error') or not r.get('cards'):
+            if src != 'account':
+                out = dict(r) if r.get('error') else {'error': 'no styles matched these filters', 'source': src}
+                out.pop('held', None)
+                out.setdefault('customer', cust_q)
+                return out
+            empty[s] = r.get('error') or 'nothing matched these filters'
+            continue
+        results[s] = r
+    if not results:
+        return {'error': 'nothing booked, on order or shipped matched for this customer and these filters',
+                'sections_empty': empty, 'notes': notes}
+
+    # Sections in deck order, brands A-Z inside each; booked by allocation then size,
+    # on order by first ship window, shipped newest first.
+    ordered = []
+    for s in sections:
+        if s not in results:
+            continue
+        cs = sorted(results[s]['cards'], key=lambda cd: cd['sku'])
+        if s == 'allocations':
+            cs.sort(key=lambda cd: (cd['first'], -cd['number']))
+        elif s == 'open_orders':
+            cs.sort(key=lambda cd: cd['first'])
+        else:
+            cs.sort(key=lambda cd: cd['first'], reverse=True)
+        cs.sort(key=lambda cd: (_pres_brand_name(cd['brand']).upper(), cd['brand']))
+        ordered.extend((s, cd) for cd in cs)
+    dropped = ordered[_PRES_MAX_CARDS:]
+    ordered = ordered[:_PRES_MAX_CARDS]
+
+    cust_label = (next(iter(results['open_orders']['customers']), '') if 'open_orders' in results else '') or \
+        ((results.get('shipped') or {}).get('customer_full') or '') or \
+        next(iter((results.get('allocations') or {}).get('customers') or {}), cust_q)
+    if cust_label.upper() == cust_q.upper():
+        cust_label = cust_q          # 'ROSS' on the APO file reads as the person typed it
+    short = _pres_customer_short(cust_q, cust_label) or cust_q
+    deck_brands = sorted({cd['brand'] for _s, cd in ordered})
+    brand_words = _pres_brand_name(deck_brands[0]) if (len(deck_brands) == 1 and spec['brands']) else ''
+    title = _pres_title_core(params.get('title'), [cust_label, short, cust_q, 'booked', 'shipped', 'allocations']) \
+        or brand_words
+    sect_words = ' '.join(_PRES_SECTION_LABEL[s] for s in sections if s in results)
+    headline = ' · '.join(x for x in ('Versa Group', cust_label, title) if x)
+    if src != 'account':
+        headline += f' · {_PRES_SECTION_LABEL[src]}'
+    stem = ' '.join(x for x in (short, title, sect_words, 'Presentation') if x)
+    uniq = {cd['sku']: cd for _s, cd in ordered}
+    photos = dict(_pres_parallel(lambda cd: (cd['sku'], _pres_photo_jpeg(cd['sku'], cd['brand'])),
+                                 list(uniq.values()), 12))
+    logos = dict(_pres_parallel(lambda k: (k, _pres_logo_png(k)), sorted({cd['brand'] for _s, cd in ordered}), 6))
+    now = _pres_now_et()
+    date_label = _apo_fmt_date(now)
+    hist = (results.get('shipped') or {}).get('meta') or {}
+    twins = (results.get('allocations') or {}).get('mismatches') or []
+    sect_opts = {
+        'allocations': {'po_hdr': 'Allocation', 'date_hdr': 'Arrives', 'total_label': 'Total booked',
+                        'show_cost': False, 'count_word': 'allocation', 'more_word': 'allocation',
+                        'footer_note': 'Booked = allocated, no customer PO yet. Arrives = when the goods land.'},
+        'open_orders': {'footer_note': 'Open A2000 POs' + ('' if params.get('include_bulks') else ', bulks excluded') + '.'},
+        'shipped': {'date_hdr': 'Shipped', 'total_label': 'Total shipped',
+                    'footer_note': ((hist.get('history_label') or '').split(' Shipments after')[0]
+                                    + ' Dates marked est. are order-book estimates awaiting invoice.').strip()},
+    }
+    groups = []
+    for s, cd in ordered:
+        cd['photo'] = photos.get(cd['sku'])
+        if not groups or groups[-1]['key'] != (s, cd['brand']):
+            name = _pres_brand_name(cd['brand'])
+            groups.append({'key': (s, cd['brand']), 'section': s,
+                           'name': f"{name} · {_PRES_SECTION_LABEL[s]}" if src == 'account' else name,
+                           'logo': logos.get(cd['brand']), 'cards': [],
+                           'opts': dict(sect_opts[s], headline=headline)})
+        groups[-1]['cards'].append(cd)
+
+    def sect_cards(s):
+        return [cd for s2, cd in ordered if s2 == s]
+    summary = {}
+    for s in sections:
+        cs = sect_cards(s)
+        if not cs:
+            continue
+        lines = [ln for cd in cs for ln in cd['lines']]
+        e = {'styles': len(cs), 'units': sum(cd['number'] for cd in cs)}
+        if s == 'allocations':
+            e['allocations'] = len({ln['name'] for ln in lines})
+        else:
+            e['pos'] = len({ln['po'] for ln in lines})
+            e['value'] = round(sum(ln['units'] * (ln['cost'] or 0) for ln in lines), 2)
+        summary[s] = e
+    from html import unescape
+    fname = unescape(unescape(str(params.get('filename') or ''))).strip() or stem
+    if fname.lower().endswith('.pdf'):
+        fname = fname[:-4]
+    fname = re.sub(r'\s{2,}', ' ', re.sub(r'[^A-Za-z0-9 &_.()-]+', '', fname)).strip() or 'Presentation'
+    cover = None
+    if src == 'account':
+        cover = _pres_account_cover({
+            'title': ' · '.join(x for x in (cust_label, title) if x), 'date_label': date_label,
+            'logo': logos.get(deck_brands[0]) if len(deck_brands) == 1 else None,
+            'hist_label': hist.get('history_label') or '', 'sections': sections, 'summary': summary,
+            'cards': {s: sect_cards(s) for s in sections}, 'shipped_pos': (results.get('shipped') or {}).get('pos') or []})
+    pdf, page_count = _pres_render_pdf(groups, headline, date_label, density, True,
+                                       show_cost=params.get('show_cost') is not False, doc_title=fname, cover=cover)
+    key = f"claude uploaded/{fname} {now.strftime('%m.%d.%y %H%M%S')}.pdf"
+    get_s3().put_object(Bucket=S3_BUCKET, Key=key, Body=pdf, ContentType='application/pdf')
+    from urllib.parse import quote
+    url = f"https://{S3_BUCKET}.s3.us-east-2.amazonaws.com/{quote(key)}"
+    out = {'download_url': url, 'format': 'PDF presentation (photo cards)', 'source': src,
+           'customer': cust_label, 'sections': [s for s in sections if s in summary],
+           'cards_per_page': density, 'pages': page_count,
+           'styles': len(uniq), 'by_section': {_PRES_SECTION_LABEL[s]: v for s, v in summary.items()},
+           'groups': [{'name': g['name'], 'styles': len(g['cards']), 'units': sum(cd['number'] for cd in g['cards']),
+                       'pages': (len(g['cards']) + density - 1) // density} for g in groups],
+           'missing_photos': [cd['sku'] for cd in uniq.values() if not cd.get('photo')][:40],
+           'note': ('Give the user this link as a clickable download. It is a print-ready PDF presentation of '
+                    'photo cards, not a line sheet.')}
+    if src == 'account':
+        out['summary_page'] = 'page 1 summarises every section and lists the shipped and on-order POs by date'
+    if 'allocations' in results:
+        a = results['allocations']
+        out['booked_basis'] = ('open allocations on the APO file (no customer PO yet); Arrives = the stock or '
+                               'production that covers them (warehouse first, then production by arrival)')
+        if a['held']['lines']:
+            out['held_back_substitutes'] = {'lines': a['held']['lines'], 'units': a['held']['units'],
+                                            'note': 'substitute allocations are never shown in a deck'}
+        if not a['held']['subs_check_ok']:
+            out['substitute_check_warning'] = ('the open-orders substitute list could not be fully read, so only '
+                                               'allocations named SUB were certainly held back')
+        if twins:
+            out['style_mismatches'] = twins
+    if 'shipped' in results:
+        r = results['shipped']
+        out['history_label'] = hist.get('history_label')
+        out['invoices_through'] = hist.get('invoices_through')
+        out['shipped_period'] = r['period']
+        out['shipped_basis'] = ('invoiced lines at invoice quantity and date, plus POs that shipped after the '
+                                'invoice cut-off as order-book estimates (marked est.); POs that left the book '
+                                'but are not confirmed yet are not counted')
+        if r['legacy_skipped']['lines']:
+            out['legacy_lines_not_shown'] = dict(r['legacy_skipped'], note=(
+                'old invoice lines without a modern style number (no photo or brand) are not on cards'))
+        if r.get('notes'):
+            out['history_warnings'] = r['notes']
+    if 'open_orders' in results:
+        out['bulk_lines_skipped'] = results['open_orders']['stats']['bulk_lines_skipped']
+    if empty:
+        out['sections_empty'] = {_PRES_SECTION_LABEL[s]: why for s, why in empty.items()}
+    if dropped:
+        out['truncated'] = True
+        out['styles_dropped_over_cap'] = len(dropped)
+    if notes:
+        out['notes'] = notes
+    return out
+
+
+def _pres_account_cover(info):
+    """The account deck's first page: a tile per section and the POs by date."""
+    def draw(c, PW, PH, total):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        INK, MUTED, FAINT = HexColor('#16181d'), HexColor('#475569'), HexColor('#94a3b8')
+        LINE, LINE2, GREEN, NAVY, HDR = (HexColor('#e2e8f0'), HexColor('#f1f5f9'), HexColor('#16a34a'),
+                                          HexColor('#1e3a8a'), HexColor('#64748b'))
+
+        def fit(text, font, size, width):
+            text = str(text or '')
+            if stringWidth(text, font, size) <= width:
+                return text
+            while text and stringWidth(text + '…', font, size) > width:
+                text = text[:-1]
+            return text.rstrip() + '…'
+        M = 25.2
+        X0, X1, YT, YB = M, PW - M, PH - M, M
+        lh = 30.0
+        hy = YT - lh
+        xx = X0
+        if info.get('logo'):
+            try:
+                lg = ImageReader(BytesIO(info['logo']))
+                lw, lhh = lg.getSize()
+                dw = min(112.5, lw * lh / float(lhh))
+                dh = dw * lhh / float(lw)
+                c.drawImage(lg, xx, hy + (lh - dh) / 2, dw, dh, mask='auto')
+                xx += dw + 9
+            except Exception:
+                pass
+        c.setFillColor(INK)
+        c.setFont('Helvetica-Bold', 15)
+        c.drawString(xx, hy + lh / 2 - 5.2, fit(info['title'], 'Helvetica-Bold', 15, X1 - xx - 280), charSpace=0.4)
+        c.setFillColor(MUTED)
+        c.setFont('Helvetica-Bold', 7.1)
+        words = [_PRES_SECTION_LABEL[s].lower() for s in info['sections'] if s in info['summary']]
+        what = (', '.join(words[:-1]) + ' and ' + words[-1]) if len(words) > 1 else (words[0] if words else '')
+        c.drawRightString(X1, hy + lh / 2 + 2.2, fit('Versa Group · ' + what[:1].upper() + what[1:], 'Helvetica-Bold', 7.1, 262))
+        c.setFont('Helvetica', 7.1)
+        sub = info['date_label'] + ((' · ' + info['hist_label'].split('. ')[0]) if info.get('hist_label') else '')
+        c.drawRightString(X1, hy + lh / 2 - 8.1, fit(sub, 'Helvetica', 7.1, 262))
+        c.setStrokeColor(INK)
+        c.setLineWidth(2.25)
+        c.line(X0, hy - 4.5, X1, hy - 4.5)
+
+        # tiles
+        tiles = []
+        smy, cards = info['summary'], info['cards']
+        for s in info['sections']:
+            if s not in smy:
+                continue
+            e = smy[s]
+            lines = [ln for cd in cards[s] for ln in cd['lines']]
+            if s == 'allocations':
+                n = e['allocations']
+                l1 = f"{e['styles']} style{'s' if e['styles'] != 1 else ''} · {n} allocation{'s' if n != 1 else ''}, no PO yet"
+                names = sorted({ln['name'] for ln in lines})
+                l2 = names[0] if len(names) == 1 else f"{len(names)} allocations"
+                dated = sorted({ln['date'] for ln in lines if ln['date'][:1].isdigit() and ln['date'] not in ('0000', '0001', '9998', '9999')})
+                l3 = (f"Production arrives {_apo_fmt_date(_apo_parse_date(dated[0]))}" +
+                      (f" to {_apo_fmt_date(_apo_parse_date(dated[-1]))}" if dated[-1] != dated[0] else '')) if dated else ''
+            elif s == 'open_orders':
+                l1 = f"{e['styles']} style{'s' if e['styles'] != 1 else ''} · {e['pos']} PO{'s' if e['pos'] != 1 else ''} · ${e['value']:,.0f}"
+                starts = sorted(ln['start'] for ln in lines if ln.get('start'))
+                ends = sorted(ln['cancel'] for ln in lines if ln.get('cancel'))
+                l2 = (f"Ship windows {_apo_fmt_date(_apo_parse_date(starts[0]))} to "
+                      f"{_apo_fmt_date(_apo_parse_date(ends[-1]))}") if starts and ends else ''
+                l3 = ''
+            else:
+                l1 = f"{e['styles']} style{'s' if e['styles'] != 1 else ''} · {e['pos']} PO{'s' if e['pos'] != 1 else ''} · ${e['value']:,.0f}"
+                ds = sorted(ln['date'] for ln in lines if ln.get('date'))
+                l2 = (f"{_apo_fmt_date(_apo_parse_date(ds[0]))} to {_apo_fmt_date(_apo_parse_date(ds[-1]))}") if ds else ''
+                est = sum(ln['units'] for ln in lines if str(ln.get('when') or '').endswith('est.'))
+                l3 = (f"Invoiced {e['units'] - est:,} · {est:,} since the cut-off (est.)") if est else 'All invoiced'
+            tiles.append((_PRES_SECTION_LABEL[s].upper(), f"{e['units']:,} units", l1, l2, l3))
+        ty = hy - 4.5 - 12
+        n_t = max(1, len(tiles))
+        tw = (X1 - X0 - 12 * (n_t - 1)) / n_t
+        th = 74
+        for i, (k, big, l1, l2, l3) in enumerate(tiles):
+            x = X0 + i * (tw + 12)
+            c.setStrokeColor(LINE)
+            c.setLineWidth(1.1)
+            c.setFillColor(HexColor('#ffffff'))
+            c.roundRect(x, ty - th, tw, th, 7.5, stroke=1, fill=1)
+            c.setFillColor(MUTED)
+            c.setFont('Helvetica-Bold', 7.1)
+            c.drawString(x + 10, ty - 15, k)
+            c.setFillColor(GREEN)
+            c.setFont('Helvetica-Bold', 17)
+            c.drawString(x + 10, ty - 35, big)
+            c.setFillColor(INK)
+            c.setFont('Helvetica-Bold', 7.4)
+            c.drawString(x + 10, ty - 48, fit(l1, 'Helvetica-Bold', 7.4, tw - 20))
+            c.setFillColor(MUTED)
+            c.setFont('Helvetica', 7.1)
+            c.drawString(x + 10, ty - 59, fit(l2, 'Helvetica', 7.1, tw - 20))
+            if l3:
+                c.drawString(x + 10, ty - 69, fit(l3, 'Helvetica', 7.1, tw - 20))
+
+        # tables: shipped POs (newest first), open POs, booked lines
+        tables = []
+        if 'shipped' in smy:
+            def status(p):
+                if p['status'] == 'Invoiced':
+                    return 'Invoiced'
+                return 'Likely shipped, not invoiced' if 'likely' in p['status'].lower() else 'Shipped, not invoiced'
+            rows = [[_apo_fmt_date(_apo_parse_date(p['date'])) + ('' if p['status'] == 'Invoiced' else ' est.'),
+                     p['po'], status(p), str(p['styles']), f"{p['units']:,}", f"${p['value']:,.0f}"]
+                    for p in info['shipped_pos']]
+            tables.append(('Shipped, newest first', ['Shipped', 'PO #', 'Status', 'Styles', 'Units', 'Value'],
+                           rows, ['Total', '', '', str(smy['shipped']['styles']), f"{smy['shipped']['units']:,}",
+                                  f"${smy['shipped']['value']:,.0f}"],
+                           [0.17, 0.15, 0.36, 0.08, 0.11, 0.13], 'lllrrr'))
+        if 'open_orders' in smy:
+            agg = {}
+            for cd in cards['open_orders']:
+                for ln in cd['lines']:
+                    e = agg.setdefault(ln['po'], {'start': ln.get('start') or '', 'cancel': ln.get('cancel') or '',
+                                                  'styles': set(), 'units': 0, 'value': 0.0})
+                    e['styles'].add(cd['sku'])
+                    e['units'] += ln['units']
+                    e['value'] += ln['units'] * (ln['cost'] or 0)
+            rows = [[_pres_window(e['start'], e['cancel']), po, str(len(e['styles'])), f"{e['units']:,}",
+                     f"${e['value']:,.0f}"] for po, e in sorted(agg.items(), key=lambda kv: (kv[1]['start'], kv[0]))]
+            tables.append(('On order (open POs)', ['Ship window', 'PO #', 'Styles', 'Units', 'Value'], rows,
+                           ['Total', '', str(smy['open_orders']['styles']), f"{smy['open_orders']['units']:,}",
+                            f"${smy['open_orders']['value']:,.0f}"], [0.33, 0.21, 0.12, 0.16, 0.18], 'llrrr'))
+        if 'allocations' in smy:
+            rows = [[ln['po'], cd['sku'], f"{ln['units']:,}", ln['when']]
+                    for cd in cards['allocations'] for ln in cd['lines']]
+            tables.append(('Booked (allocations)', ['Allocation', 'Style', 'Units', 'Arrives'], rows,
+                           ['Total', '', f"{smy['allocations']['units']:,}", ''], [0.44, 0.24, 0.12, 0.20], 'llrr'))
+        top = ty - th - 20
+        bottom = YB + 18
+
+        def table(x, w, y, avail, t):
+            title, hdr, rows, total, widths, aligns = t
+            c.setFillColor(INK)
+            c.setFont('Helvetica-Bold', 9.5)
+            c.drawString(x, y, title)
+            y -= 14
+            xs, acc = [], x
+            for wd in widths:
+                xs.append(acc)
+                acc += wd * w
+            c.setFillColor(HDR)
+            c.setFont('Helvetica-Bold', 6.8)
+            for i, h in enumerate(hdr):
+                if aligns[i] == 'r':
+                    c.drawRightString(xs[i] + widths[i] * w - 4, y, h)
+                else:
+                    c.drawString(xs[i], y, h)
+            c.setStrokeColor(LINE)
+            c.setLineWidth(0.75)
+            c.line(x, y - 4, x + w, y - 4)
+            y -= 15
+            cap = max(2, int((avail - 29 + 0.5) // 13.2) - 1)     # body lines that fit above the total row
+            shown = rows if len(rows) <= cap else rows[:cap - 1]
+            more = len(rows) - len(shown)
+            for r in shown + ([[f'+ {more} more']] if more else []) + [total + ['__total__']]:
+                bold = r[-1] == '__total__'
+                vals = r[:-1] if bold else r
+                for i, v in enumerate(vals):
+                    mono = i == 1 and not bold and len(vals) > 1
+                    font = 'Courier-Bold' if mono else ('Helvetica-Bold' if bold else
+                                                       ('Helvetica-Oblique' if len(vals) == 1 else 'Helvetica'))
+                    c.setFont(font, 7.2)
+                    c.setFillColor(NAVY if mono else (MUTED if len(vals) == 1 else INK))
+                    cw = widths[i] * w - 6
+                    if aligns[i] == 'r' and len(vals) > 1:
+                        c.drawRightString(xs[i] + widths[i] * w - 4, y, fit(v, font, 7.2, cw))
+                    else:
+                        c.drawString(xs[i], y, fit(v, font, 7.2, cw if len(vals) > 1 else w))
+                c.setStrokeColor(LINE2)
+                c.setLineWidth(0.6)
+                c.line(x, y - 4.5, x + w, y - 4.5)
+                y -= 13.2
+            return y
+        if len(tables) == 1:
+            table(X0, X1 - X0, top, top - bottom, tables[0])
+        elif tables:
+            lw = (X1 - X0) * (0.57 if tables[0][0].startswith('Shipped') else 0.5)
+            table(X0, lw, top, top - bottom, tables[0])
+            rx, rw = X0 + lw + 20, X1 - (X0 + lw + 20)
+            y = top
+            for i, t in enumerate(tables[1:]):
+                last = i == len(tables) - 2
+                need = 29 + 13.2 * (len(t[2]) + 1)          # title, header, lines, total
+                avail = (y - bottom) if last else min(need, (y - bottom) * 0.6)
+                y = table(rx, rw, y, avail, t) - 16
+        c.setStrokeColor(LINE)
+        c.setLineWidth(0.75)
+        c.line(X0, YB + 10.5, X1, YB + 10.5)
+        c.setFont('Helvetica', 6.4)
+        c.setFillColor(FAINT)
+        c.drawString(X0, YB + 3, 'Versa Group LLC · Original Brands')
+        c.drawRightString(X1, YB + 3, f"{info['date_label']} · Page 1 of {total}")
+        if info.get('hist_label'):
+            c.drawCentredString((X0 + X1) / 2, YB + 3, fit(info['hist_label'].split(' Shipments after')[0]
+                                                          + ' Anything shipped after that is an estimate until invoiced.',
+                                                          'Helvetica', 6.4, X1 - X0 - 330))
+    return draw
 
 
 _PRES_PROPOSED_CAP = 240   # the deck's own card cap; a full program pitch (DKNY knits = 156 serials) must fit in one deck
@@ -21675,12 +22702,17 @@ def _ai_tool_build_presentation(params):
     if params.get('proposed_styles'):
         want0 = _pres_int(params.get('cards_per_page')) or 8
         return _pres_proposed_build(params, min((4, 6, 8, 10), key=lambda d: (abs(d - want0), d)))
-    src = str(params.get('source') or '').strip().lower().replace(' ', '_')
+    src = str(params.get('source') or '').strip().lower().replace(' ', '_').replace('-', '_')
     src = {'stock': 'warehouse', 'wh': 'warehouse', 'ats': 'warehouse', 'in_stock': 'warehouse',
            'incoming': 'overseas', 'on_order': 'open_orders', 'orders': 'open_orders',
-           'customer_orders': 'open_orders', 'open_order': 'open_orders', 'any': 'all'}.get(src, src)
-    if src not in ('warehouse', 'overseas', 'all', 'open_orders'):
-        return {'error': "source must be 'warehouse', 'overseas', 'all' or 'open_orders'"}
+           'customer_orders': 'open_orders', 'open_order': 'open_orders', 'any': 'all',
+           'allocation': 'allocations', 'allocated': 'allocations', 'booked': 'allocations', 'apo': 'allocations',
+           'bookings': 'allocations', 'history': 'shipped', 'shipped_history': 'shipped', 'past_orders': 'shipped',
+           'invoiced': 'shipped', 'customer': 'account', 'customer_summary': 'account', 'everything': 'account',
+           'summary': 'account'}.get(src, src)
+    if src not in ('warehouse', 'overseas', 'all', 'open_orders', 'allocations', 'shipped', 'account'):
+        return {'error': "source must be 'warehouse', 'overseas', 'all', 'open_orders', 'allocations', "
+                         "'shipped' or 'account'"}
     want = _pres_int(params.get('cards_per_page')) or 8
     density = min((4, 6, 8, 10), key=lambda d: (abs(d - want), d))
     cat = str(params.get('category') or '').strip().lower()
@@ -21692,6 +22724,10 @@ def _ai_tool_build_presentation(params):
     for k in ('arrive_before', 'arrive_after', 'exfactory_before', 'exfactory_after'):
         if params.get(k) and not _apo_parse_date(params.get(k)):
             return {'error': f"{k} must be a date like 2026-10-01 (got {params.get(k)!r})"}
+    if src in ('allocations', 'shipped', 'account'):
+        # _admin_ok is set by the server for every call (_ai_agent_run, the MCP route),
+        # never by the model: shipped history is Past Orders data, admins only.
+        return _pres_customer_deck(src, params, spec, density, params.get('_admin_ok') is True)
     if src == 'open_orders':
         res = _pres_order_cards(params, spec)
     else:
@@ -22095,12 +23131,18 @@ _AI_AGENT_TOOLS = [
      'input_schema': {'type': 'object', 'properties': {'brand': {'type': 'string'}}}},
     {'name': 'open_orders_lookup',
      'description': ('Open customer orders (A2000 + bulks) with quantities, dollars, and ship windows. '
-                     'Filter by customer name, style # and/or po (ONE PO number; every non-digit is '
+                     'Filter by customer name, brands, style # and/or po (ONE PO number; every non-digit is '
                      "ignored when matching, so '50005391' finds a PO stored as '50-005391' and a 7+ digit "
                      'number also matches suffixed line numbers). Always try the po filter before declaring '
-                     'a PO number missing.'),
+                     'a PO number missing. brands (e.g. ["VD"] or ["Von Dutch"]) is THE way to ask about a '
+                     "brand: 'Ross Von Dutch on order' = customer 'Ross', brands ['VD']. Never put a brand in "
+                     "style: style is a style # or the start of one ('ROVD' = every Ross Von Dutch style #). "
+                     'Each row carries its brand; units_by_brand appears when several brands match. Open '
+                     'orders never include allocations (booked goods with no PO): build_presentation source '
+                     "'allocations' or build_allocation_sheet show those."),
      'input_schema': {'type': 'object', 'properties': {
-         'customer': {'type': 'string'}, 'style': {'type': 'string'}, 'po': {'type': 'string'},
+         'customer': {'type': 'string'}, 'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'style': {'type': 'string'}, 'po': {'type': 'string'},
          'limit': {'type': 'integer'}}}},
     {'name': 'past_orders_lookup',
      'description': ('Order history from the daily order-book archive (since 2026-06-03): every customer PO '
@@ -22175,22 +23217,56 @@ _AI_AGENT_TOOLS = [
                      'and pipeline: an Invoiced tab (real invoice dates + shipped quantities per PO and '
                      'style), a "Shipped, not yet invoiced" tab (POs that shipped but have no invoice yet, '
                      'early shipments included, with quantities marked as estimates until invoiced), and '
-                     'an On Order tab (current open hard POs with ship windows; bulks excluded). '
-                     'customer accepts a name or code (Winners, Burlington, ROSS…). Date filters: from/to '
+                     'an On Order tab (current open hard POs with ship windows; bulks excluded), and a '
+                     "Booked tab (open allocations with no PO yet, and what covers them) when include has "
+                     "'allocated'. "
+                     'customer accepts a name or code (Winners, Burlington, ROSS…). brands / exclude_brands '
+                     "narrow EVERY tab to those brands ('Ross Von Dutch' = customer 'Ross', brands ['VD']). "
+                     'Date filters: from/to '
                      '(YYYY-MM-DD), or year (2026), or month (YYYY-MM); they apply to the invoiced and the '
-                     'not yet invoiced rows. On Order always shows the current book. include narrows the tabs '
-                     "(['invoiced','shipped_pending','on_order']); group_by 'po' (default) or 'month' sets "
+                     'not yet invoiced rows. On Order and Booked always show the current book. include picks '
+                     "the tabs (['invoiced','shipped_pending','on_order','allocated']; default the first "
+                     "three); group_by 'po' (default) or 'month' sets "
                      'the sort. Takes up to a minute. The answer and the summary tab carry history_label, '
                      'the invoice cut-off: state it with the link. Present the returned download_url to the '
                      'user as a clickable link. Use this whenever the user wants past selling as a line '
-                     'sheet / document rather than numbers in chat.'),
+                     'sheet / document rather than numbers in chat; for booked goods ALONE use '
+                     'build_allocation_sheet.'),
      'input_schema': {'type': 'object', 'properties': {
          'customer': {'type': 'string'},
+         'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'exclude_brands': {'type': 'array', 'items': {'type': 'string'}},
          'from': {'type': 'string'}, 'to': {'type': 'string'},
          'year': {'type': 'string'}, 'month': {'type': 'string'},
          'include': {'type': 'array', 'items': {'type': 'string',
-                     'enum': ['invoiced', 'shipped_pending', 'on_order']}},
+                     'enum': ['invoiced', 'shipped_pending', 'on_order', 'allocated']}},
          'group_by': {'type': 'string', 'enum': ['po', 'month']},
+         'filename': {'type': 'string'}},
+         'required': ['customer']}},
+    {'name': 'build_allocation_sheet',
+     'description': ("Build an Excel LINE SHEET of ONE customer's BOOKED goods: their open allocations on the "
+                     'APO file (goods set aside for them with no customer PO yet, e.g. "the spring booked '
+                     'goods"), with photos, one tab per brand (biggest first), and the weekly allocation '
+                     "report's columns: style, brand, color, fit, fabrication, allocation name, units "
+                     'allocated, and the production # / arrival / warehouse that cover them (warehouse stock '
+                     'first, then production by arrival). Substitute allocations are never shown and there '
+                     'are no prices, so the sheet can go to the buyer as it is. customer = the name as '
+                     "people say it (Ross, Burlington, Macy's Backstage, BBZ, Costco Canada...); a name that "
+                     'matches several allocation customers returns customers_matched, and a customer with no '
+                     'allocations returns allocation_customers (never swap in a different customer). brands '
+                     "narrows it ('Ross's Von Dutch allocations' = customer 'Ross', brands ['VD']); "
+                     'category, fabric_codes, color and search work like query_inventory. Use this whenever '
+                     "the user wants a customer's allocations or booked goods as a line sheet, spreadsheet "
+                     "or Excel; for a presentation, deck or print-out use build_presentation source "
+                     "'allocations' (or 'account' with on-order and shipped goods too). Returns "
+                     'download_url; takes up to a minute.'),
+     'input_schema': {'type': 'object', 'properties': {
+         'customer': {'type': 'string'},
+         'brands': {'type': 'array', 'items': {'type': 'string'}},
+         'exclude_brands': {'type': 'array', 'items': {'type': 'string'}},
+         'category': {'type': 'string'}, 'fabric_codes': {'type': 'array', 'items': {'type': 'string'}},
+         'color': {'type': 'string'}, 'search': {'type': 'string'},
+         'combine_customers': {'type': 'boolean'},
          'filename': {'type': 'string'}},
          'required': ['customer']}},
     {'name': 'build_line_sheet',
@@ -22273,7 +23349,22 @@ _AI_AGENT_TOOLS = [
                      "pos_found / pos_not_found. One card per "
                      "style with the shirt details and a row per PO "
                      "showing PO #, units, cost and ship window; never arrival or ex-factory dates; bulks excluded "
-                     "unless include_bulks. Filters work like query_inventory: brands, exclude_brands ('everything "
+                     "unless include_bulks. "
+                     "CUSTOMER DECKS (customer required; brands narrows every one, so 'Ross Von Dutch' = customer "
+                     "'Ross', brands ['VD']): source 'allocations' = the customer's BOOKED goods, their open "
+                     "allocations on the APO file with no PO yet ('the spring booked goods', 'what is allocated "
+                     "to Burlington'); a card shows a row per allocation with units and when the goods that cover "
+                     "it arrive; substitute allocations are never shown. source 'shipped' = what the customer "
+                     "was SHIPPED and when: invoices, plus POs shipped after the invoice cut-off as estimates "
+                     "(marked est.), a row per PO with units, cost and ship date, newest first; from/to "
+                     "(YYYY-MM-DD), year or month narrow it; admins only. source 'account' = several of these in "
+                     "ONE deck: a summary page (totals, and the shipped and open POs by date), then a Booked, an "
+                     "On Order and a Shipped section, each brand on its own pages; sections "
+                     "(['allocations','open_orders','shipped']) picks which. Example: 'print me out what is on "
+                     "order and already shipped for Ross Von Dutch, and also the spring booked goods' = "
+                     "{source:'account', customer:'Ross', brands:['VD']}. Say the result's history_label with "
+                     "shipped numbers, and name style_mismatches in one line (internal data to fix). "
+                     "Filters work like query_inventory: brands, exclude_brands ('everything "
                      "except Shaq' = exclude_brands ['SHAQ']), category, fabric_codes, color, search, skus (an exact "
                      "curated list), min_units, arrive_before/arrive_after (YYYY-MM-DD, overseas and all). "
                      "exfactory_before/exfactory_after filter the production lots by EX-FACTORY date the same way: "
@@ -22308,7 +23399,14 @@ _AI_AGENT_TOOLS = [
                              'description': "Pitch-deck mode: full 12-char style numbers that do not exist yet, "
                                             "optionally 'STYLE | Color name' to name a colorway the serial registry "
                                             "cannot. Exclusive: no other filters alongside it."},
-         'source': {'type': 'string', 'enum': ['warehouse', 'overseas', 'all', 'open_orders']},
+         'source': {'type': 'string', 'enum': ['warehouse', 'overseas', 'all', 'open_orders',
+                                               'allocations', 'shipped', 'account']},
+         'sections': {'type': 'array', 'items': {'type': 'string',
+                                                 'enum': ['allocations', 'open_orders', 'shipped']},
+                      'description': "source 'account' only: which sections, default all three."},
+         'from': {'type': 'string', 'description': "shipped history from (YYYY-MM-DD)"},
+         'to': {'type': 'string', 'description': "shipped history to (YYYY-MM-DD)"},
+         'year': {'type': 'string'}, 'month': {'type': 'string'},
          'customer': {'type': 'string'}, 'include_bulks': {'type': 'boolean'},
          'pos': {'type': 'array', 'items': {'type': 'string'},
                  'description': 'Exact PO numbers for an open_orders deck of specific POs; customer optional.'},
@@ -22348,8 +23446,22 @@ _AI_AGENT_TOOL_FNS = {
     'build_sales_sheet': _ai_tool_build_sales_sheet,
     'build_line_sheet': _ai_tool_build_line_sheet,
     'build_presentation': _ai_tool_build_presentation,
+    'build_allocation_sheet': _ai_tool_build_allocation_sheet,
     'list_style_numbers': _ai_tool_list_style_numbers,
 }
+
+# Tools that hold admin-only parts inside an otherwise shared tool (build_presentation's
+# shipped and account decks carry Past Orders data). The SERVER tells them who is asking
+# through _admin_ok: the model can never set it, any value it sends is dropped first.
+_AI_AGENT_ADMIN_FLAG_TOOLS = {'build_presentation'}
+
+
+def _ai_agent_tool_input(name, raw, admin_ok):
+    params = {k: v for k, v in (raw or {}).items() if k != '_admin_ok'} if isinstance(raw, dict) else {}
+    if name in _AI_AGENT_ADMIN_FLAG_TOOLS:
+        params['_admin_ok'] = bool(admin_ok)
+    return params
+
 
 # The tool rules split in two. CORE is true wherever these tools run — the
 # platform chat, the MCP connector and the email agent — so the three surfaces
@@ -22364,6 +23476,7 @@ PRESENTATIONS: "presentation", "presentation format", "deck", "print-out", "look
 COLOUR MIX IN PAST SALES: for ANY question about how many White Solids, Black Solids, Navy Solids, Other Solids or Fancies SOLD (or were invoiced or shipped) in a period, for a customer, or compared with another period, use colour_sales_lookup. Do not use sales_history_lookup for this: it has no colour dimension and it ignores dates unless a customer is named. Navy Solids means every shade of blue. When the user names a season, pass it as season (for example "Fall 2025") and never turn it into months yourself: Fall is June to November and Spring is December to May, the same as the Past Selling season chips, so your number always equals the screen's. Give units first, then dollars, name the period exactly (say which months a season covers), and always state the history_label cut-off. Repeat any note the tool returns. For colours in CURRENT stock use query_inventory instead.
 CURATED SELECTIONS: when a request needs styles no single filter expresses (e.g. several specific colors in one tab), query_inventory FIRST, pick the exact styles from the results yourself, then pass them as an explicit style list — build_line_sheet tabs[].skus. Never ask the user to paste style numbers you can look up.
 MINIMUMS: when the user asks for a minimum quantity ("36 pc minimum", "only styles with 500+ available"), pass min_units on every build_line_sheet tab and on build_presentation. They apply it to the ATS they print. query_inventory's min_units counts stock before committed and allocated come out, so a style it returns can have less available than the minimum, even 0: never quote one as meeting an ATS minimum on that filter alone.
+ONE CUSTOMER'S BOOKED, ON-ORDER AND SHIPPED GOODS: "booked", "allocated", "allocations", "set aside" or "booked goods" means the customer's open allocations on the APO file (no customer PO yet); "on order" means their open POs; "shipped", "sold" or "what went out" means invoices plus shipments awaiting invoice. A customer's brand ("Ross Von Dutch", "Burlington's Nautica") is the customer plus brands, never a style search. Presentations, print-outs and decks: build_presentation source 'allocations', 'open_orders' or 'shipped' for one of them, or source 'account' for several in ONE deck (sections narrows it). Line sheets and Excel: build_allocation_sheet for booked goods; build_sales_sheet with include ['allocated','on_order','invoiced','shipped_pending'] when booked goods and past selling go in one workbook. Do not decide that a customer has no POs or no allocations from memory or from a style search: run the tool with customer and brands. Example: "print me out what's on order and already shipped for Ross Von Dutch and also the spring booked goods" = build_presentation {source:'account', customer:'Ross', brands:['VD']}. Never mention substitute allocations in a reply (a reply can reach the buyer); name any style_mismatches in one line, they are internal data to fix.
 CATEGORIES: "by category" means the categories of the sheet's Category column: Dress Shirts, Sportswear, Dress Pants, Shorts, Blazers, Vests, Shirt & Tie Sets, Accessories. A line sheet "by category" is ONE build_line_sheet tab with split_by_category:true; "by category by brand", "each brand by category" or "a tab per brand per category" adds split_by_brand:true to that same tab. The long_sleeve and short_sleeve categories are DRESS SHIRTS only; polos, tees and other sportswear are Sportswear. Split sportswear into short and long sleeve ONLY when the user asks for it: split_sleeve:["sportswear"] on the tab, or category sportswear_short_sleeve / sportswear_long_sleeve when they want one sleeve only ("short sleeve polos"). The sleeve comes from the style number's fit code, the two letters before the last letter: SS = short sleeve, SL = long sleeve.
 """
 
@@ -22437,7 +23550,7 @@ def _ai_agent_run(client, convo, system, agent_tools, model, max_tokens, admin_o
                     raise ValueError(f'unknown tool {tu.name}')
                 if tu.name in _AI_AGENT_ADMIN_TOOLS and not admin_ok:
                     raise PermissionError('Past Orders and sales history are available to admins only')
-                out = fn(tu.input or {})
+                out = fn(_ai_agent_tool_input(tu.name, tu.input, admin_ok))
                 if isinstance(out, dict) and out.get('download_url'):
                     artifacts.append({'tool': tu.name, 'url': str(out['download_url']),
                                       'format': str(out.get('format') or '')})
@@ -22545,7 +23658,7 @@ _MCP_PROTOCOL_VERSION = '2025-06-18'
 
 _MCP_INSTRUCTIONS = """Versa Group live inventory connector. Versa is a men's apparel manufacturer/reseller (Nautica, DKNY, Chaps, U.S. Polo Assn., Von Dutch, and ~20 more brands).
 Conventions: styles are SKUs shaped [CUSTOMER 2][BRAND 2][FABRIC 2][SERIAL 3][FIT 2][COLLAR 1]; a base style is the part before any -size suffix. Warehouse = stock on hand now (JTW/TR/DCW/QA/NJ). Incoming/overseas = on production order. Total ATS = available to sell. committed/allocated come back as positive magnitudes already deducted from ATS. NT is Nautica overflow (NT 201 and NA 201 are DIFFERENT styles).
-Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for order history from the daily order-book archive since Jun 2026 (each PO that left the book has a status: invoiced, shipped and awaiting invoice as an estimate, not confirmed yet, moved to another PO, or left without shipping; only shipped POs count), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities; the ground truth for what shipped). Both answer with invoices_through and history_label: always state the invoice cut-off with past numbers, and call anything after it an estimate. Dropship is never in this archive: it is only in the invoices. build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute). build_presentation produces a print-ready PDF PRESENTATION of photo cards (brand logo on top, 8 cards per page, a new page per brand) for warehouse stock, overseas stock or one customer's open orders; it also returns a download URL and takes up to a minute or two. Whenever the user says presentation, presentation format, deck, print-out or photo cards, use build_presentation, never build_line_sheet."""
+Use query_inventory for any quantity/availability question (totals cover all matches even when rows truncate), style_detail for one style, brand_summary for rollups, open_orders_lookup for customer demand and dollars, past_orders_lookup for order history from the daily order-book archive since Jun 2026 (each PO that left the book has a status: invoiced, shipped and awaiting invoice as an estimate, not confirmed yet, moved to another PO, or left without shipping; only shipped POs count), sales_history_lookup for INVOICED sales going back to Nov 2019 (real invoice dates and shipped quantities; the ground truth for what shipped). Both answer with invoices_through and history_label: always state the invoice cut-off with past numbers, and call anything after it an estimate. Dropship is never in this archive: it is only in the invoices. build_sales_sheet to turn one customer's past selling + open orders into a downloadable Excel sales sheet with photos, build_line_sheet to produce a current-inventory Excel with photos (both return a download URL; each takes up to a minute). build_presentation produces a print-ready PDF PRESENTATION of photo cards (brand logo on top, 8 cards per page, a new page per brand) for warehouse stock, overseas stock, one customer's open orders, one customer's BOOKED goods (source allocations: open APO allocations, no PO yet), what one customer was shipped and when (source shipped), or all of that for one customer in one deck with a summary page (source account); it also returns a download URL and takes up to a minute or two. build_allocation_sheet makes the Excel line sheet of one customer's booked goods, a tab per brand. A customer's brand ("Ross Von Dutch") is customer plus brands on every one of these tools, never a style search. Whenever the user says presentation, presentation format, deck, print-out or photo cards, use build_presentation, never build_line_sheet."""
 
 
 def _mcp_rpc_result(rid, result):
@@ -22585,7 +23698,8 @@ def _mcp_handle(payload):
         if fn is None:
             return _mcp_rpc_error(rid, -32602, f'unknown tool: {name}')
         try:
-            out = fn(args)
+            # The connector keeps the full table for its own token (David, Sep 9 2026).
+            out = fn(_ai_agent_tool_input(name, args, True))
             text = json.dumps(out, default=str)
             if len(text) > 90000:
                 text = text[:90000] + '... [truncated]'
