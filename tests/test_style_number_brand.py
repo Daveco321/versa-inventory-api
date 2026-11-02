@@ -130,6 +130,17 @@ class StyleNumberBrand(unittest.TestCase):
         self.assertEqual(it['total_ats'], 15 + 50 - 7 - 2)
         self.assertEqual(it['lot_number'], 'LOT C')            # the copy holding the most stock
 
+    def test_scorecard_tracker_lines(self):
+        import factory_scorecard as fs
+        snap = {'orders': {
+            'ZZ26161::ZZDKPK001SLS': {'production': 'ZZ26161', 'style': 'ZZDKPK001SLS', 'units': 100,
+                                      'brand': 'JNY', 'first_seen': '2026-10-30T19:38:57Z'},
+            'ZZ26162::ZZGBPJ013SLM': {'production': 'ZZ26162', 'style': 'ZZGBPJ013SLM', 'units': 50,
+                                      'brand': 'GB', 'first_seen': '2026-10-30T19:38:57Z'},
+        }}
+        by = {l['style']: l['brand'] for l in fs.parse_tracker(snap)['lines']}
+        self.assertEqual(by, {'ZZDKPK001SLS': 'DKNY', 'ZZGBPJ013SLM': 'GB'})
+
     def test_different_brands_stay_apart(self):
         # a legacy number under two brands: nothing settles it, both rows stay
         items = self.app.parse_inventory_excel(xlsx([

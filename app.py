@@ -23814,7 +23814,8 @@ register_scorecard_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
                           get_dropbox_token=get_dropbox_token,
                           caller_identity=_caller_identity,
                           machine_key=INVENTORY_API_KEY,
-                          load_master=load_production_from_dropbox)
+                          load_master=load_production_from_dropbox,
+                          brand_of=_brand_by_style_number)
 
 
 # ── Inbound email agent: POST /inbound-email (Resend webhook) ────────────────

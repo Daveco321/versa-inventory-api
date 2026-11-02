@@ -317,10 +317,13 @@ def parse_tracker(obj):
         if not _REF_RE.match(ref) or not style:
             continue
         l = _blank_line(ref, style)
+        brand = str(e.get('brand') or '').strip()
+        if _deps.get('brand_of'):   # the style number decides the brand (app._brand_by_style_number)
+            brand = _deps['brand_of'](style, brand)
         l.update({
             'po_name': str(e.get('po_name') or '').strip(),
             'po_units': to_int(e.get('units'), LINE_UNITS_CAP),
-            'brand': str(e.get('brand') or '').strip(),
+            'brand': brand,
             'etd': to_date(e.get('etd')),
             'placed': to_date((e.get('first_seen') or '')[:10]),
         })
@@ -1306,10 +1309,12 @@ def _authorized():
     return True, None
 
 
-def register_scorecard_routes(app, get_s3, s3_bucket, get_dropbox_token, caller_identity, machine_key, load_master):
+def register_scorecard_routes(app, get_s3, s3_bucket, get_dropbox_token, caller_identity, machine_key, load_master,
+                              brand_of=None):
     global _daily_thread_started
     _deps.update(get_s3=get_s3, s3_bucket=s3_bucket, get_dropbox_token=get_dropbox_token,
-                 caller_identity=caller_identity, machine_key=machine_key, load_master=load_master)
+                 caller_identity=caller_identity, machine_key=machine_key, load_master=load_master,
+                 brand_of=brand_of)
 
     @app.route('/factory-scorecard', methods=['GET', 'OPTIONS'])
     def factory_scorecard_get():
