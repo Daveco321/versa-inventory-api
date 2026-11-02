@@ -1022,7 +1022,9 @@ def load_production_from_dropbox():
                 'poName': str(row[1] or '').strip(),
                 'style': style,
                 'units': units,
-                'brand': str(row[4] or '').strip(),
+                # Column E unless the style number names another brand (see
+                # _brand_by_style_number): NB26161 typed JNY on two DKNY knits.
+                'brand': _brand_by_style_number(style, str(row[4] or '').strip()),
                 'etd': etd,
                 # The ledger's own column-F date, untouched by the column-G
                 # backdate. Only /factory-view consumes it (see etd_raw above).
@@ -5118,6 +5120,73 @@ def _col_val(row_dict, name):
     return None
 
 
+# The style number decides the brand, on every platform (David, Nov 2 2026). The Style
+# Ledger typed JNY on the DKNY knits RODKPK001SLS/002SLS (Jones run NB26161), so the
+# hourly ATS file gave each style a second, Jones row and the apps showed DKNY styles
+# as Jones New York with Jones's colours. Only a modern style number decides (the shape
+# the APO and deck readers already trust, with a P/B/V serial for pants, blazers and
+# vests), and never BL (Black Label or Bloomingdale's) or CK (only ever the CK of LUCK).
+# Same rule as the desktop's and the phone app's styleNumberBrand.
+_STYLE_NO_BRAND_RE = re.compile(r'^[A-Z]{6}(\d{3}|[PBV]\d\d)[A-Z]{2,3}$')
+_STYLE_NO_BRAND_SKIP = {'BL', 'CK'}
+_STYLE_NO_BRAND_EXTRA = {'DN': 'DN', 'VS': 'VERSA', 'CS': 'CHAPS'}   # the frontends' extra codes
+
+
+def _style_number_brand(sku):
+    """The brand a modern style number names, or '' when it does not settle it.
+    VP (Versa Group Purchase) is always Versa and LUCK always Lucky, as on the frontends."""
+    base = str(sku or '').strip().upper().split('-')[0]
+    if base.startswith('VP'):
+        return 'VERSA'
+    if base.startswith('LUCK'):
+        return 'LUCKY'
+    code = base[2:4]
+    if not _STYLE_NO_BRAND_RE.match(base) or code in _STYLE_NO_BRAND_SKIP:
+        return ''
+    return SKU_BRAND_CODE_MAP.get(code) or _STYLE_NO_BRAND_EXTRA.get(code, '')
+
+
+def _brand_by_style_number(sku, brand):
+    """A known brand that disagrees with the style number gives way to it. Feed keys
+    the platform does not know (NM, KLP, RB...) are left as they are: the frontends
+    already read the style number for those."""
+    named = _style_number_brand(sku)
+    b = str(brand or '').strip().upper()
+    return named if named and named != b and b in BRAND_FULL_NAMES else brand
+
+
+def _merge_duplicate_rows(items):
+    """One row per SKU and brand. The hourly file lists a style once per brand it is
+    filed under and every copy repeats the style's committed and allocated, so
+    warehouses and incoming add up while committed and allocated keep the largest
+    figure (the rule the routing engine and /factory-view already use). The lot
+    fields come from the row holding the most stock."""
+    out, first_of, lot_wh = [], {}, {}
+    wh_keys = ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi')
+    for it in items:
+        key = (it['sku'].upper(), it['brand'])
+        m = first_of.get(key)
+        if m is None:
+            first_of[key] = it
+            lot_wh[key] = it['total_warehouse']
+            out.append(it)
+            continue
+        # Each row already took the full committed and allocated off its total ATS:
+        # give back the smaller one, which was taken twice.
+        m['total_ats'] += it['total_ats'] + min(abs(m['committed']), abs(it['committed'])) \
+            + min(abs(m['allocated']), abs(it['allocated']))
+        m['committed'] = max(m['committed'], it['committed'], key=abs)
+        m['allocated'] = max(m['allocated'], it['allocated'], key=abs)
+        if it['total_warehouse'] > lot_wh[key]:
+            lot_wh[key] = it['total_warehouse']
+            for k in ('container', 'receive_date', 'lot_number'):
+                m[k] = it[k]
+        for k in wh_keys + ('incoming',):
+            m[k] += it[k]
+        m['total_warehouse'] = sum(m[k] for k in wh_keys)
+    return out
+
+
 def parse_inventory_excel(file_bytes):
     wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -5144,6 +5213,7 @@ def parse_inventory_excel(file_bytes):
             brand = 'NAUTICA'
         if not sku or sku == 'N/A' or not brand:
             continue
+        brand = _brand_by_style_number(sku, brand)
 
         jtw = int(_col_val(rd, 'JTW') or 0)
         tr  = int(_col_val(rd, 'TR')  or 0)
@@ -5217,6 +5287,7 @@ def parse_inventory_excel(file_bytes):
         })
 
     wb.close()
+    items = _merge_duplicate_rows(items)
     # Stashed as PENDING: a parse can still be rejected by the sanity check, and
     # the admin report must describe the ACCEPTED file (_nj_commit_report).
     with _nj_lock:
