@@ -337,7 +337,7 @@ class TestCaptureAndRoutes(_Env):
         self.ident = {'tier': 'staff'}
         with mock.patch.object(pa, 'et_today', return_value=self._day('2026-11-09')):
             self.assertEqual(self.c.get('/production-audit?from=2026-11-01&to=2026-11-09').status_code, 200)
-            self.assertEqual(self.c.get('/production-audit?from=2026-06-01&to=2026-11-09').status_code, 400)
+            self.assertEqual(self.c.get('/production-audit?from=2026-06-01&to=2026-11-09').status_code, 200)   # long ranges are fine
         self.assertEqual(self.c.post('/production-audit/backfill', json={}).status_code, 401)
 
 

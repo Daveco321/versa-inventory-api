@@ -32,7 +32,7 @@ machine key and is Fernet-encrypted with a key derived from it (the email agent'
 its own domain separation). Nothing here is ever written in plain text.
 
 Routes (Versa-Docs staff session or the machine key; held factories are left out, as in /production)
-  GET  /production-audit?from=YYYY-MM-DD&to=YYYY-MM-DD   changes per day in the range (max 62 days)
+  GET  /production-audit?from=YYYY-MM-DD&to=YYYY-MM-DD   changes per day in the range (up to the whole history)
   GET  /production-audit/since?from=&to=&po=             everything from the start of a day until now (or `to`):
                                                          the ledger then against the ledger at the end, per line,
                                                          with how often each changed in between (steps for one PO)
@@ -59,7 +59,7 @@ import worker_leader
 PA_TRACKER_KEY = os.environ.get('PA_TRACKER_KEY', 'production-inventory/snapshot.json')
 PA_CAPTURE_SECONDS = int(os.environ.get('PA_CAPTURE_SECONDS', '600'))
 PA_HISTORY_START = dt.date(2026, 4, 16)     # the tracker's first full copy (Apr 15 was one row per PO)
-PA_MAX_RANGE_DAYS = 62
+PA_MAX_RANGE_DAYS = int(os.environ.get('PA_MAX_RANGE_DAYS', '400'))   # the phone's Range can ask for the whole history
 PA_EVENTS_CACHE_DAYS = 400                  # day-change docs kept per worker (a few MB; ranges reuse them)
 PA_PARALLEL_READS = int(os.environ.get('PA_PARALLEL_READS', '24'))   # S3 reads at once for a long range
 PA_WARM_AFTER_SECONDS = 150                 # each worker reads the whole history once after it starts
@@ -1126,11 +1126,21 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
             return jsonify({'error': f'Pick at most {PA_MAX_RANGE_DAYS} days at a time.'}), 400
         held = _held()
         days, events, pos_ctx = [], [], {}
+        span, d = [], frm
+        while d <= to:
+            span.append(d.isoformat())
+            d += dt.timedelta(days=1)
+        try:
+            docs = load_event_docs(span)          # a long range reads its days in parallel
+        except Exception as e:
+            print(f'[ProductionAudit] range read failed: {e}', flush=True)
+            docs = {}
         d = frm
         while d <= to:
             iso = d.isoformat()
             try:
-                doc = events_for_day(iso, persist=True) or {}
+                doc = docs[iso] if iso in docs else events_for_day(iso, persist=True)
+                doc = doc or {}
             except Exception as e:
                 print(f'[ProductionAudit] {iso}: {e}', flush=True)
                 doc = {'error': str(e)[:200]}
