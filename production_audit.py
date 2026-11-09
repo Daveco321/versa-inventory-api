@@ -236,36 +236,46 @@ def lines_from_rows(rows):
 
 
 def lines_from_tracker(obj):
-    """One version of the hourly tracker -> the lines still on the ledger at that moment."""
+    """One version of the hourly tracker -> the lines still on the ledger at that moment.
+
+    The tracker keys a line PRODUCTION::STYLE. For a few days in April 2026 it also wrote
+    PRODUCTION::STYLE::ETD keys, and both kinds stayed live side by side (the Apr 16-19 copies
+    hold every line twice). So per production + style: the plain entry when there is one (the
+    latest one when spacing variants repeat it), else the dated entries added up (one per date)."""
     brand_of = _deps.get('brand_of')
-    out = {}
-    for _key, e in ((obj or {}).get('orders') or {}).items():
+    groups = defaultdict(list)
+    for key, e in ((obj or {}).get('orders') or {}).items():
         if e.get('fell_off_date'):
             continue
         prod = norm_prod(e.get('production'))
         style = str(e.get('style') or '').strip().upper()
         if not prod or not style:
             continue
-        try:
-            u = int(e.get('units') or 0)
-        except (TypeError, ValueError):
-            u = 0
-        brand = str(e.get('brand') or '').strip()
+        groups[(prod, style)].append((str(key), e))
+    out = {}
+    for (prod, style), items in groups.items():
+        plain = [(k, e) for k, e in items if k.count('::') < 2]
+        if plain:
+            use = [max(plain, key=lambda ke: str(ke[1].get('last_seen') or ke[1].get('last_seen_on_ledger') or ''))]
+        else:
+            use = items
+        units, etds, brand, po = 0, set(), '', ''
+        for _k, e in use:
+            try:
+                units += int(e.get('units') or 0)
+            except (TypeError, ValueError):
+                pass
+            etd = norm_etd(e.get('etd'))
+            if etd:
+                etds.add(etd)
+            brand = brand or str(e.get('brand') or '').strip()
+            po = po or str(e.get('po_name') or '').strip()
         if brand_of:
             try:
                 brand = brand_of(style, brand) or brand
             except Exception:
                 pass
-        k = prod + '::' + style
-        cur = out.get(k)
-        etd = norm_etd(e.get('etd'))
-        if cur:
-            cur['u'] += u
-            if etd and etd not in cur['e']:
-                cur['e'] = sorted(set(cur['e']) | {etd})
-            continue
-        out[k] = {'p': prod, 's': style, 'u': u, 'po': str(e.get('po_name') or '').strip(), 'b': brand,
-                  'e': [etd] if etd else []}
+        out[prod + '::' + style] = {'p': prod, 's': style, 'u': units, 'po': po, 'b': brand, 'e': sorted(etds)}
     return out
 
 
@@ -637,6 +647,12 @@ def _make_doc(day_iso, base, cur):
             'computed_at': dt.datetime.now(dt.timezone.utc).isoformat()}
 
 
+def _glitch_doc(day_iso, cur):
+    return {'v': 1, 'd': day_iso, 'base': None, 'src': [None, cur.get('source')], 'fields': [], 'events': [],
+            'pos': {}, 'sum': summarize([]), 'skipped': cur.get('glitch'),
+            'computed_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
 def live_doc():
     """Today's changes so far: yesterday's copy (or the one before it) against the ledger now."""
     rows, rev = _deps['ledger_rows']()
@@ -674,7 +690,9 @@ def events_for_day(day_iso, persist=True):
         day = _parse_day(day_iso)
         cur = load_day(day_iso)
         base = _base_for(day) if (cur and cur.get('lines')) else None
-        if cur and cur.get('lines') and base:
+        if cur and cur.get('glitch'):
+            doc = _glitch_doc(day_iso, cur)
+        elif cur and cur.get('lines') and base:
             doc = _make_doc(day_iso, base, cur)
             if persist:
                 try:
@@ -730,11 +748,35 @@ def tracker_snapshot(day_iso, versions, min_lines=0):
     return None
 
 
+PA_SPIKE_RATIO = 1.5      # a tracker day whose unit total is 1.5x both neighbours (or 1/1.5) is a glitch
+
+
+def find_glitch_days(totals):
+    """totals: [(day_iso, units, lines, source)] in day order (days with a copy only).
+    A tracker day whose total units jump above BOTH neighbours by PA_SPIKE_RATIO, or fall below
+    both by the same factor, is a copy the tracker got wrong (Apr 22 2026 counted every line twice
+    and the next day went back): {day: reason}. Our own captured days are never judged."""
+    out = {}
+    for i in range(1, len(totals) - 1):
+        d, u, n, src = totals[i]
+        if src != 'tracker' or not u:
+            continue
+        pu, nu = totals[i - 1][1], totals[i + 1][1]
+        if not pu or not nu:
+            continue
+        if u > PA_SPIKE_RATIO * pu and u > PA_SPIKE_RATIO * nu:
+            out[d] = f'the copy counted {u:,} units against {pu:,} the day before and {nu:,} the day after'
+        elif u * PA_SPIKE_RATIO < pu and u * PA_SPIKE_RATIO < nu:
+            out[d] = f'the copy held {u:,} units against {pu:,} the day before and {nu:,} the day after'
+    return out
+
+
 def _set_bf(**kw):
     with _backfill_lock:
         _backfill.update(**kw)
     if 'progress' in kw:
         print(f"[ProductionAudit] {kw['progress']}", flush=True)
+        _persist_backfill()      # so /status on any worker can show it
 
 
 def backfill(start=None, end=None, force=False):
@@ -752,14 +794,13 @@ def backfill(start=None, end=None, force=False):
             if m:
                 have.add(m.group(1))
         prev_n = 0
+        totals = []
         d = start
         while d <= end:
             iso = d.isoformat()
-            snap = None
-            if iso in have and not force:
-                snap = load_day(iso)
+            snap = load_day(iso, use_cache=False) if iso in have else None
             if snap and snap.get('source') == 'own':
-                counts['own_days'] += 1
+                counts['own_days'] += 1          # a day we captured ourselves is never replaced
             elif snap and not force:
                 counts['kept'] += 1
             else:
@@ -773,10 +814,24 @@ def backfill(start=None, end=None, force=False):
                     counts['missing'] += 1
             if snap and snap.get('lines'):
                 prev_n = len(snap['lines'])
+                totals.append((iso, sum(l['u'] for l in snap['lines'].values()), len(snap['lines']), snap.get('source')))
+            elif snap and snap.get('glitch_lines'):
+                totals.append((iso, snap.get('glitch_units') or 0, snap.get('glitch_lines') or 0, snap.get('source')))
             if d.day == 1 or d == end:
                 _set_bf(progress=f'day copies through {iso}', counts=dict(counts))
             time.sleep(0.05)     # give the worker's other requests a turn (gevent)
             d += dt.timedelta(days=1)
+        # tracker days that counted the ledger wrong are left out (their lines are set aside)
+        glitches = find_glitch_days(totals)
+        for iso, why in glitches.items():
+            snap = load_day(iso, use_cache=False)
+            if snap and snap.get('lines'):
+                snap['glitch'] = why
+                snap['glitch_lines'] = len(snap['lines'])
+                snap['glitch_units'] = sum(l['u'] for l in snap['lines'].values())
+                snap['lines'] = {}
+                save_day(snap)
+        counts['glitch_days'] = sorted(glitches)
         # the changes, oldest first, always rebuilt from the copies
         d = start + dt.timedelta(days=1)
         while d <= end:
@@ -787,6 +842,11 @@ def backfill(start=None, end=None, force=False):
             base = _base_for(d) if cur and cur.get('lines') else None
             if cur and cur.get('lines') and base:
                 doc = _make_doc(iso, base, cur)
+            elif cur and cur.get('glitch'):
+                doc = _glitch_doc(iso, cur)
+            else:
+                doc = None
+            if doc is not None:
                 _put(_events_name(iso), doc)
                 with _mem_lock:
                     _mem['events'][iso] = doc
@@ -893,7 +953,7 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
                     continue
                 pos_ctx.setdefault(iso, {})[p] = info
             s = summarize(evs)
-            s.update(d=iso, base=doc.get('base'), live=bool(doc.get('live')),
+            s.update(d=iso, base=doc.get('base'), live=bool(doc.get('live')), skipped=doc.get('skipped'),
                      fields=doc.get('fields') or [], src=doc.get('src') or [],
                      missing=bool(not doc or doc.get('missing')) if iso != today.isoformat() else bool(doc.get('missing')))
             days.append(s)

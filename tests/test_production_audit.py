@@ -144,6 +144,27 @@ class TestDiffEngine(unittest.TestCase):
                                              _row('TF26901', 'TJNAZZ901SLS', 0, etd='2026-12-20')])
         self.assertEqual(pa.diff_snapshots(tr, own)[0], [])   # a shared ex-factory date is no change
 
+    def test_tracker_plain_and_dated_keys_are_one_line(self):
+        obj = {'orders': {
+            'TF26901::TJNAZZ901SLS': {'production': 'TF26901', 'style': 'TJNAZZ901SLS', 'units': 500, 'etd': '12/15/2026',
+                                      'last_seen': '2026-04-20T03:00'},
+            'TF26901::TJNAZZ901SLS::2026-12-15': {'production': 'TF26901', 'style': 'TJNAZZ901SLS', 'units': 500,
+                                                  'etd': '2026-12-15'},
+            'TF26901::TJNAZZ902SLS::2026-12-15': {'production': 'TF26901', 'style': 'TJNAZZ902SLS', 'units': 300, 'etd': '2026-12-15'},
+            'TF26901::TJNAZZ902SLS::2027-01-05': {'production': 'TF26901', 'style': 'TJNAZZ902SLS', 'units': 200, 'etd': '2027-01-05'},
+        }}
+        lines = pa.lines_from_tracker(obj)
+        self.assertEqual(lines['TF26901::TJNAZZ901SLS']['u'], 500)          # not 1,000
+        self.assertEqual(lines['TF26901::TJNAZZ902SLS']['u'], 500)          # two dated lines add up
+        self.assertEqual(lines['TF26901::TJNAZZ902SLS']['e'], ['2026-12-15', '2027-01-05'])
+
+    def test_glitch_days(self):
+        t = [('2026-04-20', 100, 10, 'tracker'), ('2026-04-21', 104, 10, 'tracker'), ('2026-04-22', 208, 10, 'tracker'),
+             ('2026-04-23', 103, 10, 'tracker'), ('2026-04-24', 40, 10, 'tracker'), ('2026-04-25', 101, 10, 'tracker'),
+             ('2026-04-26', 300, 10, 'tracker'), ('2026-04-27', 310, 10, 'own')]
+        g = pa.find_glitch_days(t)
+        self.assertEqual(sorted(g), ['2026-04-22', '2026-04-24'])       # a real jump that stays is kept
+
     def test_po_names_compare_as_a_set(self):
         a = pa.own_snapshot('2026-11-09', [_row('DP26901', 'TJDKZZ901SLS', 500, po='50279001'),
                                            _row('DP26901', 'TJDKZZ901SLS', 400, po='50279002')])
@@ -214,6 +235,24 @@ class TestCaptureAndRoutes(_Env):
             self.held = {'NB'}
             j = self.c.get('/production-audit?from=2026-11-07&to=2026-11-09', headers={'X-Api-Key': KEY}).get_json()
             self.assertFalse(any(e['f'] == 'NB' for e in j['events']))
+
+    def test_backfill_leaves_out_a_double_counted_day(self):
+        t = dt.datetime(2026, 11, 3, 22, 0, tzinfo=dt.timezone.utc)
+        base = _base_lines()
+        doubled = [(p, s, u * 2, e) for p, s, u, e in base]
+        changed = list(base)
+        changed[5] = ('TF26901', 'TJNAZZ905SLS', 777, '12/15/2026')
+        for i, lines in enumerate([base, base, doubled, changed, changed]):
+            self.s3.add_version(pa.PA_TRACKER_KEY, t + dt.timedelta(days=i), _tracker(lines))
+        with mock.patch.object(pa, 'et_today', return_value=self._day('2026-11-09')):
+            pa.backfill(start=self._day('2026-11-03'), end=self._day('2026-11-07'))
+            self.assertEqual(pa._backfill['counts']['glitch_days'], ['2026-11-05'])
+            self.assertTrue(pa.events_for_day('2026-11-05')['skipped'])
+            d6 = pa.events_for_day('2026-11-06')
+            self.assertEqual(d6['base'], '2026-11-04')
+            self.assertEqual([(e['s'], e['u0'], e['u1']) for e in d6['events']], [('TJNAZZ905SLS', 105, 777)])
+            j = self.c.get('/production-audit?from=2026-11-04&to=2026-11-06', headers={'X-Api-Key': KEY}).get_json()
+            self.assertTrue(j['days'][1]['skipped'])
 
     def test_nothing_stored_in_plain_text(self):
         with mock.patch.object(pa, 'et_today', return_value=self._day('2026-11-09')):
