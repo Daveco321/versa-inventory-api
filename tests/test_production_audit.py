@@ -240,6 +240,11 @@ class TestCaptureAndRoutes(_Env):
             self.assertEqual(kinds, [('chg', 'TJNAZZ999SLS'), ('rem', 'TJNAZZ901SLS')])
             self.assertTrue(j['days'][-1]['live'])
             self.assertEqual(j['now']['NB26901']['u'], 3000)
+            # each line at the start of the range (end of Nov 6) and now
+            self.assertEqual((j['edge_from'], j['edge_to']), ('2026-11-06', 'now'))
+            self.assertEqual(j['edges']['TF26901::TJNAZZ900SLS'], [100, ['2026-12-15'], 999, ['2026-12-15']])
+            self.assertEqual(j['edges']['NB26901::TJNAZZ999SLS'], [None, None, 3000, ['2027-01-25']])   # new in the range
+            self.assertEqual(j['edges']['TF26901::TJNAZZ901SLS'][2:], [None, None])                     # off the ledger now
             # a held factory disappears from the answer
             self.held = {'NB'}
             j = self.c.get('/production-audit?from=2026-11-07&to=2026-11-09', headers={'X-Api-Key': KEY}).get_json()

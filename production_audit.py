@@ -1171,6 +1171,28 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
             now_n[p] += 1
             if not now_po.get(p) and r.get('poName'):
                 now_po[p] = str(r.get('poName')).strip()
+        # Each line's quantity and ex-factory at the start of the range and at its end (now when the
+        # range ends today): David, Nov 9 2026, "show the original quantity from the beginning of my
+        # range ... and the original ex factory (or the most current if it wasnt changed)".
+        # edges[PRODUCTION::STYLE] = [units at start, ex-factory at start, units at end, ex-factory at end];
+        # a None pair = not on the ledger then.
+        edges, edge_from, edge_to = {}, None, None
+        try:
+            start_copy = copy_at_end_of(frm - dt.timedelta(days=1))
+            if to >= today:
+                end_copy = own_snapshot(today.isoformat(), rows, _rev) if rows else None
+            else:
+                end_copy = copy_at_end_of(to)
+            sl = (start_copy or {}).get('lines') or {}
+            el = (end_copy or {}).get('lines') or {}
+            edge_from = (start_copy or {}).get('day')
+            edge_to = 'now' if to >= today else (end_copy or {}).get('day')
+            for k in {ev['p'] + '::' + ev['s'] for ev in events}:
+                a, b = sl.get(k), el.get(k)
+                edges[k] = [a['u'] if a else None, (a.get('e') or []) if a else None,
+                            b['u'] if b else None, (b.get('e') or []) if b else None]
+        except Exception as e:
+            print(f'[ProductionAudit] range start/end lines failed: {e}', flush=True)
         st = {}
         try:
             st = _state()
@@ -1181,6 +1203,7 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
             'history_start': PA_HISTORY_START.isoformat(), 'own_since': st.get('own_since'),
             'as_of': st.get('captured_at'), 'days': days, 'events': events, 'day_pos': pos_ctx,
             'now': {p: {'u': now_tot.get(p, 0), 'n': now_n.get(p, 0), 'po': now_po.get(p, '')} for p in touched},
+            'edges': edges, 'edge_from': edge_from, 'edge_to': edge_to,
             'factories': FACTORY_NAMES,
         })
         resp.headers['Cache-Control'] = 'no-store'
