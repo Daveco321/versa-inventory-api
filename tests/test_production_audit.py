@@ -165,6 +165,15 @@ class TestDiffEngine(unittest.TestCase):
         g = pa.find_glitch_days(t)
         self.assertEqual(sorted(g), ['2026-04-22', '2026-04-24'])       # a real jump that stays is kept
 
+    def test_tracker_brand_words_are_not_a_change(self):
+        tr = {'day': '2026-11-08', 'source': 'tracker', 'fields': list(pa.TRACKER_FIELDS),
+              'lines': pa.lines_from_tracker({'orders': {'TF26901::TJGBZZ901SLS': {
+                  'production': 'TF26901', 'style': 'TJGBZZ901SLS', 'units': 100, 'brand': 'BEENE', 'etd': '12/15/2026'}}})}
+        own = pa.own_snapshot('2026-11-09', [_row('TF26901', 'TJGBZZ901SLS', 100, brand='GB')])
+        self.assertEqual(pa.diff_snapshots(tr, own)[0], [])
+        own2 = pa.own_snapshot('2026-11-10', [_row('TF26901', 'TJGBZZ901SLS', 100, brand='DKNY')])
+        self.assertEqual([e.get('b0') for e in pa.diff_snapshots(own, own2)[0]], ['GB'])
+
     def test_po_names_compare_as_a_set(self):
         a = pa.own_snapshot('2026-11-09', [_row('DP26901', 'TJDKZZ901SLS', 500, po='50279001'),
                                            _row('DP26901', 'TJDKZZ901SLS', 400, po='50279002')])

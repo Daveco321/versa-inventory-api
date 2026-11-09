@@ -63,7 +63,8 @@ PA_DROP_CONFIRM_SECONDS = 1800              # ... and is only accepted once it h
 
 OWN_FIELDS = ('u', 'pn', 'b', 'e', 'sh', 'g', 'w')
 # The tracker keeps the PO name a line had when it was first seen (about a third of its lines
-# differed from the ledger on Nov 9 2026), so tracker days never compare PO names.
+# differed from the ledger on Nov 9 2026), so tracker days never compare PO names. Brand is kept
+# but only compared between our own copies (see diff_snapshots).
 TRACKER_FIELDS = ('u', 'b', 'e')
 FACTORY_NAMES = {'TF': 'Top Find', 'NB': 'Yuxiu', 'PC': 'Pinnacle', 'DP': 'David Peng', 'FR': 'Frank', 'NK': 'Najmul'}
 
@@ -337,7 +338,9 @@ def diff_snapshots(base, cur):
                 ev['po0'] = ', '.join(a.get('pn') or []) or ''
                 ev['po1'] = ', '.join(b.get('pn') or []) or ''
                 ch = True
-            if 'b' in common and (a.get('b') or '') != (b.get('b') or '') and a.get('b') and b.get('b'):
+            # Brand only between our own copies: the tracker writes the ledger's brand words
+            # (BEENE, USPA, VINCE) where the API's rows carry codes (GB, US, VC).
+            if exact_etd and 'b' in common and (a.get('b') or '') != (b.get('b') or '') and a.get('b') and b.get('b'):
                 ev['b0'] = a.get('b') or ''
                 ch = True
             if 'sh' in common and list(a.get('sh') or []) != list(b.get('sh') or []):
