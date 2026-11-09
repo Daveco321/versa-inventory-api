@@ -1154,5 +1154,115 @@ class CatalogReceiveDate(unittest.TestCase):
                 a._inventory.update(inv_saved)
 
 
+
+# ── units sold in the last 12 months (Nov 9 2026, the phone's Aging tab) ─────
+
+SOLD_CUBE = {
+    'customers': {
+        'CUST1': {'ZZQQAA001SLS': {'2025-10': [100, 0], '2025-11': [10, 0], '2026-10': [5, 0],
+                                   '2026-11': [7, 0]},
+                  'ZZQQAA002SLS': {'2024-01': [4, 0]}},
+        'CUST2': {'ZZQQAA001SLS': {'2026-03': [-3, 0], '2026-04': ['2', 0], '2026-05': [None, 0]},
+                  'ZZQQAA003SLS': {'2026-06': [-6, 0]}},
+        'CUST3': 'not a dict',
+    },
+    'source': {'to': '2026-11-07'},
+}
+
+
+class SoldLast12Months(unittest.TestCase):
+    def test_window_like_the_page(self):
+        # the invoices reach into the current month: the 12 full months before today
+        self.assertEqual(ia.sold_window('2026-11-09', '2026-11-07'), ('2025-11', '2026-10', '2026-11-07', False))
+        # invoices stop mid-September: the window ends with August
+        self.assertEqual(ia.sold_window('2026-11-09', '2026-09-15'), ('2025-09', '2026-08', '2026-09-15', True))
+        # the last 3 days of a month count as covering it
+        self.assertEqual(ia.sold_window('2026-11-09', '2026-09-28'), ('2025-10', '2026-09', '2026-09-28', True))
+        self.assertEqual(ia.sold_window('2026-11-09', '2026-08'), ('2025-09', '2026-08', '', True))
+        self.assertEqual(ia.sold_window('2026-11-09', None), ('2025-11', '2026-10', '', False))
+        self.assertEqual(ia.sold_window('2027-01-05', ''), ('2026-01', '2026-12', '', False))
+
+    def test_net_units_per_key(self):
+        out = ia.sold_last_12m(SOLD_CUBE, '2026-11-09')
+        self.assertEqual((out['from'], out['to'], out['cutoff'], out['shifted']), ('2025-11', '2026-10', '2026-11-07', False))
+        # 10 + 5 - 3 + 2 inside the window; Oct 2025 and Nov 2026 are outside it
+        self.assertEqual(out['sold']['ZZQQAA001SLS'], 14)
+        self.assertEqual(out['sold']['ZZQQAA002SLS'], 0)       # every cube key is listed
+        self.assertEqual(out['sold']['ZZQQAA003SLS'], -6)      # more came back than was invoiced
+        self.assertEqual(out['last'], {'ZZQQAA001SLS': '2026-11', 'ZZQQAA002SLS': '2024-01'})
+        self.assertIsInstance(out['sold']['ZZQQAA001SLS'], int)
+        self.assertEqual(ia.sold_last_12m(None, '2026-11-09')['sold'], {})
+
+
+class SoldRoute(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from _support import load_app
+        cls.a = load_app()
+        cls.client = cls.a.app.test_client()
+
+    def setUp(self):
+        a = self.a
+        self._saved = (a._request_identity, a._aging_today)
+        with a._pnl_mx_lock:
+            self._mx = dict(a._pnl_mx_cache)
+        self._memo = dict(a._aging_sold_memo)
+        self.ident = {'tier': 'staff', 'is_admin': True, 'email': 'zz@example.test'}
+        a._request_identity = lambda: self.ident
+        a._aging_today = lambda: date(2026, 11, 9)
+        a._aging_sold_memo.update(key=None, gz=None)
+
+    def tearDown(self):
+        a = self.a
+        a._request_identity, a._aging_today = self._saved
+        with a._pnl_mx_lock:
+            a._pnl_mx_cache.clear()
+            a._pnl_mx_cache.update(self._mx)
+        a._aging_sold_memo.clear()
+        a._aging_sold_memo.update(self._memo)
+
+    def hold(self, cube):
+        import time as _t
+        with self.a._pnl_mx_lock:
+            self.a._pnl_mx_cache.update(body=json.dumps(cube).encode('utf-8'), at=_t.time(), fail_until=0.0,
+                                        poll_after=0.0, refreshing=False)
+
+    def test_who_may_ask(self):
+        self.hold(SOLD_CUBE)
+        self.ident = {}
+        self.assertEqual(self.client.get('/api/inventory-aging/sold').status_code, 401)
+        self.ident = {'tier': 'staff', 'is_admin': False}
+        self.assertEqual(self.client.get('/api/inventory-aging/sold').status_code, 403)
+        self.ident = {'tier': 'machine'}
+        self.assertEqual(self.client.get('/api/inventory-aging/sold').status_code, 200)
+
+    def test_building_while_the_cube_loads(self):
+        with self.a._pnl_mx_lock:
+            self.a._pnl_mx_cache.update(body=None, at=0.0, fail_until=0.0, poll_after=0.0, refreshing=True)
+        r = self.client.get('/api/inventory-aging/sold')
+        self.assertEqual(r.status_code, 202)
+        self.assertTrue(r.get_json()['building'])
+
+    def test_numbers_and_memo(self):
+        self.hold(SOLD_CUBE)
+        r = self.client.get('/api/inventory-aging/sold')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get('Cache-Control'), 'no-store')
+        d = r.get_json()
+        self.assertEqual(d['sold']['ZZQQAA001SLS'], 14)
+        self.assertEqual((d['from'], d['to']), ('2025-11', '2026-10'))
+        # the same copy of the cube is answered from the memo, never parsed again
+        with self.a._pnl_mx_lock:
+            self.a._pnl_mx_cache['body'] = b'not json'
+        self.assertEqual(self.client.get('/api/inventory-aging/sold').get_json()['sold']['ZZQQAA001SLS'], 14)
+        # a new copy is worked out again
+        cube = json.loads(json.dumps(SOLD_CUBE))
+        cube['customers']['CUST1']['ZZQQAA001SLS']['2026-09'] = [20, 0]
+        self.hold(cube)
+        with self.a._pnl_mx_lock:
+            self.a._pnl_mx_cache['at'] += 1
+        self.assertEqual(self.client.get('/api/inventory-aging/sold').get_json()['sold']['ZZQQAA001SLS'], 34)
+
+
 if __name__ == '__main__':
     unittest.main()

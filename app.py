@@ -11609,6 +11609,7 @@ _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/expor
                         '/export-tjx-ats',        # TJMAXX ATS Monday email (Oct 5 2026)
                         # Inventory Aging (Oct 5 2026): the review copy proxies with the machine key
                         '/api/inventory-aging', '/api/inventory-aging/trend',
+                        '/api/inventory-aging/sold',   # the phone's Aging tab (Nov 9 2026)
                         # P&L fee rates and the no-cost style list (Oct 6 2026; never a cost value)
                         '/admin/pnl-fees', '/admin/pnl-missing-costs',
                         # Missing Image and Mismatch Report, Monday email (Oct 15 2026)
@@ -24077,9 +24078,11 @@ def _pnl_mx_fetch():
             _pnl_mx_cache['refreshing'] = False
 
 
-def _pnl_sales_matrix():
+def _pnl_sales_matrix(parse=True):
     """Cube getter for pnl.h_analytics: the payload, {'building': True} while a
-    fetch or the upstream build runs, or None after a recent failure."""
+    fetch or the upstream build runs, or None after a recent failure. parse=False
+    (the phone's sold route, Nov 9 2026) starts a due refresh the same way but
+    returns True for a held copy instead of parsing it."""
     now = time.time()
     with _pnl_mx_lock:
         body = _pnl_mx_cache['body']
@@ -24105,7 +24108,7 @@ def _pnl_sales_matrix():
                 return None
             return {'building': True}
     if body is not None:
-        return json.loads(body)
+        return json.loads(body) if parse else True
     return None
 
 
@@ -24824,6 +24827,53 @@ def api_inventory_aging_trend():
     if cur['error']:
         return jsonify({'configured': True, 'error': 'The trend could not be loaded. Try again shortly.'}), 503
     return _aging_gz_response(cur['gz'])
+
+
+# GET /api/inventory-aging/sold (Nov 9 2026, the phone app's Aging tab): units sold in the
+# last 12 months per sales key, the desktop aging list's "Sold last 12m"
+# (inventory_aging.sold_last_12m), so the phone never downloads the P&L cube. Admins and
+# the machine key only, like the desktop's money columns. Memoised per copy of the
+# open-orders cube and ET day; the cube cache refreshes itself every 15 minutes.
+_aging_sold_memo = {'key': None, 'gz': None}
+
+
+@app.route('/api/inventory-aging/sold', methods=['GET', 'OPTIONS'])
+def api_inventory_aging_sold():
+    if request.method == 'OPTIONS':
+        return '', 204
+    allowed, is_admin = _aging_ident()
+    if not allowed:
+        return jsonify({'error': 'Sign in on the platform to see inventory aging.'}), 401
+    if not is_admin:
+        return jsonify({'error': 'Units sold are shown to admins only.'}), 403
+    if _aging is None:
+        return jsonify({'error': 'Inventory aging is not available on this server.'}), 503
+    today = _aging_today().isoformat()
+    with _pnl_mx_lock:
+        at = _pnl_mx_cache['at'] if _pnl_mx_cache['body'] is not None else None
+    with _aging_lock:
+        memo_key, memo_gz = _aging_sold_memo['key'], _aging_sold_memo['gz']
+    if at is not None and memo_gz is not None and memo_key == (at, today):
+        _pnl_sales_matrix(parse=False)          # starts a due refresh in the background
+        return _aging_gz_response(memo_gz)
+    m = _pnl_sales_matrix()
+    if m is None:
+        return jsonify({'error': 'The sales history could not be loaded. It is retried automatically.'}), 503
+    if m.get('building'):
+        return jsonify({'building': True}), 202
+    t0 = time.time()
+    try:
+        body = _aging.sold_last_12m(m, today)
+    except Exception as e:
+        print(f"[Aging] sold numbers failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({'error': 'Units sold could not be worked out.'}), 500
+    gz = _aging_gzip.compress(json.dumps(body, separators=(',', ':'), allow_nan=False).encode('utf-8'),
+                              compresslevel=6, mtime=0)
+    with _aging_lock:
+        _aging_sold_memo.update(key=(at, today), gz=gz)
+    print(f"[Aging] sold numbers built: {len(body['sold'])} keys, {body['from']}..{body['to']}, "
+          f"{time.time() - t0:.2f}s", flush=True)
+    return _aging_gz_response(gz)
 
 
 @app.route('/admin/pnl-fees', methods=['GET', 'POST', 'OPTIONS'])

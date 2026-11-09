@@ -33,9 +33,11 @@ Public API (the trend backfill depends on these signatures):
     trend_record(analysis, src='live') -> record | None
     build_payload(analysis, is_admin, wh_ats=None, rev=None, as_of=None, built_at=None) -> dict
     validate_seed(body) -> (kind, value, error)
+    sold_last_12m(matrix, today_iso) -> {'from','to','cutoff','shifted','sold','last'}
     merge_trend(doc, series, dropped, mode, updated_at) / upsert_trend(doc, record, updated_at)
 """
 
+import calendar
 import io
 import math
 import re
@@ -914,6 +916,98 @@ def build_payload(analysis, is_admin, wh_ats=None, rev=None, as_of=None, built_a
                     'matchedUnits': restore.get('matchedUnits', 0), 'unmatchedUnits': restore.get('unmatchedUnits', 0)},
         'excluded': excluded,
     }
+
+
+# ── sold in the last 12 months (Nov 9 2026, the phone app's Aging tab) ─────────
+# The desktop aging list's "Sold last 12m" (index.html _agMoney) worked out here, so
+# the phone never downloads the P&L cube. The open-orders sales cube is
+# {customers: {customer: {sales key: {'YYYY-MM': [net units, ...]}}}, source: {to}}.
+# Units are net of returns and credits, summed over every customer, over the 12 full
+# months before today; the window ends earlier when the invoices stop earlier (a month
+# counts as covered when the last invoice date is in its last 3 days or later).
+# 'last' = the last month with net units sold. Keys stay the cube's sales keys: the
+# page files an aging base under one (desktop _agSalesKey).
+_SOLD_YMD_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})')
+_SOLD_YM_RE = re.compile(r'^(\d{4})-(\d{2})$')
+
+
+def _ym(y, m):
+    while m < 1:
+        m += 12
+        y -= 1
+    return f'{y:04d}-{m:02d}'
+
+
+def sold_window(today_iso, source_to):
+    """(from, to, cutoff, shifted): the months the desktop's 'Sold last 12m' covers."""
+    y, mo = int(str(today_iso)[:4]), int(str(today_iso)[5:7])
+    last_full = _ym(y, mo - 1)
+    src = str(source_to or '').strip()
+    covered = cutoff = ''
+    cd = _SOLD_YMD_RE.match(src)
+    cm = _SOLD_YM_RE.match(src)
+    if cd:
+        cy, cmo, cday = int(cd.group(1)), int(cd.group(2)), int(cd.group(3))
+        cutoff = f'{cd.group(1)}-{cd.group(2)}-{cd.group(3)}'
+        try:
+            dim = calendar.monthrange(cy, cmo)[1]
+        except Exception:
+            dim = 31
+        covered = f'{cd.group(1)}-{cd.group(2)}' if cday >= dim - 3 else _ym(cy, cmo - 1)
+    elif cm:
+        covered = src
+    to = covered if covered and covered < last_full else last_full
+    frm = _ym(int(to[:4]), int(to[5:7]) - 11)
+    return frm, to, cutoff, to != last_full
+
+
+def _cube_units(cell):
+    """Net units of one cube cell [units, value, ...] (the page's Number(cell && cell[0]) || 0)."""
+    if not isinstance(cell, (list, tuple)) or not cell:
+        return 0.0
+    try:
+        f = float(cell[0])
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def _whole(v):
+    r = round(v)
+    return int(r) if abs(v - r) < 1e-6 else round(v, 2)
+
+
+def sold_last_12m(matrix, today_iso):
+    """{'ready','from','to','cutoff','shifted','sold': {key: units}, 'last': {key: 'YYYY-MM'}}.
+    Every key of the cube is in 'sold' (0 when nothing sold in the window), as on the page."""
+    matrix = matrix if isinstance(matrix, dict) else {}
+    src = matrix.get('source') if isinstance(matrix.get('source'), dict) else {}
+    frm, to, cutoff, shifted = sold_window(today_iso, src.get('to'))
+    net = {}
+    customers = matrix.get('customers') if isinstance(matrix.get('customers'), dict) else {}
+    for styles in customers.values():
+        if not isinstance(styles, dict):
+            continue
+        for key, months in styles.items():
+            if not isinstance(months, dict):
+                continue
+            n = net.setdefault(str(key), {})
+            for m, cell in months.items():
+                m = str(m)
+                n[m] = n.get(m, 0.0) + _cube_units(cell)
+    sold, last = {}, {}
+    for key, n in net.items():
+        s, l = 0.0, ''
+        for m, u in n.items():
+            if frm <= m <= to:
+                s += u
+            if u > 0 and m > l:
+                l = m
+        sold[key] = _whole(s)
+        if l:
+            last[key] = l
+    return {'ready': True, 'from': frm, 'to': to, 'cutoff': cutoff, 'shifted': shifted,
+            'sold': sold, 'last': last}
 
 
 # ── trend store documents ────────────────────────────────────────────────────
