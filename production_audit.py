@@ -750,6 +750,8 @@ def range_view(frm, to, po=None, held=frozenset()):
             ev = {'p': p, 's': src.get('s') or first_ev.get('s') or k.split('::', 1)[1], 'f': factory_of(p),
                   'b': src.get('b') or first_ev.get('b') or '', 'po': src.get('po') or first_ev.get('po') or '',
                   'k': 'same', 'u': (el.get(k) or {}).get('u', 0)}
+            if k not in el and k not in sl:
+                ev['ab'] = 1          # added and taken off again inside the range
             if ev['f'] in held:
                 continue
         ev['n'] = cnt.get(k, 0)

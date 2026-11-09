@@ -265,6 +265,7 @@ class TestCaptureAndRoutes(_Env):
             self.assertEqual((j['from'], j['to'], j['base'], j['live']), ('2026-11-04', '2026-11-09', '2026-11-03', True))
             by = {l['s']: l for l in j['lines']}
             self.assertEqual((by['TJNAZZ900SLS']['k'], by['TJNAZZ900SLS']['n']), ('same', 2))   # up and back
+            self.assertNotIn('ab', by['TJNAZZ900SLS'])
             l901 = by['TJNAZZ901SLS']
             self.assertEqual((l901['k'], l901['u0'], l901['u1'], l901['e1'], l901['n']), ('chg', 101, 250, ['2027-01-20'], 1))
             self.assertEqual((by['TJNAZZ999SLS']['k'], by['TJNAZZ999SLS']['u1'], by['TJNAZZ999SLS'].get('np')), ('new', 3600, 1))
