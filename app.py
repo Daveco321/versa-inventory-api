@@ -1129,11 +1129,16 @@ def _photo_no_serial_fallback(sku, brand_abbr=''):
     Bottoms (VD pants served the same-serial shirt photo) and sportswear: polos,
     rugbys, tees and henleys share serial numbers with dress shirts, so GB_040 is a
     dress shirt, never the ROGBPL040SSR polo (David, Oct 19 2026). Their photo comes
-    from an override file or the sportswear folder; otherwise no photo is shown."""
+    from an override file or the sportswear folder; otherwise no photo is shown.
+    Pants by P## serial count too, whatever the fabric: U.S. Polo pants are DP / PP / AW,
+    codes dress shirts share, so is_bottoms_style misses them and they fell to the
+    fabric-blind 'US_02' key with no photo, while the desktop already shows their
+    '<prefix>_P<n>' pants photo. Now a new style number of a known pant colour gets
+    that photo in /image (the phone), exports and decks too (David, Nov 9 2026)."""
     if is_bottoms_style(sku):
         return True
     try:
-        return _py_get_item_category(sku, brand_abbr, structural=True) == 'sportswear'
+        return _py_get_item_category(sku, brand_abbr, structural=True) in ('sportswear', 'pants')
     except Exception:
         return False
 
