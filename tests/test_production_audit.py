@@ -413,6 +413,30 @@ class TestSwatchCards(_Env):
         bad = dict(up, file={'name': 'x.pdf', 'size': 20000, 'data': base64.urlsafe_b64encode(b'A' * 20000).decode()})
         self.assertEqual(self.c.post('/production-swatch-cards/ingest', json=bad, headers=h).status_code, 400)
 
+    def test_cards_fall_off_with_their_production(self):
+        live, seen = {'TF26901'}, {'TF26901', 'TF26902'}
+        app = Flask('t2')
+        sc._deps.clear()
+        sc._idx_cache.update(data=None, at=0.0)
+        sc.register_swatch_card_routes(app, get_s3=lambda: self.s3, s3_bucket='b', region='us-east-2', machine_key=KEY,
+                                       identity=lambda: {'tier': 'staff'}, held_factories=lambda: set(),
+                                       ledger_productions=lambda: live, productions_seen=lambda: seen)
+        c = app.test_client()
+        now = dt.datetime.now(dt.timezone.utc)
+        recent, old = (now - dt.timedelta(days=5)).isoformat(), (now - dt.timedelta(days=200)).isoformat()
+        for prod, date, salt in (('TF26901', old, 'a'), ('TF26902', recent, 'b'), ('TF26903', recent, 'c'), ('TF26904', old, 'd')):
+            sc.store_card({'id': 'm-' + salt, 'date': date, 'subject': prod}, f'AB X BRAND {prod}.pdf',
+                          _pdf(prod) + salt.encode(), [prod])
+        j = c.get('/production-swatch-cards').get_json()
+        self.assertEqual(sorted(j['by_prod']), ['TF26901', 'TF26903'])   # on the ledger / new and waiting
+        self.assertEqual(j['hidden'], 2)                                  # fell off / old and never on it
+        waiting = {cd['prods'][0]: cd.get('waiting') for cd in j['cards']}
+        self.assertEqual(waiting, {'TF26901': None, 'TF26903': ['TF26903']})
+        live.clear()                                                      # ledger not loaded: show all
+        j = c.get('/production-swatch-cards').get_json()
+        self.assertEqual(len(j['by_prod']), 4)
+        self.assertFalse(j['filtered'])
+
     def test_google_token_must_be_allowed_and_pinned(self):
         h = {'X-Api-Key': KEY}
         self.c.post('/production-swatch-cards/config', json={'allowed_emails': ['owner@example.com'],

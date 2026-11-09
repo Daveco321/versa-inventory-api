@@ -66,6 +66,7 @@ SC_BACKFILL_SINCE = os.environ.get('SWATCH_BACKFILL_SINCE', '2025/11/01')
 SC_WEEKLY_LOOKBACK_DAYS = 14          # first weekly run with no history looks back this far
 SC_OVERLAP_SECONDS = 2 * 86400        # each run re-lists 2 days before the last one started
 SC_MSG_KEEP_DAYS = 400
+SC_WAIT_DAYS = 60                     # a card for a PO the ledger has not had yet shows this long
 FACTORY_CODES = ('TF', 'NB', 'PC', 'DP', 'FR', 'NK')
 
 _deps = {}
@@ -418,9 +419,35 @@ def _weekly_since(idx):
     return int(time.time() - SC_WEEKLY_LOOKBACK_DAYS * 86400)
 
 
-def register_swatch_card_routes(app, *, get_s3, s3_bucket, region, machine_key, identity, held_factories=None):
+def visible_productions(card, live, seen, held, now=None):
+    """(shown, waiting) production numbers of one card. A card stays while its production is on the
+    Style Ledger and drops off when the production leaves it (David, Nov 9 2026: "do they disappear when
+    a production falls off the ledger (it should fall off)"). Cards usually come by email before the PO
+    reaches the ledger, so a production the ledger has never had shows for SC_WAIT_DAYS after the card
+    was sent, as waiting. Nothing is deleted: a production that comes back brings its cards back.
+    live None = the ledger is not loaded, show everything."""
+    prods = [p for p in (card.get('prods') or []) if p[:2] not in held]
+    if live is None:
+        return prods, []
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        sent = dt.datetime.fromisoformat(str(card.get('date') or '').replace('Z', '+00:00'))
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=dt.timezone.utc)
+        age = (now - sent).days
+    except ValueError:
+        age = 10 ** 6
+    shown = [p for p in prods if p in live or (p not in seen and age <= SC_WAIT_DAYS)]
+    return shown, [p for p in shown if p not in live]
+
+
+def register_swatch_card_routes(app, *, get_s3, s3_bucket, region, machine_key, identity, held_factories=None,
+                                ledger_productions=None, productions_seen=None):
+    """ledger_productions() -> production numbers on the Style Ledger now; productions_seen() -> every
+    production number the ledger has had since the audit history starts (production_audit.py)."""
     _deps.update(get_s3=get_s3, s3_bucket=s3_bucket, region=region, machine_key=machine_key,
-                 identity=identity, held_factories=held_factories)
+                 identity=identity, held_factories=held_factories, ledger_productions=ledger_productions,
+                 productions_seen=productions_seen)
 
     @app.route('/production-swatch-cards', methods=['GET', 'OPTIONS'])
     def swatch_cards_get():
@@ -436,13 +463,25 @@ def register_swatch_card_routes(app, *, get_s3, s3_bucket, region, machine_key, 
             held = set(_deps['held_factories']() or ()) if _deps.get('held_factories') else set()
         except Exception:
             held = set()
-        cards, by_prod = [], {}
+        live, seen = None, set()
+        try:
+            if _deps.get('ledger_productions'):
+                live = set(_deps['ledger_productions']() or ()) or None    # empty = not loaded: no filter
+            if _deps.get('productions_seen'):
+                seen = set(_deps['productions_seen']() or ())
+        except Exception as e:
+            print(f'[SwatchCards] ledger check failed, showing every card: {e}', flush=True)
+            live = None
+        cards, by_prod, hidden = [], {}, 0
         for c in idx['cards'].values():
-            prods = [p for p in (c.get('prods') or []) if p[:2] not in held]
+            prods, waiting = visible_productions(c, live, seen, held)
             if not prods:
+                hidden += 1
                 continue
             v = _card_view(c)
             v['prods'] = prods
+            if waiting:
+                v['waiting'] = waiting
             cards.append(v)
             for p in prods:
                 by_prod.setdefault(p, []).append(v['id'])
@@ -452,7 +491,8 @@ def register_swatch_card_routes(app, *, get_s3, s3_bucket, region, machine_key, 
         cards.sort(key=lambda c: c.get('date') or '', reverse=True)
         runs = [r for r in (idx.get('runs') or []) if r.get('finished_at')]
         resp = jsonify({'cards': cards, 'by_prod': by_prod, 'updated_at': idx.get('updated_at'),
-                        'last_run': runs[-1] if runs else None})
+                        'last_run': runs[-1] if runs else None, 'hidden': hidden,
+                        'filtered': live is not None, 'wait_days': SC_WAIT_DAYS})
         resp.headers['Cache-Control'] = 'no-store'
         return resp
 

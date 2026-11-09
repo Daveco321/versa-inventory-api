@@ -546,6 +546,41 @@ def load_day(day_iso, use_cache=True):
     return snap
 
 
+_seen_cache = {'set': None, 'at': 0.0}
+
+
+def productions_seen():
+    """Every production number the Style Ledger has had since the history starts (Apr 16 2026):
+    filled by the backfill from the day copies and by each capture. Cached for a minute."""
+    now = time.time()
+    if _seen_cache['set'] is not None and now - _seen_cache['at'] < 60:
+        return _seen_cache['set']
+    try:
+        doc = _get('seen.json.enc') or {}
+    except Exception:
+        doc = {}
+    _seen_cache['set'], _seen_cache['at'] = set(doc.get('p') or []), now
+    return _seen_cache['set']
+
+
+def add_seen(prods):
+    """Add production numbers to the seen set (read fresh, written only when something is new)."""
+    prods = {p for p in prods if p}
+    if not prods:
+        return
+    try:
+        doc = _get('seen.json.enc') or {}
+    except Exception as e:
+        print(f'[ProductionAudit] seen set not read: {e}', flush=True)
+        return
+    have = set(doc.get('p') or [])
+    if prods <= have:
+        return
+    doc = {'p': sorted(have | prods), 'at': dt.datetime.now(dt.timezone.utc).isoformat()}
+    _put('seen.json.enc', doc)
+    _seen_cache['set'], _seen_cache['at'] = set(doc['p']), time.time()
+
+
 def _state():
     now = time.time()
     with _mem_lock:
@@ -601,6 +636,10 @@ def capture_once(force=False):
             return {'ok': False, 'why': 'drop not confirmed yet'}
     prev_day = st.get('day')
     save_day(snap)
+    try:
+        add_seen(l['p'] for l in snap['lines'].values())
+    except Exception as e:
+        print(f'[ProductionAudit] seen set not updated: {e}', flush=True)
     st.update(day=today, sig=snap['sig'], lines=len(snap['lines']), rows=snap['rows'], rev=rev,
               captured_at=snap['captured_at'], drop_pending=None)
     if not st.get('own_since'):
@@ -939,6 +978,7 @@ def backfill(start=None, end=None, force=False):
                 have.add(m.group(1))
         prev_n = 0
         totals = []
+        seen = set()
         d = start
         while d <= end:
             iso = d.isoformat()
@@ -959,12 +999,15 @@ def backfill(start=None, end=None, force=False):
             if snap and snap.get('lines'):
                 prev_n = len(snap['lines'])
                 totals.append((iso, sum(l['u'] for l in snap['lines'].values()), len(snap['lines']), snap.get('source')))
+                seen.update(l['p'] for l in snap['lines'].values())
             elif snap and snap.get('glitch_lines'):
                 totals.append((iso, snap.get('glitch_units') or 0, snap.get('glitch_lines') or 0, snap.get('source')))
             if d.day == 1 or d == end:
                 _set_bf(progress=f'day copies through {iso}', counts=dict(counts))
             time.sleep(0.05)     # give the worker's other requests a turn (gevent)
             d += dt.timedelta(days=1)
+        add_seen(seen)
+        counts['productions_seen'] = len(productions_seen())
         # tracker days that counted the ledger wrong are left out (their lines are set aside)
         glitches = find_glitch_days(totals)
         for iso, why in glitches.items():

@@ -23875,11 +23875,31 @@ try:
 except Exception as _pa_err:
     print(f'[ProductionAudit] NOT registered: {_pa_err}', flush=True)
 
+def _swatch_ledger_productions():
+    """Production numbers on the Style Ledger now (upper case, trimmed)."""
+    out = set()
+    for r in _production_rows_all() or []:
+        p = re.sub(r'\s+', ' ', str(r.get('production') or '').strip().upper())
+        if p:
+            out.add(p)
+    return out
+
+
+def _swatch_productions_seen():
+    try:
+        import production_audit
+        return production_audit.productions_seen()
+    except Exception:
+        return set()
+
+
 try:
     from production_swatch_cards import register_swatch_card_routes
     register_swatch_card_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, region=AWS_REGION,
                                 machine_key=INVENTORY_API_KEY, identity=_request_identity,
-                                held_factories=_held_factories)
+                                held_factories=_held_factories,
+                                ledger_productions=_swatch_ledger_productions,
+                                productions_seen=_swatch_productions_seen)
 except Exception as _sc_err:
     print(f'[SwatchCards] NOT registered: {_sc_err}', flush=True)
 
