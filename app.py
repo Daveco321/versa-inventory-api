@@ -23842,9 +23842,32 @@ def _audit_ledger_rows():
         return rows, _production_rev
 
 
+# The audit reads up to a few hundred small S3 objects at once for a long Range, so it gets its own
+# client with a bigger connection pool (boto3's default pool is 10 connections).
+_audit_s3_client = None
+_audit_s3_lock = threading.Lock()
+
+
+def _audit_s3():
+    global _audit_s3_client
+    if _audit_s3_client is None:
+        with _audit_s3_lock:
+            if _audit_s3_client is None:
+                try:
+                    from botocore.config import Config as _AuditBotoConfig
+                    _audit_s3_client = boto3.client('s3',
+                        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', ''),
+                        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', ''),
+                        region_name=AWS_REGION, config=_AuditBotoConfig(max_pool_connections=32))
+                except Exception as e:
+                    print(f'[ProductionAudit] own S3 client failed, using the shared one: {e}', flush=True)
+                    _audit_s3_client = get_s3()
+    return _audit_s3_client
+
+
 try:
     from production_audit import register_production_audit_routes
-    register_production_audit_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, machine_key=INVENTORY_API_KEY,
+    register_production_audit_routes(app, get_s3=_audit_s3, s3_bucket=S3_BUCKET, machine_key=INVENTORY_API_KEY,
                                      identity=_request_identity, ledger_rows=_audit_ledger_rows,
                                      held_factories=_held_factories, norm_date=_norm_ledger_date,
                                      brand_of=_brand_by_style_number,

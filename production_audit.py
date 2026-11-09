@@ -61,6 +61,8 @@ PA_CAPTURE_SECONDS = int(os.environ.get('PA_CAPTURE_SECONDS', '600'))
 PA_HISTORY_START = dt.date(2026, 4, 16)     # the tracker's first full copy (Apr 15 was one row per PO)
 PA_MAX_RANGE_DAYS = 62
 PA_EVENTS_CACHE_DAYS = 400                  # day-change docs kept per worker (a few MB; ranges reuse them)
+PA_PARALLEL_READS = int(os.environ.get('PA_PARALLEL_READS', '24'))   # S3 reads at once for a long range
+PA_WARM_AFTER_SECONDS = 150                 # each worker reads the whole history once after it starts
 PA_BASE_LOOKBACK_DAYS = 10                  # how far back a day looks for the copy before it
 PA_DROP_GUARD = 0.70                        # a copy with fewer lines than this share of the last one is suspect
 PA_DROP_CONFIRM_SECONDS = 1800              # ... and is only accepted once it has held for 30 minutes
@@ -617,6 +619,23 @@ def capture_once(force=False):
     return {'ok': True, 'changed': True, 'day': today, 'lines': len(snap['lines'])}
 
 
+def _warm_history():
+    """Read every finished day's changes into this worker's memory once after it starts, so a long
+    Range (\"All history\") answers in a second instead of reading 200+ S3 objects first."""
+    time.sleep(PA_WARM_AFTER_SECONDS)
+    try:
+        end = et_today() - dt.timedelta(days=1)
+        days, d = [], PA_HISTORY_START
+        while d <= end:
+            days.append(d.isoformat())
+            d += dt.timedelta(days=1)
+        t0 = time.time()
+        docs = load_event_docs(days)
+        print(f'[ProductionAudit] warmed {sum(1 for v in docs.values() if v)} days in {time.time() - t0:.1f}s', flush=True)
+    except Exception as e:
+        print(f'[ProductionAudit] warm-up failed: {e}', flush=True)
+
+
 def _capture_loop():
     time.sleep(120)   # let the worker load the ledger first
     while True:
@@ -659,7 +678,7 @@ def copy_at_end_of(day):
 
 
 def load_event_docs(days):
-    """{day iso: changes doc or None} for many days, reading the ones not in memory 8 at a time."""
+    """{day iso: changes doc or None} for many days, reading the ones not in memory PA_PARALLEL_READS at a time."""
     out, missing = {}, []
     for iso in days:
         with _mem_lock:
@@ -670,7 +689,7 @@ def load_event_docs(days):
             missing.append(iso)
     if missing:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=PA_PARALLEL_READS) as ex:
             for iso, doc in zip(missing, ex.map(lambda i: events_for_day(i, persist=True), missing)):
                 out[iso] = doc
     return out
@@ -1200,3 +1219,4 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
     if start_capture and not _capture_thread_started:
         _capture_thread_started = True
         threading.Thread(target=_capture_loop, daemon=True, name='production-audit-capture').start()
+        threading.Thread(target=_warm_history, daemon=True, name='production-audit-warm').start()
