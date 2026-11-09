@@ -245,6 +245,44 @@ class TestCaptureAndRoutes(_Env):
             j = self.c.get('/production-audit?from=2026-11-07&to=2026-11-09', headers={'X-Api-Key': KEY}).get_json()
             self.assertFalse(any(e['f'] == 'NB' for e in j['events']))
 
+    def test_since_a_day_until_now(self):
+        t = dt.datetime(2026, 11, 3, 22, 0, tzinfo=dt.timezone.utc)
+        base = _base_lines()
+        d4 = list(base)
+        d4[0] = ('TF26901', 'TJNAZZ900SLS', 400, '12/15/2026')            # up on Nov 4 ...
+        d5 = list(base)                                                   # ... and back on Nov 5
+        d5[1] = ('TF26901', 'TJNAZZ901SLS', 250, '1/20/2027')             # units and ex-factory move
+        d6 = d5 + [('NB26901', 'TJNAZZ999SLS', 3600, '1/25/27')]           # a new production
+        for i, lines in enumerate([base, d4, d5, d6]):
+            self.s3.add_version(pa.PA_TRACKER_KEY, t + dt.timedelta(days=i), _tracker(lines))
+        with mock.patch.object(pa, 'et_today', return_value=self._day('2026-11-09')):
+            pa.backfill(start=self._day('2026-11-03'), end=self._day('2026-11-08'))
+            self.rows = [_row(p, s, u, etd=pa.norm_etd(e)) for p, s, u, e in d6]
+            self.rows[2]['units'] = 0                                    # today: one line goes to 0
+            r = self.c.get('/production-audit/since?from=2026-11-04', headers={'X-Api-Key': KEY})
+            self.assertEqual(r.status_code, 200)
+            j = r.get_json()
+            self.assertEqual((j['from'], j['to'], j['base'], j['live']), ('2026-11-04', '2026-11-09', '2026-11-03', True))
+            by = {l['s']: l for l in j['lines']}
+            self.assertEqual((by['TJNAZZ900SLS']['k'], by['TJNAZZ900SLS']['n']), ('same', 2))   # up and back
+            l901 = by['TJNAZZ901SLS']
+            self.assertEqual((l901['k'], l901['u0'], l901['u1'], l901['e1'], l901['n']), ('chg', 101, 250, ['2027-01-20'], 1))
+            self.assertEqual((by['TJNAZZ999SLS']['k'], by['TJNAZZ999SLS']['u1'], by['TJNAZZ999SLS'].get('np')), ('new', 3600, 1))
+            self.assertEqual((by['TJNAZZ902SLS']['u0'], by['TJNAZZ902SLS']['u1'], by['TJNAZZ902SLS']['d2']), (102, 0, '2026-11-09'))
+            self.assertNotIn('steps', l901)
+            self.assertEqual(j['pos']['NB26901'], {'po': 'TEST PO', 'u0': 0, 'u1': 3600, 'n0': 0, 'n1': 1})
+            self.assertEqual([d['d'] for d in j['days']][:2], ['2026-11-04', '2026-11-05'])
+            # one production with every dated step
+            j = self.c.get('/production-audit/since?from=2026-11-04&po=TF26901', headers={'X-Api-Key': KEY}).get_json()
+            self.assertTrue(all(l['p'] == 'TF26901' for l in j['lines']))
+            steps = {l['s']: [(st['d'], st.get('u0'), st.get('u1')) for st in l['steps']] for l in j['lines']}
+            self.assertEqual(steps['TJNAZZ900SLS'], [('2026-11-04', 100, 400), ('2026-11-05', 400, 100)])
+            # a range that ends before today compares with the end of that day
+            j = self.c.get('/production-audit/since?from=2026-11-04&to=2026-11-04', headers={'X-Api-Key': KEY}).get_json()
+            self.assertEqual([(l['s'], l['k']) for l in j['lines']], [('TJNAZZ900SLS', 'chg')])
+            self.assertFalse(j['live'])
+            self.assertEqual(self.c.get('/production-audit/since?from=2026-11-04').status_code, 401)
+
     def test_backfill_leaves_out_a_double_counted_day(self):
         t = dt.datetime(2026, 11, 3, 22, 0, tzinfo=dt.timezone.utc)
         base = _base_lines()

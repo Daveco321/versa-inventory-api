@@ -33,6 +33,9 @@ its own domain separation). Nothing here is ever written in plain text.
 
 Routes (Versa-Docs staff session or the machine key; held factories are left out, as in /production)
   GET  /production-audit?from=YYYY-MM-DD&to=YYYY-MM-DD   changes per day in the range (max 62 days)
+  GET  /production-audit/since?from=&to=&po=             everything from the start of a day until now (or `to`):
+                                                         the ledger then against the ledger at the end, per line,
+                                                         with how often each changed in between (steps for one PO)
   GET  /production-audit/status                          capture + backfill state
   POST /production-audit/backfill  {start?, force?}      machine key only: rebuild day copies from
                                                          the tracker and the changes from them
@@ -57,6 +60,7 @@ PA_TRACKER_KEY = os.environ.get('PA_TRACKER_KEY', 'production-inventory/snapshot
 PA_CAPTURE_SECONDS = int(os.environ.get('PA_CAPTURE_SECONDS', '600'))
 PA_HISTORY_START = dt.date(2026, 4, 16)     # the tracker's first full copy (Apr 15 was one row per PO)
 PA_MAX_RANGE_DAYS = 62
+PA_EVENTS_CACHE_DAYS = 400                  # day-change docs kept per worker (a few MB; ranges reuse them)
 PA_BASE_LOOKBACK_DAYS = 10                  # how far back a day looks for the copy before it
 PA_DROP_GUARD = 0.70                        # a copy with fewer lines than this share of the last one is suspect
 PA_DROP_CONFIRM_SECONDS = 1800              # ... and is only accepted once it has held for 30 minutes
@@ -641,6 +645,121 @@ def _base_for(day):
     return None
 
 
+def copy_at_end_of(day):
+    """The ledger copy at the end of `day` (a date): that day's copy, else the latest earlier one
+    (looking back up to PA_BASE_LOOKBACK_DAYS). Days left out as glitches have no lines and are passed over."""
+    d = day
+    stop = day - dt.timedelta(days=PA_BASE_LOOKBACK_DAYS)
+    while d >= stop and d >= PA_HISTORY_START:
+        snap = load_day(d.isoformat())
+        if snap and snap.get('lines'):
+            return snap
+        d -= dt.timedelta(days=1)
+    return None
+
+
+def load_event_docs(days):
+    """{day iso: changes doc or None} for many days, reading the ones not in memory 8 at a time."""
+    out, missing = {}, []
+    for iso in days:
+        with _mem_lock:
+            hit = _mem['events'].get(iso)
+        if hit is not None:
+            out[iso] = hit or None
+        else:
+            missing.append(iso)
+    if missing:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for iso, doc in zip(missing, ex.map(lambda i: events_for_day(i, persist=True), missing)):
+                out[iso] = doc
+    return out
+
+
+def range_view(frm, to, po=None, held=frozenset()):
+    """Everything that changed from the start of `frm` until the end of `to` (or now when `to` is
+    today): the ledger then against the ledger at the end, one line per production + style, plus how
+    many times each line changed in between (and every dated step when `po` names one production).
+    Lines that changed and came back to where they were are kept, as kind 'same'."""
+    today = et_today()
+    start = copy_at_end_of(frm - dt.timedelta(days=1))
+    if to >= today:
+        rows, rev = _deps['ledger_rows']()
+        end = own_snapshot(today.isoformat(), rows, rev) if rows else None
+    else:
+        end = copy_at_end_of(to)
+    if not start or not end:
+        return None
+    net, _pos = diff_snapshots(start, end)
+    days = []
+    d = frm
+    while d <= to:
+        days.append(d.isoformat())
+        d += dt.timedelta(days=1)
+    docs = load_event_docs(days)
+    cnt, first, last, info, full = defaultdict(int), {}, {}, {}, defaultdict(list)
+    per_day = []
+    for iso in days:
+        doc = docs.get(iso) or {}
+        n = 0
+        for ev in doc.get('events') or []:
+            if ev.get('f') in held:
+                continue
+            n += 1
+            k = ev['p'] + '::' + ev['s']
+            cnt[k] += 1
+            first.setdefault(k, iso)
+            last[k] = iso
+            info.setdefault(k, ev)
+            if po and ev['p'] == po:
+                full[k].append(dict(ev, d=iso))
+        per_day.append({'d': iso, 'n': n, 'skipped': doc.get('skipped'), 'missing': not doc})
+    net_by = {e['p'] + '::' + e['s']: e for e in net if e.get('f') not in held}
+    keys = set(net_by) | set(cnt)
+    if po:
+        keys = {k for k in keys if k.split('::', 1)[0] == po}
+    sl, el = start.get('lines') or {}, end.get('lines') or {}
+    lines = []
+    for k in keys:
+        ev = net_by.get(k)
+        if ev is not None:
+            ev = dict(ev)
+        else:
+            src = el.get(k) or sl.get(k) or {}
+            first_ev = info.get(k) or {}
+            p = src.get('p') or first_ev.get('p') or k.split('::', 1)[0]
+            ev = {'p': p, 's': src.get('s') or first_ev.get('s') or k.split('::', 1)[1], 'f': factory_of(p),
+                  'b': src.get('b') or first_ev.get('b') or '', 'po': src.get('po') or first_ev.get('po') or '',
+                  'k': 'same', 'u': (el.get(k) or {}).get('u', 0)}
+            if ev['f'] in held:
+                continue
+        ev['n'] = cnt.get(k, 0)
+        if ev['n']:
+            ev['d1'], ev['d2'] = first.get(k), last.get(k)
+        if po:
+            ev['steps'] = full.get(k, [])
+        lines.append(ev)
+    tot0, tot1, n0, n1 = defaultdict(int), defaultdict(int), defaultdict(int), defaultdict(int)
+    for l in sl.values():
+        tot0[l['p']] += l['u']
+        n0[l['p']] += 1
+    for l in el.values():
+        tot1[l['p']] += l['u']
+        n1[l['p']] += 1
+    pos = {}
+    for ev in lines:
+        p = ev['p']
+        if p not in pos:
+            pos[p] = {'po': ev.get('po') or '', 'u0': tot0.get(p, 0), 'u1': tot1.get(p, 0),
+                      'n0': n0.get(p, 0), 'n1': n1.get(p, 0)}
+    lines.sort(key=lambda e: (e['p'], e['s']))
+    return {'from': frm.isoformat(), 'to': to.isoformat(), 'today': today.isoformat(), 'live': to >= today,
+            'base': start.get('day'), 'base_src': start.get('source'), 'end_src': end.get('source'),
+            'end_at': end.get('captured_at'),
+            'fields': sorted(set(start.get('fields') or ()) & set(end.get('fields') or ())),
+            'lines': lines, 'pos': pos, 'days': per_day}
+
+
 def _make_doc(day_iso, base, cur):
     events, pos = diff_snapshots(base, cur)
     return {'v': 1, 'd': day_iso, 'base': base.get('day') if base else None,
@@ -705,9 +824,10 @@ def events_for_day(day_iso, persist=True):
         else:
             return None          # no copy for this day (yet): not remembered, see load_day
     with _mem_lock:
-        if len(_mem['events']) > 120:
-            _mem['events'].clear()
+        _mem['events'].pop(day_iso, None)
         _mem['events'][day_iso] = doc
+        while len(_mem['events']) > PA_EVENTS_CACHE_DAYS:      # least recently stored goes first
+            _mem['events'].pop(next(iter(_mem['events'])))
     return doc or None
 
 
@@ -989,6 +1109,45 @@ def register_production_audit_routes(app, *, get_s3, s3_bucket, machine_key, ide
             'now': {p: {'u': now_tot.get(p, 0), 'n': now_n.get(p, 0), 'po': now_po.get(p, '')} for p in touched},
             'factories': FACTORY_NAMES,
         })
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+
+    @app.route('/production-audit/since', methods=['GET', 'OPTIONS'])
+    def production_audit_since():
+        """?from=YYYY-MM-DD[&to=YYYY-MM-DD][&po=PRODUCTION]: everything that changed from the start of
+        `from` until now (or the end of `to`). David, Nov 9 2026: "if i click on a date a month ago, it
+        shows me the changes made from that day until today"."""
+        if request.method == 'OPTIONS':
+            return ('', 204)
+        if not _caller():
+            return _deny()
+        if _fernet() is None:
+            return jsonify({'error': 'Production Audit storage is not configured on the server.'}), 503
+        today = et_today()
+        frm = _parse_day(request.args.get('from'))
+        if not frm:
+            return jsonify({'error': 'Pick the day to start from.'}), 400
+        to = _parse_day(request.args.get('to')) or today
+        to = min(to, today)
+        frm = max(frm, PA_HISTORY_START + dt.timedelta(days=1))   # the first day with a day before it
+        if frm > to:
+            frm, to = to, frm
+        po = norm_prod(request.args.get('po')) or None
+        try:
+            view = range_view(frm, to, po=po, held=frozenset(_held()))
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({'error': f'Could not read the ledger history: {str(e)[:200]}'}), 500
+        if view is None:
+            return jsonify({'error': 'There is no copy of the ledger for that range.'}), 404
+        st = {}
+        try:
+            st = _state()
+        except Exception:
+            pass
+        view.update(history_start=PA_HISTORY_START.isoformat(), own_since=st.get('own_since'),
+                    as_of=st.get('captured_at'), factories=FACTORY_NAMES, po=po)
+        resp = jsonify(view)
         resp.headers['Cache-Control'] = 'no-store'
         return resp
 
