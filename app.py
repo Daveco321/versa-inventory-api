@@ -11584,6 +11584,11 @@ _AUTHZ_OPEN_EXACT = {'/', '/health', '/favicon.ico',
                      '/dropbox-photos', '/sportswear-photos'}
 _AUTHZ_OPEN_PREFIXES = ('/image/', '/mcp', '/factory-view', '/factory-report',
                         '/factory-scorecard',   # inline auth: Versa-Docs admin or machine key (factory_scorecard.py)
+                        # inline auth: a Versa-Docs staff session or the machine key (production_audit.py)
+                        '/production-audit',
+                        # inline auth: staff session / machine key to read; the ingest takes the machine
+                        # key or David's Apps Script (Google ID token, pinned audience) (production_swatch_cards.py)
+                        '/production-swatch-cards',
                         # inline auth: the Resend webhook signature, then a sender
                         # allow-list — an unsigned POST never reaches the agent
                         # (email_agent.py). /inbound-email/status is machine-key only.
@@ -23821,6 +23826,39 @@ register_scorecard_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET,
                           machine_key=INVENTORY_API_KEY,
                           load_master=load_production_from_dropbox,
                           brand_of=_brand_by_style_number)
+
+
+# ── Production Audit + swatch cards (phone app, David Nov 9 2026) ───────────
+# production_audit.py keeps a copy of the Style Ledger per Eastern day (captured by
+# the leader worker every 10 minutes; days before Nov 9 2026 from the hourly ledger
+# tracker's S3 versions) and serves what changed per day for the phone's Production
+# Audit tab. production_swatch_cards.py files the swatch cards found in David's email
+# (his Monday-night Apps Script) under their production POs. Both check callers inline
+# and store everything encrypted under a machine-key-derived prefix. Wrapped so a
+# failure never blocks boot.
+def _audit_ledger_rows():
+    rows = _production_rows_all()
+    with _production_lock:
+        return rows, _production_rev
+
+
+try:
+    from production_audit import register_production_audit_routes
+    register_production_audit_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, machine_key=INVENTORY_API_KEY,
+                                     identity=_request_identity, ledger_rows=_audit_ledger_rows,
+                                     held_factories=_held_factories, norm_date=_norm_ledger_date,
+                                     brand_of=_brand_by_style_number,
+                                     start_capture=os.environ.get('PRODUCTION_AUDIT_CAPTURE', 'on') != 'off')
+except Exception as _pa_err:
+    print(f'[ProductionAudit] NOT registered: {_pa_err}', flush=True)
+
+try:
+    from production_swatch_cards import register_swatch_card_routes
+    register_swatch_card_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, region=AWS_REGION,
+                                machine_key=INVENTORY_API_KEY, identity=_request_identity,
+                                held_factories=_held_factories)
+except Exception as _sc_err:
+    print(f'[SwatchCards] NOT registered: {_sc_err}', flush=True)
 
 
 # ── Inbound email agent: POST /inbound-email (Resend webhook) ────────────────
