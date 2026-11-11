@@ -11350,8 +11350,13 @@ def admin_sync_status():
 # SAVED CATALOGS — S3 persistence
 # ============================================
 
-def _load_saved_catalogs():
-    """Load saved catalogs from S3."""
+def _load_saved_catalogs(strict=False):
+    """Load saved catalogs from S3.
+
+    strict=True raises when the list cannot be read (anything but "the file does not
+    exist yet"). Every WRITE reads with strict=True: a read that failed used to come
+    back as an empty list, and the save that followed wrote that one-entry list over
+    every saved catalog (Nov 11 2026 audit)."""
     try:
         s3 = get_s3()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY)
@@ -11361,6 +11366,8 @@ def _load_saved_catalogs():
         if 'NoSuchKey' in err_str or '404' in err_str or 'does not exist' in err_str.lower():
             return []
         print(f"[Saved Catalogs] Load error: {e}", flush=True)
+        if strict:
+            raise
         return []
 
 def _save_saved_catalogs(catalogs):
@@ -11390,6 +11397,8 @@ def _save_saved_catalogs(catalogs):
             with _catalog_cache_lock:
                 _catalog_cache['list'] = None
                 _catalog_cache['ts'] = 0.0
+                _catalog_cache['etag'] = None
+                _catalog_cache['checked'] = 0.0
         except Exception:
             pass
         return True
@@ -11447,7 +11456,7 @@ def handle_saved_catalogs():
         if not data or not data.get('name') or not data.get('url'):
             return _cors_json({'error': 'name and url required'}, 400)
 
-        catalogs = _load_saved_catalogs()
+        catalogs = _load_saved_catalogs(strict=True)
 
         existing_idx = next((i for i, c in enumerate(catalogs) if c['name'].lower() == data['name'].lower()), -1)
 
@@ -11495,7 +11504,7 @@ def reorder_saved_catalogs():
     try:
         data = request.get_json()
         order = data.get('order', [])  # list of original indices in new order
-        catalogs = _load_saved_catalogs()
+        catalogs = _load_saved_catalogs(strict=True)
         if len(order) != len(catalogs):
             return _cors_json({'error': 'order length mismatch'}, 400)
         reordered = [catalogs[i] for i in order if 0 <= i < len(catalogs)]
@@ -11517,7 +11526,15 @@ def delete_saved_catalog(idx):
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Api-Key'
         return resp
     try:
-        catalogs = _load_saved_catalogs()
+        catalogs = _load_saved_catalogs(strict=True)
+        # The page sends the catalog's slug with the position (Nov 11 2026). The list is
+        # shared: a save by anyone else, or an auto-saved copied link, shifts every
+        # position, and a delete by position alone then removed the wrong catalog.
+        slug = (request.args.get('slug') or '').strip()
+        if slug:
+            idx = next((i for i, c in enumerate(catalogs) if str(c.get('slug') or '') == slug), -1)
+            if idx < 0:
+                return _cors_json({'error': 'catalog not found', 'catalogs': catalogs}, 404)
         if idx < 0 or idx >= len(catalogs):
             return _cors_json({'error': 'invalid index'}, 404)
         removed = catalogs.pop(idx)
@@ -11622,18 +11639,48 @@ _AUTHZ_CATALOG_POSTS = {'/export', '/export-multi', '/export-pdf'}
 _AUTHZ_ALL_BRAND_FLAGS = ('all', 'all_brands', 'wh_all_brands', 'os_all_brands')
 
 # ── Saved-catalog cache (60s) so slug lookups don't hit S3 per request ──────
-_catalog_cache = {'ts': 0.0, 'list': None}
+_catalog_cache = {'ts': 0.0, 'list': None, 'etag': None, 'checked': 0.0}
 _catalog_cache_lock = threading.Lock()
+_CATALOG_CACHE_RECHECK_SECONDS = 2
+
+def _saved_catalogs_etag():
+    """ETag of the saved-catalogs object on S3, or None when it cannot be read."""
+    try:
+        return get_s3().head_object(Bucket=S3_BUCKET, Key=S3_SAVED_CATALOGS_KEY).get('ETag')
+    except Exception:
+        return None
 
 def _load_saved_catalogs_cached(max_age=60):
+    """The saved catalogs for the access gate, kept per worker.
+
+    A save clears only the copy of the worker that handled it. Until Nov 11 2026 the
+    other workers went on answering from their own copy for up to a minute, so a
+    catalog opened right after it was saved came back "not found" (a new one) or with
+    its previous settings (an edited one), depending on which worker answered. The
+    copy is now checked against the S3 object's ETag every 2 seconds (one small HEAD
+    request), and a list that could not be read never replaces a good one."""
     now = time.time()
     with _catalog_cache_lock:
-        if _catalog_cache['list'] is not None and now - _catalog_cache['ts'] < max_age:
-            return _catalog_cache['list']
-    cats = _load_saved_catalogs()
+        cached = _catalog_cache['list']
+        etag = _catalog_cache.get('etag')
+        if cached is not None and now - _catalog_cache.get('checked', 0.0) < _CATALOG_CACHE_RECHECK_SECONDS:
+            return cached
+    live = _saved_catalogs_etag()
+    if cached is not None and live is not None and live == etag:
+        with _catalog_cache_lock:
+            _catalog_cache['checked'] = time.time()
+        return cached
+    try:
+        cats = _load_saved_catalogs(strict=True)
+    except Exception:
+        if cached is not None:
+            return cached          # S3 hiccup: keep answering from the last good list
+        return []                  # nothing to fall back on; not cached, the next call retries
     with _catalog_cache_lock:
         _catalog_cache['ts'] = time.time()
+        _catalog_cache['checked'] = _catalog_cache['ts']
         _catalog_cache['list'] = cats
+        _catalog_cache['etag'] = live
     return cats
 
 # ── Open-orders team token introspection (for the open-orders frontends) ────
@@ -11739,10 +11786,15 @@ def _catalog_scope_for_slug(slug):
         b = str(b).strip().upper()
         if b and b != '__SEG__':
             scope['brands'].add(b)
-    for s in str(q.get('skus') or '').split(','):
-        s = s.strip().upper()
-        if s:
-            scope['styles'].add(get_base_style(s))
+    # skus= is the catalog's SKU List. The force-include lists (regular and per segment)
+    # name styles the catalog shows whatever its brand list says, so they are in scope
+    # too: a force-included style of a brand that is not on the catalog used to be cut
+    # from the customer's feed and never showed (Nov 11 2026).
+    for key in ('skus', 'override_include', 'wh_override_include', 'os_override_include'):
+        for s in str(q.get(key) or '').split(','):
+            s = s.strip().upper()
+            if s:
+                scope['styles'].add(get_base_style(s))
     # pos= catalogs (and segment wh_pos/os_pos variants) are PO-scoped: pull
     # the matching production rows' styles in.
     po_filter = set()
