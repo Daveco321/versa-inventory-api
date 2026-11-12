@@ -1672,12 +1672,14 @@ def ddp_factory_brands(S):
 _RECORD_SKIP = ('removed', 'reissued', 'moved')     # factory record lines that the factory did not make
 
 
-def factory_record_rows(lines):
+def factory_record_rows(lines, today=None):
     """The production lines a factory record holds, as [{'production', 'style', 'factory', 'units'}] (Nov 12
     2026): the factory scorecard's line history (every master ledger copy plus the factories' own ledgers), so the
     P&L keeps knowing which factory made a style, and how many of its units, after its lines leave the ledger.
     Lines removed, re-issued at another factory or moved to another ref are left out, and so are factory-file
-    lines with no units."""
+    lines with no units. shipped: the units of the line that have left the factory (_record_shipped) as of today
+    ('YYYY-MM-DD', default the UTC date)."""
+    today = _d10(today) or datetime.utcnow().date().isoformat()
     out = []
     for ln in lines if isinstance(lines, (list, tuple)) else ():
         if not isinstance(ln, dict) or ln.get('outcome') in _RECORD_SKIP:
@@ -1688,8 +1690,32 @@ def factory_record_rows(lines):
         units = max(0, _int(ln.get('units')))
         if ln.get('outcome') is None and units <= 0:
             continue
-        out.append({'production': ref, 'style': style, 'factory': _u(ln.get('factory')), 'units': units})
+        out.append({'production': ref, 'style': style, 'factory': _u(ln.get('factory')), 'units': units,
+                    'shipped': _record_shipped(ln, units, today)})
     return out
+
+
+_RECORD_NEW_DAYS = 90
+
+
+def _record_shipped(ln, units, today):
+    """The units of a factory record line that have left the factory, as far as the record can tell (Nov 12 2026).
+    Its shipped units when the line names them; all its units when it is completed, its status is shipped, or it
+    has a departure date or a shipment; none when it clearly has not shipped yet: its ETD is still ahead, or it has
+    no ETD and was placed in the last 90 days. Any other line counts in full (a late line may well have shipped:
+    the ledger lags). No stock or invoice can have come from a line that has not shipped."""
+    sent = max(0, _int(ln.get('ship_units')))
+    if sent:
+        return sent
+    if (ln.get('outcome') == 'completed' or str(ln.get('status') or '').strip().lower() == 'shipped'
+            or ln.get('atd') or str(ln.get('shipment') or '').strip()):
+        return units
+    etd = _d10(ln.get('final_etd') or ln.get('latest_etd') or ln.get('first_etd'))
+    if etd:
+        return units if etd < today else 0
+    placed = _d10(ln.get('placed') or ln.get('first_seen'))
+    new = (date.fromisoformat(today) - timedelta(days=_RECORD_NEW_DAYS)).isoformat()
+    return 0 if placed and placed > new else units
 
 
 def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=(), row=None, skip=()):
@@ -2033,30 +2059,40 @@ class CostIndex:
         return {b: frozenset(f) for b, f in out.items()}
 
     def _made_units(self, record_rows):
-        """{base (DV letters folded): {factory: units}} from the factory record's lines (Nov 12 2026, the shares a
-        style was made in); a style with no units on record takes its current ledger lines' units."""
-        rec, led = defaultdict(lambda: defaultdict(float)), defaultdict(lambda: defaultdict(float))
+        """{base (DV letters folded): {factory: units}}: the units of each style that have SHIPPED, by factory, from
+        the factory record's lines (Nov 12 2026, the shares a style was made in). Stock and invoices can only come
+        from units that left a factory, so a line still open or late counts nothing yet; a record row without
+        shipped units (an older record) counts its units. A style the record knows with nothing shipped yet has no
+        entry; a style the record does not know takes its current ledger lines' units."""
+        rec, led, known = defaultdict(lambda: defaultdict(float)), defaultdict(lambda: defaultdict(float)), set()
 
-        def add(out, style, ref, units, hint=None):
+        def add(out, style, ref, units, hint=None, seen=None):
             b = norm_vd(base_of(style))
             f = _u(hint)
             if not f or f in _LIST_FACTORY_PSEUDO:
                 f = fac_of(ref)
+            if not b or not f or f in _LIST_FACTORY_PSEUDO:
+                return
+            if seen is not None:
+                seen.add(b)
             u = _fnum(units)
-            if b and f and f not in _LIST_FACTORY_PSEUDO and u is not None and u > 0:
+            if u is not None and u > 0:
                 out[b][f] += u
         for r in record_rows or ():
             if isinstance(r, dict):
-                add(rec, r.get('style'), r.get('production') or r.get('ref'), r.get('units'), r.get('factory'))
+                on = any((_fnum(r.get(k)) or 0) > 0 for k in ('units', 'shipped'))
+                add(rec, r.get('style'), r.get('production') or r.get('ref'),
+                    r.get('shipped') if 'shipped' in r else r.get('units'), r.get('factory'), known if on else None)
         for L in self.ledger:
             add(led, L['b'], L['ref'], L['units'])
-        out = {b: dict(v) for b, v in led.items()}
+        out = {b: dict(v) for b, v in led.items() if b not in known}
         out.update({b: dict(v) for b, v in rec.items()})
+        self._units_shipped = frozenset(rec)          # these styles' units are shipped units (the words say so)
         return out
 
     def ddp_share(self, b):
-        """The share (0..1) of base style b's units on record made by factories that deliver it duty paid, or None
-        when no units are on record (Nov 12 2026)."""
+        """The share (0..1) of base style b's shipped units (made_units) made by factories that deliver it duty paid,
+        or None when none are known (Nov 12 2026)."""
         units = self.made_units.get(norm_vd(base_of(b)))
         tot = sum(units.values()) if units else 0
         if tot <= 0:
@@ -2065,8 +2101,8 @@ class CostIndex:
 
     def part_share(self, fac, b):
         """The import share (0..1) a row with no known factory pays (Nov 12 2026, split by share): the share of the
-        style's units on record made by factories that do not deliver it duty paid. None when the row's factory is
-        known, nothing is on record, or every unit (or none) came from a delivering factory."""
+        style's shipped units made by factories that do not deliver it duty paid. None when the row's factory is
+        known, no shipped units are known, or every unit (or none) came from a delivering factory."""
         f = _u(fac)
         if not self.ddp_brands or (f and f not in _LIST_FACTORY_PSEUDO):
             return None
@@ -3016,7 +3052,7 @@ class CostIndex:
         f = _u(fac)
         if f and f not in _LIST_FACTORY_PSEUDO:
             return self._fac_delivers(f, b)
-        d = self.ddp_share(b)                  # units on record: every unit from a delivering factory
+        d = self.ddp_share(b)                  # shipped units known: every one from a delivering factory
         if d is not None:
             return d >= 1 - _SHARE_EPS
         facs = self.made_by.get(norm_vd(base_of(b)))
@@ -3039,8 +3075,10 @@ class CostIndex:
         dl = sorted(f for f in units if self._fac_delivers(f, b))
         names = self._names([_factory_name(self.S, x) for x in dl])
         pct = int(round((1 - part) * 100))
-        return ('%s made %d%% of this style\'s units on record and %s duty paid (DDP), so import costs are added on '
-                'the other %d%% only.' % (names, pct, 'delivers' if len(dl) == 1 else 'deliver', 100 - pct))
+        what = ('the units of this style that have shipped' if norm_vd(base_of(b)) in self._units_shipped
+                else 'this style\'s units on the ledger')
+        return ('%s made %d%% of %s and %s duty paid (DDP), so import costs are added on the other %d%% only.'
+                % (names, pct, what, 'delivers' if len(dl) == 1 else 'deliver', 100 - pct))
 
     def _fac_terms(self, res, b, fac):
         """Goods that their factory delivers duty paid (settings factories.<code>.ddp or .ddpBrands, Nov 12 2026)

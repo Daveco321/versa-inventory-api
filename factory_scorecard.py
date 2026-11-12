@@ -1257,13 +1257,16 @@ def _load_blob(name):
 
 
 _made_memo = {'generated_at': None, 'lines': None}
+# The fields that tell whether a line has shipped (pnl_engine._record_shipped), kept with each line for the P&L.
+_MADE_SHIP = ('status', 'atd', 'ship_units', 'shipment', 'final_etd', 'latest_etd', 'first_etd', 'placed', 'first_seen')
 
 
 def made_lines():
-    """{'generated_at', 'lines': [{ref, style, factory, outcome, units}]} for every line of the scorecard's line
-    history, or None before the first build (Nov 12 2026: the P&L reads which factory made each style from it, so
-    delivered terms outlive the ledger lines). One S3 read per new build per worker, and only these fields stay in
-    memory (the full lines.json is several MB)."""
+    """{'generated_at', 'lines': [{ref, style, factory, outcome, units, and the shipping fields _MADE_SHIP}]} for
+    every line of the scorecard's line history, or None before the first build (Nov 12 2026: the P&L reads which
+    factory made each style from it, so delivered terms outlive the ledger lines, and how many units of it have
+    shipped). One S3 read per new build per worker, and only these fields stay in memory (the full lines.json is
+    several MB)."""
     latest = None
     try:
         latest = (_s3_get_json(f'{SC_PREFIX}status.json') or {}).get('generated_at')
@@ -1276,8 +1279,8 @@ def made_lines():
         else _s3_get_json(f'{SC_PREFIX}lines.json')
     if not isinstance(obj, dict):
         return None
-    lines = [{'ref': ln.get('ref'), 'style': ln.get('style'), 'factory': ln.get('factory'),
-              'outcome': ln.get('outcome'), 'units': ln.get('units')}
+    lines = [dict({'ref': ln.get('ref'), 'style': ln.get('style'), 'factory': ln.get('factory'),
+                   'outcome': ln.get('outcome'), 'units': ln.get('units')}, **{k: ln.get(k) for k in _MADE_SHIP})
              for ln in obj.get('lines') or () if isinstance(ln, dict)]
     _made_memo.update(generated_at=obj.get('generated_at'), lines=lines)
     return dict(_made_memo)

@@ -466,14 +466,11 @@ def _normalize_sources(raw):
     osrc = {'modified': _str_or_none(osrc.get('modified')), 'ageHours': _num_or_none(osrc.get('ageHours')),
             'stale': osrc.get('stale') is True, 'checkedAt': _str_or_none(osrc.get('checkedAt'))} if osrc else {}
     # Nov 12 2026: the factory record (which factory made each style, and how many units; it decides delivered
-    # terms only). Rows keep only the production ref, the style, the factory and the units.
+    # terms only). Rows keep only the production ref, the style, the factory, the units and, when the row has them,
+    # the units shipped.
     fr = raw.get('factory_record')
     fr = fr if isinstance(fr, dict) else {}
-    fr_rows = [{'production': str(r.get('production') or '').strip().upper()[:20],
-                'style': str(r.get('style') or '').strip().upper()[:40],
-                'factory': str(r.get('factory') or '').strip().upper()[:12],
-                'units': _record_units(r.get('units'))}
-               for r in _rows(fr.get('rows')) if r.get('production') and r.get('style')]
+    fr_rows = [_record_row(r) for r in _rows(fr.get('rows')) if r.get('production') and r.get('style')]
     return {
         'inventory': {'items': _rows(inv.get('items')), 'last_sync': _str_or_none(inv.get('last_sync'))},
         'ledger': {'rows': _rows(led.get('rows')), 'last_sync': _str_or_none(led.get('last_sync'))},
@@ -491,6 +488,16 @@ def _normalize_sources(raw):
         'sales_pending': sp,
         'factory_record': {'rows': fr_rows, 'generatedAt': _str_or_none(fr.get('generatedAt'))},
     }
+
+
+def _record_row(r):
+    row = {'production': str(r.get('production') or '').strip().upper()[:20],
+           'style': str(r.get('style') or '').strip().upper()[:40],
+           'factory': str(r.get('factory') or '').strip().upper()[:12],
+           'units': _record_units(r.get('units'))}
+    if 'shipped' in r:
+        row['shipped'] = _record_units(r.get('shipped'))
+    return row
 
 
 def _record_units(v):

@@ -97,8 +97,8 @@ class FactoryDeliveredResolutions(unittest.TestCase):
         self.assertIn('ddp_part', anywhere['flags'])
         for f in ('ddp', 'ddp_mixed'):
             self.assertNotIn(f, anywhere['flags'])
-        self.assertIn('Synth Factory T made 50% of this style\'s units on record and delivers duty paid (DDP), so '
-                      'import costs are added on the other 50% only.', anywhere['basis'])
+        self.assertIn('Synth Factory T made 50% of this style\'s units on the ledger and delivers duty paid (DDP), so '
+                      'import costs are added on the other 50% only.', anywhere['basis'])     # nothing on record
 
     def test_a_list_quote_and_the_combined_cost(self):
         self.assertEqual([q['flags'] for q in T.ci().quotes('ROQAQF101SLS')], [()])
@@ -286,11 +286,44 @@ class FactoryRecord(unittest.TestCase):
                  {'ref': 'TT26013', 'style': 'ROQAQF305SLS', 'factory': 'TT', 'outcome': 'moved', 'units': 50},
                  {'ref': 'TT25001', 'style': 'ROQAQF306SLS', 'factory': 'TT', 'outcome': None, 'units': 0},
                  {'ref': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'outcome': None, 'units': 12},
-                 {'ref': '', 'style': 'ROQAQF308SLS', 'outcome': 'open'}, 'junk', None]
-        self.assertEqual(E.factory_record_rows(lines), [
-            {'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT', 'units': 100},
-            {'production': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT', 'units': 50},
-            {'production': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'units': 12}])
+                 {'ref': '', 'style': 'ROQAQF308SLS', 'outcome': 'open'}, 'junk', None,
+                 # what has shipped as of today: shipped units win; a shipped status, departure date or shipment
+                 # count the line; an ETD still ahead, or no ETD and placed in the last 90 days, count nothing
+                 {'ref': 'TT26014', 'style': 'ROQAQF309SLS', 'factory': 'TT', 'outcome': 'open', 'units': 40,
+                  'status': 'shipped'},
+                 {'ref': 'TT26015', 'style': 'ROQAQF310SLS', 'factory': 'TT', 'outcome': 'open', 'units': 40,
+                  'status': 'late', 'ship_units': 15, 'final_etd': '2026-02-01'},
+                 {'ref': 'TT25003', 'style': 'ROQAQF311SLS', 'factory': 'TT', 'outcome': None, 'units': 30,
+                  'status': 'shipped', 'atd': '2026-02-21', 'ship_units': 31},
+                 {'ref': 'TT26016', 'style': 'ROQAQF312SLS', 'factory': 'TT', 'outcome': 'open', 'units': 20,
+                  'status': 'open', 'atd': '2026-10-01'},
+                 {'ref': 'TT26017', 'style': 'ROQAQF313SLS', 'factory': 'TT', 'outcome': 'open', 'units': 20,
+                  'status': 'open', 'shipment': '26-107', 'final_etd': '2026-04-01'},
+                 {'ref': 'TT26018', 'style': 'ROQAQF314SLS', 'factory': 'TT', 'outcome': 'open', 'units': 20,
+                  'status': 'late', 'final_etd': '2026-02-20', 'latest_etd': '2026-01-01'},     # late: may have shipped
+                 {'ref': 'TT26019', 'style': 'ROQAQF315SLS', 'factory': 'TT', 'outcome': 'open', 'units': 20,
+                  'status': 'open', 'latest_etd': '2026-03-05'},                                # ahead: not yet
+                 {'ref': 'TT26020', 'style': 'ROQAQF316SLS', 'factory': 'TT', 'outcome': 'open', 'units': 20,
+                  'status': 'open', 'placed': '2026-01-10'},                                    # new, no ETD
+                 {'ref': 'TT25004', 'style': 'ROQAQF317SLS', 'factory': 'TT', 'outcome': None, 'units': 20,
+                  'status': 'open', 'first_seen': '2025-06-01'}]                                # old, no ETD
+        rows = [{'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT', 'units': 100, 'shipped': 100},
+                {'production': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT', 'units': 50, 'shipped': 50},
+                {'production': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'units': 12, 'shipped': 12},
+                {'production': 'TT26014', 'style': 'ROQAQF309SLS', 'factory': 'TT', 'units': 40, 'shipped': 40},
+                {'production': 'TT26015', 'style': 'ROQAQF310SLS', 'factory': 'TT', 'units': 40, 'shipped': 15},
+                {'production': 'TT25003', 'style': 'ROQAQF311SLS', 'factory': 'TT', 'units': 30, 'shipped': 31},
+                {'production': 'TT26016', 'style': 'ROQAQF312SLS', 'factory': 'TT', 'units': 20, 'shipped': 20},
+                {'production': 'TT26017', 'style': 'ROQAQF313SLS', 'factory': 'TT', 'units': 20, 'shipped': 20},
+                {'production': 'TT26018', 'style': 'ROQAQF314SLS', 'factory': 'TT', 'units': 20, 'shipped': 20},
+                {'production': 'TT26019', 'style': 'ROQAQF315SLS', 'factory': 'TT', 'units': 20, 'shipped': 0},
+                {'production': 'TT26020', 'style': 'ROQAQF316SLS', 'factory': 'TT', 'units': 20, 'shipped': 0},
+                {'production': 'TT25004', 'style': 'ROQAQF317SLS', 'factory': 'TT', 'units': 20, 'shipped': 20}]
+        self.assertEqual(E.factory_record_rows(lines, '2026-03-01'), rows)
+        later = E.factory_record_rows(lines, '2026-06-01T09:00:00Z')        # the ETD passed, the line is old now
+        self.assertEqual([(r['production'], r['shipped']) for r in later if r['shipped'] != dict(
+            (x['production'], x['shipped']) for x in rows)[r['production']]], [('TT26019', 20), ('TT26020', 20)])
+        self.assertEqual(len(E.factory_record_rows(lines)), len(rows))      # today by default
         for bad in (None, 'x', {}, 5):
             self.assertEqual(E.factory_record_rows(bad), [])
 
@@ -393,7 +426,7 @@ class SplitByShare(unittest.TestCase):
         self.assertIsNone(ci_rec({}, SPLIT).part_share('UNKNOWN', 'ROQAQF301SLS'))   # no factory delivers
         r = c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'UNKNOWN'))
         self.assertEqual((r['impShare'], 'ddp_part' in r['flags'], 'ddp' in r['flags']), (0.25, True, False))
-        self.assertIn('Synth Factory T made 75% of this style', r['basis'])
+        self.assertIn('Synth Factory T made 75% of the units of this style that have shipped', r['basis'])
 
     def _ds(self, settings, record, overrides=None):
         s = history_only('ROQAQF301SLS')
@@ -450,14 +483,82 @@ class SplitByShare(unittest.TestCase):
         self.assertEqual(a['shipped']['byCustomer'], b['shipped']['byCustomer'])
 
 
+def shipped(tt, nn):
+    """SPLIT with shipped units: TT ordered 300 and shipped tt, NN ordered 100 and shipped nn."""
+    return [dict(SPLIT[0], shipped=tt), dict(SPLIT[1], shipped=nn)]
+
+
+class OnlyShippedUnitsCount(unittest.TestCase):
+    """Nov 12 2026: the share counts the units that have SHIPPED. A delivering factory's lines that have not shipped
+    yet made none of the stock or invoices, so they must not cut the import on goods the other factories made."""
+
+    def test_shares(self):
+        self.assertEqual(ci_rec(TT_ALL, shipped(300, 100)).part_share('UNKNOWN', 'ROQAQF301SLS'), 0.25)
+        c = ci_rec(TT_ALL, shipped(150, 50))                            # half of each shipped: same shares
+        self.assertEqual((c.made_units['ROQAQF301SLS'], c.part_share('UNKNOWN', 'ROQAQF301SLS')),
+                         ({'TT': 150.0, 'NN': 50.0}, 0.25))
+        c = ci_rec(TT_ALL, shipped(100, 100))
+        self.assertEqual(c.part_share('UNKNOWN', 'ROQAQF301SLS'), 0.5)
+        c = ci_rec(TT_ALL, shipped(0, 100))                             # TT shipped nothing yet: all import
+        self.assertEqual(c.made_units['ROQAQF301SLS'], {'NN': 100.0})
+        self.assertEqual((c.ddp_share('ROQAQF301SLS'), c.part_share('UNKNOWN', 'ROQAQF301SLS')), (0.0, None))
+        self.assertFalse(c.delivers('UNKNOWN', 'ROQAQF301SLS'))
+        r = c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'UNKNOWN'))
+        self.assertFalse({'ddp', 'ddp_part'} & set(r['flags']))
+        c = ci_rec(TT_ALL, shipped(300, 0))                             # only TT shipped: all delivered
+        self.assertEqual((c.ddp_share('ROQAQF301SLS'), c.part_share('UNKNOWN', 'ROQAQF301SLS')), (1.0, None))
+        self.assertTrue(c.delivers('UNKNOWN', 'ROQAQF301SLS'))
+        self.assertIn('ddp', c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'UNKNOWN'))['flags'])
+
+    def test_nothing_shipped_yet_never_reads_the_ledger_share(self):
+        # On record with nothing shipped: no share at all, not the current ledger's open lines.
+        ledger = T.src()['ledger']['rows'] + [T.led('TT26009', 'ROQAQF301SLS', 300), T.led('NN26009', 'ROQAQF301SLS', 100)]
+        c = ci_rec(TT_ALL, shipped(0, 0), ledger)
+        self.assertNotIn('ROQAQF301SLS', c.made_units)
+        self.assertEqual((c.ddp_share('ROQAQF301SLS'), c.part_share('UNKNOWN', 'ROQAQF301SLS')), (None, None))
+        self.assertEqual(c.made_by['ROQAQF301SLS'], frozenset({'TT', 'NN'}))
+        self.assertFalse(c.delivers('UNKNOWN', 'ROQAQF301SLS'))        # NN does not deliver: import as before
+        self.assertEqual(ci_rec(TT_ALL, [], ledger).made_units['ROQAQF301SLS'], {'TT': 300.0, 'NN': 100.0})
+
+    def test_dataset(self):
+        def ds(record, settings=TT_ALL):
+            s = history_only('ROQAQF301SLS')
+            s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQF301SLS-M', tr=100)]
+            s['factory_record'] = {'rows': record, 'generatedAt': '2026-03-01T06:00:00Z'}
+            return T.build(s, settings=settings)
+        full, none_yet, half = ds(SPLIT, {}), ds(shipped(0, 100)), ds(shipped(100, 100))
+        one = lambda d_: T.by(d_, 'inventory', 'sku')['ROQAQF301SLS-M']
+        inv0, inv1, inv = one(full), one(none_yet), one(half)
+        # TT shipped nothing yet: its stock, style row and invoices are the other factory's goods, full import
+        self.assertEqual((inv1['dutyRegime'], inv1['fob'], inv1['landed']), (inv0['dutyRegime'], inv0['fob'], inv0['landed']))
+        self.assertFalse({'ddp', 'ddp_part'} & set(inv1['flags']))
+        st0, st1 = T.by(full, 'styles', 'base')['ROQAQF301SLS'], T.by(none_yet, 'styles', 'base')['ROQAQF301SLS']
+        self.assertEqual((st1['landedU'], st1['t12Cogs'], st1['dutyRegime']), (st0['landedU'], st0['t12Cogs'], st0['dutyRegime']))
+        bc = lambda d_: {(x['cust'], x['base']): x for x in [dict(zip(d_['shipped']['byCustomer']['fields'], r))
+                                                              for r in d_['shipped']['byCustomer']['rows']]}
+        b0, b1 = bc(full)[('ROSS', 'ROQAQF301SLS')], bc(none_yet)[('ROSS', 'ROQAQF301SLS')]
+        self.assertEqual((b1['duty'], b1['freight'], b1['fees'], b1['dutyRegime']),
+                         (b0['duty'], b0['freight'], b0['fees'], b0['dutyRegime']))
+        self.assertGreater(b1['duty'], 0)
+        d, f, e = E.adders(inv['fob'], inv['units'], inv['cat'], inv['fiber'], inv['origin'], half['settings'], 'us')
+        self.assertEqual((inv['dutyRegime'], inv['landed']),
+                         ('us', E.r2(inv['fob'] + E.r2(d * 0.5) + E.r2(f * 0.5) + E.r2(e * 0.5))))
+        self.assertEqual(inv0['landed'], E.r2(inv0['fob'] + d + f + e))
+
+
 class ServiceWiring(unittest.TestCase):
     def test_sources_and_the_rebuild_stamp(self):
         raw = {'factory_record': {'rows': [{'production': ' tt26009 ', 'style': 'roqaqf301sls', 'factory': 'tt', 'x': 1},
-                                           {'production': '', 'style': 'ROQAQF302SLS'}, 'junk'],
+                                           {'production': '', 'style': 'ROQAQF302SLS'}, 'junk',
+                                           {'production': 'NN26009', 'style': 'ROQAQF301SLS', 'factory': 'NN',
+                                            'units': 100, 'shipped': 60}],
                                   'generatedAt': '2026-03-01T06:00:00Z'}}
         norm = pnl._normalize_sources(raw)
         self.assertEqual(norm['factory_record'], {'rows': [{'production': 'TT26009', 'style': 'ROQAQF301SLS',
-                                                            'factory': 'TT', 'units': 0}], 'generatedAt': '2026-03-01T06:00:00Z'})
+                                                            'factory': 'TT', 'units': 0},
+                                                           {'production': 'NN26009', 'style': 'ROQAQF301SLS',
+                                                            'factory': 'NN', 'units': 100, 'shipped': 60}],
+                                                  'generatedAt': '2026-03-01T06:00:00Z'})
         self.assertEqual(pnl._normalize_sources({})['factory_record'], {'rows': [], 'generatedAt': None})
         self.assertIn('factory_record', pnl.SOURCE_KEYS)
         a = pnl._stamps(pnl._normalize_sources({}))
@@ -467,12 +568,17 @@ class ServiceWiring(unittest.TestCase):
 
 
 class ScorecardLines(unittest.TestCase):
-    def test_made_lines_keeps_five_fields_and_reads_once_per_build(self):
+    def test_made_lines_keeps_the_shipping_fields_and_reads_once_per_build(self):
         import factory_scorecard as F
         reads = []
         store = {'status': {'generated_at': 'G1'},
                  'lines': {'generated_at': 'G1', 'lines': [{'ref': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT',
-                                                            'outcome': 'open', 'units': 5, 'changes': [1, 2, 3]}]}}
+                                                            'outcome': 'open', 'units': 5, 'changes': [1, 2, 3],
+                                                            'status': 'shipped', 'atd': '2026-10-01', 'ship_units': 4,
+                                                            'shipment': '26-1', 'final_etd': '2026-09-30',
+                                                            'latest_etd': '2026-09-30', 'first_etd': '2026-09-01',
+                                                            'placed': '2026-06-01', 'first_seen': '2026-06-02',
+                                                            'po_name': 'X'}]}}
 
         def fake(key, version_id=None):
             reads.append(key)
@@ -484,7 +590,12 @@ class ScorecardLines(unittest.TestCase):
             F._mem['lines'] = None
             got = F.made_lines()
             self.assertEqual(got, {'generated_at': 'G1', 'lines': [{'ref': 'TT26009', 'style': 'ROQAQF301SLS',
-                                                                    'factory': 'TT', 'outcome': 'open', 'units': 5}]})
+                                                                    'factory': 'TT', 'outcome': 'open', 'units': 5,
+                                                                    'status': 'shipped', 'atd': '2026-10-01',
+                                                                    'ship_units': 4, 'shipment': '26-1',
+                                                                    'final_etd': '2026-09-30', 'latest_etd': '2026-09-30',
+                                                                    'first_etd': '2026-09-01', 'placed': '2026-06-01',
+                                                                    'first_seen': '2026-06-02'}]})
             F.made_lines()
             self.assertEqual(sum(1 for k in reads if k.endswith('lines.json')), 1)       # memo per build
             store['status'] = {'generated_at': 'G2'}
