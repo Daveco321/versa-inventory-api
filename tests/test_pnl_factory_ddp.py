@@ -323,6 +323,26 @@ class FactoryRecord(unittest.TestCase):
         self.assertEqual((no['inputs']['factory_record_rows'], no['inputs']['factory_record_at']), (0, None))
 
 
+class LedgerLinesWithNoFactory(unittest.TestCase):
+    """Nov 12 2026 regression: the live ledger holds lines whose ref names no factory (N/A, blank). The passes that
+    run while the cost index is built resolve them, so the factory record must exist before them."""
+
+    def test_builds_with_na_and_blank_refs(self):
+        ledger = T.src()['ledger']['rows'] + [T.led('N/A', 'ROQAQF301SLS', 40), T.led('', 'ROQAQF302SLS', 20)]
+        for settings in (TT_ALL, TT_QA, {}):
+            c = ci_rec(settings, RECORD, ledger)
+            r = c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'N/A'))
+            self.assertEqual('ddp' in r['flags'], bool(settings), settings)         # on record as TT's QA goods
+            self.assertNotIn('ddp', c.raw('ROQAQF302SLS', 'BLANK')['flags'])        # no factory on record
+        s = T.src()
+        s['ledger']['rows'] = ledger
+        s['factory_record'] = {'rows': RECORD, 'generatedAt': '2026-03-01T06:00:00Z'}
+        for settings in (TT_ALL, TT_QA, {}):
+            ds = T.build(s, settings=settings)
+            P = {(r['ref'], r['base']): r for r in T.rows(ds, 'production')}
+            self.assertEqual(P[('N/A', 'ROQAQF301SLS')]['dutyRegime'], 'none' if settings else 'us', settings)
+
+
 class ServiceWiring(unittest.TestCase):
     def test_sources_and_the_rebuild_stamp(self):
         raw = {'factory_record': {'rows': [{'production': ' tt26009 ', 'style': 'roqaqf301sls', 'factory': 'tt', 'x': 1},

@@ -1771,6 +1771,10 @@ class CostIndex:
         self._build_overrides(overrides)
         self.list_style, self.list_design, self.defaults = defaultdict(list), defaultdict(list), {}
         self.ledger = self._prepare_ledger(ledger_rows or [])
+        # Nov 12 2026: the factories on record for each style (the ledger, the factory record of every production
+        # line ever seen, the factory lists that name it), so delivered terms outlive the ledger lines. It decides
+        # terms only, never a price. Built before the passes: they already resolve ledger lines with no factory.
+        self.made_by = self._made_by(record_rows)
         self._pass1()
         self._pass2()
         # Contract C13: the cost rule, and the refs that carry each style (the ledger, then its history).
@@ -1779,10 +1783,6 @@ class CostIndex:
         w = _fnum(cr.get('wideSpreadPct'))
         self.wide_pct = w if w is not None and 0 <= w <= _SPREAD_MAX else DEFAULT_SETTINGS['costRule']['wideSpreadPct']
         self.carry = self._carriers(history_rows)
-        # Nov 12 2026: the factories on record for each style (the ledger, the factory record of every production
-        # line ever seen, the factory lists that name it), so delivered terms outlive the ledger lines. It decides
-        # terms only, never a price.
-        self.made_by = self._made_by(record_rows)
         self._quotes, self._comb = {}, {}
 
     # ── decode / helpers ──
