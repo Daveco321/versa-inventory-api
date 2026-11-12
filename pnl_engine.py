@@ -70,7 +70,10 @@ Duty regimes (contract C2). Every lines, apo, inventory and production row carri
           HMF; freight = units x ocean, fees = units x inland (as for us)
     us    DESIGN 5.6 as written
 settings.destinations maps an A2000 wh (lines), a ledger landing (production) or a stock
-warehouse (inventory) to a regime. Unit costs round to 4 decimals first; fob = r2(units x fobU).
+warehouse (inventory) to a regime. A delivered (DDP) price adds no import costs on any row (flag ddp): a cost
+book record or a manual cost with terms DDP (Oct 7 2026), or goods of a brand listed in the making factory's
+settings.factories.<code>.ddpBrands (Nov 12 2026, ddp_factory_brands), whatever row prices them.
+Unit costs round to 4 decimals first; fob = r2(units x fobU).
 The `regime` argument of adders, landed, line_money and stock_money also accepts the old
 fob_line boolean (true = none, false = us).
 
@@ -1600,6 +1603,29 @@ def _is_ddp(r):
     return str((r or {}).get('terms') or '').strip().upper() == 'DDP'
 
 
+_BRAND_FOLD = {'NT': 'NA', 'DV': 'VD'}       # brand letters that mean another brand code (as decode_sku folds them)
+
+
+def ddp_factory_brands(S):
+    """{factory code: frozenset of brand codes} that the factory delivers duty paid, from the settings
+    (factories.<code>.ddpBrands, Nov 12 2026). Goods of those brands from that factory carry a delivered (DDP)
+    price whatever row prices them, so the P&L adds no import costs on them. Pseudo factories (warehouse, unknown,
+    mixed) and the '_default' entry never qualify. Brand letters fold like decode_sku (DV is VD, NT is NA)."""
+    out = {}
+    facs = S.get('factories') if isinstance(S, dict) else None
+    for fac, rec in (facs.items() if isinstance(facs, dict) else ()):
+        code = _u(fac)
+        if not code or code == '_DEFAULT' or code in _LIST_FACTORY_PSEUDO or not isinstance(rec, dict):
+            continue
+        brands = rec.get('ddpBrands')
+        if not isinstance(brands, (list, tuple)):
+            continue
+        got = frozenset(_BRAND_FOLD.get(b, b) for b in (_u(x) for x in brands if isinstance(x, str)) if b)
+        if got:
+            out[code] = got
+    return out
+
+
 def _R(level, price, basis, ids=(), fac=None, alt=None, rng=None, fx=0.0, fxr=None, flags=(), row=None, skip=()):
     """A resolution. fx: the share of price that is RMB based (value share; a negative dollar step
     can put it a little above 1). fxr: the rate that RMB-based part stands at, or None. row: (record id, fit
@@ -1650,6 +1676,8 @@ class CostIndex:
         p, self.missing_params, self.invalid_params = clean_params(cb.get('params'))
         self.params = p
         self.S = S = merge_settings(settings, p)
+        # Factories that deliver some brands duty paid (settings factories.<code>.ddpBrands, Nov 12 2026).
+        self.ddp_brands = ddp_factory_brands(S)
         self.today = _d10(today)
         # The platform colour map ({key: description}, Oct 7 2026): a style's colour picks the sheet's white or
         # colour row and gives a pattern to a style number without a pattern letter. Empty: nothing changes.
@@ -2602,13 +2630,14 @@ class CostIndex:
         out = []
         for ref, pr, rid in self.pc_by_style.get(norm_vd(b), ()):
             r = self.records[rid]
-            q = self._terms(_R('L1', pr, 'Factory list, same ref and style.', (rid,),
-                               _u(r.get('factory_code')) or fac_of(ref), row=self._lrow(rid, sku)))
+            qf = _u(r.get('factory_code')) or fac_of(ref)
+            q = self._fac_terms(self._terms(_R('L1', pr, 'Factory list, same ref and style.', (rid,), qf,
+                                               row=self._lrow(rid, sku))), b, qf)
             out.append(dict(q, src=str(r.get('source_code') or ''), where=ref or None))
         im = self.img_style.get(norm_vd(b))
         if im:                                  # a customer quotation that names the style (its factory's one row)
             r = self.records[im[1]]
-            out.append(dict(self._img_res(im, sku, im[2]), src=str(r.get('source_code') or ''),
+            out.append(dict(self._fac_terms(self._img_res(im, sku, im[2]), b, im[2]), src=str(r.get('source_code') or ''),
                             where=str(r.get('sheet') or '').strip() or None))
         if sku:
             pat, fit = sku['pat'], price_fit(sku['fit'])
@@ -2627,7 +2656,7 @@ class CostIndex:
                             (rid,), fac, flags=('fit_as_regular',) if mapped else (), row=self._lrow(rid, sku))
                     else:
                         continue
-                    q = self._terms(q)
+                    q = self._fac_terms(self._terms(q), b, fac)
                     out.append(dict(q, src=str(self.records[q['ids'][0]].get('source_code') or ''), where=ref))
         lists = self.pc_facs | self.dp_facs | self.ky_facs
         grid = [fac for fac in sorted(carry)
@@ -2640,8 +2669,9 @@ class CostIndex:
             m = self.grid_exact(sku, fac)
             if m:
                 sk = m[4] if len(m) > 4 else sku          # a family match quotes the sibling reading
-                out.append(dict(self._calc_res(sk, fac, *m[:4]), src=str(m[1]['pool']).partition(':')[0],
-                                where=self._pool_sheet([m[1]['c']])))
+                # A grid price for goods the factory delivers duty paid is a delivered price too (Nov 12 2026).
+                out.append(dict(self._fac_terms(self._calc_res(sk, fac, *m[:4]), b, fac),
+                                src=str(m[1]['pool']).partition(':')[0], where=self._pool_sheet([m[1]['c']])))
         out.sort(key=lambda q: (self._qv(q), q['fac'], q['src'], q['where'] or ''))
         self._quotes[b] = out
         return out
@@ -2749,6 +2779,12 @@ class CostIndex:
         lot = tuple(f for f in (res.get('flags') or ()) if f in _LOT_FLAGS)
         if lot:
             out['flags'] = tuple(dict.fromkeys(tuple(out['flags']) + lot))
+        # Goods of a factory that delivers the brand duty paid stay delivered on their own row (a production lot,
+        # a lot-matched carton) when the combined cost also holds other factories' quotes (Nov 12 2026). The other
+        # factories' rows keep their import costs (ddp_mixed), so nothing else changes.
+        f = _u(res.get('fac'))
+        if 'ddp' not in out['flags'] and f in self.ddp_brands and self.brand_code(b) in self.ddp_brands[f]:
+            out = self._fac_terms(dict(out, flags=tuple(x for x in out['flags'] if x != 'ddp_mixed')), b, f)
         return out
 
     def cost_rule(self, b, level):
@@ -2790,7 +2826,7 @@ class CostIndex:
         out = self._cache.get(key)
         if out is None:
             out = self._resolve(b, fac, ref, poName, allow_default, brand_label, customer_group, use_ovr, full)
-            out = self._terms(out)
+            out = self._fac_terms(self._terms(out), b, fac)
             self._cache[key] = out
         return out
 
@@ -2803,6 +2839,28 @@ class CostIndex:
         if recs and all(r and _is_ddp(r) for r in recs):
             res = dict(res, flags=tuple(res['flags']) + ('ddp',))
         return res
+
+    def brand_code(self, b):
+        """The brand code a style number spells (decode_sku, else the program or legacy prefix), or None."""
+        sku = self.decode(b)
+        return _u((sku or {}).get('brand') or program_brand(b)) or None
+
+    def _fac_terms(self, res, b, fac):
+        """Goods of a brand that their factory delivers duty paid (settings factories.<code>.ddpBrands, Nov 12
+        2026) carry the ddp flag whatever row prices them (its list, a grid, a default), so no import costs are
+        added on them. fac is the factory that makes the goods. A manual cost keeps its own terms; no price, no
+        terms."""
+        if not res or not self.ddp_brands or res.get('level') in ('L0', 'L7') or 'ddp' in res['flags']:
+            return res
+        f = _u(fac)
+        brands = self.ddp_brands.get(f)
+        brand = self.brand_code(b) if brands else None
+        if not brand or brand not in brands:
+            return res
+        said = '%s delivers %s duty paid (DDP), so no import costs are added.' % (
+            _factory_name(self.S, f), BRAND_NAMES.get(brand, brand))
+        return dict(res, flags=tuple(res['flags']) + ('ddp',),
+                    basis=' '.join(x for x in (str(res.get('basis') or '').strip(), said) if x))
 
     def _resolve(self, b, fac, ref, poName, allow_default, brand_label, group, use_ovr, full=None):
         sku = self.decode(b)
@@ -4193,14 +4251,17 @@ class _Build:
             unit = sc['unit'] if sc['priced'] else None
             level = sc['level'] if unit is not None else 'L7'
             # The style lands one way when all its stock and production do (for example a Canada-only
-            # program); otherwise its landed cost is a US import.
+            # program); otherwise its landed cost is a US import. A delivered (DDP) style cost adds no import
+            # costs at all, also for a style with no stock or production row (Nov 12 2026), and its shipped
+            # history is costed the same way as shipped.byStyle costs it.
+            ddp = unit is not None and sc.get('ddp') == 'all'
             regs = reg_b.get(b) or set()
-            regime = next(iter(regs)) if len(regs) == 1 else 'us'
+            regime = 'none' if ddp else (next(iter(regs)) if len(regs) == 1 else 'us')
             lu = landed(unit, {'cat': cat, 'fiber': fiber}, self.S, regime, sc['origin'])['landedU']
             brand = self.brand_of(dec, None, label, base=b)
             ob, ib, pb, fb, ab = open_b.get(b), inv_b.get(b), prod_b.get(b), feed_b.get(b), apo_b.get(b)
             t12 = an.get('t12') or [0.0, 0.0]
-            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand)
+            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp)
             # Expected price and the deduction percent of the same customer mix (contract C8).
             # Open lines and invoice history count kit cartons, so a kit base divides by its pieces
             # per carton (build_lines' convention); the landed cost it meets below is per piece.

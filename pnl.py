@@ -882,7 +882,10 @@ SETTINGS_SCHEMA = {
     # RMB-based cost at that rate.
     'fx': ('obj', {'rate': ('nullable', _n(*_FX_BAND)), 'asOf': ('date',), 'basis': ('token',)}),
     'gridPrecedence': ('nullable', ('map', ('code',), ('list', ('code',), 12))),
-    'factories': ('map', ('code',), _nullable(('obj', {'name': _TEXT80, 'origin': ('code',)}))),
+    # ddpBrands (Nov 12 2026): brand codes the factory delivers duty paid (DDP), so the P&L adds no import
+    # costs on its goods of those brands.
+    'factories': ('map', ('code',), _nullable(('obj', {'name': _TEXT80, 'origin': ('code',),
+                                                       'ddpBrands': ('list', ('code',), 40)}))),
     # Where goods land, by A2000 warehouse, ledger landing or stock warehouse code:
     # 'us' (US duty, freight and fees), 'ca' (Canadian duty) or 'none' (no import costs).
     'destinations': ('map', ('code',), _nullable(('enum', _REGIMES))),
