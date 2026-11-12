@@ -2194,7 +2194,7 @@ class TestOct7TermsAndSources(unittest.TestCase):
                                                  now_iso='2026-03-02T00:00:00Z')
         self.assertEqual((changed[0]['by'], changed[0]['at']), (ADMIN, '2026-03-02T00:00:00Z'))
         self.assertNotIn('terms', changed[0])
-        self.assertEqual(pnl.SOURCE_KEYS[-2:], ('colour_map', 'sales_pending'))
+        self.assertEqual(pnl.SOURCE_KEYS[-3:], ('colour_map', 'sales_pending', 'factory_record'))
 
     def test_normalize_sources_shapes_the_new_inputs(self):
         norm = pnl._normalize_sources(dict(self.RAW))

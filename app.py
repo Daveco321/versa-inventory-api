@@ -24226,6 +24226,20 @@ def _pnl_sources():
         return {'ready': True, 'cube': m.get('pendingCube') or {}, 'summary': m.get('pending') or {},
                 'invoicesThrough': (m.get('source') or {}).get('to')}
 
+    def factory_record():
+        # Which factory made each style (Nov 12 2026): the factory scorecard's line history, every master ledger
+        # copy plus the factories' own ledgers, rebuilt daily. It decides delivered (DDP) terms only, so goods
+        # stay delivered after their lines leave the ledger. Not built yet or unreadable: None (no change).
+        try:
+            import factory_scorecard as _fsc
+            import pnl_engine as _pe
+            blob = _fsc.made_lines()
+        except Exception:
+            return None
+        if not isinstance(blob, dict):
+            return None
+        return {'rows': _pe.factory_record_rows(blob.get('lines')), 'generatedAt': blob.get('generated_at')}
+
     def routing_inputs():
         # Reloaded per call exactly like _pres_stock_cards: other workers may hold newer copies.
         for loader in (load_deduction_assignments_from_s3, load_suppression_overrides_from_s3):
@@ -24249,7 +24263,8 @@ def _pnl_sources():
             'manual_allocations': manual_allocations, 'vw_allocations': vw_allocations,
             'open_orders': open_orders, 'fob_customers': fob_customers,
             'routing_inputs': routing_inputs, 'sales_analytics': _pnl_sales_analytics,
-            'today': today, 'colour_map': colour_map, 'sales_pending': sales_pending}
+            'today': today, 'colour_map': colour_map, 'sales_pending': sales_pending,
+            'factory_record': factory_record}
 
 
 # Identity for the P&L only. The shared _caller_identity cache keeps a profile for 300 s; for

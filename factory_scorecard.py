@@ -1256,6 +1256,33 @@ def _load_blob(name):
     return obj
 
 
+_made_memo = {'generated_at': None, 'lines': None}
+
+
+def made_lines():
+    """{'generated_at', 'lines': [{ref, style, factory, outcome, units}]} for every line of the scorecard's line
+    history, or None before the first build (Nov 12 2026: the P&L reads which factory made each style from it, so
+    delivered terms outlive the ledger lines). One S3 read per new build per worker, and only these fields stay in
+    memory (the full lines.json is several MB)."""
+    latest = None
+    try:
+        latest = (_s3_get_json(f'{SC_PREFIX}status.json') or {}).get('generated_at')
+    except Exception:
+        pass
+    if _made_memo['lines'] is not None and (not latest or _made_memo['generated_at'] == latest):
+        return dict(_made_memo)
+    held = _mem.get('lines')          # a worker that serves the scorecard page already holds the full copy
+    obj = held if (held is not None and (not latest or held.get('generated_at') == latest)) \
+        else _s3_get_json(f'{SC_PREFIX}lines.json')
+    if not isinstance(obj, dict):
+        return None
+    lines = [{'ref': ln.get('ref'), 'style': ln.get('style'), 'factory': ln.get('factory'),
+              'outcome': ln.get('outcome'), 'units': ln.get('units')}
+             for ln in obj.get('lines') or () if isinstance(ln, dict)]
+    _made_memo.update(generated_at=obj.get('generated_at'), lines=lines)
+    return dict(_made_memo)
+
+
 def _daily_loop():
     """Once a day at SC_DAILY_HOUR_ET Eastern: write our own copy of the master ledger, then
     rebuild the scorecard (new tracker day + any new factory copies; everything else cached)."""

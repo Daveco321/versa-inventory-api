@@ -116,14 +116,20 @@ class FactoryDeliveredResolutions(unittest.TestCase):
             self.assertIn('ddp', r['flags'], st)
         self.assertNotIn('ddp', c.raw('ROQAQF201SLS', 'TT')['flags'])
 
-    def test_a_manual_cost_keeps_its_own_terms(self):
+    def test_a_manual_cost_on_goods_the_factory_delivers(self):
+        # Everything from a delivering factory is delivered, a typed (manual) cost included; the same manual cost
+        # on another factory's goods keeps its own terms.
         ov = [T.ovr('f1', 'style', {'style': 'ROQAQF201SLS'}, 9.4444)]          # FOB, the default
-        r = T.ci(settings=TT_QA, overrides=ov).resolve('ROQAQF201SLS', 'TT', 'TT26001')
-        self.assertEqual((r['level'], r['fobU'], r['flags']), ('L0', 9.4444, []))
+        c = T.ci(settings=TT_QA, overrides=ov)
+        r = c.resolve('ROQAQF201SLS', 'TT', 'TT26001')
+        self.assertEqual((r['level'], r['fobU'], r['flags']), ('L0', 9.4444, ['ddp']))
+        self.assertIn('Synth Factory T delivers QA duty paid (DDP)', r['basis'])
+        self.assertEqual(c.resolve('ROQAQF201SLS', 'NN')['flags'], [])
+        self.assertEqual(T.ci(overrides=ov).resolve('ROQAQF201SLS', 'TT', 'TT26001')['flags'], [])   # no setting
         ov = [T.ovr('f2', 'style', {'style': 'ROQAQF201SLS'}, 9.4444, terms='DDP')]
         r = T.ci(settings=TT_QA, overrides=ov).resolve('ROQAQF201SLS', 'TT', 'TT26001')
         self.assertEqual((r['level'], r['flags']), ('L0', ['ddp']))
-        self.assertNotIn('duty paid', r['basis'])
+        self.assertNotIn('duty paid', r['basis'])                  # already delivered by its own terms
 
 
 class FactoryDeliveredDataset(unittest.TestCase):
@@ -221,6 +227,151 @@ class NothingElseMoves(unittest.TestCase):
         for t in ('lines', 'apo', 'inventory', 'production', 'styles'):
             self.assertEqual(a[t], b[t], t)
         self.assertEqual(a['shipped']['byCustomer'], b['shipped']['byCustomer'])
+
+
+TT_ALL = {'factories': {'TT': {'name': 'Synth Factory T', 'origin': 'CN', 'ddp': True}}}
+RECORD = [{'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT'}]
+
+
+def ci_rec(settings, record_rows=None, ledger=()):
+    return E.CostIndex(T.COSTBOOK, settings, [], list(ledger), today=T.TODAY, record_rows=record_rows)
+
+
+class EverythingFromAFactory(unittest.TestCase):
+    """factories.<code>.ddp true: the factory delivers everything it makes duty paid, whatever the brand."""
+
+    def test_parse_and_validate(self):
+        S = E.merge_settings({'factories': {'TT': {'name': 'x', 'ddp': True, 'ddpBrands': ['QA']},
+                                            'NN': {'name': 'y', 'ddp': False, 'ddpBrands': ['QB']},
+                                            'AA': {'name': 'z', 'ddp': 'yes'}}})
+        self.assertEqual(E.ddp_factory_brands(S), {'TT': E.ALL_BRANDS, 'NN': frozenset({'QB'})})
+        clean, problems, dropped = pnl.validate_settings({'factories': {'TT': {'name': 'S', 'ddp': True}}})
+        self.assertEqual((problems, dropped, clean['factories']), ([], [], {'TT': {'name': 'S', 'ddp': True}}))
+        clean, problems, _ = pnl.validate_settings({'factories': {'TT': {'name': 'S', 'ddp': 'yes'}}})
+        self.assertIsNone(clean)
+        self.assertIn('not_a_boolean', {p['issue'] for p in problems})
+
+    def test_every_brand(self):
+        c = T.ci(settings=TT_ALL)
+        for st in ('ROQAQF201SLS', 'RODKQF201SLS', 'RODVQF201SLS'):
+            r = c.raw(st, 'TT')
+            self.assertNotEqual(r['level'], 'L7', st)
+            self.assertIn('ddp', r['flags'], st)
+            self.assertTrue(r['basis'].endswith('Synth Factory T delivers duty paid (DDP), so no import costs are added.'),
+                            r['basis'])
+        self.assertNotIn('ddp', c.raw('RODKQF201SLS', 'NN')['flags'])
+
+
+class FactoryRecord(unittest.TestCase):
+    """Which factory made each style outlives the ledger (the factory record), so stock and sold goods of a
+    delivering factory stay delivered after their lines leave the ledger."""
+
+    def test_rows_from_the_scorecard_history(self):
+        lines = [{'ref': 'tt26009', 'style': 'roqaqf301sls', 'factory': 'TT', 'outcome': 'completed', 'units': 100},
+                 {'ref': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT', 'outcome': 'open', 'units': 50},
+                 {'ref': 'TT26011', 'style': 'ROQAQF303SLS', 'factory': 'TT', 'outcome': 'removed', 'units': 50},
+                 {'ref': 'TT26012', 'style': 'ROQAQF304SLS', 'factory': 'TT', 'outcome': 'reissued', 'units': 50},
+                 {'ref': 'TT26013', 'style': 'ROQAQF305SLS', 'factory': 'TT', 'outcome': 'moved', 'units': 50},
+                 {'ref': 'TT25001', 'style': 'ROQAQF306SLS', 'factory': 'TT', 'outcome': None, 'units': 0},
+                 {'ref': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'outcome': None, 'units': 12},
+                 {'ref': '', 'style': 'ROQAQF308SLS', 'outcome': 'open'}, 'junk', None]
+        self.assertEqual(E.factory_record_rows(lines), [
+            {'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT'},
+            {'production': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT'},
+            {'production': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT'}])
+        for bad in (None, 'x', {}, 5):
+            self.assertEqual(E.factory_record_rows(bad), [])
+
+    def test_made_by(self):
+        c = ci_rec(TT_ALL, RECORD, T.src()['ledger']['rows'])
+        self.assertEqual(c.made_by['ROQAQF301SLS'], frozenset({'TT'}))                  # the record
+        self.assertEqual(c.made_by['ROQAQF201SLS'], frozenset({'TT'}))                  # the ledger
+        self.assertEqual(c.made_by['ROQAQH204SLS'], frozenset({'TT', 'NN'}))
+        self.assertEqual(c.made_by['ROQAQF101SLS'], frozenset({'AA'}))                  # the factory list
+        self.assertNotIn('ROQAQF999SLS', c.made_by)
+
+    def test_stock_and_history_with_no_known_factory(self):
+        c = ci_rec(TT_ALL, RECORD, T.src()['ledger']['rows'])
+        r = c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'UNKNOWN'))
+        self.assertIn('ddp', r['flags'])
+        self.assertIn('Made by Synth Factory T, which delivers duty paid (DDP), so no import costs are added.', r['basis'])
+        self.assertIn('ddp', c.final('ROQAQF201SLS', c.raw('ROQAQF201SLS', 'UNKNOWN'))['flags'])
+        two = c.final('ROQAQH204SLS', c.raw('ROQAQH204SLS', 'UNKNOWN'))              # TT and NN made it
+        self.assertNotIn('ddp', two['flags'])
+        self.assertNotIn('ddp', ci_rec(TT_ALL).raw('ROQAQF301SLS', 'UNKNOWN')['flags'])    # no record: not known
+        self.assertNotIn('ddp', ci_rec({}, RECORD).raw('ROQAQF301SLS', 'UNKNOWN')['flags'])  # no setting
+
+    def test_dataset(self):
+        def run(record):
+            s = T.src()
+            s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQF301SLS-M', tr=100)]
+            if record is not None:
+                s['factory_record'] = {'rows': record, 'generatedAt': '2026-03-01T06:00:00Z'}
+            return T.build(s, settings=TT_ALL)
+        ds = run(RECORD)
+        inv = T.by(ds, 'inventory', 'sku')['ROQAQF301SLS-M']
+        self.assertEqual((inv['dutyRegime'], inv['landed'], inv['landedU']), ('none', inv['fob'], inv['fobU']))
+        self.assertIn('ddp', inv['flags'])
+        st = T.by(ds, 'styles', 'base')['ROQAQF301SLS']
+        self.assertEqual((st['landedU'], st['dutyRegime']), (st['fobU'], 'none'))
+        self.assertEqual((ds['inputs']['factory_record_rows'], ds['inputs']['factory_record_at']),
+                         (1, '2026-03-01T06:00:00Z'))
+        no = run(None)
+        inv0 = T.by(no, 'inventory', 'sku')['ROQAQF301SLS-M']
+        self.assertEqual((inv0['dutyRegime'], inv0['fob']), ('us', inv['fob']))
+        self.assertGreater(inv0['landed'], inv0['fob'])
+        self.assertEqual((no['inputs']['factory_record_rows'], no['inputs']['factory_record_at']), (0, None))
+
+
+class ServiceWiring(unittest.TestCase):
+    def test_sources_and_the_rebuild_stamp(self):
+        raw = {'factory_record': {'rows': [{'production': ' tt26009 ', 'style': 'roqaqf301sls', 'factory': 'tt', 'x': 1},
+                                           {'production': '', 'style': 'ROQAQF302SLS'}, 'junk'],
+                                  'generatedAt': '2026-03-01T06:00:00Z'}}
+        norm = pnl._normalize_sources(raw)
+        self.assertEqual(norm['factory_record'], {'rows': [{'production': 'TT26009', 'style': 'ROQAQF301SLS',
+                                                            'factory': 'TT'}], 'generatedAt': '2026-03-01T06:00:00Z'})
+        self.assertEqual(pnl._normalize_sources({})['factory_record'], {'rows': [], 'generatedAt': None})
+        self.assertIn('factory_record', pnl.SOURCE_KEYS)
+        a = pnl._stamps(pnl._normalize_sources({}))
+        b = pnl._stamps(norm)
+        self.assertNotEqual(a, b)                                       # a new record rebuilds the P&L
+        self.assertEqual(b, pnl._stamps(pnl._normalize_sources(raw)))
+
+
+class ScorecardLines(unittest.TestCase):
+    def test_made_lines_keeps_five_fields_and_reads_once_per_build(self):
+        import factory_scorecard as F
+        reads = []
+        store = {'status': {'generated_at': 'G1'},
+                 'lines': {'generated_at': 'G1', 'lines': [{'ref': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT',
+                                                            'outcome': 'open', 'units': 5, 'changes': [1, 2, 3]}]}}
+
+        def fake(key, version_id=None):
+            reads.append(key)
+            return store['status'] if key.endswith('status.json') else store['lines'] if key.endswith('lines.json') else None
+        saved = (F._s3_get_json, dict(F._made_memo), F._mem.get('lines'))
+        try:
+            F._s3_get_json = fake
+            F._made_memo.update(generated_at=None, lines=None)
+            F._mem['lines'] = None
+            got = F.made_lines()
+            self.assertEqual(got, {'generated_at': 'G1', 'lines': [{'ref': 'TT26009', 'style': 'ROQAQF301SLS',
+                                                                    'factory': 'TT', 'outcome': 'open', 'units': 5}]})
+            F.made_lines()
+            self.assertEqual(sum(1 for k in reads if k.endswith('lines.json')), 1)       # memo per build
+            store['status'] = {'generated_at': 'G2'}
+            store['lines'] = {'generated_at': 'G2', 'lines': []}
+            self.assertEqual(F.made_lines(), {'generated_at': 'G2', 'lines': []})       # a new build is read
+            store['lines'] = None
+            store['status'] = {'generated_at': 'G3'}
+            F._made_memo.update(generated_at=None, lines=None)
+            self.assertIsNone(F.made_lines())                                           # nothing built yet
+        finally:
+            F._s3_get_json = saved[0]
+            F._made_memo.clear()
+            F._made_memo.update(saved[1])
+            F._mem['lines'] = saved[2]
 
 
 if __name__ == '__main__':

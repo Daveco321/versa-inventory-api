@@ -20,7 +20,9 @@ build_dataset(src, costbook, settings, overrides, now_iso, routing_module) -> di
                     optional payload brandMap{v, labels, bases{BASE: brand key}} brands past
                     invoices' styles, see brand_of), today 'YYYY-MM-DD'. Optional:
                     ledger_history{rows} (or a list) with past
-                    ledger lines (production, poName, style, units) that restore received refs.
+                    ledger lines (production, poName, style, units) that restore received refs;
+                    factory_record{rows, generatedAt} (factory_record_rows: production, style and
+                    factory of every production line ever seen), which decides delivered terms only.
     costbook        DESIGN 5.1 (records + params). Records without 'pool' get one derived from
                     source_code, so the study table (prices_ALL.json) also works.
     settings        stored settings (DESIGN 5.2) or {}; merged over DEFAULT_SETTINGS.
@@ -29,7 +31,8 @@ build_dataset(src, costbook, settings, overrides, now_iso, routing_module) -> di
     routing_module  pnl_routing (route_all is called once).
     Returns the DESIGN 5.4 dataset. Money is rounded to cents, unit costs to 4 decimals.
 decode_sku(sku, params=None) -> dict | None     SKU attributes (None when undecodable)
-CostIndex(costbook, settings, overrides, ledger_rows, today=None, history_rows=None)
+CostIndex(costbook, settings, overrides, ledger_rows, today=None, history_rows=None, colour_map=None,
+          record_rows=None)
     .resolve(style, factory, ref=None, poName=None, customer_group=None)
         -> {fobU, level, basis, evidence, rangeLo, rangeHi, factory, flags, fxShare, fxRef}   one factory's cost
     .style_quote(style) -> the combined cost of a style (contract C13) with its rule, grade, spread and
@@ -71,8 +74,10 @@ Duty regimes (contract C2). Every lines, apo, inventory and production row carri
     us    DESIGN 5.6 as written
 settings.destinations maps an A2000 wh (lines), a ledger landing (production) or a stock
 warehouse (inventory) to a regime. A delivered (DDP) price adds no import costs on any row (flag ddp): a cost
-book record or a manual cost with terms DDP (Oct 7 2026), or goods of a brand listed in the making factory's
-settings.factories.<code>.ddpBrands (Nov 12 2026, ddp_factory_brands), whatever row prices them.
+book record or a manual cost with terms DDP (Oct 7 2026), or goods of a factory that delivers them duty paid
+(Nov 12 2026, ddp_factory_brands: settings.factories.<code>.ddp true for everything it makes, or .ddpBrands for
+some brands), whatever row prices them. Stock and history with no known factory count when every factory on
+record for the style delivers it (CostIndex.made_by: the ledger, the factory record, the factory lists).
 Unit costs round to 4 decimals first; fob = r2(units x fobU).
 The `regime` argument of adders, landed, line_money and stock_money also accepts the old
 fob_line boolean (true = none, false = us).
@@ -1604,18 +1609,23 @@ def _is_ddp(r):
 
 
 _BRAND_FOLD = {'NT': 'NA', 'DV': 'VD'}       # brand letters that mean another brand code (as decode_sku folds them)
+ALL_BRANDS = '*'                             # ddp_factory_brands: the factory delivers every brand duty paid
 
 
 def ddp_factory_brands(S):
-    """{factory code: frozenset of brand codes} that the factory delivers duty paid, from the settings
-    (factories.<code>.ddpBrands, Nov 12 2026). Goods of those brands from that factory carry a delivered (DDP)
-    price whatever row prices them, so the P&L adds no import costs on them. Pseudo factories (warehouse, unknown,
-    mixed) and the '_default' entry never qualify. Brand letters fold like decode_sku (DV is VD, NT is NA)."""
+    """{factory code: ALL_BRANDS, or a frozenset of brand codes} that the factory delivers duty paid, from the
+    settings (Nov 12 2026): factories.<code>.ddp true = everything from that factory, factories.<code>.ddpBrands =
+    only those brands. Goods the factory delivers carry a delivered (DDP) price whatever row prices them, so the
+    P&L adds no import costs on them. Pseudo factories (warehouse, unknown, mixed) and the '_default' entry never
+    qualify. Brand letters fold like decode_sku (DV is VD, NT is NA)."""
     out = {}
     facs = S.get('factories') if isinstance(S, dict) else None
     for fac, rec in (facs.items() if isinstance(facs, dict) else ()):
         code = _u(fac)
         if not code or code == '_DEFAULT' or code in _LIST_FACTORY_PSEUDO or not isinstance(rec, dict):
+            continue
+        if rec.get('ddp') is True:
+            out[code] = ALL_BRANDS
             continue
         brands = rec.get('ddpBrands')
         if not isinstance(brands, (list, tuple)):
@@ -1623,6 +1633,27 @@ def ddp_factory_brands(S):
         got = frozenset(_BRAND_FOLD.get(b, b) for b in (_u(x) for x in brands if isinstance(x, str)) if b)
         if got:
             out[code] = got
+    return out
+
+
+_RECORD_SKIP = ('removed', 'reissued', 'moved')     # factory record lines that the factory did not make
+
+
+def factory_record_rows(lines):
+    """The production lines a factory record holds, as [{'production', 'style', 'factory'}] (Nov 12 2026): the
+    factory scorecard's line history (every master ledger copy plus the factories' own ledgers), so the P&L keeps
+    knowing which factory made a style after its lines leave the ledger. Lines removed, re-issued at another
+    factory or moved to another ref are left out, and so are factory-file lines with no units."""
+    out = []
+    for ln in lines if isinstance(lines, (list, tuple)) else ():
+        if not isinstance(ln, dict) or ln.get('outcome') in _RECORD_SKIP:
+            continue
+        ref, style = _u(ln.get('ref') or ln.get('production')), _u(ln.get('style'))
+        if not ref or not style:
+            continue
+        if ln.get('outcome') is None and _int(ln.get('units')) <= 0:
+            continue
+        out.append({'production': ref, 'style': style, 'factory': _u(ln.get('factory'))})
     return out
 
 
@@ -1669,7 +1700,7 @@ class CostIndex:
     optional past ledger lines; with the ledger they say which refs carry each style (contract C13)."""
 
     def __init__(self, costbook, settings=None, overrides=None, ledger_rows=None, today=None, history_rows=None,
-                 colour_map=None):
+                 colour_map=None, record_rows=None):
         cb = costbook if isinstance(costbook, dict) else {}
         # Params are type checked here, so a stored or restored cost book with a bad param switches
         # that rule off (and the dataset says so) instead of failing the build.
@@ -1748,6 +1779,10 @@ class CostIndex:
         w = _fnum(cr.get('wideSpreadPct'))
         self.wide_pct = w if w is not None and 0 <= w <= _SPREAD_MAX else DEFAULT_SETTINGS['costRule']['wideSpreadPct']
         self.carry = self._carriers(history_rows)
+        # Nov 12 2026: the factories on record for each style (the ledger, the factory record of every production
+        # line ever seen, the factory lists that name it), so delivered terms outlive the ledger lines. It decides
+        # terms only, never a price.
+        self.made_by = self._made_by(record_rows)
         self._quotes, self._comb = {}, {}
 
     # ── decode / helpers ──
@@ -1939,6 +1974,27 @@ class CostIndex:
         self.pc_by_style = defaultdict(list)
         for (ref, st), (pr, rid) in self.pc_exact.items():
             self.pc_by_style[norm_vd(st)].append((ref, pr, rid))
+
+    def _made_by(self, record_rows):
+        """{base (DV letters folded): frozenset of factory codes} that made the style: the current ledger, the
+        factory record (factory_record_rows) and the Pinnacle-type lists, whose rows name a style and its ref."""
+        out = defaultdict(set)
+
+        def add(style, ref, hint=None):
+            b = norm_vd(base_of(style))
+            f = _u(hint)
+            if not f or f in _LIST_FACTORY_PSEUDO:
+                f = fac_of(ref)
+            if b and f and f not in _LIST_FACTORY_PSEUDO:
+                out[b].add(f)
+        for L in self.ledger:
+            add(L['b'], L['ref'])
+        for (ref, st), (_, rid) in self.pc_exact.items():
+            add(st, ref, (self.records.get(rid) or {}).get('factory_code'))
+        for r in record_rows or ():
+            if isinstance(r, dict):
+                add(r.get('style'), r.get('production') or r.get('ref'), r.get('factory'))
+        return {b: frozenset(f) for b, f in out.items()}
 
     def _carriers(self, history_rows):
         """{base: {factory: {ref: poName}}}: the production refs that carry each style on the current ledger,
@@ -2779,12 +2835,12 @@ class CostIndex:
         lot = tuple(f for f in (res.get('flags') or ()) if f in _LOT_FLAGS)
         if lot:
             out['flags'] = tuple(dict.fromkeys(tuple(out['flags']) + lot))
-        # Goods of a factory that delivers the brand duty paid stay delivered on their own row (a production lot,
-        # a lot-matched carton) when the combined cost also holds other factories' quotes (Nov 12 2026). The other
-        # factories' rows keep their import costs (ddp_mixed), so nothing else changes.
-        f = _u(res.get('fac'))
-        if 'ddp' not in out['flags'] and f in self.ddp_brands and self.brand_code(b) in self.ddp_brands[f]:
-            out = self._fac_terms(dict(out, flags=tuple(x for x in out['flags'] if x != 'ddp_mixed')), b, f)
+        # Goods of a factory that delivers them duty paid stay delivered on their own row (a production lot, a
+        # lot-matched carton, stock of a style only such factories ever made) when the combined cost also holds
+        # other factories' quotes (Nov 12 2026). The other factories' rows keep their import costs (ddp_mixed).
+        if 'ddp' not in out['flags'] and self.delivers(res.get('fac'), b):
+            out = self._fac_terms(dict(out, flags=tuple(x for x in out['flags'] if x != 'ddp_mixed')), b,
+                                  res.get('fac'))
         return out
 
     def cost_rule(self, b, level):
@@ -2845,22 +2901,45 @@ class CostIndex:
         sku = self.decode(b)
         return _u((sku or {}).get('brand') or program_brand(b)) or None
 
-    def _fac_terms(self, res, b, fac):
-        """Goods of a brand that their factory delivers duty paid (settings factories.<code>.ddpBrands, Nov 12
-        2026) carry the ddp flag whatever row prices them (its list, a grid, a default), so no import costs are
-        added on them. fac is the factory that makes the goods. A manual cost keeps its own terms; no price, no
-        terms."""
-        if not res or not self.ddp_brands or res.get('level') in ('L0', 'L7') or 'ddp' in res['flags']:
-            return res
-        f = _u(fac)
+    def _fac_delivers(self, f, b):
         brands = self.ddp_brands.get(f)
-        brand = self.brand_code(b) if brands else None
-        if not brand or brand not in brands:
+        return bool(brands) and (brands == ALL_BRANDS or self.brand_code(b) in brands)
+
+    def delivers(self, fac, b):
+        """True when the goods of base style b from factory fac are delivered duty paid (settings factories, Nov 12
+        2026). A row with no known factory (warehouse stock, invoice history, a mix) counts when every factory on
+        record for the style (made_by) delivers it."""
+        if not self.ddp_brands:
+            return False
+        f = _u(fac)
+        if f and f not in _LIST_FACTORY_PSEUDO:
+            return self._fac_delivers(f, b)
+        facs = self.made_by.get(norm_vd(base_of(b)))
+        return bool(facs) and all(self._fac_delivers(x, b) for x in facs)
+
+    def _ddp_words(self, fac, b):
+        f = _u(fac)
+        own = bool(f) and f not in _LIST_FACTORY_PSEUDO
+        facs = [f] if own else sorted(self.made_by.get(norm_vd(base_of(b))) or ())
+        brand = self.brand_code(b)
+        what = '' if all(self.ddp_brands.get(x) == ALL_BRANDS for x in facs) else ' ' + BRAND_NAMES.get(brand, brand)
+        names = self._names([_factory_name(self.S, x) for x in facs])
+        verb = 'delivers' if len(facs) == 1 else 'deliver'
+        if own:
+            return '%s %s%s duty paid (DDP), so no import costs are added.' % (names, verb, what)
+        return 'Made by %s, which %s%s duty paid (DDP), so no import costs are added.' % (names, verb, what)
+
+    def _fac_terms(self, res, b, fac):
+        """Goods that their factory delivers duty paid (settings factories.<code>.ddp or .ddpBrands, Nov 12 2026)
+        carry the ddp flag whatever row prices them (its list, a grid, a default, a manual cost), so no import
+        costs are added on them. fac is the factory that makes the goods; a row with no known factory takes the
+        factories on record for the style (delivers). No price, no terms."""
+        if not res or not self.ddp_brands or res.get('level') == 'L7' or 'ddp' in res['flags']:
             return res
-        said = '%s delivers %s duty paid (DDP), so no import costs are added.' % (
-            _factory_name(self.S, f), BRAND_NAMES.get(brand, brand))
+        if not self.delivers(fac, b):
+            return res
         return dict(res, flags=tuple(res['flags']) + ('ddp',),
-                    basis=' '.join(x for x in (str(res.get('basis') or '').strip(), said) if x))
+                    basis=' '.join(x for x in (str(res.get('basis') or '').strip(), self._ddp_words(fac, b)) if x))
 
     def _resolve(self, b, fac, ref, poName, allow_default, brand_label, group, use_ovr, full=None):
         sku = self.decode(b)
@@ -3509,6 +3588,11 @@ class _Build:
             self.fob_src = 'engine'
         hist = s.get('ledger_history')
         self.history = _rows(hist.get('rows') if isinstance(hist, dict) else hist)
+        # Nov 12 2026: the factory record (which factory made each style, every production line ever seen). It
+        # decides delivered (DDP) terms only.
+        rec = s.get('factory_record')
+        self.record_src = rec if isinstance(rec, dict) else {}
+        self.record_rows = _rows(rec.get('rows') if isinstance(rec, dict) else rec)
         sa = s.get('sales_analytics')
         self.sa = sa if isinstance(sa, dict) else None
         self.bmap = brand_map_bases(self.sa)     # {} without a map: every brand as before
@@ -3569,7 +3653,7 @@ class _Build:
 
     def cost_supply(self):
         self.ci = CostIndex(self.cb, self.S, self.overrides, self.ledger_rows, today=self.today,
-                            history_rows=self.history, colour_map=self.cmap)
+                            history_rows=self.history, colour_map=self.cmap, record_rows=self.record_rows)
         self.whc = _WarehouseCoster(self.ci, self.history)
         # Contract C13: every table takes a style's cost through CostIndex.final, the one choke point. The
         # warehouse cost of a SKU and each ledger line's cost ('use') pass it here; generic() and style_cost()
@@ -5236,6 +5320,9 @@ class _Build:
             'costbook_etag': None, 'settings_etag': None, 'overrides_etag': None,
             'costbook_generated': self.cb.get('generatedAt'),
             'fob_source': self.fob_src,
+            # Nov 12 2026: the factory record behind delivered (DDP) terms (lines, and when it was built).
+            'factory_record_rows': len(self.record_rows),
+            'factory_record_at': self.record_src.get('generatedAt'),
             'routing': {'skuStatus': st.get('skuStatus'), 'skuMode': st.get('skuMode'),
                         'clock': st.get('clock'), 'assignmentsHonored': st.get('assignmentsHonored'),
                         'suppressedLots': st.get('suppressedLots'), 'lineUnits': ls.get('units'),

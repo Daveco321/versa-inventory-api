@@ -153,7 +153,8 @@ _LABELS = ((COSTBOOK, 'costbook'), (SETTINGS, 'settings'), (OVERRIDES, 'override
 
 SOURCE_KEYS = ('inventory', 'ledger', 'apo', 'manual_allocations', 'vw_allocations',
                'open_orders', 'fob_customers', 'routing_inputs', 'sales_analytics', 'today',
-               'colour_map', 'sales_pending')     # Oct 7 2026: optional; a missing getter changes nothing
+               'colour_map', 'sales_pending',     # Oct 7 2026: optional; a missing getter changes nothing
+               'factory_record')                  # Nov 12 2026: optional; which factory made each style
 
 MAX_COSTBOOK_BYTES = 12 * 1024 * 1024
 MAX_SETTINGS_BYTES = 1 * 1024 * 1024
@@ -464,6 +465,14 @@ def _normalize_sources(raw):
     osrc = oo.get('source') if isinstance(oo.get('source'), dict) else {}
     osrc = {'modified': _str_or_none(osrc.get('modified')), 'ageHours': _num_or_none(osrc.get('ageHours')),
             'stale': osrc.get('stale') is True, 'checkedAt': _str_or_none(osrc.get('checkedAt'))} if osrc else {}
+    # Nov 12 2026: the factory record (which factory made each style; it decides delivered terms only). Rows keep
+    # only the production ref, the style and the factory.
+    fr = raw.get('factory_record')
+    fr = fr if isinstance(fr, dict) else {}
+    fr_rows = [{'production': str(r.get('production') or '').strip().upper()[:20],
+                'style': str(r.get('style') or '').strip().upper()[:40],
+                'factory': str(r.get('factory') or '').strip().upper()[:12]}
+               for r in _rows(fr.get('rows')) if r.get('production') and r.get('style')]
     return {
         'inventory': {'items': _rows(inv.get('items')), 'last_sync': _str_or_none(inv.get('last_sync'))},
         'ledger': {'rows': _rows(led.get('rows')), 'last_sync': _str_or_none(led.get('last_sync'))},
@@ -479,6 +488,7 @@ def _normalize_sources(raw):
         'today': today,
         'colour_map': cm,
         'sales_pending': sp,
+        'factory_record': {'rows': fr_rows, 'generatedAt': _str_or_none(fr.get('generatedAt'))},
     }
 
 
@@ -518,12 +528,15 @@ def _stamps(src):
     sp = src.get('sales_pending') or {}
     pend_key = (sp.get('ready') is True, _digest(sp.get('summary') or {}), _digest(sp.get('cube') or {}),
                 str(sp.get('invoicesThrough')))
+    # The factory record changes once a day (Nov 12 2026); a new copy rebuilds the P&L.
+    fr = src.get('factory_record') or {}
     return (_digest(src['inventory']['items']), _digest(src['ledger']['rows']),
             _digest(src['apo']['rows']), _digest(src['open_orders']['orders']),
             src['open_orders']['ok'], _digest(src['manual_allocations']),
             _digest(src['vw_allocations']), _digest(src['fob_customers']), _digest(ri),
             sa_key, src['today'], _digest(src.get('colour_map') or {}), pend_key,
-            _digest((src['open_orders'].get('source') or {}).get('modified')))
+            _digest((src['open_orders'].get('source') or {}).get('modified')),
+            _digest(fr.get('rows') or []))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -882,9 +895,9 @@ SETTINGS_SCHEMA = {
     # RMB-based cost at that rate.
     'fx': ('obj', {'rate': ('nullable', _n(*_FX_BAND)), 'asOf': ('date',), 'basis': ('token',)}),
     'gridPrecedence': ('nullable', ('map', ('code',), ('list', ('code',), 12))),
-    # ddpBrands (Nov 12 2026): brand codes the factory delivers duty paid (DDP), so the P&L adds no import
-    # costs on its goods of those brands.
-    'factories': ('map', ('code',), _nullable(('obj', {'name': _TEXT80, 'origin': ('code',),
+    # Delivered terms (Nov 12 2026): ddp true = the factory delivers everything it makes duty paid (DDP);
+    # ddpBrands = only those brand codes. The P&L adds no import costs on those goods.
+    'factories': ('map', ('code',), _nullable(('obj', {'name': _TEXT80, 'origin': ('code',), 'ddp': _BOOL,
                                                        'ddpBrands': ('list', ('code',), 40)}))),
     # Where goods land, by A2000 warehouse, ledger landing or stock warehouse code:
     # 'us' (US duty, freight and fees), 'ca' (Canadian duty) or 'none' (no import costs).
