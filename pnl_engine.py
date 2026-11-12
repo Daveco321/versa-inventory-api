@@ -1163,6 +1163,12 @@ def _imp_part(imp):
     return k if k > 0 else 0.0
 
 
+def imp_out(imp):
+    """The import share a row publishes (impShare, Nov 12 2026): the share below 1 it paid (0 for none), else None
+    for all of it. The page's what-ifs scale each import cost by it, as adders() does."""
+    return _imp_part(imp)
+
+
 def adders(fob, qty, cat, fiber, origin, S, regime, imp=None):
     """(duty, freight, fees) for a row: fob in dollars (already rounded), qty in pieces.
     regime: 'us', 'ca' or 'none' (contract C2); the old fob_line flag still works (true = none).
@@ -3463,20 +3469,20 @@ LINE_FIELDS = ('id', 'ctrlNo', 'orderNo', 'cust', 'type', 'style', 'base', 'bran
                'units', 'price', 'rev', 'start', 'cancel', 'late', 'fobLine', 'wh',
                'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'contrib',
                'level', 'grade', 'routing', 'factory', 'ref', 'origin', 'fxShare', 'ev', 'flags', 'basis',
-               'dutyRegime', 'costRef', 'pieces', 'fxRef', 'revCost')
+               'dutyRegime', 'costRef', 'pieces', 'fxRef', 'revCost', 'impShare')
 ALLOC_FIELDS = ('line', 'units', 'kind', 'factory', 'ref', 'poName', 'landing', 'etd', 'arrival', 'fobU', 'level',
                 'routing', 'forced', 'costRef', 'lotTier', 'pieces', 'fxShare', 'fxRef', 'revCost')
 APO_FIELDS = ('id', 'cust', 'custName', 'po', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'estPrice',
               'priceBasis', 'rev', 'fobU', 'fob', 'duty', 'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty',
               'contrib', 'level', 'grade', 'factory', 'origin', 'fxShare', 'flags', 'routing', 'ref', 'basis', 'ev',
-              'dutyRegime', 'costRef', 'coveredBy', 'fxRef', 'revCost')
+              'dutyRegime', 'costRef', 'coveredBy', 'fxRef', 'revCost', 'impShare')
 INVENTORY_FIELDS = ('sku', 'base', 'brand', 'cat', 'fiber', 'wh', 'units', 'fobU', 'landedU', 'fob', 'landed', 'level',
                     'grade', 'factory', 'ref', 'lotTier', 'receiveDate', 'ageDays', 'origin', 'fxShare', 'basis', 'ev',
-                    'dutyRegime', 'flags', 'fxRef')
+                    'dutyRegime', 'flags', 'fxRef', 'impShare')
 PRODUCTION_FIELDS = ('ref', 'factory', 'poName', 'style', 'base', 'brand', 'cat', 'fiber', 'units', 'etd', 'arrival',
                      'landing', 'fobLanding', 'fobU', 'fob', 'landedU', 'landed', 'level', 'grade', 'claimed', 'free',
                      'origin', 'fxShare', 'flags', 'basis', 'ev', 'dutyRegime', 'fxRef', 'ownFobU', 'ownFxShare',
-                     'ownFxRef')
+                     'ownFxRef', 'impShare')
 STYLE_FIELDS = ('base', 'brand', 'cat', 'fab', 'fiber', 'fit', 'sleeve', 'pat', 'fobU', 'landedU', 'level', 'grade',
                 'rangeLo', 'rangeHi', 'factories', 'onHand', 'onHandFob', 'onHandLanded', 'incoming', 'incomingFob',
                 'ats', 'committed', 'allocated', 'openUnits', 'openRev', 'openGp', 'openContrib', 'apoUnits', 'apoRev',
@@ -3501,7 +3507,7 @@ PENDING_FIELDS = ('month', 'units', 'rev', 'fob', 'duty', 'freight', 'fees', 'co
 # programs are invoiced by the carton, like their order lines).
 SHIPPED_CUSTOMER_FIELDS = ('cust', 'base', 'brand', 'cat', 'fiber', 'origin', 'units', 'rev', 'fobU', 'fob', 'duty',
                            'freight', 'fees', 'cogs', 'deduct', 'net', 'gp', 'royalty', 'revCost', 'contrib', 'level',
-                           'grade', 'dutyRegime', 'fxShare', 'fxRef', 'pieces')
+                           'grade', 'dutyRegime', 'fxShare', 'fxRef', 'pieces', 'impShare')
 _COVERAGE_SETS = ('openBook', 'bulk', 'apo', 'inventory', 'production')
 
 
@@ -3990,7 +3996,8 @@ class _Build:
                    'fxShare': r4(ag['fx']) if fobU is not None else 0.0, 'ev': self.ev(ag['ids']),
                    'flags': sorted(flags), 'basis': self.bkey(ag['basis']), 'dutyRegime': regime,
                    'costRef': ag['costRef'], 'pieces': q * pcs,
-                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr'])}
+                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr']),
+                   'impShare': imp_out(ag.get('impShare'))}
             row.update(money)
             row['_pcs'], row['_group'], row['_comps'] = pcs, group, comps
             self.lines.append(row)
@@ -4270,7 +4277,8 @@ class _Build:
                    'factory': ag['factory'], 'origin': ag['origin'], 'fxShare': r4(ag['fx']) if fobU is not None else 0.0,
                    'flags': sorted(flags), 'routing': routing, 'ref': ag['ref'], 'basis': self.bkey(ag['basis']),
                    'ev': self.ev(ag['ids']), 'dutyRegime': regime, 'costRef': ag['costRef'], 'coveredBy': covered,
-                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr'])}
+                   'fxRef': _fxref_out(r4(ag['fx']) if fobU is not None else 0.0, ag['fxr']),
+                   'impShare': imp_out(ag.get('impShare'))}
             row.update(money)
             row['_comps'] = comps
             self.apo.append(row)
@@ -4327,7 +4335,7 @@ class _Build:
                        'grade': grade, 'factory': w['fac'], 'ref': w.get('ref'), 'lotTier': w.get('tier'),
                        'receiveDate': m['rd'], 'ageDays': age, 'origin': origin,
                        'fxShare': share, 'basis': bk, 'ev': ev,
-                       'dutyRegime': regime, 'flags': sorted(flags), 'fxRef': fxref}
+                       'dutyRegime': regime, 'flags': sorted(flags), 'fxRef': fxref, 'impShare': imp_out(imp)}
                 self.inventory.append(row)
                 cell = self.cov['inventory'][level]
                 cell[0] += units
@@ -4428,7 +4436,7 @@ class _Build:
                    'basis': self.bkey(res['basis']), 'ev': self.ev(res['ids']), 'dutyRegime': regime,
                    'fxRef': _fxref_out(r4(fx) if unit is not None else 0.0, self.ci.fx_ref(res)),
                    'ownFobU': r4(own_u), 'ownFxShare': own_share,
-                   'ownFxRef': _fxref_out(own_share, self.ci.fx_ref(L['res']))}
+                   'ownFxRef': _fxref_out(own_share, self.ci.fx_ref(L['res'])), 'impShare': imp_out(imp)}
             self.production.append(row)
             cell = self.cov['production'][level]
             cell[0] += units
@@ -4993,7 +5001,7 @@ class _Build:
             row = {'cust': cust, 'base': st, 'brand': brand, 'cat': cat, 'fiber': fiber, 'origin': sc['origin'],
                    'units': units, 'rev': rev, 'fobU': fobU, 'fob': fob, 'level': level,
                    'grade': max(grade_of(level), sc['cap']), 'dutyRegime': regime, 'fxShare': share,
-                   'fxRef': _fxref_out(share, sc.get('fxr')), 'pieces': qty}
+                   'fxRef': _fxref_out(share, sc.get('fxr')), 'pieces': qty, 'impShare': imp_out(hi)}
             row.update(line_money(rev, fob, qty, cat, fiber, sc['origin'], regime, self.cust_info(cust)[1],
                                   _roy_pct(brand, self.S), self.S, imp=hi))
             out.append(row)

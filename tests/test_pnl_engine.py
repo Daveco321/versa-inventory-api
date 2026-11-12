@@ -2019,7 +2019,7 @@ class CombinedCostC13(unittest.TestCase):
         # Cost of goods takes the style's combined cost, but a factory bills its own price. Each production row carries
         # the maker's own ladder cost (ownFobU, with its fxShare and fxRef) for the page's factory payments.
         ds = build(src_c13(), cb=C13_BOOK)
-        self.assertEqual(ds['production']['fields'][-3:], ['ownFobU', 'ownFxShare', 'ownFxRef'])
+        self.assertEqual(ds['production']['fields'][-4:], ['ownFobU', 'ownFxShare', 'ownFxRef', 'impShare'])
         c = c13(src_c13()['ledger']['rows'])
         P = rows(ds, 'production')
         for r in P:

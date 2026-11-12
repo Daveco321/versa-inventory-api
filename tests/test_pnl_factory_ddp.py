@@ -692,3 +692,37 @@ class UntiedStockTakesTheRecordShare(unittest.TestCase):
         # TT shipped 300 of 1,000 units on record: 70% pays import (the two ledger lots alone would say 25%)
         self.assertEqual(q['landed'], E.r2(q['fob'] + E.r2(d * 0.7) + E.r2(f * 0.7) + E.r2(e * 0.7)))
         self.assertIn('ddp_part', q['flags'])
+
+
+class RowsPublishTheirShare(unittest.TestCase):
+    """Nov 12 2026: each row publishes the import share it paid (impShare), so the page's what-ifs can scale the import
+    costs they recompute the same way: below 1 only (0 for none), else None."""
+
+    def test_rows(self):
+        s = history_only('ROQAQH204SLS')
+        s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQH204SLS-M', tr=100)]
+        s['factory_record'] = {'rows': two_lots(300, 100), 'generatedAt': '2026-03-01T06:00:00Z'}
+        ds = T.build(s, settings=TT_QA)
+        for t in ('lines', 'apo', 'inventory', 'production'):
+            self.assertEqual(ds[t]['fields'][-1], 'impShare', t)
+        self.assertEqual(ds['shipped']['byCustomer']['fields'][-1], 'impShare')
+        inv = T.by(ds, 'inventory', 'sku')['ROQAQH204SLS-M']
+        self.assertEqual(inv['impShare'], 0.25)
+        bc = {(x['cust'], x['base']): x for x in [dict(zip(ds['shipped']['byCustomer']['fields'], r))
+                                                   for r in ds['shipped']['byCustomer']['rows']]}
+        self.assertEqual(bc[('ROSS', 'ROQAQH204SLS')]['impShare'], 0.25)
+        P = {r['ref']: r for r in T.rows(ds, 'production') if r['base'] == 'ROQAQH204SLS'}
+        self.assertEqual((P['TT26002']['impShare'], P['NN26002']['impShare']), (None, None))   # tied lots: all or none
+        for t in ('lines', 'apo', 'inventory', 'production'):
+            for r in T.rows(ds, t):
+                k = r['impShare']
+                self.assertTrue(k is None or 0 <= k < 1, (t, k))
+                if k is not None and r.get('fob'):
+                    d, f, e = E.adders(r['fob'], r.get('pieces') or r['units'], r['cat'], r['fiber'], r['origin'],
+                                       ds['settings'], r['dutyRegime'])
+                    got = (r['duty'], r['freight'], r['fees']) if 'duty' in r else None
+                    if got is not None:
+                        self.assertEqual(got, (E.r2(d * k), E.r2(f * k), E.r2(e * k)), (t, r.get('id') or r.get('sku')))
+        none = T.build(T.src(), settings={})
+        for t in ('lines', 'apo', 'inventory', 'production'):
+            self.assertEqual({r['impShare'] for r in T.rows(none, t)}, {None}, t)
