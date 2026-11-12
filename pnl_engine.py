@@ -390,6 +390,7 @@ FLAG_LABELS = {
     'group_block_missing': "This customer's own price block has no row for the style. A regular sheet is used.",
     'ddp': 'Delivered price (DDP). Duty and freight are in the price, so no import costs are added.',
     'ddp_mixed': 'Part of the cost is a delivered (DDP) price. Import costs are still added on the whole row. Check.',
+    'ddp_part': 'Part of these goods come from a factory that delivers duty paid (DDP). Import costs are added on the rest only.',
 }
 
 # ── Contract C15 (David, Sep 15 2026): one right row per factory sheet ──
@@ -398,7 +399,7 @@ FLAG_LABELS = {
 # its fit (R6). Rows still tied: the lowest, flagged ambiguous_rows (R7). Never a median of rows.
 C15_FLAGS = ('ambiguous_rows', 'cross_brand', 'fit_unknown', 'pattern_guess', 'fabric_family', 'colour_row',
              'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'group_block_missing', 'ddp',
-             'weight_pref')
+             'weight_pref', 'ddp_part')
 C15_REASONS = ('other_brand', 'other_pattern', 'other_sleeve', 'variant_not_this_style', 'lower_confidence',
                'tie_not_lowest', 'other_weight')
 # costRowsSkipped order: the rows closest to the one used first.
@@ -684,6 +685,7 @@ _DIRECT_LEVELS = ('L1', 'L2', 'L4a', 'L4b')      # levels a direct quote can hav
 _LIST_LEVELS = ('L1', 'L2', 'L3')                # a list factory's own list answers at these levels
 _LOT_FLAGS = ('blended_lot', 'ref_after_stock')  # stock flags that stay on a combined cost
 _SPREAD_TOL = 1e-9                               # float noise: exactly at the threshold stays 'average'
+_SHARE_EPS = 1e-9                                # a delivered share this close to 0 or 1 is all or nothing
 _MULT_BAND = (1.0, 3.0)          # a valid import multiplier
 _REV_COST_MAX = 50.0             # a valid revenue cost item, percent of revenue
 _SPREAD_MAX = 100.0              # costRule.wideSpreadPct
@@ -1151,11 +1153,31 @@ def royalty_base(S):
     return 'revenue' if isinstance(R, dict) and R.get('base') == 'revenue' else 'net'
 
 
-def adders(fob, qty, cat, fiber, origin, S, regime):
+def _imp_part(imp):
+    """The import share a row pays (Nov 12 2026), or None for the whole of it."""
+    if imp is None:
+        return None
+    k = _fnum(imp)
+    if k is None or k >= 1:
+        return None
+    return k if k > 0 else 0.0
+
+
+def adders(fob, qty, cat, fiber, origin, S, regime, imp=None):
     """(duty, freight, fees) for a row: fob in dollars (already rounded), qty in pieces.
     regime: 'us', 'ca' or 'none' (contract C2); the old fob_line flag still works (true = none).
     Multiplier mode (contract C11): a 'us' or 'ca' row pays duty = r2(fob x (m - 1)) and no freight or
-    fees, m being the multiplier of its fiber class. A class with no multiplier keeps the math below."""
+    fees, m being the multiplier of its fiber class. A class with no multiplier keeps the math below.
+    imp (Nov 12 2026): the share of the import costs the row pays, when part of its goods come from a factory
+    that delivers them duty paid; each cost is r2(cost x imp). None or 1 = all of them."""
+    d, f, e = _adders_full(fob, qty, cat, fiber, origin, S, regime)
+    k = _imp_part(imp)
+    if k is None:
+        return d, f, e
+    return r2(d * k), r2(f * k), r2(e * k)
+
+
+def _adders_full(fob, qty, cat, fiber, origin, S, regime):
     reg = _regime(regime)
     if reg == 'none' or fob is None:
         return 0.0, 0.0, 0.0
@@ -1189,9 +1211,19 @@ def adders(fob, qty, cat, fiber, origin, S, regime):
     return duty, freight, fees
 
 
-def landed(fobU, attrs, settings, regime, origin):
+def landed(fobU, attrs, settings, regime, origin, imp=None):
     """Per-unit landed cost: {duty, freight, fees, landedU}. attrs: {'cat', 'fiber'}.
-    regime: 'us', 'ca' or 'none' (the old fob_line flag still works)."""
+    regime: 'us', 'ca' or 'none' (the old fob_line flag still works). imp: the share of the import costs paid
+    (see adders); each per-unit cost is r4(cost x imp)."""
+    out = _landed_full(fobU, attrs, settings, regime, origin)
+    k = _imp_part(imp)
+    if k is None or out['landedU'] is None:
+        return out
+    duty, freight, fees = r4(out['duty'] * k), r4(out['freight'] * k), r4(out['fees'] * k)
+    return {'duty': duty, 'freight': freight, 'fees': fees, 'landedU': r4(r4(fobU) + duty + freight + fees)}
+
+
+def _landed_full(fobU, attrs, settings, regime, origin):
     if fobU is None:
         return {'duty': None, 'freight': None, 'fees': None, 'landedU': None}
     S = settings if isinstance(settings, dict) and 'tariff' in settings else merge_settings(settings)
@@ -1249,15 +1281,16 @@ def _roy_pct(brand, S):
     return _num(R.get('defaultPct'))
 
 
-def line_money(rev, fob, qty, cat, fiber, origin, regime, ded_pct, roy_pct, S):
+def line_money(rev, fob, qty, cat, fiber, origin, regime, ded_pct, roy_pct, S, imp=None):
     """One revenue row (DESIGN 5.6, contract C11). rev None = unpriced (APO). fob None = uncosted (L7).
     regime: 'us', 'ca' or 'none' (the old fob_line flag still works). Royalty is a percent of net sales
     or of revenue (settings.royalty.base). revCost = r2(rev x revCostPct / 100) whenever rev is set,
-    and contrib = r2(gp - royalty - revCost). The page repeats this operation order."""
+    and contrib = r2(gp - royalty - revCost). The page repeats this operation order. imp: the share of the
+    import costs paid (see adders)."""
     out = {'duty': None, 'freight': None, 'fees': None, 'cogs': None, 'deduct': None, 'net': None,
            'gp': None, 'royalty': None, 'revCost': None, 'contrib': None}
     if fob is not None:
-        d, f, e = adders(fob, qty, cat, fiber, origin, S, regime)
+        d, f, e = adders(fob, qty, cat, fiber, origin, S, regime, imp)
         out.update(duty=d, freight=f, fees=e, cogs=r2(fob + d + f + e))
     if rev is not None:
         out['deduct'] = r2(rev * ded_pct / 100)
@@ -1271,11 +1304,11 @@ def line_money(rev, fob, qty, cat, fiber, origin, regime, ded_pct, roy_pct, S):
     return out
 
 
-def stock_money(fob, units, cat, fiber, origin, regime, S):
-    """Inventory and production rows: (landed, landedU). regime as in adders."""
+def stock_money(fob, units, cat, fiber, origin, regime, S, imp=None):
+    """Inventory and production rows: (landed, landedU). regime and imp as in adders."""
     if fob is None:
         return None, None
-    d, f, e = adders(fob, units, cat, fiber, origin, S, regime)
+    d, f, e = adders(fob, units, cat, fiber, origin, S, regime, imp)
     lnd = r2(fob + d + f + e)
     return lnd, (r4(lnd / units) if units > 0 else None)
 
@@ -1640,10 +1673,11 @@ _RECORD_SKIP = ('removed', 'reissued', 'moved')     # factory record lines that 
 
 
 def factory_record_rows(lines):
-    """The production lines a factory record holds, as [{'production', 'style', 'factory'}] (Nov 12 2026): the
-    factory scorecard's line history (every master ledger copy plus the factories' own ledgers), so the P&L keeps
-    knowing which factory made a style after its lines leave the ledger. Lines removed, re-issued at another
-    factory or moved to another ref are left out, and so are factory-file lines with no units."""
+    """The production lines a factory record holds, as [{'production', 'style', 'factory', 'units'}] (Nov 12
+    2026): the factory scorecard's line history (every master ledger copy plus the factories' own ledgers), so the
+    P&L keeps knowing which factory made a style, and how many of its units, after its lines leave the ledger.
+    Lines removed, re-issued at another factory or moved to another ref are left out, and so are factory-file
+    lines with no units."""
     out = []
     for ln in lines if isinstance(lines, (list, tuple)) else ():
         if not isinstance(ln, dict) or ln.get('outcome') in _RECORD_SKIP:
@@ -1651,9 +1685,10 @@ def factory_record_rows(lines):
         ref, style = _u(ln.get('ref') or ln.get('production')), _u(ln.get('style'))
         if not ref or not style:
             continue
-        if ln.get('outcome') is None and _int(ln.get('units')) <= 0:
+        units = max(0, _int(ln.get('units')))
+        if ln.get('outcome') is None and units <= 0:
             continue
-        out.append({'production': ref, 'style': style, 'factory': _u(ln.get('factory'))})
+        out.append({'production': ref, 'style': style, 'factory': _u(ln.get('factory')), 'units': units})
     return out
 
 
@@ -1775,6 +1810,7 @@ class CostIndex:
         # line ever seen, the factory lists that name it), so delivered terms outlive the ledger lines. It decides
         # terms only, never a price. Built before the passes: they already resolve ledger lines with no factory.
         self.made_by = self._made_by(record_rows)
+        self.made_units = self._made_units(record_rows)
         self._pass1()
         self._pass2()
         # Contract C13: the cost rule, and the refs that carry each style (the ledger, then its history).
@@ -1996,6 +2032,61 @@ class CostIndex:
                 add(r.get('style'), r.get('production') or r.get('ref'), r.get('factory'))
         return {b: frozenset(f) for b, f in out.items()}
 
+    def _made_units(self, record_rows):
+        """{base (DV letters folded): {factory: units}} from the factory record's lines (Nov 12 2026, the shares a
+        style was made in); a style with no units on record takes its current ledger lines' units."""
+        rec, led = defaultdict(lambda: defaultdict(float)), defaultdict(lambda: defaultdict(float))
+
+        def add(out, style, ref, units, hint=None):
+            b = norm_vd(base_of(style))
+            f = _u(hint)
+            if not f or f in _LIST_FACTORY_PSEUDO:
+                f = fac_of(ref)
+            u = _fnum(units)
+            if b and f and f not in _LIST_FACTORY_PSEUDO and u is not None and u > 0:
+                out[b][f] += u
+        for r in record_rows or ():
+            if isinstance(r, dict):
+                add(rec, r.get('style'), r.get('production') or r.get('ref'), r.get('units'), r.get('factory'))
+        for L in self.ledger:
+            add(led, L['b'], L['ref'], L['units'])
+        out = {b: dict(v) for b, v in led.items()}
+        out.update({b: dict(v) for b, v in rec.items()})
+        return out
+
+    def ddp_share(self, b):
+        """The share (0..1) of base style b's units on record made by factories that deliver it duty paid, or None
+        when no units are on record (Nov 12 2026)."""
+        units = self.made_units.get(norm_vd(base_of(b)))
+        tot = sum(units.values()) if units else 0
+        if tot <= 0:
+            return None
+        return sum(u for f, u in units.items() if self._fac_delivers(f, b)) / tot
+
+    def part_share(self, fac, b):
+        """The import share (0..1) a row with no known factory pays (Nov 12 2026, split by share): the share of the
+        style's units on record made by factories that do not deliver it duty paid. None when the row's factory is
+        known, nothing is on record, or every unit (or none) came from a delivering factory."""
+        f = _u(fac)
+        if not self.ddp_brands or (f and f not in _LIST_FACTORY_PSEUDO):
+            return None
+        d = self.ddp_share(b)
+        if d is None or d <= _SHARE_EPS or d >= 1 - _SHARE_EPS:
+            return None
+        return r4(1 - d)
+
+    def price_terms_ddp(self, ids):
+        """True when a cost's own rows say delivered (DDP): a manual cost with terms DDP, or cost book records that
+        are all DDP (Oct 7 2026 terms). Factory terms (settings) are not price terms."""
+        ids = [i for i in (ids or ()) if isinstance(i, str)]
+        if not ids:
+            return False
+        ovr = [i[4:] for i in ids if i.startswith('OVR:')]
+        if ovr:
+            return any(_is_ddp(self._ovr_by_id.get(i)) for i in ovr)
+        recs = [self.records.get(i) for i in ids]
+        return all(r and _is_ddp(r) for r in recs)
+
     def _carriers(self, history_rows):
         """{base: {factory: {ref: poName}}}: the production refs that carry each style on the current ledger,
         then on the ledger history when there is one (contract C13). Blank, N/A and other refs that name no
@@ -2082,6 +2173,8 @@ class CostIndex:
             if key:
                 self._ovr[sc][key] = o
         self.overrides_active = sum(len(v) for v in self._ovr.values())
+        # Every manual cost by id (its price terms, Nov 12 2026).
+        self._ovr_by_id = {str(o.get('id')): o for v in self._ovr.values() for o in v.values()}
 
     @staticmethod
     def style_keys(full, b):
@@ -2837,10 +2930,19 @@ class CostIndex:
             out['flags'] = tuple(dict.fromkeys(tuple(out['flags']) + lot))
         # Goods of a factory that delivers them duty paid stay delivered on their own row (a production lot, a
         # lot-matched carton, stock of a style only such factories ever made) when the combined cost also holds
-        # other factories' quotes (Nov 12 2026). The other factories' rows keep their import costs (ddp_mixed).
-        if 'ddp' not in out['flags'] and self.delivers(res.get('fac'), b):
-            out = self._fac_terms(dict(out, flags=tuple(x for x in out['flags'] if x != 'ddp_mixed')), b,
-                                  res.get('fac'))
+        # other factories' quotes (Nov 12 2026). The other factories' rows keep their import costs (ddp_mixed). A
+        # row with no known factory of a style made partly by such factories pays import on the others' share.
+        own = res.get('impShare') if res.get('impFrom') == 'lots' else None   # a blend of lots knows its own split
+        if 'ddp' in out['flags']:
+            pass
+        elif own is not None and 0 < own < 1:
+            said = ('Part of these units come from lots delivered duty paid (DDP), so import costs are added on the '
+                    'other %d%% only.' % int(round(own * 100)))
+            out = dict(out, impShare=own, impFrom='lots',
+                       flags=tuple(x for x in out['flags'] if x not in ('ddp_mixed', 'ddp_part')) + ('ddp_part',),
+                       basis=' '.join(x for x in (str(out.get('basis') or '').strip(), said) if x))
+        elif self.delivers(res.get('fac'), b) or self.part_share(res.get('fac'), b):
+            out = self._fac_terms(out, b, res.get('fac'))
         return out
 
     def cost_rule(self, b, level):
@@ -2914,6 +3016,9 @@ class CostIndex:
         f = _u(fac)
         if f and f not in _LIST_FACTORY_PSEUDO:
             return self._fac_delivers(f, b)
+        d = self.ddp_share(b)                  # units on record: every unit from a delivering factory
+        if d is not None:
+            return d >= 1 - _SHARE_EPS
         facs = self.made_by.get(norm_vd(base_of(b)))
         return bool(facs) and all(self._fac_delivers(x, b) for x in facs)
 
@@ -2929,17 +3034,31 @@ class CostIndex:
             return '%s %s%s duty paid (DDP), so no import costs are added.' % (names, verb, what)
         return 'Made by %s, which %s%s duty paid (DDP), so no import costs are added.' % (names, verb, what)
 
+    def _part_words(self, b, part):
+        units = self.made_units.get(norm_vd(base_of(b))) or {}
+        dl = sorted(f for f in units if self._fac_delivers(f, b))
+        names = self._names([_factory_name(self.S, x) for x in dl])
+        pct = int(round((1 - part) * 100))
+        return ('%s made %d%% of this style\'s units on record and %s duty paid (DDP), so import costs are added on '
+                'the other %d%% only.' % (names, pct, 'delivers' if len(dl) == 1 else 'deliver', 100 - pct))
+
     def _fac_terms(self, res, b, fac):
         """Goods that their factory delivers duty paid (settings factories.<code>.ddp or .ddpBrands, Nov 12 2026)
         carry the ddp flag whatever row prices them (its list, a grid, a default, a manual cost), so no import
         costs are added on them. fac is the factory that makes the goods; a row with no known factory takes the
-        factories on record for the style (delivers). No price, no terms."""
+        factories on record for the style (delivers). When the style was made partly by such factories, a row with
+        no known factory pays import on the other factories' share of the units on record only: impShare and flag
+        ddp_part (David, Nov 12 2026: split by share). No price, no terms."""
         if not res or not self.ddp_brands or res.get('level') == 'L7' or 'ddp' in res['flags']:
             return res
-        if not self.delivers(fac, b):
+        join = lambda words: ' '.join(x for x in (str(res.get('basis') or '').strip(), words) if x)
+        flags = tuple(x for x in res['flags'] if x not in ('ddp_mixed', 'ddp_part'))
+        if self.delivers(fac, b):
+            return dict(res, flags=flags + ('ddp',), basis=join(self._ddp_words(fac, b)), impShare=None)
+        part = self.part_share(fac, b)
+        if part is None or res.get('impShare') == part:
             return res
-        return dict(res, flags=tuple(res['flags']) + ('ddp',),
-                    basis=' '.join(x for x in (str(res.get('basis') or '').strip(), self._ddp_words(fac, b)) if x))
+        return dict(res, flags=flags + ('ddp_part',), impShare=part, basis=join(self._part_words(b, part)))
 
     def _resolve(self, b, fac, ref, poName, allow_default, brand_label, group, use_ovr, full=None):
         sku = self.decode(b)
@@ -3213,10 +3332,18 @@ class _WarehouseCoster:
         flags.update(add)
         if len(priced) < len(parts):
             flags.add('partial_cost')
-        # Delivered (DDP) and FOB refs blended: the row stays an import, flagged ddp_mixed (Oct 7 2026).
+        # Delivered (DDP) and FOB refs blended (Oct 7 2026: an import, flagged ddp_mixed). Nov 12 2026 (David: split
+        # by share): import costs only on the share of the units from refs that are not delivered (impShare, ddp_part).
+        imp = None
         if 'ddp' in flags and not all('ddp' in res['flags'] for _, _, res in priced):
-            flags.discard('ddp')
-            flags.add('ddp_mixed')
+            flags.difference_update(('ddp', 'ddp_mixed'))
+            k = sum(w * (0.0 if 'ddp' in res['flags'] else (1.0 if res.get('impShare') is None else res['impShare']))
+                    for _, w, res in priced) / tw
+            if 0 < k < 1:
+                imp = r4(k)
+                flags.add('ddp_part')
+            else:
+                flags.add('ddp_mixed')
         fw = Counter()
         for ref, w, _ in priced:
             fw[fac_of(ref)] += w
@@ -3226,7 +3353,8 @@ class _WarehouseCoster:
         vals = [res['price'] for _, _, res in priced]
         top = max(priced, key=lambda x: x[1])[2]      # contract C15: the sheet row of the ref with the most units
         return {'level': lv, 'price': price, 'alt': alt, 'fx': fx, 'fxr': fxr if fx else None, 'ids': ids, 'fac': fac, 'ref': None,
-                'rng': (min(vals), max(vals)), 'flags': tuple(sorted(flags)), 'tier': tier,
+                'rng': (min(vals), max(vals)), 'flags': tuple(sorted(flags)), 'tier': tier, 'impShare': imp,
+                'impFrom': 'lots' if imp is not None else None,
                 'basis': 'Weighted average of the %d refs that made this style. Least certain part: %s'
                          % (len(priced), worst['basis']), 'row': top.get('row'), 'skip': tuple(top.get('skip') or ())}
 
@@ -3337,7 +3465,7 @@ class _Build:
         cap = max('B' if kind == 'warehouse' and tier not in ('T1', 'T2') else 'A', res.get('gcap') or 'A')
         return {'u': units, 'p': u, 'fx': fx, 'fxr': self.ci.fx_ref(res), 'pb': res['price'], 'lv': res['level'], 'fac': fac, 'ref': ref,
                 'ids': res['ids'], 'fl': res['flags'], 'basis': res['basis'], 'kind': kind, 'a': arow,
-                'tier': tier, 'cap': cap, 'comb': bool(res.get('rule'))}
+                'tier': tier, 'cap': cap, 'comb': bool(res.get('rule')), 'imp': res.get('impShare')}
 
     def wh_fac(self, fac):
         return 'WH' if fac in ('UNKNOWN', None) else fac
@@ -3430,15 +3558,28 @@ class _Build:
         worst = next((c for c in comps if c['lv'] == lv), None)
         tiers = {c.get('tier') for c in comps if c.get('kind') == 'warehouse'}
         # Delivered (DDP) prices (Oct 7 2026): every priced component delivered means the row adds no import
-        # costs; a mix keeps the import costs and says so (ddp_mixed), so nothing is silently half landed.
-        ddp = None
+        # costs. Nov 12 2026 (David: split by share): otherwise the row pays import on the share of its units that
+        # is not delivered, each component counting its own units: a delivered one none, a part-delivered one (a
+        # row with no known factory, ddp_part) its impShare, any other all. impShare is that weighted share.
+        ddp, imp = None, 1.0
         if priced and comps:
             n = sum(1 for c in comps if 'ddp' in c['fl'])
             ddp = 'all' if n == len(comps) else 'mixed' if n else None
-        if ddp == 'mixed':
+
+            def cf(c):
+                return 0.0 if 'ddp' in c['fl'] else (1.0 if c.get('imp') is None else c['imp'])
+            imp = (sum(c['u'] * cf(c) for c in comps) / tu) if tu > 0 else sum(cf(c) for c in comps) / len(comps)
+            imp = 0.0 if ddp == 'all' else r4(imp)
+        if ddp != 'all' and 0 < imp < 1:
+            ddp = 'part'
+            flags.difference_update(('ddp', 'ddp_mixed'))
+            flags.add('ddp_part')
+        elif ddp == 'mixed':
             flags.discard('ddp')
             flags.add('ddp_mixed')
+        terms = any('ddp' in c['fl'] and self.ci.price_terms_ddp(c['ids']) for c in comps)
         return {'unit': unit, 'fx': fx, 'fxr': fxr, 'level': lv, 'factory': fac, 'ref': ref, 'costRef': cost_ref,
+                'impShare': imp, 'termsDdp': terms,
                 'origin': _factory_origin(self.S, ofac) if ofac else _factory_origin(self.S, '_default'),
                 'flags': flags, 'ids': [i for c in comps for i in c['ids']], 'priced': priced, 'ddp': ddp,
                 'cap': max([c.get('cap') or 'A' for c in comps] or ['A']),
@@ -3723,7 +3864,8 @@ class _Build:
             fiber = dec['fiber'] if dec else 'mmf'
             brand = self.brand_of(dec, sku, base=b)
             group, ded = self.cust_info(cust)
-            money = line_money(rev, fob, q * pcs, cat, fiber, ag['origin'], regime, ded, _roy_pct(brand, self.S), self.S)
+            money = line_money(rev, fob, q * pcs, cat, fiber, ag['origin'], regime, ded, _roy_pct(brand, self.S), self.S,
+                               imp=ag.get('impShare'))
             # d2 5.3: R6 only when nothing is placed; a partly unsourced line keeps the label of its
             # placed units and carries the 'unsourced' flag.
             routing = (_worst_routing(a.get('routing') for a, _ in arows if a.get('kind') != 'unsourced')
@@ -4021,7 +4163,8 @@ class _Build:
             if ag.get('ddp') == 'all':
                 regime, derived = 'none', False        # a delivered price: duty and freight are already in it
             group, ded = self.cust_info(cust)
-            money = line_money(rev, fob, qty, cat, fiber, ag['origin'], regime, ded, _roy_pct(brand, self.S), self.S)
+            money = line_money(rev, fob, qty, cat, fiber, ag['origin'], regime, ded, _roy_pct(brand, self.S), self.S,
+                               imp=ag.get('impShare'))
             routing = _worst_routing(al.get('routing') for al in arows) or ('R6' if qty > 0 else None)
             level = ag['level'] if fobU is not None else 'L7'
             flags = set(ag['flags']) | pflags
@@ -4088,13 +4231,14 @@ class _Build:
             # caps the grade at its own grade.
             grade = max(grade_of(level), 'A' if w.get('tier') in ('T1', 'T2') else 'B', w.get('gcap') or 'A')
             ddp = unit is not None and 'ddp' in (w.get('flags') or ())
+            imp = w.get('impShare') if (unit is not None and not ddp) else None      # split by share (Nov 12 2026)
             for k, code in _STOCK_KEYS:
                 units = m[k]
                 if units <= 0:
                     continue
                 regime = 'none' if ddp else self.dest_regime(code)
                 fob = r2(units * fobU) if fobU is not None else None
-                lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S)
+                lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S, imp)
                 flags = set(w.get('flags') or ())
                 if regime != 'us' and not ddp:
                     flags.add('non_us_dest')
@@ -4170,7 +4314,8 @@ class _Build:
             regime = 'none' if ddp else self.dest_regime(L['landing'])
             fobU = r4(unit)
             fob = r2(units * fobU) if fobU is not None else None
-            lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S)
+            imp = res.get('impShare') if (unit is not None and not ddp) else None    # a lot with no known factory
+            lnd, lndU = stock_money(fob, units, cat, fiber, origin, regime, self.S, imp)
             # The maker's own price for this line (L['res'], its own ladder before contract C13): what that factory
             # bills. The page's factory payments use it; cost of goods keeps the style's cost (fobU).
             own_u, own_fx = self.ci.eff(L['res'])
@@ -4338,14 +4483,17 @@ class _Build:
             # program); otherwise its landed cost is a US import. A delivered (DDP) style cost adds no import
             # costs at all, also for a style with no stock or production row (Nov 12 2026), and its shipped
             # history is costed the same way as shipped.byStyle costs it.
-            ddp = unit is not None and sc.get('ddp') == 'all'
+            # Nov 12 2026: a style made partly by a delivering factory lands, and its history is costed, at the
+            # others' share of its units on record (hist_imp).
+            hi = self.hist_imp(b, sc, unit)
+            ddp = unit is not None and hi == 0
             regs = reg_b.get(b) or set()
             regime = 'none' if ddp else (next(iter(regs)) if len(regs) == 1 else 'us')
-            lu = landed(unit, {'cat': cat, 'fiber': fiber}, self.S, regime, sc['origin'])['landedU']
+            lu = landed(unit, {'cat': cat, 'fiber': fiber}, self.S, regime, sc['origin'], imp=hi)['landedU']
             brand = self.brand_of(dec, None, label, base=b)
             ob, ib, pb, fb, ab = open_b.get(b), inv_b.get(b), prod_b.get(b), feed_b.get(b), apo_b.get(b)
             t12 = an.get('t12') or [0.0, 0.0]
-            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp)
+            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp, imp=hi)
             # Expected price and the deduction percent of the same customer mix (contract C8).
             # Open lines and invoice history count kit cartons, so a kit base divides by its pieces
             # per carton (build_lines' convention); the landed cost it meets below is per piece.
@@ -4421,8 +4569,26 @@ class _Build:
         cas = sum(v[1] for c, v in cust.items() if v[1] > 0 and regs[c] == 'ca') / tv
         return ded, fobs, cas
 
-    def shipped_style_money(self, b, an, unit, cat, fiber, origin, brand, ddp=False):
-        """ddp: the style's cost is a delivered price (no import adders on any share, Oct 7 2026)."""
+    def hist_imp(self, b, sc, unit):
+        """The import share (0..1) of a style's invoices and awaiting-invoice estimates, which never name the factory
+        (Nov 12 2026, David: split by share). A style made partly by factories that deliver it duty paid pays import
+        on the other factories' share of its units on record, unless its own price terms say delivered. Any other
+        style follows its cost: none when delivered, else its impShare."""
+        if unit is None:
+            return 1.0
+        if not sc.get('termsDdp'):
+            part = self.ci.part_share('UNKNOWN', b)
+            if part is not None:
+                return part
+        if sc.get('ddp') == 'all':
+            return 0.0
+        v = sc.get('impShare')
+        return 1.0 if v is None else v
+
+    def shipped_style_money(self, b, an, unit, cat, fiber, origin, brand, ddp=False, imp=None):
+        """ddp: the style's cost is a delivered price (no import adders on any share, Oct 7 2026). imp: the share of
+        the import costs paid (Nov 12 2026); the imported shares (US and Canada) shrink by it, the rest moves to the
+        no-import share (fobShare), so the page's own math on fobShare and caShare gives the same cost."""
         out = {'cogs': 0.0 if unit is not None else None, 'gp': None, 'net': 0.0, 'rows': {}, 'pcs': 1}
         if not an or not self.months:
             if unit is None:
@@ -4431,6 +4597,10 @@ class _Build:
         ded, fobs, cas = self.mix_of(an)
         if ddp:
             fobs, cas = 1.0, 0.0
+        else:
+            k = _imp_part(imp)
+            if k is not None:
+                fobs, cas = fobs + (1 - fobs) * (1 - k), cas * k
         roy = _roy_pct(brand, self.S)
         on_rev = royalty_base(self.S) == 'revenue'
         rcp = revenue_cost_pct(self.S)
@@ -4495,8 +4665,9 @@ class _Build:
             sc = self.style_cost(st, label)
             unit = sc['unit'] if sc['priced'] else None
             cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
-            ddp = unit is not None and sc.get('ddp') == 'all'
-            sm = self.shipped_style_money(st, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp)
+            hi = self.hist_imp(st, sc, unit)
+            sm = self.shipped_style_money(st, an, unit, cat, fiber, sc['origin'], brand, ddp=unit is not None and hi == 0,
+                                          imp=hi)
             level = sc['level'] if unit is not None else 'L7'
             # months: invoice units and value; pcs: pieces per invoice unit (a kit or carton program), so the
             # page's unit totals count garments like the booked months do (Oct 7 2026).
@@ -4614,7 +4785,8 @@ class _Build:
                 brand = self.brand_of(dec, None, label, base=st)
                 cat, fiber = (dec['cat'], dec['fiber']) if dec else ('other', 'mmf')
                 pcs = self.pieces_per(cust, st)
-                reg = 'none' if (unit is not None and sc.get('ddp') == 'all') else regime
+                hi = self.hist_imp(st, sc, unit)            # split by share (Nov 12 2026)
+                reg = 'none' if (unit is not None and hi == 0) else regime
                 roy = _roy_pct(brand, self.S)
                 for ym, v in months.items():
                     if not (isinstance(v, (list, tuple)) and len(v) >= 2):
@@ -4625,7 +4797,7 @@ class _Build:
                     qty = u * pcs
                     rev = r2(val)
                     fob = r2(qty * r4(unit)) if unit is not None else None
-                    money = line_money(rev, fob, qty, cat, fiber, sc['origin'], reg, ded, roy, self.S)
+                    money = line_money(rev, fob, qty, cat, fiber, sc['origin'], reg, ded, roy, self.S, imp=hi)
                     pr = pair.get((cust, st))
                     if pr is None:
                         pr = pair[(cust, st)] = {'cust': cust, 'base': st, 'units': 0.0, 'invUnits': 0.0, 'rev': 0.0,
@@ -4719,7 +4891,8 @@ class _Build:
             qty = units * self.pieces_per(cust, st)
             rev = r2(val)
             fob = r2(qty * fobU) if fobU is not None else None
-            regime = 'none' if (unit is not None and sc.get('ddp') == 'all') else self.cust_regime(cust)
+            hi = self.hist_imp(st, sc, unit)                # split by share (Nov 12 2026)
+            regime = 'none' if (unit is not None and hi == 0) else self.cust_regime(cust)
             level = sc['level'] if unit is not None else 'L7'
             share = r4(sc['fx']) if unit is not None else 0.0
             row = {'cust': cust, 'base': st, 'brand': brand, 'cat': cat, 'fiber': fiber, 'origin': sc['origin'],
@@ -4727,7 +4900,7 @@ class _Build:
                    'grade': max(grade_of(level), sc['cap']), 'dutyRegime': regime, 'fxShare': share,
                    'fxRef': _fxref_out(share, sc.get('fxr')), 'pieces': qty}
             row.update(line_money(rev, fob, qty, cat, fiber, sc['origin'], regime, self.cust_info(cust)[1],
-                                  _roy_pct(brand, self.S), self.S))
+                                  _roy_pct(brand, self.S), self.S, imp=hi))
             out.append(row)
         return out
 

@@ -465,13 +465,14 @@ def _normalize_sources(raw):
     osrc = oo.get('source') if isinstance(oo.get('source'), dict) else {}
     osrc = {'modified': _str_or_none(osrc.get('modified')), 'ageHours': _num_or_none(osrc.get('ageHours')),
             'stale': osrc.get('stale') is True, 'checkedAt': _str_or_none(osrc.get('checkedAt'))} if osrc else {}
-    # Nov 12 2026: the factory record (which factory made each style; it decides delivered terms only). Rows keep
-    # only the production ref, the style and the factory.
+    # Nov 12 2026: the factory record (which factory made each style, and how many units; it decides delivered
+    # terms only). Rows keep only the production ref, the style, the factory and the units.
     fr = raw.get('factory_record')
     fr = fr if isinstance(fr, dict) else {}
     fr_rows = [{'production': str(r.get('production') or '').strip().upper()[:20],
                 'style': str(r.get('style') or '').strip().upper()[:40],
-                'factory': str(r.get('factory') or '').strip().upper()[:12]}
+                'factory': str(r.get('factory') or '').strip().upper()[:12],
+                'units': _record_units(r.get('units'))}
                for r in _rows(fr.get('rows')) if r.get('production') and r.get('style')]
     return {
         'inventory': {'items': _rows(inv.get('items')), 'last_sync': _str_or_none(inv.get('last_sync'))},
@@ -490,6 +491,12 @@ def _normalize_sources(raw):
         'sales_pending': sp,
         'factory_record': {'rows': fr_rows, 'generatedAt': _str_or_none(fr.get('generatedAt'))},
     }
+
+
+def _record_units(v):
+    """Units of one factory record line: a whole number from 0 to 10 million, else 0."""
+    f = _num_or_none(v)
+    return int(f) if f is not None and 0 <= f <= 10_000_000 else 0
 
 
 def _num_or_none(v):

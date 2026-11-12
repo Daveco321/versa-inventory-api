@@ -78,9 +78,10 @@ class FactoryDeliveredResolutions(unittest.TestCase):
         self.assertNotIn('ddp', c.resolve('ROQAQF201SLS', 'UNKNOWN')['flags'])
 
     def test_a_style_two_factories_make(self):
-        # ROQAQH204SLS is made on TT26002 and NN26002: its one combined cost averages both factories' quotes. The
-        # delivering factory's lot is delivered on its own row; the other lot and any row with no known factory keep
-        # the import costs, flagged ddp_mixed.
+        # ROQAQH204SLS is made on TT26002 and NN26002 (300 units each on the ledger): its one combined cost averages
+        # both factories' quotes. The delivering factory's lot is delivered on its own row; the other lot keeps the
+        # import costs (ddp_mixed). A row with no known factory pays import on the other factory's share of the
+        # units, half (ddp_part, David Nov 12 2026: split by share).
         c = T.ci(ledger=T.src()['ledger']['rows'], settings=TT_QA)
         tt = c.final('ROQAQH204SLS', c.raw('ROQAQH204SLS', 'TT', 'TT26002'))
         nn = c.final('ROQAQH204SLS', c.raw('ROQAQH204SLS', 'NN', 'NN26002'))
@@ -89,9 +90,15 @@ class FactoryDeliveredResolutions(unittest.TestCase):
         self.assertEqual(c.combined('ROQAQH204SLS')['rule'], 'average')
         self.assertIn('ddp', tt['flags'])
         self.assertNotIn('ddp_mixed', tt['flags'])
-        for r in (nn, anywhere):
-            self.assertIn('ddp_mixed', r['flags'])
-            self.assertNotIn('ddp', r['flags'])
+        self.assertIn('ddp_mixed', nn['flags'])
+        self.assertNotIn('ddp', nn['flags'])
+        self.assertEqual((c.ddp_share('ROQAQH204SLS'), c.part_share('UNKNOWN', 'ROQAQH204SLS')), (0.5, 0.5))
+        self.assertEqual(anywhere['impShare'], 0.5)
+        self.assertIn('ddp_part', anywhere['flags'])
+        for f in ('ddp', 'ddp_mixed'):
+            self.assertNotIn(f, anywhere['flags'])
+        self.assertIn('Synth Factory T made 50% of this style\'s units on record and delivers duty paid (DDP), so '
+                      'import costs are added on the other 50% only.', anywhere['basis'])
 
     def test_a_list_quote_and_the_combined_cost(self):
         self.assertEqual([q['flags'] for q in T.ci().quotes('ROQAQF101SLS')], [()])
@@ -158,10 +165,15 @@ class FactoryDeliveredDataset(unittest.TestCase):
         for k, v in T.client_recalc(L, self.after['settings'], self.after['dict'], 'lines').items():
             self.assertEqual(L[k], v, k)
         # A line placed half on the delivering factory and half on another stays an import, flagged ddp_mixed.
+        # A line placed half on the delivering factory's lot and half on another pays import on that half only.
         M = T.by(self.after, 'lines', 'id')['4|ROQAQH204SLS']
+        M0 = T.by(self.before, 'lines', 'id')['4|ROQAQH204SLS']
         self.assertEqual(M['dutyRegime'], 'us')
-        self.assertIn('ddp_mixed', M['flags'])
-        self.assertNotIn('ddp', M['flags'])
+        self.assertIn('ddp_part', M['flags'])
+        for f in ('ddp', 'ddp_mixed'):
+            self.assertNotIn(f, M['flags'])
+        self.assertEqual((M['fob'], M['duty'], M['freight'], M['fees']),
+                         (M0['fob'], E.r2(M0['duty'] * 0.5), E.r2(M0['freight'] * 0.5), E.r2(M0['fees'] * 0.5)))
         st, st0 = T.by(self.after, 'styles', 'base')['ROQAQF201SLS'], T.by(self.before, 'styles', 'base')['ROQAQF201SLS']
         self.assertEqual((st['fobU'], st['landedU'], st['dutyRegime']), (st0['fobU'], st0['fobU'], 'none'))
         self.assertIn('ddp', st['costFlags'])
@@ -276,9 +288,9 @@ class FactoryRecord(unittest.TestCase):
                  {'ref': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'outcome': None, 'units': 12},
                  {'ref': '', 'style': 'ROQAQF308SLS', 'outcome': 'open'}, 'junk', None]
         self.assertEqual(E.factory_record_rows(lines), [
-            {'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT'},
-            {'production': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT'},
-            {'production': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT'}])
+            {'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT', 'units': 100},
+            {'production': 'TT26010', 'style': 'ROQAQF302SLS', 'factory': 'TT', 'units': 50},
+            {'production': 'TT25002', 'style': 'ROQAQF307SLS', 'factory': 'TT', 'units': 12}])
         for bad in (None, 'x', {}, 5):
             self.assertEqual(E.factory_record_rows(bad), [])
 
@@ -343,6 +355,101 @@ class LedgerLinesWithNoFactory(unittest.TestCase):
             self.assertEqual(P[('N/A', 'ROQAQF301SLS')]['dutyRegime'], 'none' if settings else 'us', settings)
 
 
+SPLIT = [{'production': 'TT26009', 'style': 'ROQAQF301SLS', 'factory': 'TT', 'units': 300},
+         {'production': 'NN26009', 'style': 'ROQAQF301SLS', 'factory': 'NN', 'units': 100}]
+
+
+class SplitByShare(unittest.TestCase):
+    """David, Nov 12 2026: a style made partly by a factory that delivers duty paid pays import, where the goods cannot
+    be tied to one factory (untied stock, sales, the style's own landed cost), on the other factories' share of its
+    units on record. Here TT made 300 of 400 units, so those rows pay a quarter of the import."""
+
+    def test_money_helpers(self):
+        S = E.merge_settings({})
+        full = E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us')
+        for imp in (None, 1, 1.0, 2):
+            self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us', imp), full, imp)
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us', 0.25), tuple(E.r2(x * 0.25) for x in full))
+        self.assertEqual(E.adders(100.0, 10, 'dress_shirt', 'mmf', 'CN', S, 'us', 0), (0.0, 0.0, 0.0))
+        self.assertEqual(E.stock_money(100.0, 10, 'dress_shirt', 'mmf', 'CN', 'us', S, 0.25)[0],
+                         E.r2(100.0 + sum(E.r2(x * 0.25) for x in full)))
+        m = E.line_money(200.0, 100.0, 10, 'dress_shirt', 'mmf', 'CN', 'us', 0, 0, S, 0.25)
+        self.assertEqual((m['duty'], m['freight'], m['fees']), tuple(E.r2(x * 0.25) for x in full))
+        L = E.landed(10.0, {'cat': 'dress_shirt', 'fiber': 'mmf'}, S, 'us', 'CN')
+        L4 = E.landed(10.0, {'cat': 'dress_shirt', 'fiber': 'mmf'}, S, 'us', 'CN', imp=0.25)
+        self.assertEqual(L4['duty'], E.r4(L['duty'] * 0.25))
+        self.assertEqual(L4['landedU'], E.r4(10.0 + L4['duty'] + L4['freight'] + L4['fees']))
+        self.assertEqual(E.landed(10.0, {'cat': 'dress_shirt', 'fiber': 'mmf'}, S, 'us', 'CN', imp=None), L)
+
+    def test_shares(self):
+        c = ci_rec(TT_ALL, SPLIT)
+        self.assertEqual(c.made_units['ROQAQF301SLS'], {'TT': 300.0, 'NN': 100.0})
+        self.assertEqual(c.ddp_share('ROQAQF301SLS'), 0.75)
+        self.assertEqual(c.part_share('UNKNOWN', 'ROQAQF301SLS'), 0.25)
+        self.assertEqual(c.part_share('WH', 'ROQAQF301SLS'), 0.25)
+        self.assertIsNone(c.part_share('TT', 'ROQAQF301SLS'))           # a known factory is all or nothing
+        self.assertIsNone(c.part_share('UNKNOWN', 'ROQAQF999SLS'))      # nothing on record
+        self.assertFalse(c.delivers('UNKNOWN', 'ROQAQF301SLS'))
+        self.assertIsNone(ci_rec({}, SPLIT).part_share('UNKNOWN', 'ROQAQF301SLS'))   # no factory delivers
+        r = c.final('ROQAQF301SLS', c.raw('ROQAQF301SLS', 'UNKNOWN'))
+        self.assertEqual((r['impShare'], 'ddp_part' in r['flags'], 'ddp' in r['flags']), (0.25, True, False))
+        self.assertIn('Synth Factory T made 75% of this style', r['basis'])
+
+    def _ds(self, settings, record, overrides=None):
+        s = history_only('ROQAQF301SLS')
+        s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQF301SLS-M', tr=100)]
+        s['factory_record'] = {'rows': record, 'generatedAt': '2026-03-01T06:00:00Z'}
+        return T.build(s, settings=settings, overrides=overrides)
+
+    def test_stock_sales_and_the_style_row(self):
+        full, ds = self._ds({}, SPLIT), self._ds(TT_ALL, SPLIT)
+        inv0, inv = T.by(full, 'inventory', 'sku')['ROQAQF301SLS-M'], T.by(ds, 'inventory', 'sku')['ROQAQF301SLS-M']
+        d, f, e = E.adders(inv['fob'], inv['units'], inv['cat'], inv['fiber'], inv['origin'], ds['settings'], 'us')
+        self.assertEqual((inv['dutyRegime'], inv['fob']), ('us', inv0['fob']))
+        self.assertEqual(inv['landed'], E.r2(inv['fob'] + E.r2(d * 0.25) + E.r2(f * 0.25) + E.r2(e * 0.25)))
+        self.assertEqual(inv0['landed'], E.r2(inv0['fob'] + d + f + e))
+        self.assertIn('ddp_part', inv['flags'])
+        tab = lambda d_, t: [dict(zip(d_['shipped'][t]['fields'], r)) for r in d_['shipped'][t]['rows']]
+        bc = {(x['cust'], x['base']): x for x in tab(ds, 'byCustomer')}[('ROSS', 'ROQAQF301SLS')]
+        bc0 = {(x['cust'], x['base']): x for x in tab(full, 'byCustomer')}[('ROSS', 'ROQAQF301SLS')]
+        self.assertEqual((bc['dutyRegime'], bc['fob']), ('us', bc0['fob']))
+        self.assertEqual((bc['duty'], bc['freight'], bc['fees']),
+                         (E.r2(bc0['duty'] * 0.25), E.r2(bc0['freight'] * 0.25), E.r2(bc0['fees'] * 0.25)))
+        bs = {x['base']: x for x in tab(ds, 'byStyle')}['ROQAQF301SLS']
+        self.assertEqual((bs['fobShare'], bs['caShare']), (0.75, 0.0))       # the page's own math gives a quarter
+        st, st0 = T.by(ds, 'styles', 'base')['ROQAQF301SLS'], T.by(full, 'styles', 'base')['ROQAQF301SLS']
+        self.assertEqual(st['landedU'], E.landed(st['fobU'], {'cat': st['cat'], 'fiber': st['fiber']}, ds['settings'], 'us',
+                                                 'CN', imp=0.25)['landedU'])
+        self.assertLess(st['t12Cogs'], st0['t12Cogs'])
+        self.assertGreater(st['t12Cogs'], E.r2(30 * st['fobU']) + E.r2(30 * st['fobU']))
+
+    def test_own_price_terms_still_win(self):
+        # A style whose own cost is a delivered price (a DDP manual cost) stays delivered on every row.
+        ov = [T.ovr('s1', 'style', {'style': 'ROQAQF301SLS'}, 9.6666, terms='DDP')]
+        ds = self._ds(TT_ALL, SPLIT, overrides=ov)
+        inv = T.by(ds, 'inventory', 'sku')['ROQAQF301SLS-M']
+        self.assertEqual((inv['dutyRegime'], inv['landed']), ('none', inv['fob']))
+        bc = {(x['cust'], x['base']): x for x in [dict(zip(ds['shipped']['byCustomer']['fields'], r))
+                                                   for r in ds['shipped']['byCustomer']['rows']]}[('ROSS', 'ROQAQF301SLS')]
+        self.assertEqual((bc['dutyRegime'], bc['duty']), ('none', 0.0))
+
+    def test_a_ledger_line_with_no_factory(self):
+        s = T.src()
+        s['ledger']['rows'] = s['ledger']['rows'] + [T.led('N/A', 'ROQAQF301SLS', 40)]
+        s['factory_record'] = {'rows': SPLIT, 'generatedAt': '2026-03-01T06:00:00Z'}
+        P = {(r['ref'], r['base']): r for r in T.rows(T.build(s, settings=TT_ALL), 'production')}[('N/A', 'ROQAQF301SLS')]
+        d, f, e = E.adders(P['fob'], P['units'], P['cat'], P['fiber'], P['origin'], E.merge_settings(TT_ALL), 'us')
+        self.assertEqual((P['dutyRegime'], P['landed']),
+                         ('us', E.r2(P['fob'] + E.r2(d * 0.25) + E.r2(f * 0.25) + E.r2(e * 0.25))))
+        self.assertIn('ddp_part', P['flags'])
+
+    def test_no_setting_no_change(self):
+        a, b = self._ds({}, SPLIT), self._ds({}, [])
+        for t in ('lines', 'apo', 'inventory', 'production', 'styles'):
+            self.assertEqual(a[t], b[t], t)
+        self.assertEqual(a['shipped']['byCustomer'], b['shipped']['byCustomer'])
+
+
 class ServiceWiring(unittest.TestCase):
     def test_sources_and_the_rebuild_stamp(self):
         raw = {'factory_record': {'rows': [{'production': ' tt26009 ', 'style': 'roqaqf301sls', 'factory': 'tt', 'x': 1},
@@ -350,7 +457,7 @@ class ServiceWiring(unittest.TestCase):
                                   'generatedAt': '2026-03-01T06:00:00Z'}}
         norm = pnl._normalize_sources(raw)
         self.assertEqual(norm['factory_record'], {'rows': [{'production': 'TT26009', 'style': 'ROQAQF301SLS',
-                                                            'factory': 'TT'}], 'generatedAt': '2026-03-01T06:00:00Z'})
+                                                            'factory': 'TT', 'units': 0}], 'generatedAt': '2026-03-01T06:00:00Z'})
         self.assertEqual(pnl._normalize_sources({})['factory_record'], {'rows': [], 'generatedAt': None})
         self.assertIn('factory_record', pnl.SOURCE_KEYS)
         a = pnl._stamps(pnl._normalize_sources({}))

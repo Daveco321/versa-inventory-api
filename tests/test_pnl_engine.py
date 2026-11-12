@@ -2606,7 +2606,7 @@ class ShippedDivDates(unittest.TestCase):
 # shipped garment counts, the awaiting-invoice estimate and the A2000 export alert. Synthetic codes (brands QA, QB,
 # QC; fabrics QD, QF, QG, QW; customer prefixes CL and ZB; account ZZPC) and sentinel prices only. ──
 NEW_FLAGS = ('colour_row', 'colour_assumed', 'pattern_from_colour', 'pattern_conflict', 'fabric_family',
-             'group_block_missing', 'ddp', 'ddp_mixed')
+             'group_block_missing', 'ddp', 'ddp_mixed', 'ddp_part')
 
 
 def ci_cm(cmap, costbook=None, overrides=None):
@@ -2977,9 +2977,10 @@ class DeliveredPricesOct7(unittest.TestCase):
         st = by(ds, 'styles', 'base')['ROQAQF201SLS']
         self.assertEqual((st['fobU'], st['landedU'], st['costRule']), (9.2222, 9.2222, 'manual'))
 
-    def test_a_mix_of_delivered_and_fob_parts_keeps_the_import_costs(self):
+    def test_a_mix_of_delivered_and_fob_parts_pays_import_on_the_rest(self):
         # Line 4 (ROQAQH204SLS, 600 units) is placed 300 on TT26002 and 300 on NN26002. A delivered manual cost on
-        # TT26002 only: the line stays a US import, flagged ddp_mixed, never ddp. The same in both cost rule modes.
+        # TT26002 only. Oct 7 2026 the line stayed a whole US import (ddp_mixed); Nov 12 2026 (David: split by share)
+        # it pays import on the 300 units that are not delivered: half of it, flagged ddp_part. Both cost rule modes.
         mix = [ovr('m1', 'ref_style', {'ref': 'TT26002', 'style': 'ROQAQH204SLS'}, 9.3333, terms='DDP')]
         for settings in ({}, CASCADE):
             ds = build(src(), overrides=mix, settings=settings)
@@ -2987,11 +2988,13 @@ class DeliveredPricesOct7(unittest.TestCase):
             al = {a['ref']: a for a in rows(ds, 'alloc') if a['line'] == L['id']}
             self.assertEqual({k: (v['units'], v['level']) for k, v in al.items()}, {'TT26002': (300, 'L0'), 'NN26002': (300, 'L4a')})
             self.assertEqual((L['dutyRegime'], L['factory'], L['fobU']), ('us', 'MIX', E.r4((300 * 9.3333 + 300 * 5.0505) / 600)))
-            self.assertIn('ddp_mixed', L['flags'])
-            self.assertNotIn('ddp', L['flags'])
+            self.assertIn('ddp_part', L['flags'])
+            for f in ('ddp', 'ddp_mixed'):
+                self.assertNotIn(f, L['flags'])
             self.assertGreater(L['duty'], 0)
             d, f, e = E.adders(L['fob'], L['units'], L['cat'], L['fiber'], L['origin'], ds['settings'], 'us')
-            self.assertEqual((L['duty'], L['freight'], L['fees']), (d, f, e))
+            self.assertEqual((L['duty'], L['freight'], L['fees']), (E.r2(d * 0.5), E.r2(f * 0.5), E.r2(e * 0.5)))
+            self.assertEqual(L['cogs'], E.r2(L['fob'] + L['duty'] + L['freight'] + L['fees']))
             P = {r['ref']: r for r in rows(ds, 'production') if r['base'] == 'ROQAQH204SLS'}   # each ref makes two styles
             self.assertEqual((P['TT26002']['dutyRegime'], P['TT26002']['fobU'], P['TT26002']['landed']),
                              ('none', 9.3333, P['TT26002']['fob']))
@@ -2999,14 +3002,18 @@ class DeliveredPricesOct7(unittest.TestCase):
             self.assertEqual(P['NN26002']['dutyRegime'], 'us')
             self.assertNotIn('ddp', P['NN26002']['flags'])
             self.assertGreater(P['NN26002']['landed'], P['NN26002']['fob'])
-        # Stock blended from both refs (lot tier T4) in cascade mode: a weighted cost flagged ddp_mixed, still an import.
+        # Stock blended from both refs (lot tier T4) in cascade mode: a weighted cost that pays import on the half of
+        # its units from the ref that is not delivered (ddp_part).
         s = src()
         s['inventory']['items'] = s['inventory']['items'] + [inv('ROQAQH204SLS-M', tr=100)]
-        row = [r for r in rows(build(s, overrides=mix, settings=CASCADE), 'inventory') if r['sku'] == 'ROQAQH204SLS-M'][0]
+        ds = build(s, overrides=mix, settings=CASCADE)
+        row = [r for r in rows(ds, 'inventory') if r['sku'] == 'ROQAQH204SLS-M'][0]
         self.assertEqual((row['lotTier'], row['dutyRegime'], row['fobU']), ('T4', 'us', E.r4((9.3333 + 5.0505) / 2)))
-        self.assertIn('ddp_mixed', row['flags'])
-        self.assertNotIn('ddp', row['flags'])
-        self.assertGreater(row['landed'], row['fob'])
+        self.assertIn('ddp_part', row['flags'])
+        for f in ('ddp', 'ddp_mixed'):
+            self.assertNotIn(f, row['flags'])
+        d, f, e = E.adders(row['fob'], row['units'], row['cat'], row['fiber'], row['origin'], ds['settings'], 'us')
+        self.assertEqual(row['landed'], E.r2(row['fob'] + E.r2(d * 0.5) + E.r2(f * 0.5) + E.r2(e * 0.5)))
 
     def test_dict_labels_every_new_flag(self):
         for f in NEW_FLAGS:
@@ -3027,7 +3034,7 @@ class DeliveredPricesOct7(unittest.TestCase):
                         seen.add(f)
             for f in NEW_FLAGS:
                 self.assertIn(f, ds['dict']['flags'])
-        self.assertTrue({'ddp', 'ddp_mixed'} <= seen)
+        self.assertTrue({'ddp', 'ddp_part'} <= seen)
 
 
 class ManualCostKeysOct7(unittest.TestCase):
