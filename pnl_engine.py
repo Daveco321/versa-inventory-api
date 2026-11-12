@@ -2065,6 +2065,7 @@ class CostIndex:
         shipped units (an older record) counts its units. A style the record knows with nothing shipped yet has no
         entry; a style the record does not know takes its current ledger lines' units."""
         rec, led, known = defaultdict(lambda: defaultdict(float)), defaultdict(lambda: defaultdict(float)), set()
+        lots = defaultdict(float)
 
         def add(out, style, ref, units, hint=None, seen=None):
             b = norm_vd(base_of(style))
@@ -2083,12 +2084,33 @@ class CostIndex:
                 on = any((_fnum(r.get(k)) or 0) > 0 for k in ('units', 'shipped'))
                 add(rec, r.get('style'), r.get('production') or r.get('ref'),
                     r.get('shipped') if 'shipped' in r else r.get('units'), r.get('factory'), known if on else None)
+                ref, b = _u(r.get('production') or r.get('ref')), norm_vd(base_of(r.get('style')))
+                if 'shipped' in r and ref and b:
+                    lots[(ref, b)] += max(0.0, _fnum(r.get('shipped')) or 0.0)
+        self._lot_shipped = dict(lots)
         for L in self.ledger:
             add(led, L['b'], L['ref'], L['units'])
         out = {b: dict(v) for b, v in led.items() if b not in known}
         out.update({b: dict(v) for b, v in rec.items()})
         self._units_shipped = frozenset(rec)          # these styles' units are shipped units (the words say so)
         return out
+
+    def lot_shipped(self, ref, b, units):
+        """The units of production ref for base style b that have shipped by the factory record (Nov 12 2026), else
+        units (a lot the record does not know, or a record without shipped units)."""
+        v = self._lot_shipped.get((_u(ref), norm_vd(base_of(b))))
+        return units if v is None else v
+
+    def made_by_delivering(self, b):
+        """True when a factory that delivers base style b duty paid has made it (made_by)."""
+        return bool(self.ddp_brands) and any(self._fac_delivers(f, b) for f in self.made_by.get(norm_vd(base_of(b))) or ())
+
+    def shipped_share(self, b):
+        """ddp_share of a style a delivering factory makes, when its units come from the factory record's shipped
+        units (not the current ledger's), else None (Nov 12 2026)."""
+        if norm_vd(base_of(b)) not in self._units_shipped or not self.made_by_delivering(b):
+            return None
+        return self.ddp_share(b)
 
     def ddp_share(self, b):
         """The share (0..1) of base style b's shipped units (made_units) made by factories that deliver it duty paid,
@@ -2971,6 +2993,11 @@ class CostIndex:
         own = res.get('impShare') if res.get('impFrom') == 'lots' else None   # a blend of lots knows its own split
         if 'ddp' in out['flags']:
             pass
+        elif own is not None and own <= 0:
+            said = 'These units come from lots delivered duty paid (DDP), so no import costs are added.'
+            out = dict(out, impShare=None, impFrom=None,
+                       flags=tuple(x for x in out['flags'] if x not in ('ddp_mixed', 'ddp_part')) + ('ddp',),
+                       basis=' '.join(x for x in (str(out.get('basis') or '').strip(), said) if x))
         elif own is not None and 0 < own < 1:
             said = ('Part of these units come from lots delivered duty paid (DDP), so import costs are added on the '
                     'other %d%% only.' % int(round(own * 100)))
@@ -3371,15 +3398,30 @@ class _WarehouseCoster:
         if len(priced) < len(parts):
             flags.add('partial_cost')
         # Delivered (DDP) and FOB refs blended (Oct 7 2026: an import, flagged ddp_mixed). Nov 12 2026 (David: split
-        # by share): import costs only on the share of the units from refs that are not delivered (impShare, ddp_part).
+        # by share): import costs only on the share of the units not delivered (impShare, ddp_part). Stock can only
+        # come from units that have SHIPPED, so: with no lot to say which refs made it (T4), the style's shipped units
+        # on record decide (most lots that shipped have left the ledger); refs matched by lot weigh their own shipped
+        # units (the factory record), so a delivering factory's lot still to ship takes no share. Every shipped unit
+        # delivered: ddp (impShare 0).
         imp = None
         if 'ddp' in flags and not all('ddp' in res['flags'] for _, _, res in priced):
             flags.difference_update(('ddp', 'ddp_mixed'))
-            k = sum(w * (0.0 if 'ddp' in res['flags'] else (1.0 if res.get('impShare') is None else res['impShare']))
-                    for _, w, res in priced) / tw
+            d = self.ci.shipped_share(b) if tier == 'T4' else None
+            if d is not None:
+                k = 0.0 if d >= 1 - _SHARE_EPS else (1.0 if d <= _SHARE_EPS else 1 - d)
+            else:
+                iw = [(self.ci.lot_shipped(ref, b, w), res) for ref, w, res in priced]
+                tiw = sum(x for x, _ in iw)
+                if tiw <= 0:                   # none of these lots has shipped by the record: their units
+                    iw, tiw = [(w, res) for _, w, res in priced], tw
+                k = sum(x * (0.0 if 'ddp' in res['flags'] else (1.0 if res.get('impShare') is None else res['impShare']))
+                        for x, res in iw) / tiw
             if 0 < k < 1:
                 imp = r4(k)
                 flags.add('ddp_part')
+            elif k <= 0:
+                imp = 0.0
+                flags.add('ddp')
             else:
                 flags.add('ddp_mixed')
         fw = Counter()
@@ -4521,17 +4563,20 @@ class _Build:
             # program); otherwise its landed cost is a US import. A delivered (DDP) style cost adds no import
             # costs at all, also for a style with no stock or production row (Nov 12 2026), and its shipped
             # history is costed the same way as shipped.byStyle costs it.
-            # Nov 12 2026: a style made partly by a delivering factory lands, and its history is costed, at the
-            # others' share of its units on record (hist_imp).
+            # Nov 12 2026: the style lands at its supply's share of import (supply_imp: a delivering factory's lot
+            # still to ship is delivered goods to come); its history is costed at the share of its SHIPPED units
+            # that other factories made (hist_imp).
             hi = self.hist_imp(b, sc, unit)
-            ddp = unit is not None and hi == 0
+            si = self.supply_imp(sc, unit)
+            ddp = unit is not None and si == 0
             regs = reg_b.get(b) or set()
             regime = 'none' if ddp else (next(iter(regs)) if len(regs) == 1 else 'us')
-            lu = landed(unit, {'cat': cat, 'fiber': fiber}, self.S, regime, sc['origin'], imp=hi)['landedU']
+            lu = landed(unit, {'cat': cat, 'fiber': fiber}, self.S, regime, sc['origin'], imp=si)['landedU']
             brand = self.brand_of(dec, None, label, base=b)
             ob, ib, pb, fb, ab = open_b.get(b), inv_b.get(b), prod_b.get(b), feed_b.get(b), apo_b.get(b)
             t12 = an.get('t12') or [0.0, 0.0]
-            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand, ddp=ddp, imp=hi)
+            sh = self.shipped_style_money(b, an, unit, cat, fiber, sc['origin'], brand, ddp=unit is not None and hi == 0,
+                                          imp=hi)
             # Expected price and the deduction percent of the same customer mix (contract C8).
             # Open lines and invoice history count kit cartons, so a kit base divides by its pieces
             # per carton (build_lines' convention); the landed cost it meets below is per piece.
@@ -4609,15 +4654,27 @@ class _Build:
 
     def hist_imp(self, b, sc, unit):
         """The import share (0..1) of a style's invoices and awaiting-invoice estimates, which never name the factory
-        (Nov 12 2026, David: split by share). A style made partly by factories that deliver it duty paid pays import
-        on the other factories' share of its units on record, unless its own price terms say delivered. Any other
-        style follows its cost: none when delivered, else its impShare."""
+        (Nov 12 2026, David: split by share). What was sold had shipped, so a style that a factory delivering it duty
+        paid makes pays import on the share of its SHIPPED units that other factories made: none when every shipped
+        unit came from a delivering factory, all of it when none did. A style whose cost is a delivered price (its
+        own terms, or a delivering factory's quote) adds no import on top. Any other style follows its supply
+        (supply_imp)."""
         if unit is None:
             return 1.0
-        if not sc.get('termsDdp'):
-            part = self.ci.part_share('UNKNOWN', b)
-            if part is not None:
-                return part
+        if sc.get('ddp') == 'all':
+            return 0.0
+        if not sc.get('termsDdp') and self.ci.made_by_delivering(b):
+            d = self.ci.ddp_share(b)
+            if d is not None:
+                return 0.0 if d >= 1 - _SHARE_EPS else (1.0 if d <= _SHARE_EPS else r4(1 - d))
+        return self.supply_imp(sc, unit)
+
+    @staticmethod
+    def supply_imp(sc, unit):
+        """The import share (0..1) of a style's own landed cost: its supply's cost (style_cost: the ledger mix, else
+        its stock, else the calculator). None when that cost is delivered, else its impShare (Nov 12 2026)."""
+        if unit is None:
+            return 1.0
         if sc.get('ddp') == 'all':
             return 0.0
         v = sc.get('impShare')

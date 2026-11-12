@@ -614,3 +614,81 @@ class ScorecardLines(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def two_lots(tt, nn):
+    """ROQAQH204SLS (made on TT26002 and NN26002, 300 units each) with tt and nn units shipped on record."""
+    return [{'production': 'TT26002', 'style': 'ROQAQH204SLS', 'factory': 'TT', 'units': 300, 'shipped': tt},
+            {'production': 'NN26002', 'style': 'ROQAQH204SLS', 'factory': 'NN', 'units': 300, 'shipped': nn}]
+
+
+class ShippedLotsInTheStockBlend(unittest.TestCase):
+    """Nov 12 2026: stock blended from several lots (T4) weighs each lot by its units that have shipped, so a
+    delivering factory's lot still to ship takes no share of it; invoices follow the shipped units, unless the
+    style's cost is already a delivered price."""
+
+    def _ds(self, record, settings=TT_QA, history=False):
+        s = history_only('ROQAQH204SLS') if history else T.src()
+        s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQH204SLS-M', tr=100)]
+        s['factory_record'] = {'rows': record, 'generatedAt': '2026-03-01T06:00:00Z'}
+        return T.build(s, settings=settings)
+
+    def test_stock(self):
+        one = lambda d_: T.by(d_, 'inventory', 'sku')['ROQAQH204SLS-M']
+        full, none_yet = one(self._ds(two_lots(0, 300), {})), one(self._ds(two_lots(0, 300)))
+        self.assertEqual((none_yet['fob'], none_yet['landed']), (full['fob'], full['landed']))     # all import
+        self.assertFalse({'ddp', 'ddp_part'} & set(none_yet['flags']))
+        q = one(self._ds(two_lots(300, 100)))                           # TT shipped 300 of 400: a quarter pays
+        d, f, e = E.adders(q['fob'], q['units'], q['cat'], q['fiber'], q['origin'], E.merge_settings(TT_QA), 'us')
+        self.assertEqual((q['dutyRegime'], q['landed']), ('us', E.r2(q['fob'] + E.r2(d * 0.25) + E.r2(f * 0.25) + E.r2(e * 0.25))))
+        self.assertIn('ddp_part', q['flags'])
+        tt = one(self._ds(two_lots(300, 0)))                            # only TT shipped: delivered
+        self.assertEqual((tt['dutyRegime'], tt['landed']), ('none', tt['fob']))
+        self.assertIn('ddp', tt['flags'])
+        older = one(self._ds([dict(r, units=300) for r in two_lots(0, 0)]))   # nothing shipped: the lots' units
+        self.assertIn('ddp_part', older['flags'])
+        self.assertEqual(older['landed'], E.r2(older['fob'] + E.r2(d * 0.5) + E.r2(f * 0.5) + E.r2(e * 0.5)))
+
+    def test_invoices(self):
+        tab = lambda d_: {(x['cust'], x['base']): x for x in [dict(zip(d_['shipped']['byCustomer']['fields'], r))
+                                                               for r in d_['shipped']['byCustomer']['rows']]}
+        full = tab(self._ds(two_lots(0, 300), {}, True))[('ROSS', 'ROQAQH204SLS')]
+        self.assertGreater(full['duty'], 0)
+        for rec, k in ((two_lots(0, 300), 1.0), (two_lots(300, 100), 0.25), (two_lots(300, 0), 0.0)):
+            got = tab(self._ds(rec, TT_QA, True))[('ROSS', 'ROQAQH204SLS')]
+            self.assertEqual((got['fob'], got['duty'], got['freight'], got['fees']),
+                             (full['fob'], E.r2(full['duty'] * k), E.r2(full['freight'] * k), E.r2(full['fees'] * k)), k)
+
+    def test_a_delivered_price_adds_no_import_on_top(self):
+        # ROQAQF201SLS: its one ledger lot is TT's (delivered), so its cost is a delivered price. Invoices of units
+        # another factory shipped add no import on top of it.
+        s = T.src()
+        s['factory_record'] = {'rows': [{'production': 'TT26001', 'style': 'ROQAQF201SLS', 'factory': 'TT', 'units': 1000,
+                                         'shipped': 0},
+                                        {'production': 'NN25001', 'style': 'ROQAQF201SLS', 'factory': 'NN', 'units': 100,
+                                         'shipped': 100}], 'generatedAt': '2026-03-01T06:00:00Z'}
+        ds = T.build(s, settings=TT_QA)
+        bc = [dict(zip(ds['shipped']['byCustomer']['fields'], r)) for r in ds['shipped']['byCustomer']['rows']]
+        rows = [x for x in bc if x['base'] == 'ROQAQF201SLS']
+        self.assertTrue(rows)
+        self.assertEqual({(x['dutyRegime'], x['duty']) for x in rows}, {('none', 0.0)})
+        st = T.by(ds, 'styles', 'base')['ROQAQF201SLS']
+        self.assertEqual((st['landedU'], st['dutyRegime']), (st['fobU'], 'none'))
+
+
+class UntiedStockTakesTheRecordShare(unittest.TestCase):
+    """Nov 12 2026: stock with no lot to tie it (T4) takes the style's shipped units on record, not only the lots still
+    on the ledger (most lots that shipped have left it)."""
+
+    def test_a_lot_that_left_the_ledger_counts(self):
+        s = T.src()
+        s['inventory']['items'] = s['inventory']['items'] + [T.inv('ROQAQH204SLS-M', tr=100)]
+        rec = two_lots(300, 100) + [{'production': 'NN25001', 'style': 'ROQAQH204SLS', 'factory': 'NN', 'units': 600,
+                                     'shipped': 600}]
+        s['factory_record'] = {'rows': rec, 'generatedAt': '2026-03-01T06:00:00Z'}
+        q = T.by(T.build(s, settings=TT_QA), 'inventory', 'sku')['ROQAQH204SLS-M']
+        self.assertEqual(q['lotTier'], 'T4')
+        d, f, e = E.adders(q['fob'], q['units'], q['cat'], q['fiber'], q['origin'], E.merge_settings(TT_QA), 'us')
+        # TT shipped 300 of 1,000 units on record: 70% pays import (the two ledger lots alone would say 25%)
+        self.assertEqual(q['landed'], E.r2(q['fob'] + E.r2(d * 0.7) + E.r2(f * 0.7) + E.r2(e * 0.7)))
+        self.assertIn('ddp_part', q['flags'])
