@@ -6799,6 +6799,12 @@ def _apo_style_color(base, brand_abbr):
                 break
     if not raw:
         return ''
+    return _apo_color_display(raw)
+
+
+def _apo_color_display(raw):
+    """A color sheet value as the catalog prints it."""
+    raw = str(raw or '')
     if '||' in raw:  # Nicole Miller dual-color "ground||print"
         parts = raw.split('||')
         return (_apo_format_color(parts[0]) + ' ' + _apo_format_color(parts[1])).strip()
@@ -17499,14 +17505,65 @@ _AI_AGENT_SELF_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://versa-invent
 
 
 def _ai_agent_base(sku):
-    return str(sku or '').split('-')[0].strip().upper()
+    """The style a feed row belongs to, the key the AI agent and the MCP tools group by.
+    - A size written after a space is not part of the style: 'MCNMPP401SLS 15-15.5 32',
+      'NAU-008-BLACK L' and 'BONAU100CF 17-17.5 32' group under MCNMPP401SLS,
+      NAU-008-BLACK and BONAU100CF (they used to split by neck size).
+    - A modern key cuts at its first dash: WMUSAWP06SRS-V-30X30 -> WMUSAWP06SRS,
+      BUCHPT587SLP-V -> BUCHPT587SLP.
+    - An older dashed style number stays whole when that cut is shorter than 8 characters,
+      the desktop _imgBaseStyleFor rule: NAU-22-207SL, BEN-22-116, AC-KN-235 and T-612REG
+      are styles, 'NAU', 'BEN', 'AC' and 'T' are not. 200 SKUs under 25 such cuts showed as
+      one line each (David, Nov 17 2026). Its vendor '-V' twin still joins it, the way a
+      modern -V joins its base (CTH08-V -> CTH08, LUCK-NWNV-SL-V -> LUCK-NWNV-SL)."""
+    s = _py_style_key(sku)
+    if not s:
+        return ''
+    cut = s.split('-')[0]
+    if len(cut) >= 8:
+        return cut
+    if s.endswith('-V') and len(s) > 2:
+        return s[:-2]
+    return s
+
+
+def _ai_agent_color(style, brand_abbr, members=()):
+    """Display color of an AI-agent row, read the way the desktop getStyleColorInfo reads it.
+    A modern base reads exactly as before (_apo_style_color). A whole older key reads its own
+    override and sheet row first, then its first-dash cut, never a code row built from its
+    digits (BEN-22-116 is not the Ben Sherman BE_116 shirt). A row with no color of its own
+    tries its member SKUs ('NAU-22-204-V' carries the sheet row of the NAU-22-204 line)."""
+    def one(key):
+        key = str(key or '').strip().upper()
+        if not key:
+            return ''
+        cut = key.split('-')[0]
+        if cut == key:
+            return _apo_style_color(key, brand_abbr)
+        ov = _style_overrides.get(key) or {}
+        if isinstance(ov, dict) and ov.get('color'):
+            return str(ov['color'])
+        raw = _apo_color_map().get(key)
+        if raw:
+            return _apo_color_display(raw)
+        return _apo_style_color(cut, brand_abbr)
+    color = one(style)
+    if color:
+        return color
+    for m in members or ():
+        if str(m or '').strip().upper() != str(style or '').strip().upper():
+            color = one(m)
+            if color:
+                return color
+    return ''
 
 
 def _ai_agent_agg_inventory():
     """Aggregate the per-size feed rows to one record per base style.
     Physical quantities SUM across size rows; committed/allocated are
     style-level NEGATIVE figures duplicated onto each size row, so keep
-    the largest magnitude — never sum (the BUGBSA002SLS lesson)."""
+    the largest magnitude — never sum (the BUGBSA002SLS lesson).
+    '_skus' lists the feed SKUs behind the record (for the color fallback only)."""
     with _inv_lock:
         items = list(_inventory.get('items') or [])
     agg = {}
@@ -17518,8 +17575,11 @@ def _ai_agent_agg_inventory():
         if r is None:
             r = {'style': base, 'brand_abbr': (it.get('brand_abbr') or it.get('brand') or '').upper(),
                  'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'abfi': 0, 'incoming': 0, 'total_ats': 0,
-                 'committed': 0, 'allocated': 0, 'size_rows': 0}
+                 'committed': 0, 'allocated': 0, 'size_rows': 0, '_skus': []}
             agg[base] = r
+        _sku_u = str(it.get('sku') or '').strip().upper()
+        if _sku_u and _sku_u not in r['_skus'] and len(r['_skus']) < 50:
+            r['_skus'].append(_sku_u)
         for k in ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi', 'incoming', 'total_ats'):
             try:
                 r[k] += int(it.get(k) or 0)
@@ -17682,7 +17742,7 @@ def _ai_agent_enrich(r):
     base = r['style']
     ab = r['brand_abbr']
     try:
-        color = _apo_style_color(base, ab) or ''
+        color = _ai_agent_color(base, ab, r.get('_skus') or ()) or ''
     except Exception:
         color = ''
     try:
