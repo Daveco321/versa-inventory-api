@@ -9770,6 +9770,15 @@ _web_img_md5 = {}         # base style -> md5 of those bytes (None = no photo)
 _photo_refreshing = set()
 
 
+def _is_inventory_key(key):
+    """True when an inventory row carries exactly this SKU (case-insensitive)."""
+    key = str(key or '').strip().upper()
+    if not key:
+        return False
+    with _inv_lock:
+        return any(str(it.get('sku', '')).strip().upper() == key for it in (_inventory.get('items') or []))
+
+
 def _brand_for_base(base_style):
     with _inv_lock:
         for item in (_inventory.get('items') or []):
@@ -10101,6 +10110,16 @@ def proxy_image(base_style):
                 th = _thumb_get(tk) or _sized(tk, _hit[0], _hit[1], w)
                 return _img_resp(th[0], th[1])
             return _img_resp(_hit[0], _hit[1])
+
+    # A cut shorter than 8 characters is not a style: older dashed keys cut at their first
+    # dash (AC-KN-620 -> 'AC', NAU-10054 -> 'NAU'). The desktop never borrows a photo from
+    # such a cut (_imgBaseStyleFor), so the phone must not either: a stray AC.jpg showed one
+    # tan polo on every American Crew card on the phone (Nov 17 2026). A row whose own
+    # photo exists was served above; a cut that is itself a stocked key (CTH08 tie sets)
+    # keeps its photo.
+    if (full_sku and full_sku != base_style and len(base_style) < 8
+            and full_sku.split('-')[0] == base_style and not _is_inventory_key(base_style)):
+        return '', 404
 
     brand_abbr = request.args.get('brand', '').upper()
     if w:
