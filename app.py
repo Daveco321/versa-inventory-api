@@ -452,6 +452,10 @@ def load_overrides_from_s3():
             with _img_lock:
                 for s in changed_styles:
                     _img_cache.pop(s, None)
+                    # The row's own STYLE OVERRIDES file (get_image_cached 'sku:<SKU>') too:
+                    # a record whose photo moved to S3 now exports that file, so a copy
+                    # cached before the move must not outlive it (Nov 17 2026).
+                    _img_cache.pop('sku:' + str(s).upper(), None)
                     stale_override_keys = [
                         k for k in list(_img_cache.keys())
                         if isinstance(k, str) and k.startswith(f"__override__:{s}:")
@@ -8299,6 +8303,7 @@ def save_overrides():
                 with _img_lock:
                     for s in changed_styles:
                         _img_cache.pop(s, None)
+                        _img_cache.pop('sku:' + str(s).upper(), None)   # own-file export cache
                         stale_override_keys = [
                             k for k in list(_img_cache.keys())
                             if isinstance(k, str) and k.startswith(f"__override__:{s}:")
@@ -8543,8 +8548,10 @@ def _ovr_is_embedded(v):
     return isinstance(v, dict) and isinstance(v.get('image'), str) and v['image'].startswith('data:image/')
 
 
-def _ovr_move_plan(overrides, folder):
+def _ovr_move_plan(overrides, folder, base_copies=True):
     """Deterministic move plan for the given overrides dict + folder listing.
+    base_copies=False writes only each key's own file: no base-style copy, so a
+    move that keeps every record (turned into a link) changes no other photo.
     Returns (plan, data) where data = {key: (bytes, md5)}."""
     import hashlib
     writes, kept, data = [], [], {}
@@ -8567,6 +8574,8 @@ def _ovr_move_plan(overrides, folder):
             continue   # identical file already there
         writes.append({'file': fn, 'key': k, 'md5': m, 'bytes': len(b),
                        'action': 'overwrite' if cur else 'new'})
+    if not base_copies:
+        return {'embedded': len(embedded), 'writes': writes, 'kept': kept}, data
     # base-style copy for size-variant-only styles that have no base file
     by_base = {}
     for k in data:
@@ -8591,7 +8600,7 @@ def _ovr_move_plan(overrides, folder):
     return {'embedded': len(embedded), 'writes': writes, 'kept': kept}, data
 
 
-def _run_ovr_move_upload(ts):
+def _run_ovr_move_upload(ts, base_copies=True):
     try:
         load_overrides_from_s3()
         with _overrides_lock:
@@ -8603,7 +8612,7 @@ def _run_ovr_move_upload(ts):
         s3.put_object(Bucket=S3_BUCKET, Key=backup_key, Body=snap_json.encode('utf-8'),
                       ContentType='application/json')
         folder = _ovr_folder_listing(s3)
-        plan, data = _ovr_move_plan(snapshot, folder)
+        plan, data = _ovr_move_plan(snapshot, folder, base_copies)
         with _ovr_move_lock:
             _ovr_move_state.update(total=len(plan['writes']), backup=backup_key)
         done, failed = [], []
@@ -8629,6 +8638,7 @@ def _run_ovr_move_upload(ts):
             for n in names:
                 _img_cache.pop(n, None)
                 _img_cache.pop(get_base_style(n), None)
+                _img_cache.pop('sku:' + n.upper(), None)   # the row's own-file export cache
         with _web_img_lock:
             for n in names:
                 _web_img_cache.pop(n.upper(), None)
@@ -8639,7 +8649,8 @@ def _run_ovr_move_upload(ts):
         if paths:
             threading.Thread(target=_invalidate_cloudfront, args=(paths,), daemon=True).start()
         result = {'phase': 'upload', 'finished_at': datetime.utcnow().isoformat() + 'Z',
-                  'backup': backup_key, 'overrides_etag': etag, 'embedded': plan['embedded'],
+                  'backup': backup_key, 'overrides_etag': etag, 'base_copies': base_copies,
+                  'embedded': plan['embedded'],
                   'planned': len(plan['writes']), 'verified': len(done), 'failed': failed,
                   'kept': plan['kept'], 'writes': done}
         result_key = f"inventory/overrides_backups/image_move_upload_{ts}.json"
@@ -8784,17 +8795,20 @@ def admin_override_images_move():
         return '', 204
     body = request.get_json(silent=True) or {}
     phase = str(body.get('phase') or request.args.get('phase') or '').strip().lower()
+    # "base_copies": false = upload only each key's own file (plan and upload)
+    base_copies = body.get('base_copies', True) is not False
     try:
         if phase == 'plan':
             load_overrides_from_s3()
             with _overrides_lock:
                 snap = json.loads(json.dumps(_style_overrides))
             folder = _ovr_folder_listing(get_s3())
-            plan, _data = _ovr_move_plan(snap, folder)
+            plan, _data = _ovr_move_plan(snap, folder, base_copies)
             by_action = {}
             for w in plan['writes']:
                 by_action[w['action']] = by_action.get(w['action'], 0) + 1
-            return jsonify({'ok': True, 'phase': 'plan', 'entries': len(snap), 'embedded': plan['embedded'],
+            return jsonify({'ok': True, 'phase': 'plan', 'base_copies': base_copies,
+                            'entries': len(snap), 'embedded': plan['embedded'],
                             'uploads': len(plan['writes']), 'by_action': by_action, 'kept': plan['kept'],
                             'folder_objects': len(folder), 'writes': plan['writes']})
         if phase == 'upload':
@@ -8806,8 +8820,9 @@ def admin_override_images_move():
                                        backup=None, started_at=datetime.utcnow().isoformat() + 'Z',
                                        result_key=f"inventory/overrides_backups/image_move_upload_{ts}.json")
                 result_key = _ovr_move_state['result_key']
-            threading.Thread(target=_run_ovr_move_upload, args=(ts,), daemon=True).start()
-            return jsonify({'ok': True, 'phase': 'upload', 'started': True, 'result_key': result_key})
+            threading.Thread(target=_run_ovr_move_upload, args=(ts, base_copies), daemon=True).start()
+            return jsonify({'ok': True, 'phase': 'upload', 'started': True, 'base_copies': base_copies,
+                            'result_key': result_key})
         if phase == 'status':
             with _ovr_move_lock:
                 return jsonify(dict(_ovr_move_state))
@@ -9850,6 +9865,7 @@ def _photos_changed(names, target=None):
         for n in names:
             _img_cache.pop(n, None)
             _img_cache.pop(get_base_style(n), None)
+            _img_cache.pop('sku:' + n, None)   # the row's own-file export cache
     with _web_img_lock:
         for n in names:
             _web_img_cache.pop(n, None)
@@ -11123,6 +11139,7 @@ def _clear_override_images(keys):
     with _img_lock:
         for s in changed:
             _img_cache.pop(s, None)
+            _img_cache.pop('sku:' + str(s).upper(), None)   # own-file export cache
             for k in [k for k in list(_img_cache.keys()) if isinstance(k, str) and k.startswith(f"__override__:{s}:")]:
                 _img_cache.pop(k, None)
     with _web_img_lock:
