@@ -8574,6 +8574,13 @@ def _ovr_move_plan(overrides, folder):
     for b, ks in sorted(by_base.items()):
         if any(str(k).upper().strip() == b for k in ks) or (b + '.jpg') in folder or not _OVR_NAME_OK.match(b):
             continue
+        # A base shorter than 8 characters is not a style: older dashed keys cut at their
+        # first dash (NAU-008-WHITE -> 'NAU', AC-KN-042 -> 'AC'), and a 'NAU.jpg' copy would
+        # become the photo of every NAU-* key on the phone, which asks /image/<cut> for any
+        # row without its own photo. Same 8-character rule as the desktop _imgBaseStyleFor
+        # and get_image_cached (Nov 17 2026).
+        if len(b) < 8:
+            continue
         cnt = {}
         for k in ks:
             cnt[data[k][1]] = cnt.get(data[k][1], 0) + 1
