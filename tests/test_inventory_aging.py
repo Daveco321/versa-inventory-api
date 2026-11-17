@@ -237,7 +237,7 @@ class Parse(unittest.TestCase):
         self.assertEqual(len(p['lots']), 11)                       # the zero-unit JTW line is ignored
         self.assertNotIn('N/A', p['skus'])                         # same skips as parse_inventory_excel
         self.assertEqual(p['skus'][I]['brand'], 'NAUTICA')         # NT is Nautica
-        self.assertEqual(p['skus'][AFBA]['nj'], 0)                 # an FBA row is never restricted stock
+        self.assertEqual(p['skus'][AFBA]['nj'], 9)                 # an FBA row counts like any NJ row (Nov 17 2026)
         self.assertEqual(p['skus'][A]['nj'], 7)
         self.assertEqual(p['skus'][DM]['base'], 'TTXXAA003SLS')
         self.assertEqual(p['skus'][E]['base'], 'ZZYYBB004RFS')
@@ -498,7 +498,7 @@ class Payload(unittest.TestCase):
         self.assertEqual(bases['TTXXAA003SLS'], ['TTXXAA003SLS', 'USPA', 0])
         fixed = next(l for l in p['lots'] if l[0] == A and l[2] == 720)
         self.assertEqual(fixed, [A, 'JTW', 720, '2026-06-18', 'ABCU1234567', '', ['bad_date_fixed'], '1900-01-15'])
-        self.assertEqual(p['excluded'], {'qa': 42, 'nj': 7, 'abfi': 5, 'notInAts': 3})
+        self.assertEqual(p['excluded'], {'qa': 42, 'nj': 16, 'abfi': 5, 'notInAts': 3})   # nj 7 + the FBA row's 9
         self.assertEqual(p['restore'], {'available': True, 'source': 'synthetic', 'matchedUnits': 450, 'unmatchedUnits': 300})
         chk = {c['code']: c for c in p['checks']}
         self.assertEqual(set(chk), {'bad_date', 'count_date', 'restored', 'reset', 'undated', 'not_in_ats'})
@@ -506,8 +506,9 @@ class Payload(unittest.TestCase):
         self.assertEqual((chk['count_date']['units'], chk['count_date']['severity']), (300, 'medium'))
         self.assertEqual((chk['restored']['units'], chk['restored']['skus']), (450, [B, C]))
         self.assertEqual(chk['reset']['byWh'], {'JTW': 0, 'TR': 200, 'DCW': 48})
-        self.assertEqual(chk['undated']['parts'], {'qa': 42, 'nj': 7, 'abfi': 5, 'lots': 50})
-        self.assertEqual(chk['undated']['units'], 104)
+        self.assertEqual(chk['undated']['parts'], {'qa': 42, 'nj': 16, 'abfi': 5, 'lots': 50})
+        self.assertEqual(chk['undated']['units'], 113)
+        self.assertIn(AFBA, chk['undated']['skus'])                # its NJ units are real stock now
         self.assertEqual(json.loads(json.dumps(p, allow_nan=False)), p)       # JSON clean
         self.assertNotIn('\u2014', json.dumps(p, ensure_ascii=False))
 
@@ -745,7 +746,7 @@ class AgingAppTests(unittest.TestCase):
         self.assertIsNone(r.headers.get('Content-Encoding'))
         p = r.get_json()
         self.assertTrue(p['isAdmin'])
-        self.assertEqual(p['excluded']['nj'], 7)
+        self.assertEqual(p['excluded']['nj'], 16)                                 # nj 7 + the FBA row's 9
         self.ident = {'tier': 'machine'}
         self.assertTrue(self.client.get('/api/inventory-aging').get_json()['isAdmin'])
         # a new rev is rebuilt (202 again), the old memo is not served for it

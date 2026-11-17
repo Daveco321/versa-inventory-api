@@ -725,18 +725,20 @@ _apo_last_sync = 0
 # parse_inventory_excel and refreshed with every ATS sync. The separate daily
 # INVENTORY_OH.CSV feed, its 10am loop, the base-level carrier merge, the
 # synthesized NJ-only rows and the S3 hydrate cache are gone. Rules kept from
-# that era (David): a negative on-hand never counts; a '-FBA' earmarked row is
-# never shippable NJ; NJ is ADMIN-ONLY everywhere (_strip_nj_rows,
-# _customer_export_scrub, the frontends) and a LAST-RESORT routing supply (the
-# frontends' engines, /export-apo-brandcolor, /factory-view consumers). The
-# file's Total ATS already includes NJ, so NJ is never added to it again.
+# that era (David): a negative on-hand never counts; NJ is ADMIN-ONLY everywhere
+# (_strip_nj_rows, _customer_export_scrub, the frontends) and a LAST-RESORT
+# routing supply (the frontends' engines, /export-apo-brandcolor, /factory-view
+# consumers). The file's Total ATS already includes NJ, so NJ is never added to
+# it again. '-FBA' rows (Amazon cartons at the 3PL) count like every other row
+# since Nov 17 2026 (David: the platform's NJ must match the NJ inventory file;
+# they used to be zeroed as "earmarked", which hid real stock on the cards).
 _nj_lock = threading.Lock()
 # RESTRICTED warehouses: (ATS column header, item field). Both are admin-only,
 # last-resort supply and are stripped from every customer surface together.
 # ABFI was added Sep 9 2026 with exactly NJ's rules (David).
 _RESTRICTED_COLUMNS = (('NJ', 'nj'), ('ABFI', 'abfi'))
 _RESTRICTED_KEYS = tuple(k for _c, k in _RESTRICTED_COLUMNS)
-_nj_report = {'ts': 0, 'rows': 0, 'units': 0, 'units_by_warehouse': {}, 'fba_rows': 0, 'fba_units': 0,
+_nj_report = {'ts': 0, 'rows': 0, 'units': 0, 'units_by_warehouse': {},
               'negative_rows': 0, 'negative_units': 0, 'excluded': []}
 _nj_report_pending = {}   # written by parse_inventory_excel, promoted only when the sync is ACCEPTED
 
@@ -756,10 +758,6 @@ def _restricted_units(it):
         except (TypeError, ValueError):
             pass
     return total
-
-def _nj_is_fba_sku(sku):
-    """'-FBA' earmarked SKU (token before any space-separated size)."""
-    return str(sku or '').strip().upper().split(' ')[0].endswith('-FBA')
 
 def _nj_snapshot():
     """NJ figures for the admin endpoints: rows/units from the LOADED inventory
@@ -5203,7 +5201,7 @@ def parse_inventory_excel(file_bytes):
     items = []
     nj_rows = 0
     nj_units_by_key = {}
-    nj_fba_rows = nj_fba_units = nj_neg_rows = nj_neg_units = 0
+    nj_neg_rows = nj_neg_units = 0
     nj_excluded = []
     for row in rows_iter:
         rd = {headers[i]: row[i].value for i in range(min(len(headers), len(row)))}
@@ -5227,10 +5225,11 @@ def parse_inventory_excel(file_bytes):
         # RESTRICTED warehouses NJ (Edison 3PL) and ABFI are columns of this file
         # since Sep 9 2026, one row per SKU like the other warehouses. The file's
         # Total ATS ALREADY counts them, so they are never added to total_ats a
-        # second time. Rules (David): a negative on-hand never counts and a
-        # '-FBA' earmarked row is never shippable restricted stock; both are
+        # second time. Rule (David): a negative on-hand never counts; it is
         # backed out of total_ats so it stays consistent with the warehouses we
-        # show. Both fields are ADMIN-ONLY downstream (see _strip_nj_rows).
+        # show. '-FBA' rows count like any other row (Nov 17 2026: the NJ column
+        # must match the NJ inventory file). Both fields are ADMIN-ONLY
+        # downstream (see _strip_nj_rows).
         restricted = {}
         excluded_units = 0
         for _col, _key in _RESTRICTED_COLUMNS:
@@ -5245,12 +5244,6 @@ def parse_inventory_excel(file_bytes):
                 nj_neg_units += raw
                 if len(nj_excluded) < 500:
                     nj_excluded.append({'sku': sku, 'warehouse': _col, 'qty': raw, 'reason': 'negative on-hand'})
-            elif raw and _nj_is_fba_sku(sku):
-                val = 0
-                nj_fba_rows += 1
-                nj_fba_units += raw
-                if len(nj_excluded) < 500:
-                    nj_excluded.append({'sku': sku, 'warehouse': _col, 'qty': raw, 'reason': 'FBA earmarked (not shippable)'})
             excluded_units += raw - val
             restricted[_key] = val
             if val:
@@ -5300,7 +5293,6 @@ def parse_inventory_excel(file_bytes):
         _nj_report_pending.update({'ts': time.time(), 'rows': nj_rows,
                                    'units': sum(nj_units_by_key.values()),
                                    'units_by_warehouse': {k: nj_units_by_key.get(k, 0) for _c, k in _RESTRICTED_COLUMNS},
-                                   'fba_rows': nj_fba_rows, 'fba_units': nj_fba_units,
                                    'negative_rows': nj_neg_rows, 'negative_units': nj_neg_units,
                                    'excluded': nj_excluded})
     return items
@@ -11232,7 +11224,6 @@ def admin_refresh_nj():
             'rows_with_restricted': rep['rows'],
             'shippable_units': rep['units'],
             'units_by_warehouse': rep['units_by_warehouse'],
-            'fba_earmarked_units': rep['fba_units'],
             'negative_rows': rep['negative_rows'],
         })
     except Exception as e:
@@ -11242,7 +11233,7 @@ def admin_refresh_nj():
 @app.route('/admin/nj-unmatched', methods=['GET', 'OPTIONS'])
 def admin_nj_unmatched():
     """NJ units in the ATS file that are NOT counted as shippable platform
-    stock: '-FBA' earmarked rows and negative on-hand rows."""
+    stock: negative on-hand rows ('-FBA' rows count since Nov 17 2026)."""
     if request.method == 'OPTIONS':
         return '', 204
     rep = _nj_snapshot()
@@ -11254,8 +11245,6 @@ def admin_nj_unmatched():
         'rows_with_restricted': rep['rows'],
         'shippable_units': rep['units'],
         'units_by_warehouse': rep['units_by_warehouse'],
-        'fba_earmarked_units': rep['fba_units'],
-        'fba_earmarked_rows': rep['fba_rows'],
         'negative_rows': rep['negative_rows'],
         'negative_units': rep['negative_units'],
         'unmatched': sorted(rep['excluded'], key=lambda r: -abs(r.get('qty') or 0)),

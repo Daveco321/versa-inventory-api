@@ -350,11 +350,9 @@ def _fold_sku_row(rows, order, sku, brand, vals, receive, is_sized):
 
 
 def _restricted(sku, v):
-    """NJ/ABFI the way app.parse_inventory_excel keeps them: a negative on-hand never counts and
-    a '-FBA' earmarked row is never shippable restricted stock."""
+    """NJ/ABFI the way app.parse_inventory_excel keeps them: a negative on-hand never counts.
+    '-FBA' rows count like any other row since Nov 17 2026 (David: NJ must match the NJ file)."""
     if v < 0:
-        return 0
-    if v and str(sku or '').strip().upper().split(' ')[0].endswith('-FBA'):
         return 0
     return v
 
@@ -362,7 +360,7 @@ def _restricted(sku, v):
 def parse_ats_sheet(wb, is_sized=None, tick=None):
     """(sku rows {sku: row}, has Receive Date column, data row count, error | None) from the
     first sheet ('ATS'), normalised like app.parse_inventory_excel (brand upper case, NT is
-    NAUTICA, rows without SKU or brand skipped, NJ/ABFI negatives and FBA rows zeroed)."""
+    NAUTICA, rows without SKU or brand skipped, NJ/ABFI negatives zeroed)."""
     name = 'ATS' if 'ATS' in wb.sheetnames else wb.sheetnames[0]
     ix, rows = read_sheet(wb, name, tick)
     if not ix or _col(ix, _ATS_COLS['sku']) is None:
