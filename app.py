@@ -30,6 +30,7 @@ import hashlib
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import worker_leader
+import versa_docs_feed as _vdf
 import tjx_sections
 from flask import Flask, request, jsonify, send_file, Response, make_response, g
 from flask_cors import CORS
@@ -842,14 +843,174 @@ _production_lock = threading.Lock()
 _PRODUCTION_TTL = int(float(os.environ.get('PRODUCTION_RESYNC_MINUTES', 10)) * 60)  # default 10 min
 
 
+def _production_row_from_ledger(row):
+    """One production row from a ledger line in the master Style Ledger's column order (A to I):
+    Production#, PO Name, Style, Units, Brand, F ETD, G port arrival, H Shipment #, I Warehouse.
+    None for a line with no style. Shared by the Dropbox master and the Versa Docs feed."""
+    from datetime import timedelta as _td
+    style = str(row[2] or '').strip().upper()
+    if not style:
+        return None
+
+    # ── Pull and normalize column G (Estimated Arrival to Port) ──
+    port_arrival_dt = None
+    if len(row) > 6 and row[6]:
+        if isinstance(row[6], datetime):
+            port_arrival_dt = row[6]
+        else:
+            try:
+                port_arrival_dt = datetime.strptime(str(row[6])[:10], '%Y-%m-%d')
+            except Exception:
+                port_arrival_dt = None
+
+    # ── Compute etd + arrival ──
+    etd = None
+    arrival = None
+    # etd_raw: column F exactly as the ledger states it, kept even when
+    # column G overrides the working dates. ONLY /factory-view reads
+    # it — the Open Order to PO factory page shows the true ledger
+    # ex-factory date, never the G-27 backdate (David, Jul 21 2026).
+    etd_raw = None
+    # Track FOB-flagged production rows. When David puts "be ready",
+    # "FOB ...", or "FOB-AS READY" in the ETD column, it signals an FOB
+    # production batch with no firm ex-factory date. These should NOT
+    # participate in date-based feasibility — frontend treats them as
+    # date-less but keeps them in the supply pool for FIFO fallback.
+    fob_flag = False
+    fob_note = ''
+
+    if port_arrival_dt is not None:
+        # Column G wins for the WORKING dates: compute both from it.
+        etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
+        arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
+        # Still capture the real column-F ETD when it parses as a date.
+        if row[5] is not None:
+            if isinstance(row[5], datetime):
+                etd_raw = row[5].strftime('%Y-%m-%d')
+            else:
+                _f = str(row[5]).strip()
+                if re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', _f):
+                    etd_raw = _norm_ledger_date(_f) or _f
+    elif row[5]:
+        if isinstance(row[5], datetime):
+            etd = row[5].strftime('%Y-%m-%d')
+        else:
+            raw_etd = str(row[5]).strip()
+            raw_upper = raw_etd.upper()
+            # FOB markers: ETD is a non-date string. Common variants:
+            #   "be ready", "FOB", "FOB 6/10", "FOB-AS READY", "as ready"
+            is_fob_marker = (
+                'FOB' in raw_upper
+                or 'BE READY' in raw_upper
+                or raw_upper == 'AS READY'
+                or raw_upper == 'READY'
+                or raw_upper == 'TBD'
+            )
+            # Try to detect if it's at least a parseable date-ish string
+            looks_like_date = bool(re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', raw_etd))
+            if is_fob_marker or not looks_like_date:
+                # No usable ETD — flag as FOB and leave dates blank
+                fob_flag = True
+                fob_note = raw_etd
+                etd = None
+            else:
+                # Ledger cells typed as text ("12/15/26", "1/15/2027") must become
+                # ISO here — every backend date consumer parses ISO only, so an
+                # un-normalised string silently read as "undated/TBD" (Sep 3 2026).
+                etd = _norm_ledger_date(raw_etd)
+                if etd is None:
+                    fob_flag = True
+                    fob_note = raw_etd
+        # Without a column-G override, the working ETD IS the raw one.
+        etd_raw = etd
+
+    try:
+        units = int(row[3] or 0)
+    except (ValueError, TypeError):
+        units = 0
+
+    # ── Column H: Shipment # ──
+    shipment_no = ''
+    if len(row) > 7 and row[7] is not None:
+        if isinstance(row[7], (int, float)):
+            shipment_no = str(int(row[7])) if float(row[7]).is_integer() else str(row[7])
+        else:
+            shipment_no = str(row[7]).strip()
+
+    # ── Column I: landing Warehouse ──
+    warehouse = ''
+    if len(row) > 8 and row[8] is not None:
+        wr = str(row[8]).strip().upper()
+        warehouse = _LEDGER_WH_MAP.get(wr, wr)
+
+    # FOB pickup (David, Nov 18 2026: "it may say FOB in that column, which means its an FOB
+    # pickup, so on the inventory platform, it would not ever show an arrival for those goods
+    # and instead just say FOB Pickup"). The customer collects at the factory, so the lot never
+    # gets an arrival. It travels like the ledger's old "FOB" ETD markers: fob_flag + fob_note
+    # with no working dates, so every screen and routing engine already in use shows no arrival
+    # (they work one out from etd), hands the lot to FOB customers first and keeps it out of
+    # dated domestic orders. The ledger's own ex-factory / ETD stays in etd_raw (never the port
+    # backdate), which the factory view shows.
+    port_dated = port_arrival_dt is not None
+    fob_pickup = warehouse == 'FOB'
+    if fob_pickup:
+        if not port_dated:
+            etd_raw = etd
+        etd = None
+        arrival = None
+        port_dated = False
+        fob_flag = True
+        fob_note = 'FOB Pickup'
+
+    rec = {
+        'production': str(row[0] or '').strip(),
+        'poName': str(row[1] or '').strip(),
+        'style': style,
+        'units': units,
+        # Column E unless the style number names another brand (see
+        # _brand_by_style_number): NB26161 typed JNY on two DKNY knits.
+        'brand': _brand_by_style_number(style, str(row[4] or '').strip()),
+        'etd': etd,
+        # The ledger's own column-F date, untouched by the column-G
+        # backdate. Only /factory-view consumes it (see etd_raw above).
+        'etd_raw': etd_raw,
+        # arrival is only set when David provided column G. None means
+        # "consumer, please apply your transit rule (category + factory)".
+        'arrival': arrival,
+        'port_dated': port_dated,
+        # FOB flag: ETD column had "be ready" / "FOB ..." instead of a
+        # real date. Frontend treats these as date-less (no feasibility
+        # filter) but keeps them in the supply pool. fob_note carries
+        # the raw text so the UI can display it.
+        'fob_flag': fob_flag,
+        'fob_note': fob_note,
+        # Shipment # — admin-only column H. Used to break a single Production#
+        # PO into physical shipments. Frontend surfaces this in a dedicated
+        # admin-only modal; deliberately excluded from all exports.
+        'shipmentNo': shipment_no,
+        # Landing warehouse — ledger column I, normalized (JT->JTW, DW->DCW).
+        # NJ/AE/AW landings are hard-hidden from every customer surface.
+        'warehouse': warehouse,
+        'fob_pickup': fob_pickup,
+    }
+    return rec
+
+
 def load_production_from_dropbox():
     """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
     Caches result in memory; returns cached data if under 1 hour old."""
     global _production_data, _production_data_all, _production_last_sync, _production_rev
 
-    # Return cache if fresh
+    # Versa Docs (Nov 18 2026): with its switch on, the online Style Ledger replaces this file.
+    if _vd_active():
+        rows = _vd_production_rows()
+        if rows is not None:
+            return rows
+
+    # Return cache if fresh (never rows that came from Versa Docs once its switch is off)
     with _production_lock:
-        if _production_data and (time.time() - _production_last_sync < _PRODUCTION_TTL):
+        if (_production_data and (time.time() - _production_last_sync < _PRODUCTION_TTL)
+                and not str(_production_rev or '').startswith('vd:')):
             return _production_data
 
     token = get_dropbox_token()
@@ -921,134 +1082,11 @@ def load_production_from_dropbox():
         # see _inventory_transit_days; /factory-view has its own FACTORY_VIEW_TRANSIT).
         # Column H (Shipment #) is admin-only metadata for grouping physical shipments
         # within the same Production#. Never appears in exports.
-        from datetime import timedelta as _td
         for row in ws.iter_rows(min_row=2, max_col=9, values_only=True):
             row_count += 1
-            style = str(row[2] or '').strip().upper()
-            if not style:
-                continue
-
-            # ── Pull and normalize column G (Estimated Arrival to Port) ──
-            port_arrival_dt = None
-            if len(row) > 6 and row[6]:
-                if isinstance(row[6], datetime):
-                    port_arrival_dt = row[6]
-                else:
-                    try:
-                        port_arrival_dt = datetime.strptime(str(row[6])[:10], '%Y-%m-%d')
-                    except Exception:
-                        port_arrival_dt = None
-
-            # ── Compute etd + arrival ──
-            etd = None
-            arrival = None
-            # etd_raw: column F exactly as the ledger states it, kept even when
-            # column G overrides the working dates. ONLY /factory-view reads
-            # it — the Open Order to PO factory page shows the true ledger
-            # ex-factory date, never the G-27 backdate (David, Jul 21 2026).
-            etd_raw = None
-            # Track FOB-flagged production rows. When David puts "be ready",
-            # "FOB ...", or "FOB-AS READY" in the ETD column, it signals an FOB
-            # production batch with no firm ex-factory date. These should NOT
-            # participate in date-based feasibility — frontend treats them as
-            # date-less but keeps them in the supply pool for FIFO fallback.
-            fob_flag = False
-            fob_note = ''
-
-            if port_arrival_dt is not None:
-                # Column G wins for the WORKING dates: compute both from it.
-                etd     = (port_arrival_dt - _td(days=27)).strftime('%Y-%m-%d')
-                arrival = (port_arrival_dt + _td(days=10)).strftime('%Y-%m-%d')
-                # Still capture the real column-F ETD when it parses as a date.
-                if row[5] is not None:
-                    if isinstance(row[5], datetime):
-                        etd_raw = row[5].strftime('%Y-%m-%d')
-                    else:
-                        _f = str(row[5]).strip()
-                        if re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', _f):
-                            etd_raw = _norm_ledger_date(_f) or _f
-            elif row[5]:
-                if isinstance(row[5], datetime):
-                    etd = row[5].strftime('%Y-%m-%d')
-                else:
-                    raw_etd = str(row[5]).strip()
-                    raw_upper = raw_etd.upper()
-                    # FOB markers: ETD is a non-date string. Common variants:
-                    #   "be ready", "FOB", "FOB 6/10", "FOB-AS READY", "as ready"
-                    is_fob_marker = (
-                        'FOB' in raw_upper
-                        or 'BE READY' in raw_upper
-                        or raw_upper == 'AS READY'
-                        or raw_upper == 'READY'
-                        or raw_upper == 'TBD'
-                    )
-                    # Try to detect if it's at least a parseable date-ish string
-                    looks_like_date = bool(re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}', raw_etd))
-                    if is_fob_marker or not looks_like_date:
-                        # No usable ETD — flag as FOB and leave dates blank
-                        fob_flag = True
-                        fob_note = raw_etd
-                        etd = None
-                    else:
-                        # Ledger cells typed as text ("12/15/26", "1/15/2027") must become
-                        # ISO here — every backend date consumer parses ISO only, so an
-                        # un-normalised string silently read as "undated/TBD" (Sep 3 2026).
-                        etd = _norm_ledger_date(raw_etd)
-                        if etd is None:
-                            fob_flag = True
-                            fob_note = raw_etd
-                # Without a column-G override, the working ETD IS the raw one.
-                etd_raw = etd
-
-            try:
-                units = int(row[3] or 0)
-            except (ValueError, TypeError):
-                units = 0
-
-            # ── Column H: Shipment # ──
-            shipment_no = ''
-            if len(row) > 7 and row[7] is not None:
-                if isinstance(row[7], (int, float)):
-                    shipment_no = str(int(row[7])) if float(row[7]).is_integer() else str(row[7])
-                else:
-                    shipment_no = str(row[7]).strip()
-
-            # ── Column I: landing Warehouse ──
-            warehouse = ''
-            if len(row) > 8 and row[8] is not None:
-                wr = str(row[8]).strip().upper()
-                warehouse = _LEDGER_WH_MAP.get(wr, wr)
-
-            results.append({
-                'production': str(row[0] or '').strip(),
-                'poName': str(row[1] or '').strip(),
-                'style': style,
-                'units': units,
-                # Column E unless the style number names another brand (see
-                # _brand_by_style_number): NB26161 typed JNY on two DKNY knits.
-                'brand': _brand_by_style_number(style, str(row[4] or '').strip()),
-                'etd': etd,
-                # The ledger's own column-F date, untouched by the column-G
-                # backdate. Only /factory-view consumes it (see etd_raw above).
-                'etd_raw': etd_raw,
-                # arrival is only set when David provided column G. None means
-                # "consumer, please apply your transit rule (category + factory)".
-                'arrival': arrival,
-                'port_dated': port_arrival_dt is not None,
-                # FOB flag: ETD column had "be ready" / "FOB ..." instead of a
-                # real date. Frontend treats these as date-less (no feasibility
-                # filter) but keeps them in the supply pool. fob_note carries
-                # the raw text so the UI can display it.
-                'fob_flag': fob_flag,
-                'fob_note': fob_note,
-                # Shipment # — admin-only column H. Used to break a single Production#
-                # PO into physical shipments. Frontend surfaces this in a dedicated
-                # admin-only modal; deliberately excluded from all exports.
-                'shipmentNo': shipment_no,
-                # Landing warehouse — ledger column I, normalized (JT->JTW, DW->DCW).
-                # NJ/AE/AW landings are hard-hidden from every customer surface.
-                'warehouse': warehouse
-            })
+            rec = _production_row_from_ledger(row)
+            if rec is not None:
+                results.append(rec)
         wb.close()
 
         # Factory holds (Oct 1 2026): the full ledger is kept for factory
@@ -3193,19 +3231,23 @@ def _refilter_production(held=None):
 
 def _reapply_factory_hold(force=False):
     """Re-filter this worker's inventory items from the raw sync result when
-    the switch changed (or force). Returns True when the items changed."""
-    stamp = _factory_holds_stamp()
+    the switch changed (or force). Also follows the Versa Docs production
+    feed: a new feed or a flipped switch re-derives incoming. Returns True
+    when the items changed."""
+    stamp = _factory_holds_stamp() + '|' + _vd_stamp_part()
     with _inv_lock:
         raw = _inventory.get('items_raw')
         same = _inventory.get('hold_stamp') == stamp
     if raw is None or (same and not force):
         return False
     held = _held_factories()
+    base, _vd_rep, vd_part = _vd_apply_items(raw)
+    stamp = ','.join(sorted(held)) + '|' + vd_part
     rows_all = _production_rows_all() if held else []
     if held and not rows_all:
         print("  ⚠ Factory holds: ledger unavailable, keeping the current filtered inventory", flush=True)
         return False
-    items, report = _apply_factory_hold_items(raw, rows_all, held)
+    items, report = _apply_factory_hold_items(base, rows_all, held)
     _refilter_production(held)
     with _inv_lock:
         _inventory['items'] = items
@@ -3230,14 +3272,258 @@ def _hold_tick():
 def _hold_filter_synced_items(items):
     """Called by the inventory sync with the freshly parsed items. Returns the
     items to publish, or None when a hold is active and the ledger cannot be
-    read (the caller then keeps its previous data: fail closed)."""
+    read (the caller then keeps its previous data: fail closed). With the
+    Versa Docs switch on, incoming comes from the online ledger first."""
+    base, _vd_rep, vd_part = _vd_apply_items(items)
     held = _held_factories()
+    stamp = ','.join(sorted(held)) + '|' + vd_part
     if not held:
-        return items, {'held': [], 'styles_hidden': 0, 'styles_cut': 0, 'units_cut': 0, 'hidden_styles': []}
+        return base, {'held': [], 'styles_hidden': 0, 'styles_cut': 0, 'units_cut': 0, 'hidden_styles': [],
+                      'stamp': stamp}
     rows_all = _production_rows_all()
     if not rows_all:
         return None, None
-    return _apply_factory_hold_items(items, rows_all, held)
+    out, report = _apply_factory_hold_items(base, rows_all, held)
+    report['stamp'] = stamp
+    return out, report
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VERSA DOCS PRODUCTION FEED (David, Nov 18 2026): "only follow inventory numbers
+# coming from Versa Docs for ALL incoming production, no longer should it follow
+# the ATS sheet hourly, that should only be done for warehouse inventory now".
+#
+# Versa Docs' cron (edge function ledger-platform-push, every 5 minutes) signs in
+# as its alerts bot and POSTs /production/versa-docs/refresh. This API then reads
+# Versa Docs' ledger_platform_feed with that same token and keeps the lines on the
+# shared disk (versa_docs_feed.py). Both workers follow the file.
+#
+# While the feed's switch is on (Versa Docs app_settings ledger_platform_push
+# .platform_on; VD_PRODUCTION_SOURCE=off on Render forces it off):
+#   - production rows come from the online ledger's open lines (not Delivered, not
+#     crossed out) instead of the Dropbox master, in the same row shape;
+#   - every item's incoming is the ledger's open units for its style and Total ATS
+#     moves with it; warehouse stock, committed and allocated stay the hourly file's.
+# Switch off: everything is exactly as before.
+# ═════════════════════════════════════════════════════════════════════════════
+_vd_lock = threading.Lock()
+_vd_state = {'stamp': None, 'feed': None, 'version': None, 'platform_on': False, 'count': 0, 'units': 0,
+             'generated_at': None, 'saved_at': None, 'loaded_at': 0.0, 'rows_all': None, 'rows_version': None,
+             'by_style': {}, 'brands': {}, 'error': '', 'last_refresh': None, 'last_fetch_at': 0.0,
+             'items_report': None}
+_VD_MIN_GAP = 15          # seconds between two Versa Docs reads on one worker
+
+
+def _vd_sync_state():
+    """Re-read the saved feed when its file changed (a refresh on either worker wrote it)."""
+    stamp = _vdf.file_stamp()
+    with _vd_lock:
+        if stamp == _vd_state['stamp']:
+            return
+    feed = _vdf.load() if stamp else None
+    with _vd_lock:
+        if stamp == _vd_state['stamp']:
+            return
+        if stamp and feed is None:
+            # keep the last good lines; the next refresh rewrites the file
+            _vd_state.update(stamp=stamp, error='saved feed unreadable')
+            return
+        s = _vdf.summary(feed) if feed else {'version': None, 'platform_on': False, 'count': 0, 'units': 0,
+                                             'generated_at': None}
+        _vd_state.update(stamp=stamp, feed=feed, version=s['version'], platform_on=s['platform_on'],
+                         count=s['count'], units=s['units'], generated_at=s['generated_at'],
+                         saved_at=(feed or {}).get('saved_at'), loaded_at=time.time(), rows_all=None,
+                         rows_version=None, by_style=_vdf.incoming_by_style(feed) if feed else {},
+                         brands=_vdf.brand_by_style(feed) if feed else {}, error='')
+
+
+def _vd_active():
+    if _vdf.forced_off():
+        return False
+    try:
+        _vd_sync_state()
+    except Exception as e:
+        print(f"  ⚠ Versa Docs feed: state check failed: {e}", flush=True)
+    with _vd_lock:
+        return bool(_vd_state['platform_on'] and _vd_state['feed'] is not None)
+
+
+def _vd_stamp_part():
+    if not _vd_active():
+        return 'vd:off'
+    with _vd_lock:
+        return 'vd:' + str(_vd_state['version'])
+
+
+def _vd_production_rows():
+    """The served (hold-filtered) production rows built from the saved feed, or None."""
+    global _production_data, _production_data_all, _production_last_sync, _production_rev
+    with _vd_lock:
+        feed, version = _vd_state['feed'], _vd_state['version']
+        rows_all = _vd_state['rows_all'] if _vd_state['rows_version'] == version else None
+    if feed is None:
+        return None
+    if rows_all is None:
+        rows_all = [r for r in (_production_row_from_ledger(t) for t in _vdf.ledger_tuples(feed)) if r is not None]
+        with _vd_lock:
+            if _vd_state['version'] == version:
+                _vd_state['rows_all'] = rows_all
+                _vd_state['rows_version'] = version
+    rev = 'vd:' + str(version)
+    with _production_lock:
+        if _production_rev == rev and _production_data_all is rows_all and _production_data:
+            return _production_data
+    held = _held_factories()
+    served = _hold_filter_production(rows_all, held)
+    with _production_lock:
+        first = not str(_production_rev or '').startswith('vd:')
+        _production_data_all = rows_all
+        _production_data = served
+        _production_last_sync = time.time()
+        _production_rev = rev
+    print(f"  ✓ Production from Versa Docs: {len(rows_all)} open ledger lines (feed {str(version)[:8]})"
+          + (" (switched from the Dropbox master)" if first else '')
+          + (f"; {len(rows_all) - len(served)} rows of held factory {','.join(sorted(held))} hidden" if held else ''),
+          flush=True)
+    return served
+
+
+def _vd_item_brand(sku, ledger_brand):
+    """The platform brand key for a style the hourly file doesn't list yet."""
+    named = _style_number_brand(sku)
+    if named:
+        return named
+    b = str(ledger_brand or '').strip().upper()
+    if b in BRAND_FULL_NAMES:
+        return b
+    full = _normalize_brand(b)
+    for abbr, f in BRAND_FULL_NAMES.items():
+        if f == full:
+            return abbr
+    return b
+
+
+def _vd_brand_fix_for(items):
+    """A style the hourly file doesn't list yet takes the brand key the platform already uses for
+    its style code (the file says RB and NM where the brand table says REEBOK and NICOLE), so a
+    brand never splits into two groups. Falls back to _vd_item_brand."""
+    by_code = {}
+    for it in items or []:
+        if isinstance(it, dict) and it.get('brand'):
+            base = str(it.get('sku') or '').strip().upper().split('-')[0]
+            if _STYLE_NO_BRAND_RE.match(base):
+                cnt = by_code.setdefault(base[2:4], {})
+                cnt[it['brand']] = cnt.get(it['brand'], 0) + 1
+    known = {c: max(cnt.items(), key=lambda kv: kv[1])[0] for c, cnt in by_code.items() if cnt}
+
+    def fix(sku, ledger_brand):
+        base = str(sku or '').strip().upper().split('-')[0]
+        if _STYLE_NO_BRAND_RE.match(base) and known.get(base[2:4]):
+            return known[base[2:4]]
+        return _vd_item_brand(sku, ledger_brand)
+    return fix
+
+
+def _vd_new_item(sku, brand, units):
+    return {'sku': sku, 'brand': brand, 'brand_abbr': brand, 'brand_full': BRAND_FULL_NAMES.get(brand, brand),
+            'name': f"{brand} {sku}", 'jtw': 0, 'tr': 0, 'dcw': 0, 'qa': 0, 'nj': 0, 'abfi': 0,
+            'incoming': units, 'committed': 0, 'allocated': 0, 'total_ats': units, 'total_warehouse': 0,
+            'container': '', 'receive_date': '', 'lot_number': '', 'image': ''}
+
+
+def _vd_apply_items(items):
+    """(items, report, stamp part): incoming from Versa Docs while its switch is on, else unchanged."""
+    if not _vd_active():
+        return list(items or []), None, 'vd:off'
+    with _vd_lock:
+        by_style, brands, version = dict(_vd_state['by_style']), dict(_vd_state['brands']), _vd_state['version']
+    out, rep = _vdf.apply_incoming(items, by_style, brands, _vd_new_item, _vd_brand_fix_for(items))
+    with _vd_lock:
+        _vd_state['items_report'] = {k: v for k, v in rep.items() if not k.endswith('_styles')}
+    print(f"  ✓ Incoming from Versa Docs: {rep['incoming_before']:,} -> {rep['incoming_after']:,} units; "
+          f"{rep['changed']} styles changed, {rep['added']} added, {rep['dropped']} dropped", flush=True)
+    return out, rep, 'vd:' + str(version)
+
+
+def _vd_after_change():
+    """This worker follows a new feed (or a flipped switch) right away."""
+    global _production_last_sync
+    with _production_lock:
+        _production_last_sync = 0
+    try:
+        load_production_from_dropbox()
+    except Exception as e:
+        print(f"  ⚠ Versa Docs feed: production reload failed: {e}", flush=True)
+    try:
+        _reapply_factory_hold(force=True)
+    except Exception as e:
+        print(f"  ⚠ Versa Docs feed: inventory re-apply failed: {e}", flush=True)
+
+
+def _vd_health():
+    try:
+        _vd_sync_state()
+    except Exception:
+        pass
+    off = _vdf.forced_off()
+    with _vd_lock:
+        return {'active': (not off) and bool(_vd_state['platform_on'] and _vd_state['feed'] is not None),
+                'switch_on': bool(_vd_state['platform_on']), 'forced_off': off,
+                'version': _vd_state['version'], 'lines': _vd_state['count'], 'units': _vd_state['units'],
+                'generated_at': _vd_state['generated_at'], 'saved_at': _vd_state['saved_at'],
+                'last_refresh': _vd_state['last_refresh'], 'error': _vd_state['error'],
+                'items': _vd_state['items_report']}
+
+
+@app.route('/production/versa-docs/refresh', methods=['POST', 'OPTIONS'])
+def versa_docs_production_refresh():
+    """Pull the open ledger lines from Versa Docs with the caller's own office sign-in."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    ident = _request_identity()
+    if not ident or ident.get('tier') != 'staff':
+        return jsonify({'ok': False, 'error': 'An office sign-in is required.'}), 401
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    _vd_sync_state()
+    now = time.time()
+    with _vd_lock:
+        known, prev = _vd_state['version'], _vd_state['feed']
+        if now - (_vd_state['last_fetch_at'] or 0) < _VD_MIN_GAP:
+            return jsonify({'ok': True, 'changed': False, 'skipped': 'refreshed moments ago', **_vd_health()})
+        _vd_state['last_fetch_at'] = now
+    was_active = _vd_active()
+    try:
+        feed = _vdf.fetch(http_requests, VERSA_DOCS_SUPABASE_URL, VERSA_DOCS_SUPABASE_ANON, token,
+                          known=known if prev is not None else None)
+    except _vdf.FeedError as e:
+        with _vd_lock:
+            _vd_state['error'] = e.code
+            _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': False, 'error': e.code}
+        print(f"  ⚠ Versa Docs feed: refresh failed: {e.code} {e.detail}", flush=True)
+        return jsonify({'ok': False, 'error': e.code}), 502
+    if feed.get('unchanged'):
+        with _vd_lock:
+            _vd_state['error'] = ''
+            _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': True, 'changed': False}
+        return jsonify({'ok': True, 'changed': False, **_vd_health()})
+    ok, reason = _vdf.validate(feed, prev)
+    if not ok:
+        with _vd_lock:
+            _vd_state['error'] = 'refused: ' + reason
+            _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': False, 'error': reason}
+        print(f"  ⚠ Versa Docs feed REFUSED ({reason}); keeping the last good feed", flush=True)
+        return jsonify({'ok': False, 'error': reason}), 422
+    _vdf.save(feed)
+    _vd_sync_state()
+    s = _vdf.summary(feed)
+    with _vd_lock:
+        _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': True, 'changed': True}
+    print(f"  ✓ Versa Docs feed saved: {s['count']} lines, {s['units']:,} units, switch "
+          f"{'ON' if s['platform_on'] else 'off'} (version {str(s['version'])[:8]})", flush=True)
+    if was_active or _vd_active():
+        _vd_after_change()
+    return jsonify({'ok': True, 'changed': True, **_vd_health()})
 
 
 def _factory_hold_overview():
@@ -3278,7 +3564,7 @@ def _factory_hold_overview():
     with _factory_holds_lock:
         meta = {k: _factory_holds[k] for k in ('note', 'updated_at', 'updated_by', 'ok', 'error')}
     return {'held': sorted(held), 'factories': factories, 'report': report,
-            'applied': stamp == ','.join(sorted(held)), 'allocations_on_hidden': allocations,
+            'applied': str(stamp or '').split('|')[0] == ','.join(sorted(held)), 'allocations_on_hidden': allocations,
             'config_key': S3_FACTORY_HOLDS_KEY, **meta}
 
 
@@ -3329,7 +3615,7 @@ def _factory_holds_health():
             meta = {k: _factory_holds[k] for k in ('updated_at', 'updated_by', 'ok', 'error')}
         with _production_lock:
             held_rows = len(_production_data_all) - len(_production_data)
-        return {'held': sorted(held), 'applied': stamp == ','.join(sorted(held)),
+        return {'held': sorted(held), 'applied': str(stamp or '').split('|')[0] == ','.join(sorted(held)),
                 'styles_hidden': report.get('styles_hidden', 0), 'styles_cut': report.get('styles_cut', 0),
                 'units_cut': report.get('units_cut', 0), 'production_rows_hidden': held_rows, **meta}
     except Exception as e:
@@ -5471,7 +5757,7 @@ def sync_from_dropbox():
         with _inv_lock:
             _inventory['items'] = items
             _inventory['items_raw'] = items_raw
-            _inventory['hold_stamp'] = ','.join(hold_report['held'])
+            _inventory['hold_stamp'] = hold_report.get('stamp') or ','.join(hold_report['held'])
             _inventory['hold_report'] = hold_report
             _inventory['brands'] = brands
             _inventory['gen'] = _inventory.get('gen', 0) + 1
@@ -5614,7 +5900,7 @@ def sync_inventory():
     with _inv_lock:
         _inventory['items'] = items
         _inventory['items_raw'] = items_raw
-        _inventory['hold_stamp'] = ','.join(hold_report['held'])
+        _inventory['hold_stamp'] = hold_report.get('stamp') or ','.join(hold_report['held'])
         _inventory['hold_report'] = hold_report
         _inventory['brands'] = brands
         _inventory['gen'] = _inventory.get('gen', 0) + 1
@@ -5867,6 +6153,7 @@ def health():
         "production_last_sync": _production_last_sync,
         "production_folder": DROPBOX_PRODUCTION_FOLDER,
         "factory_holds": _factory_holds_health(),
+        "versa_docs_production": _vd_health(),
     })
 
 
@@ -7129,8 +7416,10 @@ def _apo_prod_arrival(p, pants):
     """Effective arrival for a production row, mirroring the frontend's
     loadProductionFromS3 transit rule: the ledger's real arrival (port date
     + 10) when present, else ETD + _inventory_transit_days. Rows with neither
-    date are genuinely TBD."""
+    date are genuinely TBD. An FOB pickup lot never arrives (David, Nov 18 2026)."""
     from datetime import timedelta
+    if p.get('fob_pickup'):
+        return None
     ad = _apo_parse_date(p.get('arrival'))
     if ad:
         return ad
@@ -16539,7 +16828,7 @@ def factory_view():
             'style': style,
             'units': row.get('units', 0),
             'brand': row.get('brand', ''),
-            'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
+            'etd': row.get('etd_raw') if (row.get('port_dated') or row.get('fob_pickup')) else row.get('etd'),
             # Server-side arrival (port date, else ETD + FACTORY_VIEW_TRANSIT), so the
             # page, the weekly email and the Excel report all read the same date.
             'arrival': _factory_view_arrival(row),
@@ -16575,7 +16864,7 @@ def factory_view():
                 'ref': ext_ref_map[prod_ref],
                 'style': style,
                 'units': row.get('units', 0),
-                'etd': row.get('etd_raw') if row.get('port_dated') else row.get('etd'),
+                'etd': row.get('etd_raw') if (row.get('port_dated') or row.get('fob_pickup')) else row.get('etd'),
                 # Computed from the real production # before it is masked, so an
                 # external Pinnacle lot keeps its longer transit in the routing.
                 'arrival': _factory_view_arrival(row),
