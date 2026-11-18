@@ -3563,10 +3563,16 @@ def _vd_dropbox_upload(path, data):
         return False, f'dropbox_unreachable: {type(e).__name__}'
     if r.status_code == 200:
         return True, 'ok'
-    txt = (r.text or '')[:300]
+    txt = (r.text or '')[:1000]
     if 'missing_scope' in txt or r.status_code == 401:
         return False, 'dropbox_no_write_access'
-    return False, f'dropbox_http_{r.status_code}: {txt[:120]}'
+    msg = txt
+    try:
+        j = r.json()
+        msg = ((j.get('user_message') or {}).get('text') or j.get('error_summary') or txt) if isinstance(j, dict) else txt
+    except Exception:
+        pass
+    return False, f'dropbox_http_{r.status_code}: {str(msg)[:400]}'
 
 
 @app.route('/production/versa-docs/dropbox-sync', methods=['POST', 'OPTIONS'])
