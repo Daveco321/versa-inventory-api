@@ -997,6 +997,29 @@ def _production_row_from_ledger(row):
     return rec
 
 
+_PROD_ROW_KEY_FIELDS = ('production', 'poName', 'style', 'brand', 'etd', 'etd_raw', 'arrival', 'port_dated',
+                        'fob_flag', 'fob_note', 'shipmentNo', 'warehouse', 'fob_pickup')
+
+
+def _merge_identical_rows(rows):
+    """Ledger lines that agree on every field except units (a style split into equal rows, or
+    FOB PO breaks with no dates) become one lot with the units added, so a catalog never shows
+    the same card twice (Nov 18 2026 audit). Totals and every other field are unchanged."""
+    out, idx = [], {}
+    for r in rows or []:
+        k = tuple(r.get(f) for f in _PROD_ROW_KEY_FIELDS)
+        i = idx.get(k)
+        if i is None:
+            idx[k] = len(out)
+            out.append(dict(r))
+        else:
+            try:
+                out[i]['units'] = int(out[i].get('units') or 0) + int(r.get('units') or 0)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 def load_production_from_dropbox():
     """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
     Caches result in memory; returns cached data if under 1 hour old."""
@@ -1089,6 +1112,7 @@ def load_production_from_dropbox():
             if rec is not None:
                 results.append(rec)
         wb.close()
+        results = _merge_identical_rows(results)
 
         # Factory holds (Oct 1 2026): the full ledger is kept for factory
         # accounts and the admin hold panel; everyone else gets the filtered one.
@@ -3373,7 +3397,8 @@ def _vd_production_rows():
     if feed is None:
         return None
     if rows_all is None:
-        rows_all = [r for r in (_production_row_from_ledger(t) for t in _vdf.ledger_tuples(feed)) if r is not None]
+        rows_all = _merge_identical_rows(
+            [r for r in (_production_row_from_ledger(t) for t in _vdf.ledger_tuples(feed)) if r is not None])
         with _vd_lock:
             if _vd_state['version'] == version:
                 _vd_state['rows_all'] = rows_all
@@ -16754,6 +16779,19 @@ FACTORY_VIEW_TRANSIT = {'default_days': 35, 'pants_days': 45, 'pinnacle_days': 4
                         'pinnacle_prefixes': ['PC']}
 
 
+def _factory_row(row):
+    """The factory pages (Open Order to PO and the Thursday schedule emails) show an FOB Pickup
+    lot the way they did before Nov 18 2026: its ledger ex-factory date, the usual arrival
+    estimate and no FOB flag. "No arrival date, FOB Pickup" is the inventory platform's rule
+    (David: "on the inventory platform, it would not ever show an arrival for those goods").
+    A lot whose ETD cell holds an FOB marker instead of a date stays an FOB lot, as before."""
+    if row.get('fob_pickup') and row.get('etd_raw'):
+        r = dict(row)
+        r.update(etd=row.get('etd_raw'), fob_flag=False, fob_note='')
+        return r
+    return row
+
+
 def _factory_view_arrival(row):
     """A ledger row's arrival on the factory page, as ISO text: the port-dated
     arrival when column G is filled, else ETD + FACTORY_VIEW_TRANSIT days, else
@@ -17007,6 +17045,7 @@ def factory_view():
         # ETD is the RAW ledger date (etd_raw): factories see what the ledger
         # says, never the G-27 backdate. Port-dated rows may therefore carry
         # arrival without etd when column F was blank.
+        row = _factory_row(row)
         productions.append({
             'production': prod_ref,
             'poName': row.get('poName', ''),
@@ -17045,6 +17084,7 @@ def factory_view():
                 continue
             if prod_ref not in ext_ref_map:
                 ext_ref_map[prod_ref] = f"EXT-{len(ext_ref_map) + 1}"
+            row = _factory_row(row)
             external_supply.append({
                 'ref': ext_ref_map[prod_ref],
                 'style': style,

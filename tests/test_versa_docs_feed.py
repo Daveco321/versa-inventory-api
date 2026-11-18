@@ -151,6 +151,30 @@ class PureFeedTests(unittest.TestCase):
         self.assertEqual((r1['fob_flag'], r1['fob_note'], r1['etd']), (True, 'FOB AS READY', None))
         self.assertEqual((r2['fob_flag'], r2['etd']), (False, '2026-12-01'))
 
+    def test_factory_pages_keep_fob_lot_dates(self):
+        a = self.a
+        from datetime import timedelta
+        r = a._production_row_from_ledger(('TF99005', 'ZZ', 'ZZNAPQ005SLD', 600, 'NAUTICA', datetime(2026, 12, 9),
+                                           None, None, 'FOB'))
+        fr = a._factory_row(r)
+        self.assertEqual((fr['etd'], fr['fob_flag']), ('2026-12-09', False))
+        want = (datetime(2026, 12, 9) + timedelta(days=a.FACTORY_VIEW_TRANSIT['default_days'])).date().isoformat()
+        self.assertEqual(a._factory_view_arrival(fr), want)
+        self.assertTrue(r['fob_flag'])                      # the platform's own row is untouched
+        self.assertIsNone(r['etd'])
+        marker = a._production_row_from_ledger(('TF99006', 'ZZ', 'ZZNAPQ006SLD', 600, 'NAUTICA', 'FOB AS READY',
+                                                None, None, 'FOB'))
+        self.assertTrue(a._factory_row(marker)['fob_flag'])   # an FOB marker with no date stays an FOB lot
+
+    def test_identical_ledger_lines_become_one_lot(self):
+        a = self.a
+        row = lambda units, etd=datetime(2026, 12, 1), po='ZZ PO': a._production_row_from_ledger(
+            ('TF99001', po, 'ZZNAPQ001SLD', units, 'NAUTICA', etd, None, None, 'FOB'))
+        merged = a._merge_identical_rows([row(828), row(828), row(612), row(500, po='OTHER PO'),
+                                          row(100, etd=datetime(2026, 12, 20))])
+        self.assertEqual([r['units'] for r in merged], [2268, 500, 100])
+        self.assertEqual(sum(r['units'] for r in merged), 828 + 828 + 612 + 500 + 100)
+
     def test_item_brand(self):
         a = self.a
         self.assertEqual(a._vd_item_brand('ZZNAPQ001SLD', 'whatever'), 'NAUTICA')     # the style number decides
