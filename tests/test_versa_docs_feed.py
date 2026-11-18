@@ -129,6 +129,28 @@ class PureFeedTests(unittest.TestCase):
         self.assertEqual(by['ZZRBPK009SLS']['brand'], 'RB')          # not a second REEBOK group
         self.assertEqual(by['ZZNAPK009SLS']['brand'], 'NAUTICA')     # no item with NA yet: the style number decides
 
+    def test_placeholder_styles_and_unguessable_codes_are_not_added(self):
+        a, f = self.a, self.f
+        items = [item('ZZBLPK001SLS', incoming=10, brand='BLO'), item('ZZBLPK002SLS', wh=5, brand='BLO')]
+        fd = feed([line('TF99001', 'TBD', 3000), line('TF99002', 'SEE PO', 100),
+                   line('TF99003', 'ZZBLPK009SLS', 700, brand='BLACK')])
+        out, rep = f.apply_incoming(items, f.incoming_by_style(fd), f.brand_by_style(fd), a._vd_new_item,
+                                    a._vd_brand_fix_for(items), a._vd_style_ok)
+        by = {i['sku']: i for i in out}
+        self.assertNotIn('TBD', by)
+        self.assertNotIn('SEE PO', by)
+        self.assertEqual(by['ZZBLPK009SLS']['brand'], 'BLACK')
+
+    def test_etd_text_markers_survive_the_feed(self):
+        a, f = self.a, self.f
+        l1 = line('TF99001', 'ZZNAPQ001SLD', 500, etd=None)
+        l1.update(etd_col=None, etd_text='FOB AS READY', ex_factory='2026-12-01')
+        l2 = line('TF99002', 'ZZNAPQ002SLD', 500, etd='2026-12-01')
+        l2.update(etd_col=None, ex_factory='2026-12-01')
+        r1, r2 = [a._production_row_from_ledger(t) for t in f.ledger_tuples(feed([l1, l2]))]
+        self.assertEqual((r1['fob_flag'], r1['fob_note'], r1['etd']), (True, 'FOB AS READY', None))
+        self.assertEqual((r2['fob_flag'], r2['etd']), (False, '2026-12-01'))
+
     def test_item_brand(self):
         a = self.a
         self.assertEqual(a._vd_item_brand('ZZNAPQ001SLD', 'whatever'), 'NAUTICA')     # the style number decides
@@ -300,6 +322,42 @@ class FeedRouteTests(unittest.TestCase):
         finally:
             os.environ.pop('VD_PRODUCTION_SOURCE', None)
 
+    def test_quick_second_refresh_does_not_freeze_the_worker(self):
+        import threading
+        a = self.a
+        a._VD_MIN_GAP = 60
+        self.http.answer = FakeResp(200, feed(self.lines(), on=False, version='v-off'))
+        self.assertEqual(self.refresh().status_code, 200)
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault('r', self.refresh()))
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), 'the second refresh hung')
+        self.assertEqual(box['r'].get_json().get('skipped'), 'refreshed moments ago')
+        self.assertTrue(a._vd_lock.acquire(timeout=2))
+        a._vd_lock.release()
+
+    def test_a_big_drop_is_taken_when_switching_off_or_once_it_lasts(self):
+        a = self.a
+        self.http.answer = FakeResp(200, feed(self.lines(), on=True, version='v-on'))
+        self.refresh()
+        shrunk = [dict(l, units=1) for l in self.lines()]
+        a._VD_DROP_CONFIRM_SECONDS = 3600
+        self.http.answer = FakeResp(200, feed(shrunk, on=True, version='v-drop'))
+        self.assertEqual(self.refresh().status_code, 422)
+        self.assertEqual(a._vd_health()['version'], 'v-on')
+        a._VD_DROP_CONFIRM_SECONDS = 0
+        self.assertEqual(self.refresh().status_code, 200)
+        self.assertEqual(a._vd_health()['version'], 'v-drop')
+        a._VD_DROP_CONFIRM_SECONDS = 20 * 60
+        self.http.answer = FakeResp(200, feed(self.lines(), on=True, version='v-on2'))
+        self.assertEqual(self.refresh().status_code, 200)
+        self.http.answer = FakeResp(200, feed(shrunk, on=False, version='v-off-drop'))
+        self.assertEqual(self.refresh().status_code, 200)
+        h = a._vd_health()
+        self.assertEqual((h['version'], h['active']), ('v-off-drop', False))
+        self.assertIsNotNone(h['last_contact'])
+
     def test_bad_feeds_are_refused(self):
         a = self.a
         self.http.answer = FakeResp(200, feed(self.lines(), on=True, version='v-on'))
@@ -315,9 +373,6 @@ class FeedRouteTests(unittest.TestCase):
         self.assertEqual(r.status_code, 502)
         self.assertEqual(len(a.load_production_from_dropbox()), 212)
 
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 class DropboxCopyTests(unittest.TestCase):
@@ -335,12 +390,26 @@ class DropboxCopyTests(unittest.TestCase):
         self.data = b'PK\x03\x04' + b'zz-ledger' * 50
         self.sha = hashlib.sha256(self.data).hexdigest()
         self.uploads = []
+        self.gets = []
+        self.get_status = 200
         self.upload_status = 200
         test = self
 
+        class Resp:
+            def __init__(self, status, data):
+                self.status_code, self._data = status, data
+
+            def iter_content(self, n):
+                for i in range(0, len(self._data), n):
+                    yield self._data[i:i + n]
+
+            def close(self):
+                pass
+
         class Http:
-            def get(self, url, timeout=None):
-                return type('R', (), {'status_code': 200, 'content': test.data, 'text': ''})()
+            def get(self, url, timeout=None, allow_redirects=True, stream=False):
+                test.gets.append({'url': url, 'allow_redirects': allow_redirects})
+                return Resp(test.get_status, test.data)
 
             def post(self, url, headers=None, data=None, json=None, timeout=None):
                 test.uploads.append({'url': url, 'arg': headers.get('Dropbox-API-Arg'), 'bytes': data})
@@ -380,11 +449,36 @@ class DropboxCopyTests(unittest.TestCase):
         r = self.post([
             {'name': '../evil.xlsx', 'url': self.url, 'sha256': self.sha},
             {'name': 'NB_Production_Style_Ledger.xlsx', 'url': 'https://example.test/x.xlsx', 'sha256': self.sha},
-            {'name': 'PC_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': '0' * 64},
-            {'name': 'Frank_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': 'nope'}])
+            {'name': 'PC_Production_Style_Ledger.xlsx', 'url': self.url.replace('TF/FY1_', 'PC/PC_'), 'sha256': '0' * 64},
+            {'name': 'Frank_Production_Style_Ledger.xlsx', 'url': self.url.replace('TF/FY1_', 'FR/Frank_'), 'sha256': 'nope'}])
         self.assertEqual(r.status_code, 502)
         errs = [f['error'] for f in r.get_json()['files']]
         self.assertEqual(errs, ['unknown file name', 'not a Versa Docs storage link', 'sha256 mismatch', 'sha256 missing'])
+        self.assertEqual(self.uploads, [])
+
+    def test_links_must_be_exactly_the_ledger_file(self):
+        a = self.a
+        host = a._vd_storage_prefixes()[0].split('/storage/')[0]
+        bad = [
+            host + '/storage/v1/object/sign/ledger-live/../packs/x.xlsx?token=zz',
+            host + '/storage/v1/object/sign/ledger-live/%2e%2e/packs/x.xlsx?token=zz',
+            host + '/storage/v1/object/sign/ledger-live/NB/FY1_Production_Style_Ledger.xlsx?token=zz',
+            host + '/storage/v1/object/sign/ledger-live/TF/FY1_Production_Style_Ledger.xlsx',
+            'https://evil.test/storage/v1/object/sign/ledger-live/TF/FY1_Production_Style_Ledger.xlsx?token=zz',
+            'https://user@' + host.split('://')[1] + '/storage/v1/object/sign/ledger-live/TF/FY1_Production_Style_Ledger.xlsx?token=zz',
+        ]
+        for u in bad:
+            self.assertFalse(a._vd_link_ok(u, 'FY1_Production_Style_Ledger.xlsx'), u)
+        self.assertTrue(a._vd_link_ok(self.url, 'FY1_Production_Style_Ledger.xlsx'))
+        r = self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': bad[0], 'sha256': self.sha}])
+        self.assertEqual(r.get_json()['files'][0]['error'], 'not a Versa Docs storage link')
+        self.assertEqual(self.gets, [])
+
+    def test_no_redirects_followed(self):
+        self.get_status = 302
+        r = self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': self.sha}])
+        self.assertEqual(r.get_json()['files'][0]['error'], 'download failed (302)')
+        self.assertFalse(self.gets[0]['allow_redirects'])
         self.assertEqual(self.uploads, [])
 
     def test_no_write_access_is_reported(self):
@@ -392,3 +486,7 @@ class DropboxCopyTests(unittest.TestCase):
         r = self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': self.sha}])
         self.assertEqual(r.status_code, 502)
         self.assertEqual(r.get_json()['files'][0]['error'], 'dropbox_no_write_access')
+
+
+if __name__ == '__main__':
+    unittest.main()

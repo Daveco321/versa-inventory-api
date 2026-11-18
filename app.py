@@ -710,7 +710,8 @@ S3_ALLOCATION_KEY = os.environ.get('S3_ALLOCATION_KEY', 'inventory/VIRTUAL WAREH
 _LEDGER_WH_MAP = {'JT': 'JTW', 'JTW': 'JTW', 'TR': 'TR', 'DW': 'DCW', 'DCW': 'DCW',
                   'DC': 'DCW', 'QA': 'QA', 'NJ': 'NJ', 'AE': 'AE', 'AW': 'AW', 'ABFI': 'ABFI'}
 # Landing codes that are admin-only / last-resort (NJ rules); ABFI added Sep 9 2026.
-_HIDDEN_LANDING_WH = {'NJ', 'AE', 'AW', 'ABFI'}
+# WALM (Nov 18 2026): goods made for Walmart on Walmart POs, never free stock for other customers.
+_HIDDEN_LANDING_WH = {'NJ', 'AE', 'AW', 'ABFI', 'WALM'}
 
 # Production/Style Ledger — now Dropbox-only (S3 removed)
 DROPBOX_PRODUCTION_FOLDER = os.environ.get('DROPBOX_PRODUCTION_FOLDER',
@@ -3238,10 +3239,17 @@ def _reapply_factory_hold(force=False):
     with _inv_lock:
         raw = _inventory.get('items_raw')
         same = _inventory.get('hold_stamp') == stamp
+        old_vd = str(_inventory.get('hold_stamp') or '').partition('|')[2]
     if raw is None or (same and not force):
         return False
     held = _held_factories()
     base, _vd_rep, vd_part = _vd_apply_items(raw)
+    if vd_part != old_vd:
+        # production rows follow the same feed (or go back to the master) on this worker too
+        try:
+            load_production_from_dropbox()
+        except Exception as e:
+            print(f"  ⚠ Versa Docs feed: production reload failed: {e}", flush=True)
     stamp = ','.join(sorted(held)) + '|' + vd_part
     rows_all = _production_rows_all() if held else []
     if held and not rows_all:
@@ -3306,12 +3314,13 @@ def _hold_filter_synced_items(items):
 #     moves with it; warehouse stock, committed and allocated stay the hourly file's.
 # Switch off: everything is exactly as before.
 # ═════════════════════════════════════════════════════════════════════════════
-_vd_lock = threading.Lock()
+_vd_lock = threading.RLock()   # re-entrant: _vd_health() takes it again
 _vd_state = {'stamp': None, 'feed': None, 'version': None, 'platform_on': False, 'count': 0, 'units': 0,
              'generated_at': None, 'saved_at': None, 'loaded_at': 0.0, 'rows_all': None, 'rows_version': None,
              'by_style': {}, 'brands': {}, 'error': '', 'last_refresh': None, 'last_fetch_at': 0.0,
              'items_report': None}
 _VD_MIN_GAP = 15          # seconds between two Versa Docs reads on one worker
+_VD_DROP_CONFIRM_SECONDS = 20 * 60   # a big drop is taken once it has lasted this long
 
 
 def _vd_sync_state():
@@ -3411,17 +3420,24 @@ def _vd_brand_fix_for(items):
     for it in items or []:
         if isinstance(it, dict) and it.get('brand'):
             base = str(it.get('sku') or '').strip().upper().split('-')[0]
-            if _STYLE_NO_BRAND_RE.match(base):
+            if _STYLE_NO_BRAND_RE.match(base) and base[2:4] not in _STYLE_NO_BRAND_SKIP:
                 cnt = by_code.setdefault(base[2:4], {})
                 cnt[it['brand']] = cnt.get(it['brand'], 0) + 1
     known = {c: max(cnt.items(), key=lambda kv: kv[1])[0] for c, cnt in by_code.items() if cnt}
 
     def fix(sku, ledger_brand):
         base = str(sku or '').strip().upper().split('-')[0]
-        if _STYLE_NO_BRAND_RE.match(base) and known.get(base[2:4]):
+        if _STYLE_NO_BRAND_RE.match(base) and base[2:4] not in _STYLE_NO_BRAND_SKIP and known.get(base[2:4]):
             return known[base[2:4]]
         return _vd_item_brand(sku, ledger_brand)
     return fix
+
+
+def _vd_style_ok(sku):
+    """A ledger-only style becomes a platform item only when it looks like a style number
+    (letters/digits, at least one digit, 6+ characters): never "TBD" or "SEE PO"."""
+    s = str(sku or '').strip().upper()
+    return bool(re.fullmatch(r'[A-Z0-9][A-Z0-9-]{5,}', s)) and any(ch.isdigit() for ch in s)
 
 
 def _vd_new_item(sku, brand, units):
@@ -3437,7 +3453,7 @@ def _vd_apply_items(items):
         return list(items or []), None, 'vd:off'
     with _vd_lock:
         by_style, brands, version = dict(_vd_state['by_style']), dict(_vd_state['brands']), _vd_state['version']
-    out, rep = _vdf.apply_incoming(items, by_style, brands, _vd_new_item, _vd_brand_fix_for(items))
+    out, rep = _vdf.apply_incoming(items, by_style, brands, _vd_new_item, _vd_brand_fix_for(items), _vd_style_ok)
     with _vd_lock:
         _vd_state['items_report'] = {k: v for k, v in rep.items() if not k.endswith('_styles')}
     print(f"  ✓ Incoming from Versa Docs: {rep['incoming_before']:,} -> {rep['incoming_after']:,} units; "
@@ -3472,6 +3488,7 @@ def _vd_health():
                 'version': _vd_state['version'], 'lines': _vd_state['count'], 'units': _vd_state['units'],
                 'generated_at': _vd_state['generated_at'], 'saved_at': _vd_state['saved_at'],
                 'last_refresh': _vd_state['last_refresh'], 'error': _vd_state['error'],
+                'last_contact': _vdf.read_contact(), 'pending_drop': _vd_state.get('pending_drop'),
                 'items': _vd_state['items_report']}
 
 
@@ -3489,9 +3506,11 @@ def versa_docs_production_refresh():
     now = time.time()
     with _vd_lock:
         known, prev = _vd_state['version'], _vd_state['feed']
-        if now - (_vd_state['last_fetch_at'] or 0) < _VD_MIN_GAP:
-            return jsonify({'ok': True, 'changed': False, 'skipped': 'refreshed moments ago', **_vd_health()})
-        _vd_state['last_fetch_at'] = now
+        too_soon = now - (_vd_state['last_fetch_at'] or 0) < _VD_MIN_GAP
+        if not too_soon:
+            _vd_state['last_fetch_at'] = now
+    if too_soon:   # answered outside the lock (it used to be answered inside it and froze the worker)
+        return jsonify({'ok': True, 'changed': False, 'skipped': 'refreshed moments ago', **_vd_health()})
     was_active = _vd_active()
     try:
         feed = _vdf.fetch(http_requests, VERSA_DOCS_SUPABASE_URL, VERSA_DOCS_SUPABASE_ANON, token,
@@ -3502,19 +3521,44 @@ def versa_docs_production_refresh():
             _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': False, 'error': e.code}
         print(f"  ⚠ Versa Docs feed: refresh failed: {e.code} {e.detail}", flush=True)
         return jsonify({'ok': False, 'error': e.code}), 502
+    _vdf.touch_contact()
     if feed.get('unchanged'):
         with _vd_lock:
             _vd_state['error'] = ''
+            _vd_state['pending_drop'] = None
             _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': True, 'changed': False}
         return jsonify({'ok': True, 'changed': False, **_vd_health()})
     ok, reason = _vdf.validate(feed, prev)
+    if not ok and prev is not None and reason.startswith(('lines_dropped', 'units_dropped')):
+        if not feed.get('platform_on'):
+            ok, reason = True, 'taken (switch off): ' + reason
+        else:
+            with _vd_lock:
+                pend = _vd_state.get('pending_drop')
+                if not pend:
+                    pend = _vd_state['pending_drop'] = {'since': now, 'reason': reason}
+                waited = now - pend['since']
+            if waited >= _VD_DROP_CONFIRM_SECONDS:
+                ok, reason = True, f'taken after {int(waited // 60)} minutes of the same drop: ' + reason
+    if ok:
+        with _vd_lock:
+            _vd_state['pending_drop'] = None
     if not ok:
         with _vd_lock:
             _vd_state['error'] = 'refused: ' + reason
             _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': False, 'error': reason}
         print(f"  ⚠ Versa Docs feed REFUSED ({reason}); keeping the last good feed", flush=True)
         return jsonify({'ok': False, 'error': reason}), 422
-    _vdf.save(feed)
+    try:
+        _vdf.save(feed)
+    except Exception as e:
+        with _vd_lock:
+            _vd_state['error'] = f'save failed: {type(e).__name__}'
+            _vd_state['last_refresh'] = {'at': datetime.utcnow().isoformat() + 'Z', 'ok': False, 'error': 'save failed'}
+        print(f"  ⚠ Versa Docs feed: could not save: {type(e).__name__}: {e}", flush=True)
+        return jsonify({'ok': False, 'error': 'save failed'}), 500
+    if reason != 'ok':
+        print(f"  ℹ Versa Docs feed {reason}", flush=True)
     _vd_sync_state()
     s = _vdf.summary(feed)
     with _vd_lock:
@@ -3547,6 +3591,49 @@ def _vd_storage_prefixes():
     return tuple(sorted(h.rstrip('/') + '/storage/v1/object/sign/ledger-live/'
                         for h in {VERSA_DOCS_SUPABASE_URL, 'https://krgvaxvbekqhtjpyexpn.supabase.co'}))
 _VD_DBX_MAX_BYTES = 25 * 1024 * 1024
+_VD_NAME_PREFIX = {'FY1_Production_Style_Ledger.xlsx': 'TF', 'NB_Production_Style_Ledger.xlsx': 'NB',
+                   'PC_Production_Style_Ledger.xlsx': 'PC', 'DavidPeng_Production_Style_Ledger.xlsx': 'DP',
+                   'Frank_Production_Style_Ledger.xlsx': 'FR', 'Najmul_Production_Style_Ledger.xlsx': 'NK'}
+
+
+def _vd_link_ok(url, name):
+    """True only for https://<Versa Docs host>/storage/v1/object/sign/ledger-live/<PREFIX>/<name>?token=..."""
+    from urllib.parse import urlsplit
+    raw = str(url or '')
+    low = raw.lower()
+    if any(x in low for x in ('..', '\\', '%2e', '%2f', '%5c', '@')):
+        return False
+    try:
+        u = urlsplit(raw)
+    except ValueError:
+        return False
+    if u.scheme != 'https' or u.port is not None or u.fragment:
+        return False
+    hosts = {h.rstrip('/') for h in (VERSA_DOCS_SUPABASE_URL, 'https://krgvaxvbekqhtjpyexpn.supabase.co')}
+    if f'https://{u.netloc}' not in hosts:
+        return False
+    pfx = _VD_NAME_PREFIX.get(name)
+    return bool(pfx) and u.path == f'/storage/v1/object/sign/ledger-live/{pfx}/{name}' and u.query.startswith('token=')
+
+
+def _vd_download_capped(url):
+    """(status, bytes or b''): no redirects, stops reading past the size cap."""
+    r = http_requests.get(url, timeout=60, allow_redirects=False, stream=True)
+    try:
+        if r.status_code != 200:
+            return r.status_code, b''
+        chunks, total = [], 0
+        for chunk in r.iter_content(65536):
+            total += len(chunk)
+            if total > _VD_DBX_MAX_BYTES:
+                return r.status_code, b''
+            chunks.append(chunk)
+        return r.status_code, b''.join(chunks)
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
 
 
 def _vd_dropbox_upload(path, data):
@@ -3597,20 +3684,19 @@ def versa_docs_dropbox_sync():
         if name not in VD_LEDGER_FILE_NAMES:
             res['error'] = 'unknown file name'
             continue
-        if not url.startswith(_vd_storage_prefixes()):
+        if not _vd_link_ok(url, name):
             res['error'] = 'not a Versa Docs storage link'
             continue
         if not re.fullmatch(r'[0-9a-f]{64}', want):
             res['error'] = 'sha256 missing'
             continue
         try:
-            r = http_requests.get(url, timeout=60)
+            status, data = _vd_download_capped(url)
         except Exception as e:
             res['error'] = f'download failed: {type(e).__name__}'
             continue
-        data = r.content if r.status_code == 200 else b''
-        if not data or len(data) > _VD_DBX_MAX_BYTES or not data.startswith(b'PK'):
-            res['error'] = f'download failed ({r.status_code})'
+        if not data or not data.startswith(b'PK'):
+            res['error'] = f'download failed ({status})'
             continue
         if hashlib.sha256(data).hexdigest() != want:
             res['error'] = 'sha256 mismatch'

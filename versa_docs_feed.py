@@ -135,6 +135,25 @@ def save(feed, folder=None):
     return feed_path(folder)
 
 
+def touch_contact(folder=None):
+    """Remember (on the shared disk) that Versa Docs answered just now."""
+    try:
+        folder = folder or FEED_DIR
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, 'last_contact.txt'), 'w', encoding='utf-8') as fh:
+            fh.write(datetime.utcnow().isoformat() + 'Z')
+    except OSError:
+        pass
+
+
+def read_contact(folder=None):
+    try:
+        with open(os.path.join(folder or FEED_DIR, 'last_contact.txt'), encoding='utf-8') as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
 def file_stamp(folder=None):
     """(mtime_ns, size) of the saved feed, or None when there is none."""
     try:
@@ -163,14 +182,33 @@ def _dt(v):
         return None
 
 
+def _f_column(l):
+    """Column F as the master had it: the ETD date; else an FOB marker typed in ETD ("FOB ...",
+    "be ready"), which the row builder turns into an FOB lot; else the Ex-Factory date (David:
+    ex-factory = ETD when filled, else Ex-Factory); else whatever text either cell holds ("TBD",
+    "PENDING"), which the row builder treats as no firm date."""
+    d = _dt(l.get('etd_col'))
+    if d:
+        return d
+    etd_text = str(l.get('etd_text') or '').strip()
+    up = etd_text.upper()
+    if etd_text and ('FOB' in up or 'READY' in up):
+        return etd_text
+    d = _dt(l.get('ex_factory'))
+    if d:
+        return d
+    return etd_text or str(l.get('exf_text') or '').strip() or _dt(l.get('etd'))
+
+
 def ledger_tuples(feed):
     """Each line in the master Style Ledger's column order, A to I:
     Production#, PO Name, Style, Units, Brand, F ETD, G port arrival, H Shipment #, I Warehouse.
     F = the ledger's ETD when filled, else its Ex-Factory date (David's rule); G = its ETA column."""
     out = []
     for l in (feed or {}).get('lines') or []:
+        f_col = _f_column(l)
         out.append((l.get('production') or '', l.get('po_name') or '', str(l.get('style') or '').strip().upper(),
-                    units_of(l), l.get('brand') or '', _dt(l.get('etd')), _dt(l.get('eta')),
+                    units_of(l), l.get('brand') or '', f_col, _dt(l.get('eta')),
                     l.get('shipment') or '', l.get('warehouse') or ''))
     return out
 
@@ -199,7 +237,7 @@ def brand_by_style(feed):
     return {k: v[0] for k, v in best.items()}
 
 
-def apply_incoming(items, by_style, brands, new_item, brand_fix=None):
+def apply_incoming(items, by_style, brands, new_item, brand_fix=None, style_ok=None):
     """Inventory items with Versa Docs as the only source of incoming production.
 
     For every item: incoming becomes the ledger's open units for its style (0 when the
@@ -207,7 +245,8 @@ def apply_incoming(items, by_style, brands, new_item, brand_fix=None):
     committed and allocated stay exactly as the hourly file had them. An item left with
     no warehouse stock, no incoming, nothing committed and nothing allocated is dropped
     (only the old incoming kept it on the platform). A style on the ledger that the
-    hourly file does not list is added as an incoming-only item built by new_item(sku, brand).
+    hourly file does not list is added as an incoming-only item built by new_item(sku, brand, units),
+    when style_ok(sku) agrees it is a real style number.
     Returns (items, report). Pure: the inputs are never changed."""
     report = {'styles': 0, 'changed': 0, 'added': 0, 'dropped': 0, 'incoming_before': 0,
               'incoming_after': 0, 'added_styles': [], 'dropped_styles': []}
@@ -242,6 +281,8 @@ def apply_incoming(items, by_style, brands, new_item, brand_fix=None):
         out.append(it)
     for sku in sorted(by_style):
         if sku in seen or by_style[sku] <= 0:
+            continue
+        if style_ok and not style_ok(sku):
             continue
         b = brands.get(sku) or ''
         if brand_fix:
