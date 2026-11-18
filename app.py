@@ -3526,6 +3526,99 @@ def versa_docs_production_refresh():
     return jsonify({'ok': True, 'changed': True, **_vd_health()})
 
 
+# ── Versa Docs -> Dropbox: the live Excel copy of each factory ledger ─────────
+# David, Nov 18 2026: "create an hourly sync to dropbox to update the master style
+# ledgers (following the same format) to match whats on versa docs, this way we have
+# an updated live excel sheet there". Versa Docs' hourly function builds each changed
+# factory's workbook with the same writer as its Export button, stores it in its
+# private storage and calls this route (signed in as its alerts bot) with short-lived
+# signed links. This route downloads them from Versa Docs storage only, checks each
+# file's SHA-256 and writes it into ONE Dropbox folder under the six known names.
+# The folder is a separate "Versa Docs Live" folder until everyone edits in Versa Docs
+# (the team still edits the originals): VD_DROPBOX_FOLDER on Render can point it at
+# /Production_Style_Ledger itself later.
+VD_DROPBOX_FOLDER = os.environ.get('VD_DROPBOX_FOLDER', '/Production_Style_Ledger/Versa Docs Live').rstrip('/')
+VD_LEDGER_FILE_NAMES = frozenset({
+    'FY1_Production_Style_Ledger.xlsx', 'NB_Production_Style_Ledger.xlsx', 'PC_Production_Style_Ledger.xlsx',
+    'DavidPeng_Production_Style_Ledger.xlsx', 'Frank_Production_Style_Ledger.xlsx',
+    'Najmul_Production_Style_Ledger.xlsx'})
+def _vd_storage_prefixes():
+    """Signed links into Versa Docs' private ledger-live storage, on either of its hosts."""
+    return tuple(sorted(h.rstrip('/') + '/storage/v1/object/sign/ledger-live/'
+                        for h in {VERSA_DOCS_SUPABASE_URL, 'https://krgvaxvbekqhtjpyexpn.supabase.co'}))
+_VD_DBX_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _vd_dropbox_upload(path, data):
+    """(ok, code): write one file to Dropbox, replacing what is there."""
+    token = get_dropbox_token()
+    if not token:
+        return False, 'no_dropbox_token'
+    try:
+        r = http_requests.post('https://content.dropboxapi.com/2/files/upload', headers={
+            'Authorization': f'Bearer {token}', 'Content-Type': 'application/octet-stream',
+            'Dropbox-API-Arg': json.dumps({'path': path, 'mode': 'overwrite', 'autorename': False, 'mute': True})},
+            data=data, timeout=120)
+    except Exception as e:
+        return False, f'dropbox_unreachable: {type(e).__name__}'
+    if r.status_code == 200:
+        return True, 'ok'
+    txt = (r.text or '')[:300]
+    if 'missing_scope' in txt or r.status_code == 401:
+        return False, 'dropbox_no_write_access'
+    return False, f'dropbox_http_{r.status_code}: {txt[:120]}'
+
+
+@app.route('/production/versa-docs/dropbox-sync', methods=['POST', 'OPTIONS'])
+def versa_docs_dropbox_sync():
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    ident = _request_identity()
+    if not ident or ident.get('tier') != 'staff':
+        return jsonify({'ok': False, 'error': 'An office sign-in is required.'}), 401
+    body = request.get_json(silent=True) or {}
+    files = body.get('files') if isinstance(body.get('files'), list) else []
+    if not files or len(files) > 12:
+        return jsonify({'ok': False, 'error': 'files: 1 to 12 entries'}), 400
+    out = []
+    for f in files:
+        f = f if isinstance(f, dict) else {}
+        name = str(f.get('name') or '')
+        url = str(f.get('url') or '')
+        want = str(f.get('sha256') or '').lower()
+        res = {'name': name, 'ok': False}
+        out.append(res)
+        if name not in VD_LEDGER_FILE_NAMES:
+            res['error'] = 'unknown file name'
+            continue
+        if not url.startswith(_vd_storage_prefixes()):
+            res['error'] = 'not a Versa Docs storage link'
+            continue
+        if not re.fullmatch(r'[0-9a-f]{64}', want):
+            res['error'] = 'sha256 missing'
+            continue
+        try:
+            r = http_requests.get(url, timeout=60)
+        except Exception as e:
+            res['error'] = f'download failed: {type(e).__name__}'
+            continue
+        data = r.content if r.status_code == 200 else b''
+        if not data or len(data) > _VD_DBX_MAX_BYTES or not data.startswith(b'PK'):
+            res['error'] = f'download failed ({r.status_code})'
+            continue
+        if hashlib.sha256(data).hexdigest() != want:
+            res['error'] = 'sha256 mismatch'
+            continue
+        ok, code = _vd_dropbox_upload(f'{VD_DROPBOX_FOLDER}/{name}', data)
+        res.update(ok=ok, bytes=len(data), path=f'{VD_DROPBOX_FOLDER}/{name}')
+        if not ok:
+            res['error'] = code
+    good = sum(1 for r in out if r['ok'])
+    print(f"  ✓ Versa Docs ledgers to Dropbox: {good}/{len(out)} written to {VD_DROPBOX_FOLDER}"
+          + ''.join(f"; {r['name']}: {r.get('error')}" for r in out if not r['ok']), flush=True)
+    return jsonify({'ok': good == len(out), 'written': good, 'folder': VD_DROPBOX_FOLDER, 'files': out}), (200 if good else 502)
+
+
 def _factory_hold_overview():
     """What the admin hold panel shows: every known factory with its ledger
     footprint, which are held, and the allocations that sit on hidden styles."""

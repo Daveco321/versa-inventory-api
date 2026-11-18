@@ -318,3 +318,77 @@ class FeedRouteTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DropboxCopyTests(unittest.TestCase):
+    """POST /production/versa-docs/dropbox-sync: only known ledger names, only Versa Docs
+    storage links, SHA-256 checked, one fixed Dropbox folder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = load_app()
+        cls.client = cls.a.app.test_client()
+
+    def setUp(self):
+        import hashlib
+        a = self.a
+        self.data = b'PK\x03\x04' + b'zz-ledger' * 50
+        self.sha = hashlib.sha256(self.data).hexdigest()
+        self.uploads = []
+        self.upload_status = 200
+        test = self
+
+        class Http:
+            def get(self, url, timeout=None):
+                return type('R', (), {'status_code': 200, 'content': test.data, 'text': ''})()
+
+            def post(self, url, headers=None, data=None, json=None, timeout=None):
+                test.uploads.append({'url': url, 'arg': headers.get('Dropbox-API-Arg'), 'bytes': data})
+                body = '{"error_summary": "missing_scope/"}' if test.upload_status != 200 else '{}'
+                return type('R', (), {'status_code': test.upload_status, 'text': body})()
+
+        self.ident = {'tier': 'staff', 'is_admin': False, 'email': 'zz@example.test'}
+        self._saved = (a.http_requests, a._request_identity, a.get_dropbox_token)
+        a.http_requests = Http()
+        a._request_identity = lambda: self.ident
+        a.get_dropbox_token = lambda: 'zz-token'
+        self.url = a._vd_storage_prefixes()[0] + 'TF/FY1_Production_Style_Ledger.xlsx?token=zz'
+
+    def tearDown(self):
+        a = self.a
+        a.http_requests, a._request_identity, a.get_dropbox_token = self._saved
+
+    def post(self, files):
+        return self.client.post('/production/versa-docs/dropbox-sync', json={'files': files})
+
+    def test_office_sign_in_only(self):
+        self.ident = {'tier': 'factory', 'prefix': 'TF'}
+        self.assertEqual(self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': self.sha}]).status_code, 401)
+        self.assertEqual(self.uploads, [])
+
+    def test_good_file_is_written_to_the_one_folder(self):
+        a = self.a
+        r = self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': self.sha}])
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(len(self.uploads), 1)
+        arg = json.loads(self.uploads[0]['arg'])
+        self.assertEqual(arg['path'], a.VD_DROPBOX_FOLDER + '/FY1_Production_Style_Ledger.xlsx')
+        self.assertEqual(arg['mode'], 'overwrite')
+        self.assertEqual(self.uploads[0]['bytes'], self.data)
+
+    def test_refusals(self):
+        r = self.post([
+            {'name': '../evil.xlsx', 'url': self.url, 'sha256': self.sha},
+            {'name': 'NB_Production_Style_Ledger.xlsx', 'url': 'https://example.test/x.xlsx', 'sha256': self.sha},
+            {'name': 'PC_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': '0' * 64},
+            {'name': 'Frank_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': 'nope'}])
+        self.assertEqual(r.status_code, 502)
+        errs = [f['error'] for f in r.get_json()['files']]
+        self.assertEqual(errs, ['unknown file name', 'not a Versa Docs storage link', 'sha256 mismatch', 'sha256 missing'])
+        self.assertEqual(self.uploads, [])
+
+    def test_no_write_access_is_reported(self):
+        self.upload_status = 401
+        r = self.post([{'name': 'FY1_Production_Style_Ledger.xlsx', 'url': self.url, 'sha256': self.sha}])
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.get_json()['files'][0]['error'], 'dropbox_no_write_access')
