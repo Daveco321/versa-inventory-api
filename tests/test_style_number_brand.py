@@ -63,6 +63,8 @@ class StyleNumberBrand(unittest.TestCase):
         self.assertEqual(f('ZZGBPJ013SLM', 'GB'), 'GB')      # a key the platform does not know: as typed
         self.assertEqual(f('ZVDNP003C', 'VD'), 'VD')
         self.assertEqual(f('ZZDKPK001SLS', ''), '')
+        self.assertEqual(f('ZZNASU207SLS', '### UNKNOWN ###'), 'NAUTICA')   # the file's placeholder gives way
+        self.assertEqual(f('ZVDNP003C', '### UNKNOWN ###'), '### UNKNOWN ###')   # nothing names it: as typed
 
     def test_parse_refiles_and_merges(self):
         items = self.app.parse_inventory_excel(xlsx([
@@ -140,6 +142,34 @@ class StyleNumberBrand(unittest.TestCase):
         }}
         by = {l['style']: l['brand'] for l in fs.parse_tracker(snap)['lines']}
         self.assertEqual(by, {'ZZDKPK001SLS': 'DKNY', 'ZZGBPJ013SLM': 'GB'})
+
+    def test_unknown_copy_merges(self):
+        # Nov 19 2026: a style had a '### UNKNOWN ###' copy holding part of its incoming and
+        # repeating its committed / allocated (synthetic numbers, the real shape)
+        items = self.app.parse_inventory_excel(xlsx([
+            row('ZZNASU207SLS', '### UNKNOWN ###', incoming=800, committed=-2250, allocated=-4750),
+            row('ZZNASU207SLS', 'NAUTICA', incoming=5300, jtw=8500, tr=800, committed=-2250, allocated=-4750,
+                container='ZZCU0000001', lot='ZZ-NAU-SUPERSHIRT', received='03-18-2026'),
+            row('99ZZ75301', '### UNKNOWN ###', incoming=5),
+            row('99ZZ75301', 'BEN', jtw=13),
+            row('99ZZ75302', '### UNKNOWN ###', incoming=7),
+        ]))
+        by = {}
+        for it in items:
+            by.setdefault(it['sku'], []).append(it)
+        self.assertEqual(len(items), 3)
+        na = by['ZZNASU207SLS']
+        self.assertEqual(len(na), 1)
+        na = na[0]
+        self.assertEqual((na['brand'], na['brand_abbr'], na['brand_full']), ('NAUTICA', 'NAUTICA', 'Nautica'))
+        self.assertEqual((na['jtw'], na['tr'], na['incoming']), (8500, 800, 6100))
+        self.assertEqual((na['committed'], na['allocated']), (-2250, -4750))
+        self.assertEqual(na['total_ats'], 8500 + 800 + 6100 - 2250 - 4750)   # the orders taken off once
+        self.assertEqual(na['container'], 'ZZCU0000001')
+        ben = by['99ZZ75301']
+        self.assertEqual(len(ben), 1)
+        self.assertEqual((ben[0]['brand'], ben[0]['jtw'], ben[0]['incoming'], ben[0]['name']), ('BEN', 13, 5, 'BEN 99ZZ75301'))
+        self.assertEqual(by['99ZZ75302'][0]['brand'], '### UNKNOWN ###')   # no real copy: left as it is
 
     def test_different_brands_stay_apart(self):
         # a legacy number under two brands: nothing settles it, both rows stay

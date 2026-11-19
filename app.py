@@ -5624,13 +5624,25 @@ def _style_number_brand(sku):
     return SKU_BRAND_CODE_MAP.get(code) or _STYLE_NO_BRAND_EXTRA.get(code, '')
 
 
+def _placeholder_brand(brand):
+    """The hourly file's stand-in for a style it has no brand for: '### UNKNOWN ###'. On Nov 19
+    2026 two styles each had a second copy filed under it (holding part of their incoming and
+    repeating the style's committed and allocated), so both apps showed two cards and took the
+    style's orders off twice."""
+    b = str(brand or '').strip().upper()
+    return 'UNKNOWN' in b or '#' in b
+
+
 def _brand_by_style_number(sku, brand):
-    """A known brand that disagrees with the style number gives way to it. Feed keys
-    the platform does not know (NM, KLP, RB...) are left as they are: the frontends
-    already read the style number for those."""
+    """A known brand that disagrees with the style number gives way to it, and so does the
+    file's '### UNKNOWN ###' placeholder (a copy filed under it never merged with the style's
+    real row). Feed keys the platform does not know (NM, KLP, RB...) are left as they are: the
+    frontends already read the style number for those."""
     named = _style_number_brand(sku)
     b = str(brand or '').strip().upper()
-    return named if named and named != b and b in BRAND_FULL_NAMES else brand
+    if not named or named == b:
+        return brand
+    return named if (b in BRAND_FULL_NAMES or _placeholder_brand(b)) else brand
 
 
 def _merge_duplicate_rows(items):
@@ -5641,6 +5653,18 @@ def _merge_duplicate_rows(items):
     fields come from the row holding the most stock."""
     out, first_of, lot_wh = [], {}, {}
     wh_keys = ('jtw', 'tr', 'dcw', 'qa', 'nj', 'abfi')
+    # A copy under the file's '### UNKNOWN ###' placeholder joins the style's real-brand copy,
+    # also when the style number names no brand (a modern number already took its brand).
+    real = {}
+    for it in items:
+        if not _placeholder_brand(it['brand']):
+            real.setdefault(it['sku'].upper(), it['brand'])
+    for it in items:
+        b = real.get(it['sku'].upper())
+        if b and _placeholder_brand(it['brand']):
+            it['brand'] = it['brand_abbr'] = b
+            it['brand_full'] = BRAND_FULL_NAMES.get(b, b)
+            it['name'] = f"{b} {it['sku']}"
     for it in items:
         key = (it['sku'].upper(), it['brand'])
         m = first_of.get(key)
