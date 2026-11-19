@@ -997,29 +997,6 @@ def _production_row_from_ledger(row):
     return rec
 
 
-_PROD_ROW_KEY_FIELDS = ('production', 'poName', 'style', 'brand', 'etd', 'etd_raw', 'arrival', 'port_dated',
-                        'fob_flag', 'fob_note', 'shipmentNo', 'warehouse', 'fob_pickup')
-
-
-def _merge_identical_rows(rows):
-    """Ledger lines that agree on every field except units (a style split into equal rows, or
-    FOB PO breaks with no dates) become one lot with the units added, so a catalog never shows
-    the same card twice (Nov 18 2026 audit). Totals and every other field are unchanged."""
-    out, idx = [], {}
-    for r in rows or []:
-        k = tuple(r.get(f) for f in _PROD_ROW_KEY_FIELDS)
-        i = idx.get(k)
-        if i is None:
-            idx[k] = len(out)
-            out.append(dict(r))
-        else:
-            try:
-                out[i]['units'] = int(out[i].get('units') or 0) + int(r.get('units') or 0)
-            except (TypeError, ValueError):
-                pass
-    return out
-
-
 def load_production_from_dropbox():
     """Load Style Ledger xlsx from Dropbox — picks the first .xlsx in the folder.
     Caches result in memory; returns cached data if under 1 hour old."""
@@ -1112,7 +1089,6 @@ def load_production_from_dropbox():
             if rec is not None:
                 results.append(rec)
         wb.close()
-        results = _merge_identical_rows(results)
 
         # Factory holds (Oct 1 2026): the full ledger is kept for factory
         # accounts and the admin hold panel; everyone else gets the filtered one.
@@ -3397,8 +3373,7 @@ def _vd_production_rows():
     if feed is None:
         return None
     if rows_all is None:
-        rows_all = _merge_identical_rows(
-            [r for r in (_production_row_from_ledger(t) for t in _vdf.ledger_tuples(feed)) if r is not None])
+        rows_all = [r for r in (_production_row_from_ledger(t) for t in _vdf.ledger_tuples(feed)) if r is not None]
         with _vd_lock:
             if _vd_state['version'] == version:
                 _vd_state['rows_all'] = rows_all
