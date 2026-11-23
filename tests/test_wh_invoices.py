@@ -85,11 +85,28 @@ def setup_hooks(items=None):
                      'inventory_items': lambda: list(items or []), 'base_style': lambda s: str(s).split('-')[0]})
     with W._cfg_lock:
         W._cfg_cache.update(at=0.0, data=None)
+    W._DEFAULT_CONFIG_SAVED = getattr(W, '_DEFAULT_CONFIG_SAVED', dict(W._DEFAULT_CONFIG))
+    W._DEFAULT_CONFIG.update(W._DEFAULT_CONFIG_SAVED)
     return s3
 
 
 def cfg():
     return W._load_config(force=True)
+
+
+class PauseTests(unittest.TestCase):
+    def test_mailbox_ships_paused_and_reads_nothing(self):
+        s3 = setup_hooks()
+        self.assertFalse(cfg()['enabled'])
+        called = []
+        W._HOOKS['agent_client'] = lambda: called.append(1)
+        old_fetch = EA._fetch_received
+        EA._fetch_received = lambda *a, **k: called.append(2) or {}
+        self.addCleanup(lambda: setattr(EA, '_fetch_received', old_fetch))
+        out = W._handle({'data': {'email_id': 'z-paused', 'from': 'a@z.test', 'subject': 'bill'}})
+        self.assertEqual(out['entry']['status'], 'skipped')
+        self.assertEqual(called, [], 'nothing is fetched or read while paused')
+        self.assertTrue(W.wants({'to': ['whconfirmation@z.test']}), 'still routed away from the assistant')
 
 
 def ctx(ledger=None, items=None, email_id='z-email-1'):

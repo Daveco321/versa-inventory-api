@@ -313,7 +313,11 @@ def _s3_delete(key):
 
 # ── Config ───────────────────────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
-    'enabled': True,
+    # PAUSED by David, Nov 23 2026 ("pause this for now so im not getting
+    # charged"). Off = every email to the mailbox is skipped before anything is
+    # read, so no AI cost. Resume with POST /wh-invoices/config {"enabled": true}
+    # (machine key or an admin session), then recreate his Gmail filter.
+    'enabled': False,
     'local_parts': list(_LOCAL_PARTS),
     # Empty = the inventory mailbox's notify list (David). Set it with POST /wh-invoices/config.
     'report_to': [],
