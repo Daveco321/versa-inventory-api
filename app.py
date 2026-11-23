@@ -12146,6 +12146,9 @@ _AUTHZ_OPEN_PREFIXES = ('/image/', '/mcp', '/factory-view', '/factory-report',
                         # allow-list — an unsigned POST never reaches the agent
                         # (email_agent.py). /inbound-email/status is machine-key only.
                         '/inbound-email',
+                        # inline auth: the machine key or an ADMIN Versa-Docs session
+                        # (wh_invoices.py). The mail itself arrives via /inbound-email.
+                        '/wh-invoices',
                         '/sportswear-match/', '/catalog/')
 # GET endpoints a customer catalog page needs. Anonymous access requires a valid
 # catalog_slug and the response is scoped; staff/machine/oo tiers get them full.
@@ -24587,6 +24590,27 @@ try:
                           caller_identity=_caller_identity)
 except Exception as _email_agent_err:
     print(f'[EmailAgent] NOT registered: {_email_agent_err}', flush=True)
+
+
+# ── Warehouse invoice check: the whconfirmation@ mailbox (Nov 23 2026) ───────
+# David: "an email agent that will confirm my warehouse invoices ... basically
+# automated so I dont have to type anything". wh_invoices.py reads every bill
+# sent or forwarded to the mailbox (Transcal, DCW, JTW, Junction, Quetico),
+# checks it and emails David the result. It reads warehouse stock from the
+# inventory feed (pallets billed vs units on hand, containers) and the A2000
+# order-book backups in S3; it writes nothing outside its own sealed prefix.
+def _wh_inventory_items():
+    with _inv_lock:
+        return list(_inventory.get('items') or [])
+
+
+try:
+    import wh_invoices
+    wh_invoices.register_wh_routes(app, get_s3=get_s3, s3_bucket=S3_BUCKET, agent_client=_ai_agent_client,
+                                   machine_key=INVENTORY_API_KEY, caller_identity=_caller_identity,
+                                   inventory_items=_wh_inventory_items, base_style=_ai_agent_base)
+except Exception as _wh_err:
+    print(f'[WHInvoices] NOT registered: {_wh_err}', flush=True)
 
 
 # ── Missing Image and Mismatch Report (Monday email, Oct 15 2026) ───────────

@@ -89,6 +89,17 @@ _runs = deque(maxlen=_RUN_LOG_MAX)
 
 _HOOKS = {}                       # filled by register_email_routes
 
+# Other mailboxes on the same inbound domain (Nov 23 2026). Resend posts EVERY
+# email the domain receives to /inbound-email. A module that owns an address
+# registers here; the webhook hands it the emails addressed to it (after the
+# signature check) and the inventory assistant never sees them. Everything not
+# claimed is the inventory assistant's, exactly as before.
+_MAILBOXES = []                   # [(name, wants(data) -> bool, accept(event) -> str)]
+
+
+def add_mailbox(name, wants, accept):
+    _MAILBOXES[:] = [m for m in _MAILBOXES if m[0] != name] + [(name, wants, accept)]
+
 
 # ── Where this module's objects live, and how they are protected ─────────────
 def _secret():
@@ -1140,6 +1151,17 @@ def register_email_routes(app, *, get_s3, s3_bucket, agent_client, agent_run,
             return jsonify({'error': 'bad payload'}), 400
         if str(event.get('type') or '') != 'email.received':
             return jsonify({'ok': True, 'ignored': event.get('type')}), 200
+        # Another mailbox's email goes to it, before this mailbox's own
+        # switch is read: the inventory mailbox being off must not silence it.
+        for box_name, box_wants, box_accept in list(_MAILBOXES):
+            if box_wants(event.get('data') or {}):
+                try:
+                    return jsonify({'ok': True, 'mailbox': box_name, 'result': box_accept(event)}), 200
+                except Exception as e:
+                    # 500 so Svix delivers it again later; never fall through
+                    # to the inventory assistant with someone else's email.
+                    print(f'[EmailAgent] mailbox {box_name} could not take an email: {e}', flush=True)
+                    return jsonify({'error': f'{box_name} unavailable'}), 500
         cfg = _load_config()
         if not cfg.get('enabled', True):
             return jsonify({'ok': True, 'ignored': 'disabled'}), 200
