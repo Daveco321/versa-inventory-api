@@ -4803,6 +4803,127 @@ def _drop_sized_rows(rows):
         return rows
     return [r for r in rows if not (isinstance(r, dict) and _is_sized_sku(r.get('sku')))]
 
+def _prepack_rule_match(item, prepack_defaults):
+    """The prepack rule an item annotated by _annotate_items_for_prepack falls under, or None.
+    PRIORITY B (a rule naming the SKU, its base style or a prefix of it) wins, then PRIORITY C
+    (two-tier dimension scoring, mirrors the frontend matchPrepackDefault). The per-item Override
+    Tool pack (PRIORITY A, item["_override_size_pack"]) is the caller's to check first.
+    Shared by the export size grids (_add_size_charts) and the Amazon agent's cartons, so both
+    read a style's pack the same way. Moved here verbatim from _add_size_charts (Nov 2026)."""
+    cat = item.get('_export_category', '')
+    fit = item.get('_export_fit', '')
+    cust = item.get('_export_customer', '')
+    sku = item.get('sku', '').upper()
+    base = sku.split('-')[0]
+    prepack_defaults = prepack_defaults or []
+    # PRIORITY B: SKU-specific assignment on any prepack rule
+    sku_matched = None
+    for rule in prepack_defaults:
+        # 'sk', not 's' — 's' is the red subtitle cell format defined above;
+        # shadowing it made every "SIZE SCALE TO USE" row silently disappear.
+        for sk in (rule.get('skus') or []):
+            su = sk.upper().strip()
+            if su and (su == sku or su == base or sku.startswith(su)):
+                sku_matched = rule
+                break
+        if sku_matched:
+            break
+
+    matched = sku_matched
+    if not matched:
+        # PRIORITY C: Dimension matching — mirrors frontend matchPrepackDefault().
+        # Two-tier scoring:
+        #   TIER A (🎯 Specific) = rule has a specific category AND specific fabrics
+        #   TIER B (☂️ Umbrella) = everything else
+        # Within a tier, +1 per specified dimension (category, fit, customer, brand, fabrics)
+        # breaks ties. Ties within the same score fall back to list order (first wins).
+        brand_abbr = item.get('brand_abbr', item.get('brand', '')).upper()
+        best_fab_spec = -1  # 0 or 1: the primary tier flag
+        best_score    = -1  # secondary — dimension count within tier
+        best_rule     = None
+
+        # Extract fabric code from SKU (positions 4:6)
+        fab = base[4:6] if len(base) >= 6 else ''
+
+        for r in prepack_defaults:
+            # Skip rules that have a SKU list — they should ONLY match via Priority B (exact SKU),
+            # never act as a catch-all through dimension scoring
+            r_skus = r.get('skus') or []
+            if isinstance(r_skus, list) and len([s for s in r_skus if s and s.strip()]) > 0:
+                continue
+
+            # Category — use INCLUSIVE match so a BC Carpenter (which is pants+sportswear+young_men)
+            # can match a 'pants' rule, a 'sportswear' rule, OR a 'young_men' rule.
+            r_cat = r.get('category', 'any')
+            if r_cat and r_cat != 'any' and not _py_matches_category(sku, brand_abbr, r_cat, for_prepack=True):
+                continue
+
+            # Fits: if specified, item must match
+            r_fits = r.get('fits')
+            if isinstance(r_fits, list):
+                r_fits = [x for x in r_fits if x and x != 'any']
+            else:
+                legacy = r.get('fit', '')
+                r_fits = [legacy] if legacy and legacy != 'any' else []
+            if r_fits and fit not in r_fits:
+                continue
+
+            # Customers: if specified, item must match
+            r_custs = r.get('customers')
+            if isinstance(r_custs, list):
+                r_custs = [c.upper().strip() for c in r_custs if c and c.strip()]
+            else:
+                legacy_c = (r.get('customer') or '').strip()
+                r_custs = [legacy_c.upper()] if legacy_c else []
+            if r_custs and (not cust or cust.upper() not in r_custs):
+                continue
+
+            # Brands: if specified, item must match
+            r_brands = r.get('brands')
+            if isinstance(r_brands, list):
+                r_brands = [b.upper().strip() for b in r_brands if b and b.strip()]
+            else:
+                r_brands = []
+            if r_brands and (not brand_abbr or brand_abbr not in r_brands):
+                continue
+
+            # Fabrics: if specified, item's fabric code must match.
+            # (This match was missing on the backend — fabric-narrowed rules used
+            # to be silently ignored by server-side exports.)
+            r_fabs = r.get('fabrics')
+            if isinstance(r_fabs, list):
+                r_fabs = [f.upper().strip() for f in r_fabs if f and f.strip()]
+            else:
+                r_fabs = []
+            if r_fabs and (not fab or fab not in r_fabs):
+                continue
+
+            # Tier A (Specific) requires BOTH a specific category AND specific fabrics
+            is_specific = 1 if (r_cat and r_cat != 'any' and r_fabs) else 0
+
+            # Secondary score: weighted dimensions.
+            # Brand and customer count as +2 (harder constraints — "who the item is FOR"),
+            # everything else as +1 (softer constraints — "what the item IS").
+            # This means a brand-specific or customer-specific rule beats a rule that
+            # specifies only category + fit. Mirrors frontend matchPrepackDefault().
+            score = 0
+            if r_cat and r_cat != 'any': score += 1
+            if r_fits:                    score += 1
+            if r_custs:                   score += 2
+            if r_brands:                  score += 2
+            if r_fabs:                    score += 1
+
+            # Compare: tier first (primary), then dimension count
+            if (is_specific > best_fab_spec
+                    or (is_specific == best_fab_spec and score > best_score)):
+                best_fab_spec = is_specific
+                best_score    = score
+                best_rule     = r
+
+        matched = best_rule
+    return matched
+
+
 def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=None):
     """
     Render prepack size scale grids vertically at the bottom of the worksheet.
@@ -4857,111 +4978,7 @@ def _add_size_charts(workbook, worksheet, start, prepack_defaults=None, items=No
                     }
                 continue  # This item is handled — don't also add a prepack rule for it
 
-            # PRIORITY B: SKU-specific assignment on any prepack rule
-            sku_matched = None
-            for rule in prepack_defaults:
-                # 'sk', not 's' — 's' is the red subtitle cell format defined above;
-                # shadowing it made every "SIZE SCALE TO USE" row silently disappear.
-                for sk in (rule.get('skus') or []):
-                    su = sk.upper().strip()
-                    if su and (su == sku or su == base or sku.startswith(su)):
-                        sku_matched = rule
-                        break
-                if sku_matched:
-                    break
-
-            matched = sku_matched
-            if not matched:
-                # PRIORITY C: Dimension matching — mirrors frontend matchPrepackDefault().
-                # Two-tier scoring:
-                #   TIER A (🎯 Specific) = rule has a specific category AND specific fabrics
-                #   TIER B (☂️ Umbrella) = everything else
-                # Within a tier, +1 per specified dimension (category, fit, customer, brand, fabrics)
-                # breaks ties. Ties within the same score fall back to list order (first wins).
-                brand_abbr = item.get('brand_abbr', item.get('brand', '')).upper()
-                best_fab_spec = -1  # 0 or 1: the primary tier flag
-                best_score    = -1  # secondary — dimension count within tier
-                best_rule     = None
-
-                # Extract fabric code from SKU (positions 4:6)
-                fab = base[4:6] if len(base) >= 6 else ''
-
-                for r in prepack_defaults:
-                    # Skip rules that have a SKU list — they should ONLY match via Priority B (exact SKU),
-                    # never act as a catch-all through dimension scoring
-                    r_skus = r.get('skus') or []
-                    if isinstance(r_skus, list) and len([s for s in r_skus if s and s.strip()]) > 0:
-                        continue
-
-                    # Category — use INCLUSIVE match so a BC Carpenter (which is pants+sportswear+young_men)
-                    # can match a 'pants' rule, a 'sportswear' rule, OR a 'young_men' rule.
-                    r_cat = r.get('category', 'any')
-                    if r_cat and r_cat != 'any' and not _py_matches_category(sku, brand_abbr, r_cat, for_prepack=True):
-                        continue
-
-                    # Fits: if specified, item must match
-                    r_fits = r.get('fits')
-                    if isinstance(r_fits, list):
-                        r_fits = [x for x in r_fits if x and x != 'any']
-                    else:
-                        legacy = r.get('fit', '')
-                        r_fits = [legacy] if legacy and legacy != 'any' else []
-                    if r_fits and fit not in r_fits:
-                        continue
-
-                    # Customers: if specified, item must match
-                    r_custs = r.get('customers')
-                    if isinstance(r_custs, list):
-                        r_custs = [c.upper().strip() for c in r_custs if c and c.strip()]
-                    else:
-                        legacy_c = (r.get('customer') or '').strip()
-                        r_custs = [legacy_c.upper()] if legacy_c else []
-                    if r_custs and (not cust or cust.upper() not in r_custs):
-                        continue
-
-                    # Brands: if specified, item must match
-                    r_brands = r.get('brands')
-                    if isinstance(r_brands, list):
-                        r_brands = [b.upper().strip() for b in r_brands if b and b.strip()]
-                    else:
-                        r_brands = []
-                    if r_brands and (not brand_abbr or brand_abbr not in r_brands):
-                        continue
-
-                    # Fabrics: if specified, item's fabric code must match.
-                    # (This match was missing on the backend — fabric-narrowed rules used
-                    # to be silently ignored by server-side exports.)
-                    r_fabs = r.get('fabrics')
-                    if isinstance(r_fabs, list):
-                        r_fabs = [f.upper().strip() for f in r_fabs if f and f.strip()]
-                    else:
-                        r_fabs = []
-                    if r_fabs and (not fab or fab not in r_fabs):
-                        continue
-
-                    # Tier A (Specific) requires BOTH a specific category AND specific fabrics
-                    is_specific = 1 if (r_cat and r_cat != 'any' and r_fabs) else 0
-
-                    # Secondary score: weighted dimensions.
-                    # Brand and customer count as +2 (harder constraints — "who the item is FOR"),
-                    # everything else as +1 (softer constraints — "what the item IS").
-                    # This means a brand-specific or customer-specific rule beats a rule that
-                    # specifies only category + fit. Mirrors frontend matchPrepackDefault().
-                    score = 0
-                    if r_cat and r_cat != 'any': score += 1
-                    if r_fits:                    score += 1
-                    if r_custs:                   score += 2
-                    if r_brands:                  score += 2
-                    if r_fabs:                    score += 1
-
-                    # Compare: tier first (primary), then dimension count
-                    if (is_specific > best_fab_spec
-                            or (is_specific == best_fab_spec and score > best_score)):
-                        best_fab_spec = is_specific
-                        best_score    = score
-                        best_rule     = r
-
-                matched = best_rule
+            matched = _prepack_rule_match(item, prepack_defaults)
 
             if sized_label:
                 try:
@@ -12169,7 +12186,9 @@ _AUTHZ_MACHINE_EXTRA = {'/export-apo-brandcolor', '/apo-dollar-summary', '/expor
                         # P&L fee rates and the no-cost style list (Oct 6 2026; never a cost value)
                         '/admin/pnl-fees', '/admin/pnl-missing-costs',
                         # Missing Image and Mismatch Report, Monday email (Oct 15 2026)
-                        '/export-image-audit', '/admin/image-audit/status'}
+                        '/export-image-audit', '/admin/image-audit/status',
+                        # Amazon agent status (Nov 23 2026; counts and settings only)
+                        '/admin/amazon/status'}
 # POST endpoints a customer catalog page legitimately uses (Excel/PDF exports
 # of the already-scoped data the page holds). Anonymous access still requires
 # a valid catalog_slug, like the reads.
@@ -12947,7 +12966,10 @@ def authz_gate():
                                              '/admin/banner-rules/upsert', '/admin/photos/refresh',
                                              '/admin/factory-holds', '/admin/aging/seed',
                                              '/admin/pnl-fees', '/admin/color-map/rows',
-                                             '/admin/image-audit/build', '/admin/image-audit/verdicts'):
+                                             '/admin/image-audit/build', '/admin/image-audit/verdicts',
+                                             # Amazon agent: a run (dry run by default) and its
+                                             # non-secret settings (Nov 23 2026)
+                                             '/admin/amazon/run', '/admin/amazon/settings'):
                 return None
         if tier == 'oo' and ((method == 'GET' and path in _AUTHZ_CATALOG_READS)
                              or (method == 'POST' and path == '/suppression-overrides')):
@@ -25765,6 +25787,275 @@ def admin_aging_seed():
     except Exception as e:
         print(f"[Aging] seed failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({'error': 'The aging store could not be written.', 'code': type(e).__name__}), 503
+
+
+
+# ── Amazon agent (David, Nov 23 2026) ─────────────────────────────────────────
+# Weekday mornings it reads Amazon (SP-API), plans whole 36-pc cartons from Transcal's AM
+# stock (amazon_planner.py), sets up an UNCONFIRMED Amazon draft and emails David the Amazon
+# SKU list and the Transcal pick ticket. Only his YES, a reply to the Amazon mailbox that
+# email_agent.py has verified, confirms at Amazon and sends Transcal the ticket and labels.
+# State, settings and the latest Amazon snapshot are encrypted under inventory/amazon/ with the
+# P&L key (the bucket is public-read). Scheduled runs need AMAZON_AGENT_ENABLED=on and the
+# SP-API keys (SPAPI_LWA_CLIENT_ID / SPAPI_LWA_CLIENT_SECRET / SPAPI_REFRESH_TOKEN); the routes
+# take the machine key or a staff session whose email is an approver. Never blocks boot.
+AMAZON_STORE_PREFIX = 'inventory/amazon/'
+_amazon_agent = None
+try:
+    import amazon_agent as _amz
+    import amazon_planner as _amz_planner
+    import amazon_skus as _amz_skus
+    import amazon_spapi as _amz_spapi
+    from pnl_store import EncryptedStore as _AmzEncryptedStore, S3Store as _AmzS3Store
+
+    _amz_store = _AmzEncryptedStore(
+        _AmzS3Store(get_s3, os.environ.get('PNL_S3_BUCKET') or S3_BUCKET, prefix=AMAZON_STORE_PREFIX),
+        os.environ.get('PNL_DATA_KEYS', ''))
+    AMAZON_MAILBOX = (os.environ.get('AMAZON_AGENT_MAILBOX') or '').strip().lower()
+    AMAZON_AGENT_FROM = (os.environ.get('AMAZON_AGENT_FROM') or '').strip()
+    AMAZON_AGENT_ENABLED = (os.environ.get('AMAZON_AGENT_ENABLED') or 'off').strip().lower() == 'on'
+    try:
+        AMAZON_AGENT_HOUR = int(os.environ.get('AMAZON_AGENT_HOUR') or 8)     # Eastern time, weekdays
+    except ValueError:
+        AMAZON_AGENT_HOUR = 8
+
+    def _amz_int(v):
+        try:
+            return int(float(v or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _amz_get(name):
+        if not getattr(_amz_store, 'ok', False):
+            raise RuntimeError('Amazon store not configured: ' + str(getattr(_amz_store, 'reason', '')))
+        obj, _etag = _amz_store.get_obj(f'{name}.v1.bin')
+        return obj
+
+    def _amz_put(name, obj):
+        if not getattr(_amz_store, 'ok', False):
+            raise RuntimeError('Amazon store not configured: ' + str(getattr(_amz_store, 'reason', '')))
+        _amz_store.put_obj(f'{name}.v1.bin', obj)
+
+    def _amz_client():
+        cfg, _why = _amz_spapi.SpApiConfig.from_env()
+        return _amz_spapi.SpApiClient(cfg) if cfg else None
+
+    def _amz_is_amazon_customer(code):
+        c = str(code or '').upper().strip()
+        return c.startswith('AMAZON') or c in ('AMZ', 'AMAZ')
+
+    def _amz_stock_rows():
+        """AM rows: units available at Transcal and the units held for anyone but Amazon (open
+        orders plus other customers' APO). Amazon's own APO is its supply, never a hold."""
+        items = list(_inventory.get('items') or [])
+        with _apo_lock:
+            apo = list(_apo_data or [])
+        amazon_apo = {}
+        for a in apo:
+            if _amz_is_amazon_customer(a.get('customer')):
+                k = _amz_skus.norm_sku(a.get('style'))
+                amazon_apo[k] = amazon_apo.get(k, 0) + _amz_int(a.get('qty'))
+        rows = []
+        for r in items:
+            sku = _amz_skus.norm_sku(r.get('sku'))
+            if not sku.startswith(_amz_skus.AMAZON_PREFIX):
+                continue
+            hold = abs(_amz_int(r.get('committed'))) + abs(_amz_int(r.get('allocated'))) - amazon_apo.get(sku, 0)
+            rows.append(_amz_planner.StockRow(sku, _amz_int(r.get('tr')), max(0, hold)))
+        return rows
+
+    def _amz_prepack_resolver():
+        """One prepack-rules snapshot per run, matched exactly like the platform's exports
+        (Override Tool pack first, then _prepack_rule_match)."""
+        rules = _fresh_prepack_defaults()
+        abbr = {}
+        for r in (_inventory.get('items') or []):
+            sku = str(r.get('sku') or '').upper()
+            if sku.startswith(_amz_skus.AMAZON_PREFIX):
+                abbr.setdefault(_amz_skus.base_of(sku), r.get('brand_abbr') or r.get('brand') or '')
+        cache = {}
+
+        def resolve(base):
+            if base not in cache:
+                ab = abbr.get(base, '')
+                item = _annotate_items_for_prepack([{'sku': base, 'brand_abbr': ab, 'brand': ab}])[0]
+                rule = item.get('_override_size_pack') or _prepack_rule_match(item, rules)
+                cache[base] = _amz_planner.ratio_from_rule(rule, _amz_skus.fit_code(base))[0]
+            return cache[base]
+        return resolve
+
+    def _amz_meta_for(base):
+        rows = [r for r in (_inventory.get('items') or []) if _amz_skus.base_of(r.get('sku')) == base]
+        ab = (rows[0].get('brand_abbr') or rows[0].get('brand') or '') if rows else ''
+        try:
+            color, fit, fab = _ai_agent_enrich({'style': base, 'brand_abbr': ab,
+                                                '_skus': [r.get('sku') for r in rows]})
+        except Exception:
+            color, fit, fab = '', '', ''
+        return {'brand': (rows[0].get('brand_full') or ab) if rows else '', 'color': color,
+                'fit': fit, 'fabrication': fab}
+
+    def _amz_send(to, subject, html, attachments, cc=None):
+        from email_agent import _send_reply
+        if not AMAZON_AGENT_FROM:
+            return False, 'AMAZON_AGENT_FROM not set on the server'
+        return _send_reply(to, subject, html, attachments, {'always_cc': [], 'reply_to': AMAZON_MAILBOX},
+                           cc=list(cc or []), sender=AMAZON_AGENT_FROM)
+
+    _amazon_agent = _amz.Agent({'client': _amz_client, 'store_get': _amz_get, 'store_put': _amz_put,
+                                'stock_rows': _amz_stock_rows, 'prepack_resolver': _amz_prepack_resolver,
+                                'meta_for': _amz_meta_for, 'send_email': _amz_send})
+    # The Amazon mailbox rides email_agent.add_mailbox (the same hand-off the invoice mailbox
+    # uses): the webhook checks Resend's signature, the claim stops a second delivery, and the
+    # reply is read on a background thread so Resend gets its 200 at once.
+    def _amz_wants(data):
+        if not AMAZON_MAILBOX:
+            return False
+        import email_agent as _ea
+        to = data.get('to') or []
+        to = to if isinstance(to, (list, tuple)) else [to]
+        return any(_ea._addr(t) == AMAZON_MAILBOX for t in to)
+
+    def _amz_read_reply(event):
+        """Fetch the body, prove the sender is who they claim (DMARC/SPF/DKIM, email_agent's own
+        check), then give it to the agent, which acts only for an approver."""
+        import email_agent as _ea
+        data = event.get('data') or {}
+        email_id = str(data.get('email_id') or data.get('id') or '')
+        sender = _ea._addr(data.get('from'))
+        subject = str(data.get('subject') or '').strip()
+        try:
+            body = _ea._fetch_received(email_id, data)
+            headers = body.get('headers') or {}
+            ok, why = _ea._sender_is_authentic(sender, headers)
+            if not ok:
+                print(f'[Amazon] reply claiming to be {sender} not verified ({why}); nothing done', flush=True)
+                try:
+                    david = _amazon_agent.settings().get('david')
+                    if david and sender in _amazon_agent.settings()['approvers']:
+                        _amz_send(david, f'Re: {subject}', '<p>A reply to the Amazon agent could not be verified '
+                                  'as coming from you, so nothing was done. Please reply again.</p>', [])
+                except Exception:
+                    pass
+                return
+            if _ea._is_machine_mail(data, headers):
+                return
+            text = body.get('text') or _ea._plain_from_html(body.get('html'))
+            result = _amazon_agent.handle_reply(sender, subject, text)
+            print(f"[Amazon] reply from {sender}: {(result or {}).get('status')}", flush=True)
+        except Exception as e:
+            print(f'[Amazon] reply handling failed: {type(e).__name__}: {e}', flush=True)
+
+    def _amz_accept(event):
+        import email_agent as _ea
+        data = (event or {}).get('data') or {}
+        email_id = str(data.get('email_id') or data.get('id') or '')
+        if not email_id:
+            return 'no email id'
+        if not _ea._claim(email_id):
+            return 'duplicate'
+        threading.Thread(target=_amz_read_reply, args=(event,), daemon=True,
+                         name=f'amazon-reply-{email_id[:8]}').start()
+        return 'queued'
+
+    if AMAZON_MAILBOX:
+        import email_agent as _amz_ea
+        _amz_ea.add_mailbox('amazon', _amz_wants, _amz_accept)
+
+    def _amz_allowed():
+        ident = _request_identity() or {}
+        if ident.get('tier') == 'machine':
+            return True
+        if ident.get('tier') == 'staff':
+            try:
+                return str(ident.get('email') or '').strip().lower() in _amazon_agent.settings()['approvers']
+            except Exception:
+                return False
+        return False
+
+    _amz_job = {'thread': None, 'last': None}
+
+    def _amz_start(dry_run):
+        if _amz_job['thread'] is not None and _amz_job['thread'].is_alive():
+            return False
+
+        def work():
+            try:
+                _amz_job['last'] = {'dry_run': dry_run, 'result': _amazon_agent.run(dry_run=dry_run),
+                                    'at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+            except Exception as e:
+                _amz_job['last'] = {'dry_run': dry_run, 'error': f'{type(e).__name__}: {e}'[:400]}
+                print(f'[Amazon] run failed: {type(e).__name__}: {e}', flush=True)
+        _amz_job['thread'] = threading.Thread(target=work, daemon=True, name='amazon-agent-run')
+        _amz_job['thread'].start()
+        return True
+
+    @app.route('/admin/amazon/status', methods=['GET', 'OPTIONS'])
+    def admin_amazon_status():
+        if request.method == 'OPTIONS':
+            return '', 204
+        if not _amz_allowed():
+            return jsonify({'error': 'not allowed'}), 403
+        out = {'enabled': AMAZON_AGENT_ENABLED, 'hour_et': AMAZON_AGENT_HOUR,
+               'store': 'ok' if getattr(_amz_store, 'ok', False) else str(getattr(_amz_store, 'reason', '')),
+               'mailbox': bool(AMAZON_MAILBOX and AMAZON_AGENT_FROM),
+               'job': {'running': bool(_amz_job['thread'] and _amz_job['thread'].is_alive()), 'last': _amz_job['last']}}
+        try:
+            out.update(_amazon_agent.status())
+        except Exception as e:
+            out['error'] = f'{type(e).__name__}: {e}'[:300]
+        return jsonify(out)
+
+    @app.route('/admin/amazon/run', methods=['POST', 'OPTIONS'])
+    def admin_amazon_run():
+        """Start a run in the background. A dry run (the default) plans only: no Amazon draft,
+        no email. A real run does what the morning job does."""
+        if request.method == 'OPTIONS':
+            return '', 204
+        if not _amz_allowed():
+            return jsonify({'error': 'not allowed'}), 403
+        body = request.get_json(silent=True) or {}
+        dry = body.get('dry_run', True) is not False
+        if not _amz_start(dry):
+            return jsonify({'ok': False, 'detail': 'a run is already going'}), 409
+        return jsonify({'ok': True, 'started': True, 'dry_run': dry}), 202
+
+    @app.route('/admin/amazon/settings', methods=['POST', 'OPTIONS'])
+    def admin_amazon_settings():
+        if request.method == 'OPTIONS':
+            return '', 204
+        if not _amz_allowed():
+            return jsonify({'error': 'not allowed'}), 403
+        try:
+            return jsonify({'ok': True, 'settings': _amazon_agent.update_settings(request.get_json(silent=True) or {})})
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'{type(e).__name__}: {e}'[:300]}), 503
+
+    def _amz_scheduler():
+        """Leader worker only: one run each weekday at AMAZON_AGENT_HOUR Eastern."""
+        while True:
+            time.sleep(300)
+            try:
+                if not AMAZON_AGENT_ENABLED or not worker_leader.is_leader():
+                    continue
+                now = _pres_now_et()
+                if now.weekday() >= 5 or now.hour != AMAZON_AGENT_HOUR:
+                    continue
+                last = ((_amz_get('state') or {}).get('last_run') or {}).get('at') or ''
+                if last[:10] == datetime.utcnow().strftime('%Y-%m-%d'):
+                    continue
+                _amz_start(False)
+            except Exception as e:
+                print(f'[Amazon] scheduler: {type(e).__name__}: {e}', flush=True)
+
+    if AMAZON_AGENT_ENABLED:
+        threading.Thread(target=_amz_scheduler, daemon=True, name='amazon-agent-scheduler').start()
+    print(f"[Amazon] agent registered | store {'ok' if getattr(_amz_store, 'ok', False) else 'NOT CONFIGURED'} | "
+          f"{'scheduled' if AMAZON_AGENT_ENABLED else 'not scheduled'} | "
+          f"mailbox {'on' if AMAZON_MAILBOX else 'off'}", flush=True)
+except Exception as _amazon_err:
+    print(f'[Amazon] agent NOT registered: {type(_amazon_err).__name__}: {_amazon_err}', flush=True)
+
 
 
 if __name__ == '__main__':

@@ -362,17 +362,23 @@ def _fetch_received(email_id, data):
 
 
 def _send_reply(to_addr, subject, html, attachments, cfg, in_reply_to=None, references=None,
-                cc=None, idempotency_key=None):
+                cc=None, idempotency_key=None, sender=None):
     if not RESEND_API_KEY:
         return False, 'RESEND_API_KEY not configured on the server'
-    sender = EMAIL_AGENT_FROM or cfg.get('reply_from') or ''
+    # sender: another surface's own From line (the Amazon agent, Nov 23 2026). Its reply-to then
+    # comes from cfg first, so a reply reaches THAT mailbox and not the inventory assistant's.
+    own = bool(sender)
+    sender = sender or EMAIL_AGENT_FROM or cfg.get('reply_from') or ''
     if not sender:
         return False, 'EMAIL_AGENT_FROM not configured on the server'
-    payload = {'from': sender, 'to': [to_addr], 'subject': subject, 'html': html,
+    to_list = [a for a in (to_addr if isinstance(to_addr, (list, tuple)) else [to_addr]) if a]
+    if not to_list:
+        return False, 'no recipient'
+    payload = {'from': sender, 'to': to_list, 'subject': subject, 'html': html,
                # X-Versa-Agent marks our own mail so a reply that loops back
                # into the mailbox is dropped instead of answered again.
                'headers': {'X-Versa-Agent': '1', 'Auto-Submitted': 'auto-replied'}}
-    reply_to = EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or ''
+    reply_to = ((cfg.get('reply_to') if own else '') or EMAIL_AGENT_REPLY_TO or cfg.get('reply_to') or '')
     if reply_to:
         payload['reply_to'] = reply_to
     # cc is worked out by the caller (reply-all); always_cc is the fallback for
