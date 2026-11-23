@@ -216,6 +216,33 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNotNone(W._skip_reason({'from': 'mailer-daemon@z.test', 'subject': 'x'}, {}))
         self.assertIsNotNone(W._skip_reason({'from': 'a@z.test', 'subject': 'Out of Office: back Monday'}, {}))
 
+    def test_trust_for_a_bill_auto_forwarded_by_our_own_gmail(self):
+        c = cfg()
+        ses = ('amazonses.com; spf=pass (spfcheck: domain of z-co.test designates 192.0.2.1 as permitted sender) '
+               'client-ip=192.0.2.1; envelope-from=owner+caf_=whconfirmation=z-mail.test@z-co.test; '
+               'dkim=fail header.i=@z-vendor.test; dmarc=fail header.from=z-vendor.test')
+        c = dict(c, internal_domains=['z-co.test'])
+        hdr = {'Authentication-Results': ses, 'X-Forwarded-For': 'owner@z-co.test whconfirmation@z-mail.test'}
+        self.assertEqual(W._trust('ar@z-vendor.test', hdr, c)[0], 'forwarded')
+        no_fwd = {'Authentication-Results': ses}
+        self.assertEqual(W._trust('ar@z-vendor.test', no_fwd, c)[0], 'unverified',
+                         'a relay that does not say it forwarded for us earns nothing')
+        stranger = {'Authentication-Results': ses.replace('z-co.test', 'z-other.test'),
+                    'X-Forwarded-For': 'owner@z-co.test whconfirmation@z-mail.test'}
+        self.assertEqual(W._trust('ar@z-vendor.test', stranger, c)[0], 'unverified',
+                         'the forwarding envelope must authenticate as our own domain')
+        signed = {'Authentication-Results': 'amazonses.com; dmarc=pass header.from=z-vendor.test'}
+        self.assertEqual(W._trust('ar@z-vendor.test', signed, c)[0], 'verified')
+
+    def test_report_goes_to_the_inventory_mailbox_admins_when_notify_is_empty(self):
+        old = EA._load_config
+        self.addCleanup(lambda: setattr(EA, '_load_config', old))
+        EA._load_config = lambda force=False: {'notify': ['z-boss@z-co.test']}
+        self.assertEqual(W._report_recipients_default(), ['z-boss@z-co.test'])
+        EA._load_config = lambda force=False: {'notify': [], 'senders': [
+            {'email': 'z-boss@z-co.test', 'tier': 'admin'}, {'email': 'z-staff@z-co.test', 'tier': 'staff'}]}
+        self.assertEqual(W._report_recipients_default(), ['z-boss@z-co.test'])
+
     def test_claim_is_once(self):
         self.assertTrue(W._claim('z-claim-1'))
         self.assertFalse(W._claim('z-claim-1'))

@@ -369,12 +369,17 @@ def _save_config(cfg):
 
 
 def _report_recipients_default():
-    """The inventory mailbox's notify list: whoever hears about its blocked or
-    failed requests (David). Read in-process so no address lives in this file."""
+    """The inventory mailbox's notify list (whoever hears about its blocked or
+    failed requests: David), else its admin senders. Read in-process so no
+    address lives in this file."""
     try:
-        return [a for a in (_ea._load_config().get('notify') or []) if _ea._addr(a)]
+        acfg = _ea._load_config()
     except Exception:
         return []
+    out = [_ea._addr(a) for a in (acfg.get('notify') or []) if _ea._addr(a)]
+    if not out:
+        out = [r['email'] for r in (acfg.get('senders') or []) if r.get('tier') == 'admin' and r.get('email')]
+    return out
 
 
 # ── The ledger: everything this mailbox has learned, sealed ──────────────────
@@ -2745,7 +2750,8 @@ def _report_html(results, meta, notes):
         out.append('<p style="margin:16px 0 4px"><b>Reading notes</b></p><ul style="margin-top:0">'
                    + ''.join(f'<li>{_esc(n)}</li>' for n in notes[:12]) + '</ul>')
     who = meta.get('original_from') or meta.get('from') or ''
-    trust = {'internal': 'internal', 'verified': 'verified sender', 'unverified': 'sender NOT verified'}.get(
+    trust = {'internal': 'internal', 'verified': 'verified sender', 'forwarded': 'auto-forwarded from your inbox',
+             'unverified': 'sender NOT verified'}.get(
         meta.get('trust'), meta.get('trust') or '')
     out.append(f'<p style="color:#777;font-size:12px;margin-top:22px">From {_esc(who)} ({_esc(trust)}). '
                'Every line and check is in the attached workbook. This mailbox only reports to you; it never '
@@ -2974,11 +2980,26 @@ def _record(entry):
 
 
 def _trust(from_addr, headers, cfg):
+    """internal: a colleague sent or forwarded it. verified: the sender's own
+    domain signed it. forwarded: one of our mailboxes auto-forwarded it (a
+    Gmail filter). The vendor's signature often does not survive that hop,
+    but the relay itself is authenticated as our domain (SPF for the
+    forwarding envelope) and names who forwarded it. unverified: neither."""
+    internal = [d for d in (cfg.get('internal_domains') or []) if d]
     ok, why = _ea._sender_is_authentic(from_addr, headers)
     dom = from_addr.rsplit('@', 1)[-1] if '@' in from_addr else ''
-    if ok and dom in (cfg.get('internal_domains') or []):
+    if ok and dom in internal:
         return 'internal', why
-    return ('verified' if ok else 'unverified'), why
+    if ok:
+        return 'verified', why
+    fwd = ' '.join(str(v) for k, v in (headers or {}).items()
+                   if str(k).lower() in ('x-forwarded-for', 'x-forwarded-to')).lower()
+    for d in internal:
+        if f'@{d}' in fwd:
+            ok2, why2 = _ea._sender_is_authentic(f'relay@{d}', headers)
+            if ok2:
+                return 'forwarded', f'auto-forwarded through {d} ({why2})'
+    return 'unverified', why
 
 
 def _quota_ok(sender, cfg):
@@ -3133,6 +3154,13 @@ def _handle(event, *, files=None, dry=False, remember=None, send_to=None, test=F
         led, _etag = _ledger_load()
         ctx = _Ctx(cfg, led, meta)
         results = _check_all(docs, ctx)
+        billable = [r for r in results if r['doc']['type'] in ('invoice', 'credit_memo', 'statement')]
+        if not billable and trust != 'internal' and not dry:
+            # A payment receipt or a notice that came in on its own: nothing to
+            # check, and an email saying so every time would only be noise.
+            entry.update(status='skipped', reason='no bill or statement in it',
+                         documents=[f"{r['doc']['type']}:{r['doc'].get('file')}" for r in results][:10])
+            return out
         subj = _subject(results, cfg, test=meta['test'])
         html = _report_html(results, meta, notes)
         xlsx = _report_xlsx(results, meta, notes)
