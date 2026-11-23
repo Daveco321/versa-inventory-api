@@ -3061,6 +3061,18 @@ def _is_forwarding_confirmation(from_addr, subject):
     return from_addr.endswith('@google.com') and 'forwarding' in from_addr and 'confirm' in subject.lower()
 
 
+def _forwarding_requester(text, cfg):
+    """Who asked Gmail to forward to this mailbox ('jane@versamens.com has
+    requested to automatically forward mail to your email address ...'), when
+    that person is one of ours: the confirmation link goes to them, so any
+    teammate can set up a filter in their own inbox."""
+    m = re.search(r'([\w.+\-]+@[\w.\-]+)\s+has\s+requested\s+to\s+automatically\s+forward', str(text or ''), re.I)
+    if not m:
+        return ''
+    addr = m.group(1).lower()
+    return addr if addr.rsplit('@', 1)[-1] in (cfg.get('internal_domains') or []) else ''
+
+
 def _help_html():
     return ('<div style="font-family:Arial,sans-serif;font-size:14px"><p>This mailbox checks warehouse and freight '
             'bills. Forward an email with the bill attached (PDF, Excel or a photo) and I will reply with what checks '
@@ -3095,7 +3107,10 @@ def _handle(event, *, files=None, dry=False, remember=None, send_to=None, test=F
         if not dry and _is_forwarding_confirmation(from_addr, subject):
             ok, _why = _ea._sender_is_authentic(from_addr, headers)
             if ok:
-                to = cfg.get('report_to') or _report_recipients_default()
+                to = list(cfg.get('report_to') or _report_recipients_default())
+                who = _forwarding_requester(text, cfg)
+                if who and who not in to:
+                    to.insert(0, who)
                 _send(to, [], 'Gmail forwarding confirmation for the invoice mailbox',
                       '<p>Gmail sent this confirmation to the invoice mailbox. Click the link in it to finish '
                       'setting up forwarding.</p><pre style="white-space:pre-wrap">' + _esc(text[:4000]) + '</pre>')

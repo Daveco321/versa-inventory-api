@@ -243,6 +243,15 @@ class RoutingTests(unittest.TestCase):
             {'email': 'z-boss@z-co.test', 'tier': 'admin'}, {'email': 'z-staff@z-co.test', 'tier': 'staff'}]}
         self.assertEqual(W._report_recipients_default(), ['z-boss@z-co.test'])
 
+    def test_gmail_confirmation_goes_to_the_teammate_who_asked(self):
+        c = dict(cfg(), internal_domains=['z-co.test'])
+        text = ('z-jane@z-co.test has requested to automatically forward mail to your email '
+                'address whconfirmation@z-mail.test.')
+        self.assertEqual(W._forwarding_requester(text, c), 'z-jane@z-co.test')
+        outsider = text.replace('z-jane@z-co.test', 'z-jane@z-elsewhere.test')
+        self.assertEqual(W._forwarding_requester(outsider, c), '', 'only our own people get the link')
+        self.assertEqual(W._forwarding_requester('nothing here', c), '')
+
     def test_claim_is_once(self):
         self.assertTrue(W._claim('z-claim-1'))
         self.assertFalse(W._claim('z-claim-1'))
