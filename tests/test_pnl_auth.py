@@ -1332,6 +1332,67 @@ class TestAnalyticsRoute(PnlTestCase):
         self.assertIsNone(d['costLens']['state'])                      # rebuilt from the fake engine (no shipped block)
         self.assertEqual(d['costByCustomer'], {'ROSS': {'ZZAAAA001': SENTINEL_COST}})
 
+    def test_yearly_rate_maps_and_rates(self):
+        """Yearly rate (Nov 24 2026, Charlesy through David: the average annual conversion in the numbers): the
+        route publishes the yuan part of each cost (fxShare at its printed fxRef) per account and style from the
+        invoice history, per style from the styles table, and the host app's yearly rates. Rows with no yuan
+        part, no cost or an unreadable share or rate are left out. Synthetic shares and rates only."""
+        eng = make_engine()
+        eng.HISTORY_CUSTOMER_ALIAS = {}
+
+        def build_dataset(src, costbook, settings, overrides, now_iso, routing_module):
+            return {'v': 1, 'builtAt': now_iso, 'asOf': src['today'],
+                    'shipped': {'byCustomer': {
+                        'fields': ['cust', 'base', 'fobU', 'grade', 'units', 'fob', 'duty', 'freight', 'fees',
+                                   'fxShare', 'fxRef'],
+                        'rows': [['ROSS', 'ZZAAAA001', SENTINEL_COST, 'A', 10, 10 * SENTINEL_COST, 0, 0, 0, 1.0, 9.0],
+                                 ['ROSS', 'ZZBBBB002', SENTINEL_COST, 'A', 10, 10 * SENTINEL_COST, 0, 0, 0, 0.25, 9.5],
+                                 ['ROSS', 'ZZCCCC003', SENTINEL_COST, 'A', 10, 10 * SENTINEL_COST, 0, 0, 0, 0.0, None],
+                                 ['ROSS', 'ZZDDDD004', SENTINEL_COST, 'A', 10, 10 * SENTINEL_COST, 0, 0, 0, 0.5, 0],
+                                 ['ROSS', 'ZZEEEE005', SENTINEL_COST, 'A', 10, 10 * SENTINEL_COST, 0, 0, 0, 'x', 9.0],
+                                 ['NORD', 'ZZAAAA001', None, 'D', 0, None, 0, 0, 0, 1.0, 9.0]]},
+                                'pending': {'ready': True, 'byPair': {
+                                    'fields': ['cust', 'base', 'units', 'invUnits', 'rev', 'fobU', 'fob', 'duty',
+                                               'freight', 'fees', 'level', 'grade', 'pcs'],
+                                    'rows': [['MARS', 'ZZAAAA001', 4, 4, 40.0, SENTINEL_COST, 4 * SENTINEL_COST,
+                                              0.0, 0.0, 0.0, 'L4a', 'A', 1],
+                                             ['ROSS', 'ZZCCCC003', 4, 4, 40.0, SENTINEL_COST, 4 * SENTINEL_COST,
+                                              0.0, 0.0, 0.0, 'L4a', 'A', 1]]}}},
+                    'styles': {'fields': ['base', 'fobU', 'grade', 'fxShare', 'fxRef'],
+                               'rows': [['ZZAAAA001', SENTINEL_COST, 'A', 0.75, 9.25],
+                                        ['ZZBBBB002', SENTINEL_COST, 'A', None, None],
+                                        ['ZZCCCC003', SENTINEL_COST, 'A', 1.0, 9.0],
+                                        ['ZZFFFF006', None, 'D', 1.0, 9.0]]}}
+        eng.build_dataset = build_dataset
+        h = self.harness(engine=eng)
+        h.upload()
+        h.svc.sales_matrix = self.cube
+        self.assertEqual(h.dataset().status_code, 200)
+        d = h.admin('GET', '/api/pnl/analytics').get_json()
+        # ROSS ZZCCCC003 is invoiced in dollars (share 0): no entry, although its style has a yuan split and an
+        # awaiting-invoice row; MARS ZZAAAA001 is only awaiting invoice, so it takes its style's split.
+        self.assertEqual(d['costFx'], {'ROSS': {'ZZAAAA001': [1.0, 9.0], 'ZZBBBB002': [0.25, 9.5]},
+                                       'MARS': {'ZZAAAA001': [0.75, 9.25]}})
+        self.assertEqual(d['costFxByStyle'], {'ZZAAAA001': [0.75, 9.25], 'ZZCCCC003': [1.0, 9.0]})
+        self.assertIn('ZZCCCC003', d['costByCustomer']['ROSS'])
+        self.assertEqual(d['fxYears'], {'ready': False, 'reason': 'unwired'})
+        block = {'ready': True, 'rates': {'2031': 8.5, '2032': 8.25}, 'through': {'2031': '2031-12-31'},
+                 'live': [], 'source': 'test', 'fixedAsOf': '2031-12-31'}
+        h.svc.fx_years = lambda: block
+        self.assertEqual(h.admin('GET', '/api/pnl/analytics').get_json()['fxYears'], block)
+
+        def boom():
+            raise RuntimeError('no rates')
+        h.svc.fx_years = boom
+        self.assertEqual(h.admin('GET', '/api/pnl/analytics').get_json()['fxYears'], {'ready': False, 'reason': 'rates'})
+        self.assertIn('[PnL] analytics fx years unavailable: RuntimeError', self._out.getvalue())
+        for bad in (None, [], {'ready': False}, {'ready': True, 'rates': []}):
+            h.svc.fx_years = (lambda v: (lambda: v))(bad)
+            self.assertEqual(h.admin('GET', '/api/pnl/analytics').get_json()['fxYears'],
+                             {'ready': False, 'reason': 'rates'})
+        # the cost maps themselves never move with the rates
+        self.assertEqual(d['cost2ByCustomer']['ROSS']['ZZAAAA001'], [round(SENTINEL_COST, 4), 0.0])
+
     def test_gzip_when_accepted(self):
         h = self.harness(engine=self.eng_with_history())
         h.upload()
@@ -1459,6 +1520,20 @@ class TestAppWiring(unittest.TestCase):
         store_src = ast.get_source_segment(self.src, kws['store'])
         for part in ('EncryptedStore(', 'S3Store(', 'PNL_DATA_KEYS'):
             self.assertIn(part, store_src)
+
+    def test_yearly_rates_are_wired_inside_the_pnl_block(self):
+        """Nov 24 2026: the yearly yuan rates getter (fx_years.get) is attached to the P&L service inside the
+        registration block, in its own try so a failure there never disables the P&L."""
+        block = next(n for n in self.body if isinstance(n, ast.Try)
+                     and any(isinstance(s, ast.ImportFrom) and s.module == 'pnl' for s in n.body))
+        inner = [n for n in block.body if isinstance(n, ast.Try)]
+        self.assertEqual(len(inner), 1)
+        seg = ast.get_source_segment(self.src, inner[0])
+        self.assertIn('import fx_years as _fx_years', seg)
+        self.assertIn('_pnl_svc.fx_years = _fx_years.get', seg)
+        handler = ast.get_source_segment(self.src, inner[0].handlers[0])
+        self.assertIn('type(', handler)
+        self.assertNotIn('str(', handler)
 
     def test_pnl_names_only_inside_the_pnl_block(self):
         start = next(n.lineno for n in self.body if isinstance(n, ast.Assign)

@@ -24973,6 +24973,13 @@ try:
         caller_identity=_pnl_caller_identity,
         sources=_pnl_sources())
     _pnl_svc.sales_matrix = _pnl_sales_matrix   # request-thread-safe getter, not a build source
+    try:
+        # Each year's average yuan per dollar for Inventory Analytics (Nov 24 2026): public ECB rates, fetched in
+        # the background; the getter never blocks a request.
+        import fx_years as _fx_years
+        _pnl_svc.fx_years = _fx_years.get
+    except Exception as _fx_exc:
+        print(f"[PnL] yearly yuan rates unavailable: {type(_fx_exc).__name__}", flush=True)
 except Exception as _pnl_exc:   # boot must never fail because of the P&L
     print(f"[PnL] disabled: {type(_pnl_exc).__name__}", flush=True)
 

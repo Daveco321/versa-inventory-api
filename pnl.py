@@ -1277,6 +1277,7 @@ class _PnlService:
         self._quote_memo = None     # {'key', 'ci'}: the Cost Glossary's cost index (Oct 8 2026)
         self._why_memo = None       # {'key', 'builtAt', 'started', 'styles', 'custs', ...}: the style-cost index (Oct 13 2026)
         self.sales_matrix = None    # set by the host app after registration (invoiced-history cube getter)
+        self.fx_years = None        # set by the host app: () -> yearly yuan per dollar (fx_years.get, Nov 24 2026)
         # Other stores on the same PNL_DATA_KEYS that POST /api/pnl/rotate must re-encrypt too:
         # callables () -> {label: 'rotated' | 'absent' | ...}, appended by the host app (the
         # Inventory Aging objects, Oct 5 2026). A failure there never fails the P&L rotate.
@@ -1904,7 +1905,12 @@ class _PnlService:
                'piecesPer': self._analytics_pieces(matrix, cost),
                'datasetBuiltAt': cost['builtAt'],
                'costLens': lens,
-               'fees': self._analytics_fees(matrix)}
+               'fees': self._analytics_fees(matrix),
+               # Yearly rate (Nov 24 2026): the yuan part of each cost (fxShare at the printed fxRef) per account and
+               # style, per style for pairs the history lacks, and each year's average yuan per dollar.
+               'costFx': cost.get('fx') or {},
+               'costFxByStyle': cost.get('fxStyle') or {},
+               'fxYears': self._analytics_fx_years()}
         body = json.dumps(out, separators=(',', ':'), allow_nan=False, default=_json_default).encode('utf-8')
         gz = gzip.compress(body, compresslevel=6, mtime=0)
         try:
@@ -2011,6 +2017,34 @@ class _PnlService:
             print(f"[PnL] analytics fees unavailable: {type(e).__name__}", flush=True)
             return {'ready': False, 'reason': 'settings'}
 
+    def _analytics_fx_years(self):
+        """Each year's average yuan per US dollar (Nov 24 2026, Charlesy through David: "the average annual
+        conversion calculated into the numbers"), from the host app's getter (fx_years.get: public ECB rates).
+        The page restates the yuan part of a cost (costFx) from its printed rate to the rate of the year the
+        units sold in. Never raises: {'ready': False} when the getter is not wired or fails."""
+        getter = self.fx_years
+        if not callable(getter):
+            return {'ready': False, 'reason': 'unwired'}
+        try:
+            out = getter()
+        except Exception as e:
+            print(f"[PnL] analytics fx years unavailable: {type(e).__name__}", flush=True)
+            return {'ready': False, 'reason': 'rates'}
+        if not isinstance(out, dict) or not out.get('ready') or not isinstance(out.get('rates'), dict):
+            return {'ready': False, 'reason': 'rates'}
+        return out
+
+    @staticmethod
+    def _fx_pair(share, ref):
+        """[fxShare, fxRef] of a row whose cost is partly or wholly yuan based, else None."""
+        try:
+            s, r = float(share), float(ref)
+        except (TypeError, ValueError):
+            return None
+        if not (0 < s <= 1.0000001) or not (0 < r < 100) or not (math.isfinite(s) and math.isfinite(r)):
+            return None
+        return [round(min(s, 1.0), 4), round(r, 4)]
+
     def _kick_lens_rebuild(self, key):
         """Start a forced rebuild for `key` when none is running and the served
         memo is older than a minute. Used when the memo was built without the
@@ -2086,17 +2120,23 @@ class _PnlService:
         by_cust = {}
         by_cust2 = {}
         pieces = {}         # account -> {base: pieces per invoiced unit} where a unit holds several (kits, cartons)
+        fx = {}             # account -> {base: [fxShare, fxRef]} for costs with a yuan-based part (Nov 24 2026)
         bc = (ds.get('shipped') or {}).get('byCustomer') or {}
         f = {n: i for i, n in enumerate(bc.get('fields') or [])}
         if 'cust' in f and 'base' in f and 'fobU' in f:
             have2 = all(k in f for k in ('units', 'fob', 'duty', 'freight', 'fees'))
             havep = 'units' in f and 'pieces' in f
+            havefx = 'fxShare' in f and 'fxRef' in f
             for row in bc.get('rows') or []:
                 if havep and row[f['units']] and row[f['pieces']] and row[f['pieces']] != row[f['units']]:
                     pieces.setdefault(row[f['cust']], {})[row[f['base']]] = round(row[f['pieces']] / row[f['units']], 4)
                 fob = row[f['fobU']]
                 if fob is not None:
                     by_cust.setdefault(row[f['cust']], {})[row[f['base']]] = fob
+                    if havefx:
+                        pair = self._fx_pair(row[f['fxShare']], row[f['fxRef']])
+                        if pair:
+                            fx.setdefault(row[f['cust']], {})[row[f['base']]] = pair
                 # Per HISTORY unit (kit cartons stay cartons: the byCustomer totals
                 # already carry the kit piece scaling), so the client multiplies by
                 # the cube's own units: [factory cost per unit, import add per unit].
@@ -2109,11 +2149,12 @@ class _PnlService:
                         imp = (row[f['duty']] or 0) + (row[f['freight']] or 0) + (row[f['fees']] or 0)
                         by_cust2.setdefault(row[f['cust']], {})[row[f['base']]] = [
                             round(tot / u, 4), round(imp / u, 4)]
+        hist_pairs = {(c, b) for c, styles in by_cust.items() for b in styles}
         # Awaiting-invoice pairs (Oct 13 2026, David: no more invoice reports): a style that only
         # shipped since the last invoice takes its cost from the pending block, so the analytics
         # never show its units without a cost. Invoiced pairs keep their own numbers.
         self._pending_pair_costs(shipped, by_cust, by_cust2, pieces)
-        by_style, grades, kit_styles = {}, {}, {}
+        by_style, grades, kit_styles, fx_style = {}, {}, {}, {}
         st = ds.get('styles') or {}
         sf = {n: i for i, n in enumerate(st.get('fields') or [])}
         if 'base' in sf and 'kitPcs' in sf:
@@ -2121,15 +2162,27 @@ class _PnlService:
                 if row[sf['kitPcs']]:
                     kit_styles[row[sf['base']]] = row[sf['kitPcs']]
         if 'base' in sf and 'fobU' in sf:
+            havefx = 'fxShare' in sf and 'fxRef' in sf
             for row in st.get('rows') or []:
                 fob = row[sf['fobU']]
                 if fob is not None:
                     by_style[row[sf['base']]] = fob
                     if 'grade' in sf:
                         grades[row[sf['base']]] = row[sf['grade']]
+                    if havefx:
+                        pair = self._fx_pair(row[sf['fxShare']], row[sf['fxRef']])
+                        if pair:
+                            fx_style[row[sf['base']]] = pair
+        # A pair costed from the awaiting-invoice block carries no yuan split of its own: it takes its style's.
+        # An invoiced pair keeps its own (none when its cost has no yuan part), so the page never falls back
+        # to the style for an account whose own cost is in dollars.
+        for c in set(by_cust) | set(by_cust2):
+            for b in set(by_cust.get(c) or ()) | set(by_cust2.get(c) or ()):
+                if (c, b) not in hist_pairs and b in fx_style:
+                    fx.setdefault(c, {})[b] = fx_style[b]
         hit = {'key': key, 'builtAt': built_at, 'started': started, 'alias': alias, 'byCust': by_cust,
                'byCust2': by_cust2, 'byStyle': by_style, 'grades': grades, 'lens': lens, 'pieces': pieces,
-               'kitStyles': kit_styles}
+               'kitStyles': kit_styles, 'fx': fx, 'fxStyle': fx_style}
         with self._lock:
             self._an_memo = hit
         return hit
