@@ -251,7 +251,7 @@ FABRIC_RULES = {
     "PY": "50% cotton / 47% polyester/ 3% spandex - CVC OXFORD",
     "UP": "95% poly / 5%spandex ---Perforated", "NY": "78% Nylon / 22% Spandex - 165GSM",
     "CL": "35% Lyocell/35%Cotton/27% Nylon/3%Spandex", "PM": "50% Polyester / 50% Microfiber",
-    "PX": "95% Polyester / 5% Spandex - Core", "CN": "71% Cotton / 27% Nylon / 2% Spandex",
+    "PX": "87% Polyester / 13% Spandex", "CN": "71% Cotton / 27% Nylon / 2% Spandex",
     "MP": "74% Modal / 26% Polyester", "LE": "100% Linen",
     "PE": "96% POLYESTER / 4% SPANDEX - END ON END", "OC": "100% Cotton - OXFORD",
     "CD": "65% Polyester / 35% Cotton - Dobby", "CY": "100% Cotton - Yarn Dye",
